@@ -294,40 +294,57 @@ impl Controller {
             callbacks,
         );
 
-        let add = {
-            let weak = Rc::downgrade(self);
-            Rc::new(move |url, name| {
-                if let Some(controller) = weak.upgrade() {
-                    controller.add_subscription(url, name);
-                }
-            }) as Rc<dyn Fn(String, Option<String>)>
+        let sub_callbacks = super::views::subscriptions::SubscriptionCallbacks {
+            add: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |url, name| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.add_subscription(url, name);
+                    }
+                })
+            },
+            import: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |text| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.import_servers(text);
+                    }
+                })
+            },
+            refresh: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.refresh_subscription(id);
+                    }
+                })
+            },
+            remove: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.remove_subscription(id);
+                    }
+                })
+            },
+            remove_server: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.remove_server(id);
+                    }
+                })
+            },
+            hwid: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id, enabled| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.set_hwid(id, enabled);
+                    }
+                })
+            },
         };
-        let refresh = {
-            let weak = Rc::downgrade(self);
-            Rc::new(move |id| {
-                if let Some(controller) = weak.upgrade() {
-                    controller.refresh_subscription(id);
-                }
-            }) as Rc<dyn Fn(String)>
-        };
-        let remove = {
-            let weak = Rc::downgrade(self);
-            Rc::new(move |id| {
-                if let Some(controller) = weak.upgrade() {
-                    controller.remove_subscription(id);
-                }
-            }) as Rc<dyn Fn(String)>
-        };
-        let hwid = {
-            let weak = Rc::downgrade(self);
-            Rc::new(move |id, enabled| {
-                if let Some(controller) = weak.upgrade() {
-                    controller.set_hwid(id, enabled);
-                }
-            }) as Rc<dyn Fn(String, bool)>
-        };
-        self.subscriptions
-            .rebuild(&subscriptions, add, refresh, remove, hwid);
+        self.subscriptions.rebuild(&subscriptions, sub_callbacks);
     }
 
     fn toggle_connection(self: &Rc<Self>) {
@@ -480,6 +497,32 @@ impl Controller {
             |controller, result| {
                 controller.finish_subscription_change("delete subscription", result)
             },
+        );
+    }
+
+    fn import_servers(self: &Rc<Self>, text: String) {
+        self.engine_job(
+            move |engine| engine.import_links(&text),
+            |controller, result| match result {
+                Ok(count) => {
+                    controller.rebuild_views();
+                    controller.start_probes();
+                    let message = match count {
+                        0 => "No new servers (already imported)".to_string(),
+                        1 => "Imported 1 server".to_string(),
+                        n => format!("Imported {n} servers"),
+                    };
+                    controller.show_message(&message);
+                }
+                Err(error) => controller.show_message(&format!("Could not import: {error}")),
+            },
+        );
+    }
+
+    fn remove_server(self: &Rc<Self>, server_id: String) {
+        self.engine_job(
+            move |engine| engine.remove_server(&server_id),
+            |controller, result| controller.finish_subscription_change("remove server", result),
         );
     }
 

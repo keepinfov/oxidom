@@ -2,9 +2,21 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use crate::engine::LOCAL_ID;
 use crate::model::Subscription;
 
 use super::super::group::subscription_description;
+
+/// Callbacks the subscriptions view invokes.
+#[derive(Clone)]
+pub struct SubscriptionCallbacks {
+    pub add: Rc<dyn Fn(String, Option<String>)>,
+    pub import: Rc<dyn Fn(String)>,
+    pub refresh: Rc<dyn Fn(String)>,
+    pub remove: Rc<dyn Fn(String)>,
+    pub remove_server: Rc<dyn Fn(String)>,
+    pub hwid: Rc<dyn Fn(String, bool)>,
+}
 
 #[derive(Clone)]
 pub struct SubscriptionsView {
@@ -27,14 +39,7 @@ impl SubscriptionsView {
         Self { root, content }
     }
 
-    pub fn rebuild(
-        &self,
-        subscriptions: &[Subscription],
-        on_add: Rc<dyn Fn(String, Option<String>)>,
-        on_refresh: Rc<dyn Fn(String)>,
-        on_remove: Rc<dyn Fn(String)>,
-        on_hwid: Rc<dyn Fn(String, bool)>,
-    ) {
+    pub fn rebuild(&self, subscriptions: &[Subscription], callbacks: SubscriptionCallbacks) {
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
@@ -55,6 +60,7 @@ impl SubscriptionsView {
         add_group.add(&add);
         let url_for_add = url.clone();
         let name_for_add = name.clone();
+        let on_add = callbacks.add.clone();
         add.connect_clicked(move |_| {
             let value = url_for_add.text().trim().to_string();
             if value.is_empty() {
@@ -67,6 +73,50 @@ impl SubscriptionsView {
         });
         self.content.append(&add_group);
 
+        // Standalone servers: paste one or more share-links, no subscription.
+        let server_group = adw::PreferencesGroup::builder()
+            .title("Add server")
+            .description("Paste share-links (vless://, vmess://, trojan://, ss://), one per line.")
+            .build();
+        let buffer = gtk::TextBuffer::new(None);
+        let editor = gtk::TextView::builder()
+            .buffer(&buffer)
+            .monospace(true)
+            .top_margin(6)
+            .bottom_margin(6)
+            .left_margin(8)
+            .right_margin(8)
+            .wrap_mode(gtk::WrapMode::Char)
+            .build();
+        let scroller = gtk::ScrolledWindow::builder()
+            .min_content_height(76)
+            .max_content_height(180)
+            .propagate_natural_height(true)
+            .child(&editor)
+            .build();
+        let frame = gtk::Frame::builder()
+            .child(&scroller)
+            .css_classes(["card"])
+            .build();
+        let import = gtk::Button::builder()
+            .label("Import")
+            .halign(gtk::Align::End)
+            .css_classes(["suggested-action", "pill"])
+            .build();
+        server_group.add(&frame);
+        server_group.add(&import);
+        let on_import = callbacks.import.clone();
+        import.connect_clicked(move |_| {
+            let (start, end) = buffer.bounds();
+            let text = buffer.text(&start, &end, false).to_string();
+            if text.trim().is_empty() {
+                return;
+            }
+            on_import(text);
+            buffer.set_text("");
+        });
+        self.content.append(&server_group);
+
         let list = adw::PreferencesGroup::builder()
             .title("Subscriptions")
             .build();
@@ -76,13 +126,40 @@ impl SubscriptionsView {
                 .subtitle(subscription_description(subscription))
                 .build();
 
+            if subscription.id == LOCAL_ID {
+                for server in &subscription.servers {
+                    let row = adw::ActionRow::builder()
+                        .title(&server.name)
+                        .subtitle(format!(
+                            "{}:{} · {}",
+                            server.address,
+                            server.port,
+                            server.protocol.as_str()
+                        ))
+                        .build();
+                    let trash = gtk::Button::builder()
+                        .icon_name("user-trash-symbolic")
+                        .tooltip_text("Remove server")
+                        .valign(gtk::Align::Center)
+                        .css_classes(["flat"])
+                        .build();
+                    let id = server.id.clone();
+                    let remove_server = callbacks.remove_server.clone();
+                    trash.connect_clicked(move |_| remove_server(id.clone()));
+                    row.add_suffix(&trash);
+                    expander.add_row(&row);
+                }
+                list.add(&expander);
+                continue;
+            }
+
             let privacy = adw::SwitchRow::builder()
                 .title("Send HWID")
                 .subtitle("Only sends this install's identifier to this subscription when enabled")
                 .active(subscription.send_hwid)
                 .build();
             let id = subscription.id.clone();
-            let callback = on_hwid.clone();
+            let callback = callbacks.hwid.clone();
             privacy.connect_active_notify(move |row| callback(id.clone(), row.is_active()));
             expander.add_row(&privacy);
 
@@ -96,10 +173,10 @@ impl SubscriptionsView {
             let delete = gtk::Button::with_label("Delete");
             delete.add_css_class("destructive-action");
             let refresh_id = subscription.id.clone();
-            let refresh = on_refresh.clone();
+            let refresh = callbacks.refresh.clone();
             update.connect_clicked(move |_| refresh(refresh_id.clone()));
             let remove_id = subscription.id.clone();
-            let remove = on_remove.clone();
+            let remove = callbacks.remove.clone();
             delete.connect_clicked(move |_| remove(remove_id.clone()));
             actions.append(&update);
             actions.append(&delete);
