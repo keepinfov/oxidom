@@ -16,6 +16,21 @@ pub struct SettingsView {
     pub root: adw::PreferencesPage,
 }
 
+/// Recognized subscription client identifiers. Picking one fills the editable
+/// User-Agent field; the field itself stays the source of truth so users can
+/// still type a value not listed here.
+const UA_PRESETS: &[(&str, &str)] = &[
+    ("v2rayNG", "v2rayNG/1.9.5"),
+    ("Happ", "Happ/3.13.0"),
+    ("v2rayN", "v2rayN/6.45"),
+    ("Streisand", "Streisand"),
+    ("Hiddify", "Hiddify/2.0.5"),
+    ("NekoBox", "NekoBox/1.3.5"),
+    ("Shadowrocket", "Shadowrocket/2.2.9"),
+    ("Clash Meta", "clash-verge/1.7.7"),
+    ("sing-box", "SFA/1.10.0"),
+];
+
 impl SettingsView {
     pub fn new(config: &Config, on_change: impl Fn(SettingsValues) + Clone + 'static) -> Self {
         let socks = adw::SpinRow::with_range(1.0, 65535.0, 1.0);
@@ -49,6 +64,22 @@ impl SettingsView {
             .title("Subscription User-Agent")
             .text(&config.subscription_user_agent)
             .build();
+        let preset_labels: Vec<&str> = std::iter::once("Custom")
+            .chain(UA_PRESETS.iter().map(|(label, _)| *label))
+            .collect();
+        let presets = gtk::StringList::new(&preset_labels);
+        // Preselect the preset matching the saved value, else "Custom" (index 0).
+        let selected_preset = UA_PRESETS
+            .iter()
+            .position(|(_, ua)| *ua == config.subscription_user_agent)
+            .map(|i| i as u32 + 1)
+            .unwrap_or(0);
+        let ua_preset = adw::ComboRow::builder()
+            .title("Client preset")
+            .subtitle("Fills the User-Agent below")
+            .model(&presets)
+            .selected(selected_preset)
+            .build();
 
         let proxy_group = adw::PreferencesGroup::builder()
             .title("Local proxy")
@@ -66,6 +97,7 @@ impl SettingsView {
             .title("Subscription")
             .description("Some panels only return configs to recognized clients; change this if a subscription reports \"app not supported\"")
             .build();
+        subscription_group.add(&ua_preset);
         subscription_group.add(&user_agent);
 
         let root = adw::PreferencesPage::new();
@@ -115,7 +147,35 @@ impl SettingsView {
             let emit = emit.clone();
             move |_| emit()
         });
-        user_agent.connect_changed(move |_| emit());
+        // Selecting a preset writes its UA into the entry (the emitting field).
+        // Index 0 is "Custom" and leaves the entry untouched.
+        ua_preset.connect_selected_notify({
+            let user_agent = user_agent.clone();
+            move |row| {
+                if let Some((_, ua)) = UA_PRESETS.get(row.selected().wrapping_sub(1) as usize) {
+                    if user_agent.text() != *ua {
+                        user_agent.set_text(ua);
+                    }
+                }
+            }
+        });
+        // Editing the entry moves the preset to whichever entry matches, else Custom.
+        user_agent.connect_changed({
+            let ua_preset = ua_preset.clone();
+            let emit = emit.clone();
+            move |entry| {
+                let text = entry.text();
+                let idx = UA_PRESETS
+                    .iter()
+                    .position(|(_, ua)| *ua == text)
+                    .map(|i| i as u32 + 1)
+                    .unwrap_or(0);
+                if ua_preset.selected() != idx {
+                    ua_preset.set_selected(idx);
+                }
+                emit();
+            }
+        });
 
         Self { root }
     }
