@@ -11,6 +11,11 @@ pub struct Config {
     pub system_proxy: bool,
     pub latency_method: LatencyMethod,
     pub latency_test_url: String,
+    /// User-Agent sent when fetching subscriptions. Many panels (Remnawave,
+    /// Marzban, Happ) gate the response body on this string and reply with an
+    /// "app not supported" page to unknown clients, so we default to a widely
+    /// recognized client identifier rather than our own.
+    pub subscription_user_agent: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +35,7 @@ impl Default for Config {
             system_proxy: false,
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".to_string(),
+            subscription_user_agent: "v2rayNG/1.9.5".to_string(),
         }
     }
 }

@@ -141,6 +141,11 @@ pub struct Subscription {
     /// OPT-IN device identifier on fetch. Default false (max privacy).
     #[serde(default)]
     pub send_hwid: bool,
+    /// Per-subscription User-Agent override. When `None` the global config
+    /// value is used. Lets a single provider that expects a specific client
+    /// (e.g. `Happ/3.13.0`) work without changing the global default.
+    #[serde(default)]
+    pub user_agent: Option<String>,
     #[serde(default)]
     pub servers: Vec<Server>,
     pub updated_at: Option<i64>,
@@ -155,6 +160,7 @@ impl Subscription {
             description: None,
             userinfo: None,
             send_hwid: false,
+            user_agent: None,
             servers: Vec::new(),
             updated_at: None,
         }

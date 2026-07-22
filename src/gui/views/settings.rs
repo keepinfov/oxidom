@@ -9,6 +9,7 @@ pub struct SettingsValues {
     pub system_proxy: bool,
     pub latency_method: LatencyMethod,
     pub latency_test_url: String,
+    pub subscription_user_agent: String,
 }
 
 pub struct SettingsView {
@@ -44,6 +45,10 @@ impl SettingsView {
             .title("Latency test URL")
             .text(&config.latency_test_url)
             .build();
+        let user_agent = adw::EntryRow::builder()
+            .title("Subscription User-Agent")
+            .text(&config.subscription_user_agent)
+            .build();
 
         let proxy_group = adw::PreferencesGroup::builder()
             .title("Local proxy")
@@ -57,16 +62,23 @@ impl SettingsView {
             .build();
         latency_group.add(&method);
         latency_group.add(&test_url);
+        let subscription_group = adw::PreferencesGroup::builder()
+            .title("Subscription")
+            .description("Some panels only return configs to recognized clients; change this if a subscription reports \"app not supported\"")
+            .build();
+        subscription_group.add(&user_agent);
 
         let root = adw::PreferencesPage::new();
         root.add(&proxy_group);
         root.add(&latency_group);
+        root.add(&subscription_group);
 
         let socks_value = socks.clone();
         let http_value = http.clone();
         let system_proxy_value = system_proxy.clone();
         let method_value = method.clone();
         let test_url_value = test_url.clone();
+        let user_agent_value = user_agent.clone();
         let emit = move || {
             on_change(SettingsValues {
                 socks_port: socks_value.value() as u16,
@@ -79,6 +91,7 @@ impl SettingsView {
                     _ => LatencyMethod::HttpGet,
                 },
                 latency_test_url: test_url_value.text().to_string(),
+                subscription_user_agent: user_agent_value.text().to_string(),
             });
         };
         let emit = std::rc::Rc::new(emit);
@@ -98,7 +111,11 @@ impl SettingsView {
             let emit = emit.clone();
             move |_| emit()
         });
-        test_url.connect_changed(move |_| emit());
+        test_url.connect_changed({
+            let emit = emit.clone();
+            move |_| emit()
+        });
+        user_agent.connect_changed(move |_| emit());
 
         Self { root }
     }

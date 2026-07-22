@@ -429,6 +429,7 @@ impl Controller {
             engine.config.system_proxy = values.system_proxy;
             engine.config.latency_method = values.latency_method;
             engine.config.latency_test_url = values.latency_test_url;
+            engine.config.subscription_user_agent = values.subscription_user_agent;
             engine.core.socks_port = values.socks_port;
             engine.core.http_port = values.http_port;
             engine.save()

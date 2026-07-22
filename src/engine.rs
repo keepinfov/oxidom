@@ -47,7 +47,7 @@ impl Engine {
     pub fn add_subscription(&mut self, url: String, name: Option<String>) -> Result<()> {
         let mut sub = Subscription::new(url, name);
         let hwid = if sub.send_hwid { state::hwid().ok() } else { None };
-        subscription::refresh(&mut sub, hwid.as_deref())?;
+        subscription::refresh(&mut sub, &self.config.subscription_user_agent, hwid.as_deref())?;
         self.subscriptions.push(sub);
         store::save(&self.subscriptions)?;
         Ok(())
@@ -55,13 +55,14 @@ impl Engine {
 
     pub fn refresh(&mut self, sub_id: &str) -> Result<()> {
         let hwid_val = state::hwid().ok();
+        let ua = self.config.subscription_user_agent.clone();
         let sub = self
             .subscriptions
             .iter_mut()
             .find(|s| s.id == sub_id)
             .ok_or_else(|| anyhow!("subscription not found"))?;
         let hwid = if sub.send_hwid { hwid_val.as_deref() } else { None };
-        subscription::refresh(sub, hwid)?;
+        subscription::refresh(sub, &ua, hwid)?;
         store::save(&self.subscriptions)?;
         Ok(())
     }

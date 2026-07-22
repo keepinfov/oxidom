@@ -1,9 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::link::{b64_decode, parse_links};
 use crate::model::{Server, Subscription, UserInfo};
 
-const USER_AGENT: &str = concat!("oxidom/", env!("CARGO_PKG_VERSION"));
+/// Fallback User-Agent when neither the subscription nor config specify one.
+/// Panels commonly gate the response on a recognized client string.
+const DEFAULT_USER_AGENT: &str = "v2rayNG/1.9.5";
 
 /// Result of fetching + parsing a subscription URL.
 pub struct FetchResult {
@@ -13,13 +15,32 @@ pub struct FetchResult {
     pub update_interval: Option<u64>,
 }
 
-/// Fetch and parse a subscription. `hwid` is only sent if `send_hwid` is true.
-pub fn fetch(url: &str, send_hwid: bool, hwid: Option<&str>) -> Result<FetchResult> {
-    let mut req = ureq::get(url).set("User-Agent", USER_AGENT);
+/// Fetch and parse a subscription.
+///
+/// `user_agent` matters: many panels (Remnawave, Marzban, Happ) return an
+/// "app not supported" page instead of configs when the client is unknown, so
+/// callers should pass a recognized client identifier.
+///
+/// `hwid` is only sent when `send_hwid` is true, and uses the Happ header set
+/// (`x-hwid` + optional device metadata) that Remnawave-style panels expect.
+pub fn fetch(
+    url: &str,
+    user_agent: &str,
+    send_hwid: bool,
+    hwid: Option<&str>,
+) -> Result<FetchResult> {
+    let ua = if user_agent.trim().is_empty() { DEFAULT_USER_AGENT } else { user_agent };
+    let mut req = ureq::get(url).set("User-Agent", ua);
     if send_hwid {
         if let Some(id) = hwid {
-            // Happ-style device identifier — only ever sent when the user opts in.
-            req = req.set("Hwid", id);
+            // Happ/Remnawave device identification headers. Only x-hwid is
+            // required; the rest help the panel label the device. Sent solely
+            // when the user opts in per subscription.
+            req = req
+                .set("x-hwid", id)
+                .set("x-device-os", "Linux")
+                .set("x-ver-os", std::env::consts::ARCH)
+                .set("x-device-model", "oxidom");
         }
     }
     let resp = req.call().with_context(|| format!("fetching subscription {url}"))?;
@@ -37,12 +58,24 @@ pub fn fetch(url: &str, send_hwid: bool, hwid: Option<&str>) -> Result<FetchResu
     let text = decode_body(&body);
     let servers = parse_links(&text);
 
+    // A non-empty response that yields no servers and carries no link scheme is
+    // almost always a gate page ("app not supported", captcha, HTML error).
+    // Surface it so the user can fix the User-Agent instead of seeing "0 servers".
+    if servers.is_empty() && !text.trim().is_empty() && !text.contains("://") {
+        let snippet: String = text.trim().chars().take(200).collect();
+        bail!(
+            "subscription returned no servers — the panel likely rejected the client \
+             (User-Agent \"{ua}\"). Response: {snippet}"
+        );
+    }
+
     Ok(FetchResult { servers, userinfo, title, update_interval })
 }
 
 /// Fetch into an existing Subscription, updating servers/userinfo/name/timestamp.
-pub fn refresh(sub: &mut Subscription, hwid: Option<&str>) -> Result<()> {
-    let res = fetch(&sub.url, sub.send_hwid, hwid)?;
+pub fn refresh(sub: &mut Subscription, user_agent: &str, hwid: Option<&str>) -> Result<()> {
+    let ua = sub.user_agent.as_deref().unwrap_or(user_agent);
+    let res = fetch(&sub.url, ua, sub.send_hwid, hwid)?;
     sub.servers = res.servers;
     sub.userinfo = res.userinfo;
     if let Some(t) = res.title {
