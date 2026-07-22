@@ -1,15 +1,28 @@
+use std::rc::Rc;
+
 use adw::prelude::*;
 
 use crate::model::Server;
 
 #[derive(Clone)]
 pub struct ServerCard {
-    pub button: gtk::Button,
+    pub root: gtk::Box,
     latency: gtk::Label,
+    detail_latency: gtk::Label,
+    revealer: gtk::Revealer,
 }
 
 impl ServerCard {
-    pub fn new(server: &Server, active: bool, on_activate: impl Fn() + 'static) -> Self {
+    pub fn new(
+        server: &Server,
+        connected: bool,
+        selected: bool,
+        on_select: impl Fn() + 'static,
+        on_connect: impl Fn() + 'static,
+        on_ping: impl Fn() + 'static,
+    ) -> Self {
+        let on_connect = Rc::new(on_connect);
+
         let flag = match server.country.as_deref().and_then(country_flag) {
             Some(flag) => gtk::Label::builder()
                 .label(flag)
@@ -35,7 +48,7 @@ impl ServerCard {
             .xalign(0.0)
             .css_classes(["dim-label", "server-subtitle"])
             .build();
-        let labels = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        let labels = gtk::Box::new(gtk::Orientation::Vertical, 2);
         labels.set_hexpand(true);
         labels.append(&name);
         labels.append(&subtitle);
@@ -46,25 +59,99 @@ impl ServerCard {
             .build();
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        content.set_margin_top(14);
-        content.set_margin_bottom(14);
-        content.set_margin_start(14);
-        content.set_margin_end(14);
+        content.set_margin_top(10);
+        content.set_margin_bottom(10);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
         content.append(&flag);
         content.append(&labels);
         content.append(&latency);
 
-        let button = gtk::Button::builder()
+        // Single click selects/expands; the header stays a Button for hover +
+        // keyboard activation, but connection is deliberately kept off it.
+        let header = gtk::Button::builder()
             .child(&content)
-            .hexpand(true)
-            .css_classes(["server-card"])
+            .css_classes(["server-card-header"])
             .build();
-        if active {
-            button.add_css_class("active-server");
-        }
-        button.connect_clicked(move |_| on_activate());
+        header.connect_clicked(move |_| on_select());
 
-        let card = Self { button, latency };
+        // Double click connects. Capture phase so we see the press before the
+        // button's own gesture consumes it.
+        let double = gtk::GestureClick::new();
+        double.set_button(gtk::gdk::BUTTON_PRIMARY);
+        double.set_propagation_phase(gtk::PropagationPhase::Capture);
+        double.connect_pressed({
+            let on_connect = on_connect.clone();
+            move |_, n_press, _, _| {
+                if n_press == 2 {
+                    on_connect();
+                }
+            }
+        });
+        header.add_controller(double);
+
+        // Expanded detail: address, per-server latency, and explicit actions.
+        let meta = gtk::Label::builder()
+            .label(format!(
+                "{}  ·  {}:{}",
+                server.protocol.as_str(),
+                server.address,
+                server.port
+            ))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .css_classes(["dim-label", "server-meta"])
+            .build();
+        let detail_latency = gtk::Label::builder()
+            .label("Not measured")
+            .xalign(0.0)
+            .css_classes(["dim-label", "server-meta"])
+            .build();
+        let connect_button = gtk::Button::builder()
+            .label("Connect")
+            .css_classes(["suggested-action"])
+            .build();
+        connect_button.connect_clicked({
+            let on_connect = on_connect.clone();
+            move |_| on_connect()
+        });
+        let ping_button = gtk::Button::builder()
+            .icon_name("emblem-synchronizing-symbolic")
+            .tooltip_text("Test latency")
+            .css_classes(["flat"])
+            .build();
+        ping_button.connect_clicked(move |_| on_ping());
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.append(&connect_button);
+        actions.append(&ping_button);
+        let actions_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        actions_spacer.set_hexpand(true);
+        actions.append(&actions_spacer);
+        actions.append(&detail_latency);
+
+        let detail = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        detail.set_css_classes(&["server-card-detail"]);
+        detail.append(&meta);
+        detail.append(&actions);
+        let revealer = gtk::Revealer::builder()
+            .child(&detail)
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .reveal_child(selected)
+            .build();
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.set_hexpand(true);
+        root.add_css_class("server-card");
+        root.append(&header);
+        root.append(&revealer);
+        if connected {
+            root.add_css_class("active-server");
+        }
+        if selected {
+            root.add_css_class("selected-server");
+        }
+
+        let card = Self { root, latency, detail_latency, revealer };
         card.set_latency(server.latency_ms);
         card
     }
@@ -74,23 +161,37 @@ impl ServerCard {
         self.latency.remove_css_class("latency-slow");
         match latency_ms {
             Some(ms) => {
-                self.latency.set_label(&format!("{ms} ms"));
+                let text = format!("{ms} ms");
+                self.latency.set_label(&text);
                 self.latency.add_css_class(if ms < 300 {
                     "latency-good"
                 } else {
                     "latency-slow"
                 });
                 self.latency.set_visible(true);
+                self.detail_latency.set_label(&format!("Latency: {ms} ms"));
             }
-            None => self.latency.set_visible(false),
+            None => {
+                self.latency.set_visible(false);
+                self.detail_latency.set_label("Not measured");
+            }
         }
     }
 
     pub fn set_active(&self, active: bool) {
         if active {
-            self.button.add_css_class("active-server");
+            self.root.add_css_class("active-server");
         } else {
-            self.button.remove_css_class("active-server");
+            self.root.remove_css_class("active-server");
+        }
+    }
+
+    pub fn set_selected(&self, selected: bool) {
+        self.revealer.set_reveal_child(selected);
+        if selected {
+            self.root.add_css_class("selected-server");
+        } else {
+            self.root.remove_css_class("selected-server");
         }
     }
 }

@@ -23,7 +23,11 @@ type SettingsCallback = Rc<dyn Fn(SettingsValues)>;
 struct AppState {
     engine: Option<Engine>,
     subscriptions: Vec<Subscription>,
+    /// Card the user is inspecting/expanded. Also the target of the header
+    /// Connect button. Distinct from the server that is actually connected.
     selected_id: Option<String>,
+    /// Server the tunnel is (optimistically) running for; drives the highlight.
+    connected_id: Option<String>,
     latencies: HashMap<String, Option<u32>>,
     pending_status: Option<Status>,
 }
@@ -57,6 +61,7 @@ pub fn build(app: &adw::Application) {
         engine: Some(engine),
         subscriptions: subscriptions_snapshot,
         selected_id,
+        connected_id: None,
         latencies: HashMap::new(),
         pending_status: None,
     }));
@@ -85,23 +90,25 @@ pub fn build(app: &adw::Application) {
     stack.add_named(&logs.root, Some(Page::Logs.stack_name()));
 
     let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search servers")
-        .hexpand(true)
-        .max_width_chars(48)
+        .placeholder_text("Search")
+        .max_width_chars(24)
+        .width_request(220)
+        .css_classes(["compact-search"])
         .build();
     let sidebar_toggle = gtk::Button::builder()
         .icon_name("sidebar-show-symbolic")
         .tooltip_text("Show sidebar")
         .visible(false)
+        .css_classes(["flat"])
         .build();
     let connect_spinner = gtk::Spinner::new();
     let connect_label = gtk::Label::new(Some("Connect"));
-    let connect_content = gtk::Box::new(gtk::Orientation::Horizontal, 7);
+    let connect_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     connect_content.append(&connect_spinner);
     connect_content.append(&connect_label);
     let connect = gtk::Button::builder()
         .child(&connect_content)
-        .css_classes(["suggested-action", "pill"])
+        .css_classes(["suggested-action", "pill", "compact-connect"])
         .build();
 
     let header = adw::HeaderBar::new();
@@ -244,23 +251,48 @@ impl Controller {
     }
 
     fn rebuild_views(self: &Rc<Self>) {
-        let (subscriptions, selected_id, latencies) = {
+        let (subscriptions, selected_id, connected_id, latencies) = {
             let state = self.state.borrow();
             (
                 state.subscriptions.clone(),
                 state.selected_id.clone(),
+                state.connected_id.clone(),
                 state.latencies.clone(),
             )
         };
-        self.servers
-            .rebuild(&subscriptions, selected_id.as_deref(), &latencies, {
+        let callbacks = super::views::servers::CardCallbacks {
+            select: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.select_server(id);
+                    }
+                })
+            },
+            connect: {
                 let weak = Rc::downgrade(self);
                 Rc::new(move |id| {
                     if let Some(controller) = weak.upgrade() {
                         controller.connect_server(id);
                     }
                 })
-            });
+            },
+            ping: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.probe_one(id);
+                    }
+                })
+            },
+        };
+        self.servers.rebuild(
+            &subscriptions,
+            connected_id.as_deref(),
+            selected_id.as_deref(),
+            &latencies,
+            callbacks,
+        );
 
         let add = {
             let weak = Rc::downgrade(self);
@@ -315,6 +347,62 @@ impl Controller {
         }
     }
 
+    fn select_server(self: &Rc<Self>, server_id: String) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.selected_id = Some(server_id.clone());
+        }
+        self.servers.set_selected(Some(&server_id));
+        self.refresh_status();
+    }
+
+    fn probe_one(self: &Rc<Self>, server_id: String) {
+        let server = self
+            .state
+            .borrow()
+            .subscriptions
+            .iter()
+            .flat_map(|subscription| subscription.servers.iter())
+            .find(|server| server.id == server_id)
+            .cloned();
+        let Some(server) = server else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let engine = Engine::load();
+            let _ = sender.send(engine.probe(&server));
+        });
+        let weak = Rc::downgrade(self);
+        let id = server_id;
+        glib::timeout_add_local(Duration::from_millis(50), move || match receiver.try_recv() {
+            Ok(latency) => {
+                if let Some(controller) = weak.upgrade() {
+                    {
+                        let mut state = controller.state.borrow_mut();
+                        state.latencies.insert(id.clone(), latency);
+                        if let Some(engine) = state.engine.as_mut() {
+                            for server in engine
+                                .subscriptions
+                                .iter_mut()
+                                .flat_map(|subscription| subscription.servers.iter_mut())
+                            {
+                                if server.id == id {
+                                    server.latency_ms = latency;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    controller.servers.set_latency(&id, latency);
+                }
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        });
+    }
+
     fn connect_server(self: &Rc<Self>, server_id: String) {
         if self.state.borrow().engine.is_none() {
             self.show_message("Another operation is still running");
@@ -323,16 +411,22 @@ impl Controller {
         {
             let mut state = self.state.borrow_mut();
             state.selected_id = Some(server_id.clone());
+            state.connected_id = Some(server_id.clone());
             state.pending_status = Some(Status::Connecting);
         }
         self.servers.set_active(Some(&server_id));
+        self.servers.set_selected(Some(&server_id));
         self.refresh_status();
         self.engine_job(
             move |engine| engine.connect(&server_id),
             move |controller, result| {
                 if let Err(error) = result {
-                    controller.state.borrow_mut().pending_status =
-                        Some(Status::Error(error.to_string()));
+                    {
+                        let mut state = controller.state.borrow_mut();
+                        state.pending_status = Some(Status::Error(error.to_string()));
+                        state.connected_id = None;
+                    }
+                    controller.servers.set_active(None);
                     controller.show_message(&format!("Could not connect: {error}"));
                 } else {
                     controller.state.borrow_mut().pending_status = Some(Status::Connecting);
@@ -344,7 +438,12 @@ impl Controller {
     }
 
     fn disconnect(self: &Rc<Self>) {
-        self.state.borrow_mut().pending_status = Some(Status::Disconnected);
+        {
+            let mut state = self.state.borrow_mut();
+            state.pending_status = Some(Status::Disconnected);
+            state.connected_id = None;
+        }
+        self.servers.set_active(None);
         self.refresh_status();
         self.engine_job(
             |engine| {
@@ -691,16 +790,30 @@ fn install_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
         r#"
+        headerbar { min-height: 34px; padding: 0 4px; }
+        headerbar button { min-height: 26px; min-width: 26px; padding: 2px 6px; }
+        .compact-search { min-height: 28px; }
+        .compact-search text { padding-top: 1px; padding-bottom: 1px; }
+        .compact-connect { min-height: 26px; padding: 2px 14px; font-weight: 700; }
+
         .sidebar { background: alpha(@window_fg_color, 0.035); }
-        .sidebar-status { padding: 10px; border-radius: 12px; background: alpha(@window_fg_color, 0.055); }
-        .server-card { border-radius: 14px; background: alpha(@window_fg_color, 0.06); border: 1px solid alpha(@window_fg_color, 0.08); }
-        .server-card:hover { background: alpha(@window_fg_color, 0.10); }
-        .server-card.active-server { border: 2px solid @accent_color; background: alpha(@accent_color, 0.13); }
-        .server-flag { font-size: 28px; }
-        .server-globe { min-width: 34px; min-height: 34px; }
-        .server-name { font-weight: 700; font-size: 1.05em; }
-        .server-subtitle { font-size: 0.9em; }
-        .latency-badge { border-radius: 999px; padding: 4px 8px; font-size: 0.85em; font-weight: 700; }
+        .sidebar-status { padding: 8px 10px; border-radius: 10px; background: alpha(@window_fg_color, 0.055); }
+
+        .server-card { border-radius: 12px; background: alpha(@window_fg_color, 0.05); border: 1px solid alpha(@window_fg_color, 0.07); }
+        .server-card:hover { background: alpha(@window_fg_color, 0.09); }
+        .server-card.selected-server { border-color: alpha(@accent_color, 0.55); }
+        .server-card.active-server { border: 1px solid @accent_color; background: alpha(@accent_color, 0.12); }
+        .server-card-header { min-height: 0; padding: 0; background: transparent; border: none; box-shadow: none; }
+        .server-card-header:hover { background: transparent; }
+        .server-card-detail { padding: 0 12px 10px 12px; }
+        .server-card-detail button { min-height: 24px; padding: 2px 12px; }
+        .server-meta { font-size: 0.85em; }
+
+        .server-flag { font-size: 22px; }
+        .server-globe { min-width: 26px; min-height: 26px; }
+        .server-name { font-weight: 600; font-size: 0.98em; }
+        .server-subtitle { font-size: 0.82em; }
+        .latency-badge { border-radius: 999px; padding: 2px 7px; font-size: 0.78em; font-weight: 700; }
         .latency-good { color: #57e389; background: alpha(#57e389, 0.14); }
         .latency-slow { color: #f8e45c; background: alpha(#f8e45c, 0.14); }
         "#,

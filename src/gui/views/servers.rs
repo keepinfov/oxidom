@@ -9,6 +9,16 @@ use crate::model::Subscription;
 use super::super::group::subscription_description;
 use super::super::server_card::ServerCard;
 
+/// Callbacks a server card invokes. `select` just inspects/expands the card,
+/// `connect` starts the tunnel (double-click or the panel button), `ping`
+/// re-measures a single server.
+#[derive(Clone)]
+pub struct CardCallbacks {
+    pub select: Rc<dyn Fn(String)>,
+    pub connect: Rc<dyn Fn(String)>,
+    pub ping: Rc<dyn Fn(String)>,
+}
+
 #[derive(Clone)]
 pub struct ServersView {
     pub root: gtk::ScrolledWindow,
@@ -21,11 +31,11 @@ pub struct ServersView {
 
 impl ServersView {
     pub fn new() -> Self {
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 28);
-        content.set_margin_top(24);
-        content.set_margin_bottom(32);
-        content.set_margin_start(28);
-        content.set_margin_end(28);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 20);
+        content.set_margin_top(16);
+        content.set_margin_bottom(20);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
 
         let root = gtk::ScrolledWindow::builder()
             .child(&content)
@@ -45,9 +55,10 @@ impl ServersView {
     pub fn rebuild(
         &self,
         subscriptions: &[Subscription],
-        active_id: Option<&str>,
+        connected_id: Option<&str>,
+        selected_id: Option<&str>,
         latencies: &HashMap<String, Option<u32>>,
-        on_activate: Rc<dyn Fn(String)>,
+        callbacks: CardCallbacks,
     ) {
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
@@ -92,15 +103,34 @@ impl ServersView {
                 .build();
             for server in &subscription.servers {
                 let id = server.id.clone();
-                let callback = on_activate.clone();
                 let mut display = server.clone();
                 if let Some(latency) = latencies.get(&id) {
                     display.latency_ms = *latency;
                 }
-                let card = ServerCard::new(&display, active_id == Some(id.as_str()), move || {
-                    callback(id.clone());
-                });
-                card.button.set_tooltip_text(Some(&format!(
+                let on_select = {
+                    let cb = callbacks.select.clone();
+                    let id = id.clone();
+                    move || cb(id.clone())
+                };
+                let on_connect = {
+                    let cb = callbacks.connect.clone();
+                    let id = id.clone();
+                    move || cb(id.clone())
+                };
+                let on_ping = {
+                    let cb = callbacks.ping.clone();
+                    let id = id.clone();
+                    move || cb(id.clone())
+                };
+                let card = ServerCard::new(
+                    &display,
+                    connected_id == Some(id.as_str()),
+                    selected_id == Some(id.as_str()),
+                    on_select,
+                    on_connect,
+                    on_ping,
+                );
+                card.root.set_tooltip_text(Some(&format!(
                     "{} · {}:{} · {} · {}",
                     server.name,
                     server.address,
@@ -108,7 +138,7 @@ impl ServersView {
                     server.protocol.as_str(),
                     server.country.as_deref().unwrap_or("")
                 )));
-                flow.insert(&card.button, -1);
+                flow.insert(&card.root, -1);
                 self.cards.borrow_mut().insert(server.id.clone(), card);
             }
 
@@ -135,15 +165,14 @@ impl ServersView {
             while let Some(widget) = child {
                 let next = widget.next_sibling();
                 if let Ok(flow_child) = widget.clone().downcast::<gtk::FlowBoxChild>() {
-                    let matches = flow_child
-                        .child()
-                        .and_then(|child| child.tooltip_text())
-                        .map(|text| text.to_lowercase().contains(&query))
-                        .unwrap_or(query.is_empty())
+                    let matches = query.is_empty()
                         || flow_child
                             .child()
-                            .and_then(|child| child.downcast::<gtk::Button>().ok())
-                            .and_then(|button| button.child())
+                            .and_then(|child| child.tooltip_text())
+                            .map(|text| text.to_lowercase().contains(&query))
+                            .unwrap_or(false)
+                        || flow_child
+                            .child()
                             .map(|child| widget_text(&child).to_lowercase().contains(&query))
                             .unwrap_or(false);
                     flow_child.set_visible(matches);
@@ -166,6 +195,12 @@ impl ServersView {
     pub fn set_active(&self, server_id: Option<&str>) {
         for (id, card) in self.cards.borrow().iter() {
             card.set_active(server_id == Some(id.as_str()));
+        }
+    }
+
+    pub fn set_selected(&self, server_id: Option<&str>) {
+        for (id, card) in self.cards.borrow().iter() {
+            card.set_selected(server_id == Some(id.as_str()));
         }
     }
 
