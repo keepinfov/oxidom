@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=oxidom
+GenericName=Xray Client
+Comment=oxided freedom — a GTK4 Xray client
+Exec=oxidom
+Icon=dev.keepinfov.oxidom
+Terminal=false
+Categories=Network;GTK;
+Keywords=vpn;xray;vless;reality;proxy;
+StartupNotify=true

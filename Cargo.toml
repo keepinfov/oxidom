@@ -1,0 +1,31 @@
+[package]
+name = "oxidom"
+version = "0.1.0"
+edition = "2021"
+description = "oxided freedom: a GTK4/libadwaita Xray client for Linux"
+license = "MIT"
+repository = "https://github.com/keepinfov/oxidom"
+
+[[bin]]
+name = "oxidom"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9" }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_4"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "5"
+anyhow = "1"
+thiserror = "1"
+ureq = { version = "2", features = ["json", "socks-proxy"] }
+base64 = "0.22"
+url = "2"
+percent-encoding = "2"
+shell-words = "1"
+libc = "0.2"
+nix = { version = "0.29", features = ["sched", "process", "mount", "user", "net"] }
+log = "0.4"
+env_logger = "0.11"

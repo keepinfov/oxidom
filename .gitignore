@@ -1,0 +1,8 @@
+/target
+/result
+/result-*
+.cargo-home/
+.direnv/
+
+# Local project notes / handoff docs — not tracked
+.notes/
