@@ -1,7 +1,38 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Placeholder icon for oxidom. Replace with final branding art. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <rect width="128" height="128" rx="28" fill="#1e1e2e"/>
-  <circle cx="64" cy="64" r="34" fill="none" stroke="#f9c440" stroke-width="8"/>
-  <path d="M64 30 L64 98" stroke="#e64553" stroke-width="8" stroke-linecap="round"/>
+  <defs>
+    <!-- The chain is a curved metal tube, so a restrained material gradient is appropriate. -->
+    <linearGradient id="rust" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e7a17d"/>
+      <stop offset="0.22" stop-color="#cf7149"/>
+      <stop offset="0.58" stop-color="#a3472d"/>
+      <stop offset="1" stop-color="#742d20"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Dark four-pixel profiles establish weight without an external shadow. -->
+  <g fill="none" stroke="#5b241b" stroke-width="20" stroke-linecap="butt">
+    <path d="M52 69 H25 A17 17 0 0 0 8 86 A17 17 0 0 0 25 103 H52"
+          transform="rotate(-30 30 86)"/>
+    <path d="M76 33 H103 A17 17 0 0 1 120 50 A17 17 0 0 1 103 67 H76"
+          transform="rotate(-30 98 50)"/>
+  </g>
+
+  <!-- Two open chain segments. Their facing ends are the fracture itself. -->
+  <g fill="none" stroke="url(#rust)" stroke-width="18" stroke-linecap="butt">
+    <path d="M52 65 H25 A17 17 0 0 0 8 82 A17 17 0 0 0 25 99 H52"
+          transform="rotate(-30 30 82)"/>
+    <path d="M76 29 H103 A17 17 0 0 1 120 46 A17 17 0 0 1 103 63 H76"
+          transform="rotate(-30 98 46)"/>
+  </g>
+
+  <!-- Exposed cut faces make the separation physical rather than decorative. -->
+  <g fill="none" stroke="#f0b99d" stroke-width="3" stroke-linecap="butt">
+    <path d="M52 56 V74 M52 90 V108" transform="rotate(-30 30 82)"/>
+    <path d="M76 20 V38 M76 54 V72" transform="rotate(-30 98 46)"/>
+  </g>
+
+  <path d="M58 55 L64 57 L61 63 L56 60 Z" fill="#c65d39"/>
+  <path d="M68 64 L74 61 L76 67 L71 70 Z" fill="#8f3827"/>
+  <path d="M59 72 L65 75 L61 80 L56 77 Z" fill="#e09670"/>
 </svg>
