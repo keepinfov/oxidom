@@ -112,7 +112,7 @@ impl Sidebar {
         status_button.set_margin_end(14);
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        root.set_width_request(245);
+        root.set_width_request(230);
         root.add_css_class("sidebar");
         root.append(&brand);
         root.append(&list);

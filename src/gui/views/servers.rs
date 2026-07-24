@@ -15,7 +15,7 @@ use super::super::server_card::{
 
 const CARD_COLUMN_SPACING: i32 = 12;
 const CARD_ROW_SPACING: i32 = 12;
-const MIN_CARD_WIDTH: i32 = 320;
+const MIN_CARD_WIDTH: i32 = 250;
 const COLUMN_HYSTERESIS: i32 = 16;
 const RESIZE_SETTLE_MS: u64 = 120;
 
@@ -30,29 +30,25 @@ pub struct CardCallbacks {
     pub refresh: Rc<dyn Fn(String)>,
 }
 
-/// One subscription block: the header widget (hidden when filtered empty), the
-/// grid that lays out cards, and the cards in source order.
+/// One subscription block. Cards live in independent vertical column boxes
+/// (equal widths via the homogeneous horizontal box), so a card growing or
+/// shrinking moves only its own column's tail — columns never couple through
+/// shared row heights, and a card's slot changes only on repack (rebuild,
+/// filter, sort, column-count change), never on selection.
 #[derive(Clone)]
 struct GroupUi {
     root: gtk::Widget,
-    grid: gtk::Grid,
-    reserver: gtk::Box,
+    columns_box: gtk::Box,
+    column_boxes: Rc<RefCell<Vec<gtk::Box>>>,
     cards: Vec<(String, gtk::Widget)>,
     display_order: Rc<RefCell<Vec<String>>>,
     sort_button: gtk::Button,
     sort_generation: Rc<Cell<u64>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GridAnchor {
-    column: i32,
-    row: i32,
-}
-
 #[derive(Clone)]
 pub struct ServersView {
     pub root: gtk::ScrolledWindow,
-    viewport: gtk::Viewport,
     content: gtk::Box,
     cards: Rc<RefCell<HashMap<String, ServerCard>>>,
     groups: Rc<RefCell<Vec<GroupUi>>>,
@@ -61,21 +57,16 @@ pub struct ServersView {
     /// "Connected" badge — otherwise connecting would change search results.
     search_texts: Rc<RefCell<HashMap<String, String>>>,
     query: Rc<RefCell<String>>,
-    /// Number of grid columns; adapts to window width (1, 2, or 3).
+    /// Number of card columns; driven by the window width (1, 2, or 3).
     columns: Rc<Cell<usize>>,
     pending_columns: Rc<Cell<usize>>,
     column_update_scheduled: Rc<Cell<bool>>,
-    viewport_width: Rc<Cell<i32>>,
-    layout_sync_scheduled: Rc<Cell<bool>>,
     resize_generation: Rc<Cell<u64>>,
     /// Latest completed measurements. This never changes display order by itself.
     latencies: Rc<RefCell<HashMap<String, Option<u32>>>>,
-    /// The expanded/selected card spans complete grid rows so its content never
-    /// overlaps a neighboring card.
+    /// The card whose inline details are open (at most one).
     selected: Rc<RefCell<Option<String>>>,
     requested_selected: Rc<RefCell<Option<String>>>,
-    selected_anchor: Rc<RefCell<Option<GridAnchor>>>,
-    selection_generation: Rc<Cell<u64>>,
 }
 
 impl ServersView {
@@ -98,9 +89,8 @@ impl ServersView {
             .propagate_natural_width(false)
             .vexpand(true)
             .build();
-        let view = Self {
+        Self {
             root,
-            viewport,
             content,
             cards: Rc::new(RefCell::new(HashMap::new())),
             groups: Rc::new(RefCell::new(Vec::new())),
@@ -109,77 +99,30 @@ impl ServersView {
             columns: Rc::new(Cell::new(1)),
             pending_columns: Rc::new(Cell::new(1)),
             column_update_scheduled: Rc::new(Cell::new(false)),
-            viewport_width: Rc::new(Cell::new(-1)),
-            layout_sync_scheduled: Rc::new(Cell::new(false)),
             resize_generation: Rc::new(Cell::new(0)),
             latencies: Rc::new(RefCell::new(HashMap::new())),
             selected: Rc::new(RefCell::new(None)),
             requested_selected: Rc::new(RefCell::new(None)),
-            selected_anchor: Rc::new(RefCell::new(None)),
-            selection_generation: Rc::new(Cell::new(0)),
-        };
-
-        // Adapt the grid column count (1/2/3) to the viewport width. With the
-        // horizontal scrollbar disabled the hadjustment's page-size tracks the
-        // visible content width, and it notifies on every resize.
-        let hadj = view.root.hadjustment();
-        hadj.connect_page_size_notify({
-            let view = view.clone();
-            move |_| {
-                view.update_columns_for_viewport();
-            }
-        });
-        view.root.connect_map({
-            let view = view.clone();
-            move |_| {
-                view.update_columns_for_viewport();
-            }
-        });
-
-        view
+        }
     }
 
-    fn update_columns_for_viewport(&self) {
-        let width = self.viewport.width();
-        if width <= 0 || self.viewport_width.replace(width) == width {
-            return;
-        }
-        let usable_width = width
+    /// Pick the column count from the width the window gives this view.
+    /// Driven from window.rs — deriving it from our own allocation would form
+    /// a feedback loop with the content's minimum width and deadlock the
+    /// window's ability to shrink.
+    pub fn set_available_width(&self, width: i32) {
+        let usable = width
             .saturating_sub(self.content.margin_start())
             .saturating_sub(self.content.margin_end());
         let columns = columns_for_width_with_hysteresis(
-            usable_width,
+            usable,
             self.pending_columns.get(),
             COLUMN_HYSTERESIS,
         );
         if columns != self.columns.get() {
             self.schedule_columns(columns);
-        } else if columns == 1 {
-            self.schedule_single_column_resize();
         }
-    }
-
-    fn invalidate_layout(&self) {
-        self.viewport_width.set(-1);
-        if self.layout_sync_scheduled.replace(true) {
-            return;
-        }
-        let view = self.clone();
-        glib::idle_add_local_once(move || {
-            view.layout_sync_scheduled.set(false);
-            view.update_columns_for_viewport();
-        });
-    }
-
-    fn schedule_single_column_resize(&self) {
-        let generation = self.resize_generation.get().wrapping_add(1);
-        self.resize_generation.set(generation);
-        let view = self.clone();
-        glib::timeout_add_local_once(Duration::from_millis(RESIZE_SETTLE_MS), move || {
-            if view.resize_generation.get() == generation && view.columns.get() == 1 {
-                view.refresh_single_column_geometry();
-            }
-        });
+        self.schedule_expanded_remeasure();
     }
 
     fn schedule_columns(&self, count: usize) {
@@ -194,6 +137,20 @@ impl ServersView {
         });
     }
 
+    fn set_columns(&self, count: usize) {
+        let count = count.clamp(1, 3);
+        if self.columns.get() == count {
+            return;
+        }
+        self.columns.set(count);
+        self.pending_columns.set(count);
+        for group in self.groups.borrow().iter() {
+            repack_group(group, count);
+        }
+        self.refresh_expanded_height();
+        self.schedule_expanded_remeasure();
+    }
+
     pub fn rebuild(
         &self,
         subscriptions: &[Subscription],
@@ -203,8 +160,6 @@ impl ServersView {
         checking: &HashSet<String>,
         callbacks: CardCallbacks,
     ) {
-        self.selection_generation
-            .set(self.selection_generation.get().wrapping_add(1));
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
@@ -214,7 +169,6 @@ impl ServersView {
         *self.latencies.borrow_mut() = latencies.clone();
         *self.selected.borrow_mut() = selected_id.map(str::to_string);
         *self.requested_selected.borrow_mut() = selected_id.map(str::to_string);
-        *self.selected_anchor.borrow_mut() = None;
 
         if subscriptions.is_empty() {
             let empty = adw::StatusPage::builder()
@@ -224,7 +178,6 @@ impl ServersView {
                 .vexpand(true)
                 .build();
             self.content.append(&empty);
-            self.invalidate_layout();
             return;
         }
 
@@ -307,20 +260,12 @@ impl ServersView {
             header.set_hexpand(true);
             header.append(&title_box);
 
-            let grid = gtk::Grid::builder()
-                .column_homogeneous(true)
-                .row_homogeneous(false)
-                .column_spacing(CARD_COLUMN_SPACING)
-                .row_spacing(CARD_ROW_SPACING)
+            let columns_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(CARD_COLUMN_SPACING)
+                .homogeneous(true)
                 .hexpand(true)
                 .build();
-            let reserver = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            reserver.set_can_target(false);
-            reserver.set_focusable(false);
-            reserver.set_opacity(0.0);
-            reserver.set_visible(false);
-            reserver.set_valign(gtk::Align::Start);
-            grid.attach(&reserver, 0, 0, 1, 1);
 
             let mut group_cards: Vec<(String, gtk::Widget)> = Vec::new();
             for server in &subscription.servers {
@@ -386,12 +331,12 @@ impl ServersView {
             let group = gtk::Box::new(gtk::Orientation::Vertical, 12);
             group.set_hexpand(true);
             group.append(&header);
-            group.append(&grid);
+            group.append(&columns_box);
             self.content.append(&group);
             let group_ui = GroupUi {
                 root: group.upcast::<gtk::Widget>(),
-                grid,
-                reserver,
+                columns_box,
+                column_boxes: Rc::new(RefCell::new(Vec::new())),
                 display_order: Rc::new(RefCell::new(
                     group_cards.iter().map(|(id, _)| id.clone()).collect(),
                 )),
@@ -399,14 +344,14 @@ impl ServersView {
                 sort_button: sort,
                 sort_generation: Rc::new(Cell::new(0)),
             };
-            fill_grid(&group_ui, self.columns.get(), selected_id, None, None, true);
+            repack_group(&group_ui, self.columns.get());
             self.groups.borrow_mut().push(group_ui);
         }
         self.apply_filter();
         if let Some(server_id) = selected_id {
             self.set_selected_immediately(server_id);
         }
-        self.invalidate_layout();
+        self.schedule_expanded_remeasure();
     }
 
     pub fn set_query(&self, query: &str) {
@@ -417,38 +362,32 @@ impl ServersView {
     fn apply_filter(&self) {
         let query = self.query.borrow().clone();
         let selected = self.selected.borrow().clone();
-        let selected_anchor = *self.selected_anchor.borrow();
-        let geometry = selected
-            .as_deref()
-            .and_then(|id| self.expanded_geometry_for(id));
-        let search_texts = self.search_texts.borrow();
-        for group in self.groups.borrow().iter() {
-            let mut visible = 0;
-            for (id, card) in &group.cards {
-                let matches = query.is_empty()
-                    || search_texts
-                        .get(id)
-                        .is_some_and(|text| text.contains(&query));
-                card.set_visible(matches);
-                if matches {
-                    visible += 1;
+        {
+            let search_texts = self.search_texts.borrow();
+            for group in self.groups.borrow().iter() {
+                let mut visible = 0;
+                for (id, card) in &group.cards {
+                    let matches = query.is_empty()
+                        || search_texts
+                            .get(id)
+                            .is_some_and(|text| text.contains(&query));
+                    card.set_visible(matches);
+                    if matches {
+                        visible += 1;
+                    }
                 }
+                group.root.set_visible(visible > 0);
             }
-            group.root.set_visible(visible > 0);
-            // Re-pack so only the matching cards occupy grid cells; filtered-out
-            // cards leave no holes.
-            fill_grid(
-                group,
-                self.columns.get(),
-                selected.as_deref(),
-                if query.is_empty() {
-                    selected_anchor
-                } else {
-                    None
-                },
-                geometry,
-                true,
-            );
+        }
+        // Cards mid-collapse from a recent selection switch reflow anyway —
+        // snap them closed before repacking.
+        for (id, card) in self.cards.borrow().iter() {
+            if Some(id.as_str()) != selected.as_deref() && card.is_expanded() {
+                card.collapse_immediately();
+            }
+        }
+        for group in self.groups.borrow().iter() {
+            repack_group(group, self.columns.get());
         }
         // Keep the selected card's expansion in sync with its visibility, so a
         // filtered-out card doesn't stay tall and highlighted off-grid, and
@@ -459,13 +398,13 @@ impl ServersView {
                 if !card.root.get_visible() {
                     card.collapse_immediately();
                 } else if !card.is_expanded()
-                    && let Some(geometry) = self.expanded_geometry_for(selected_id)
+                    && let Some(height) = self.expanded_target_height(selected_id)
                 {
-                    card.set_expanded_immediately(geometry.height);
+                    card.set_expanded_immediately(height);
                 }
             }
         }
-        self.invalidate_layout();
+        self.schedule_expanded_remeasure();
     }
 
     pub fn set_latency_state(&self, server_id: &str, state: LatencyState) {
@@ -515,20 +454,14 @@ impl ServersView {
         if self.requested_selected.borrow().as_deref() == server_id {
             return;
         }
-
-        let generation = self.selection_generation.get().wrapping_add(1);
-        self.selection_generation.set(generation);
         let next = server_id.map(str::to_string);
         *self.requested_selected.borrow_mut() = next.clone();
-        let next_anchor = server_id.and_then(|id| self.anchor_for(id));
         let current = self.selected.borrow().clone();
 
         if current == next {
             if let Some(server_id) = current {
                 let card = self.cards.borrow().get(&server_id).cloned();
-                let target_height = self
-                    .expanded_geometry_for(&server_id)
-                    .map(|geometry| geometry.height);
+                let target_height = self.expanded_target_height(&server_id);
                 if let (Some(card), Some(target_height)) = (card, target_height) {
                     card.expand(target_height, None);
                 }
@@ -536,183 +469,132 @@ impl ServersView {
             return;
         }
 
-        let current_card = current
-            .as_deref()
-            .and_then(|id| self.cards.borrow().get(id).cloned());
-        let geometry = next
-            .as_deref()
-            .and_then(|id| self.expanded_geometry_for(id));
         *self.selected.borrow_mut() = next.clone();
-        *self.selected_anchor.borrow_mut() = next_anchor;
 
-        // Re-plan the grid at the moment of the click, without the reserver:
-        // the new card moves into its full-row span and the old one returns to
-        // a single row before either height animation starts. Grid rows are
-        // shared across columns, so their heights now follow both animations
-        // coherently instead of drifting with the stale plan and snapping when
-        // the expand finishes.
-        for group in self.groups.borrow().iter() {
-            fill_grid(
-                group,
-                self.columns.get(),
-                next.as_deref(),
-                next_anchor,
-                geometry,
-                false,
-            );
+        // The clicked card expands strictly in place — its slot never changes
+        // on selection (only an explicit sort moves cards), so its header
+        // stays put and a follow-up double-click always lands on it.
+        if let Some(id) = next.as_deref() {
+            let card = self.cards.borrow().get(id).cloned();
+            let height = self.expanded_target_height(id);
+            if let (Some(card), Some(height)) = (card, height) {
+                card.expand(height, None);
+            }
         }
+        self.collapse_others(next.as_deref());
+    }
 
-        if let Some(card) = current_card {
-            card.collapse(None);
-        }
-
-        let expansion = next.as_deref().and_then(|server_id| {
-            let card = self.cards.borrow().get(server_id).cloned()?;
-            let target_height = geometry.map(|geometry| geometry.height)?;
-            Some((card, target_height))
-        });
-        if let Some((card, target_height)) = expansion {
-            let view = self.clone();
-            card.expand(
-                target_height,
-                Some(Box::new(move || {
-                    view.commit_selection_layout(generation);
-                })),
-            );
-        } else if next.is_some() {
-            self.commit_selection_layout(generation);
+    /// Collapse every expanded card except `keep`, immediately. When a
+    /// collapsing card sits above the kept card (earlier group, or same
+    /// column and earlier slot in the same group), compensate the scroll
+    /// position frame-by-frame so the kept card stays pinned on screen.
+    fn collapse_others(&self, keep: Option<&str>) {
+        let keep_position = keep.and_then(|id| self.position_of(id));
+        let vadjustment = self.root.vadjustment();
+        let columns = self.columns.get();
+        for (id, card) in self.cards.borrow().iter() {
+            if Some(id.as_str()) == keep || !card.is_expanded() {
+                continue;
+            }
+            let shifts_kept_card = match (self.position_of(id), keep_position) {
+                (Some(prev), Some(next)) => collapse_would_shift(prev, next, columns),
+                _ => false,
+            };
+            if shifts_kept_card {
+                let vadjustment = vadjustment.clone();
+                card.collapse(Some(Rc::new(move |delta: i32| {
+                    let value = (vadjustment.value() - f64::from(delta)).max(0.0);
+                    vadjustment.set_value(value);
+                })));
+            } else {
+                card.collapse(None);
+            }
         }
     }
 
-    /// Steady-state pass after the expand animation: re-plan from the *current*
-    /// selection state and place the reserver. Positions were already applied
-    /// when the selection changed, so this is visually a no-op, but re-reading
-    /// state keeps it correct if columns or order changed mid-animation.
-    fn commit_selection_layout(&self, generation: u64) {
-        if self.selection_generation.get() != generation {
-            return;
+    /// (group index, index within the group's ordered visible cards).
+    fn position_of(&self, server_id: &str) -> Option<(usize, usize)> {
+        let groups = self.groups.borrow();
+        for (group_index, group) in groups.iter().enumerate() {
+            let display_order = group.display_order.borrow();
+            let mut visible_index = 0;
+            for id in display_order.iter() {
+                let Some((_, widget)) = group.cards.iter().find(|(card_id, _)| card_id == id)
+                else {
+                    continue;
+                };
+                if !widget.get_visible() {
+                    continue;
+                }
+                if id == server_id {
+                    return Some((group_index, visible_index));
+                }
+                visible_index += 1;
+            }
         }
-        let selected = self.selected.borrow().clone();
-        let anchor = *self.selected_anchor.borrow();
-        let geometry = selected
-            .as_deref()
-            .and_then(|id| self.expanded_geometry_for(id));
-        for group in self.groups.borrow().iter() {
-            fill_grid(
-                group,
-                self.columns.get(),
-                selected.as_deref(),
-                anchor,
-                geometry,
-                true,
-            );
-        }
+        None
     }
 
     fn set_selected_immediately(&self, server_id: &str) {
-        *self.selected_anchor.borrow_mut() = self.anchor_for(server_id);
-        let geometry = self.expanded_geometry_for(server_id);
-        let anchor = *self.selected_anchor.borrow();
-        for group in self.groups.borrow().iter() {
-            fill_grid(
-                group,
-                self.columns.get(),
-                Some(server_id),
-                anchor,
-                geometry,
-                true,
-            );
-        }
-        let card = self.cards.borrow().get(server_id).cloned();
-        let target_height = geometry.map(|geometry| geometry.height);
-        if let (Some(card), Some(target_height)) = (card, target_height) {
-            card.set_expanded_immediately(target_height);
+        let height = self.expanded_target_height(server_id);
+        if let Some(height) = height
+            && let Some(card) = self.cards.borrow().get(server_id)
+        {
+            card.set_expanded_immediately(height);
         }
     }
 
-    fn expanded_geometry_for(&self, server_id: &str) -> Option<ExpandedGeometry> {
-        let groups = self.groups.borrow();
-        let group = groups
-            .iter()
-            .find(|group| group.cards.iter().any(|(id, _)| id == server_id))?;
+    /// Natural expanded height at the current column width.
+    fn expanded_target_height(&self, server_id: &str) -> Option<i32> {
         let cards = self.cards.borrow();
         let card = cards.get(server_id)?;
-        if self.columns.get() == 1 {
-            let allocated_width =
-                grid_column_width(&group.grid, 1).max(card.root.allocated_width());
-            let width = if allocated_width > 0 {
-                allocated_width
-            } else {
-                CARD_MEASURE_WIDTH
-            };
-            return Some(ExpandedGeometry {
-                row_span: 1,
-                height: card.expanded_natural_height(width).max(COMPACT_CARD_HEIGHT),
-            });
-        }
-        let row_spacing = i32::try_from(group.grid.row_spacing()).unwrap_or(CARD_ROW_SPACING);
-        let row_span = card.expanded_span(row_spacing);
-        Some(ExpandedGeometry {
-            row_span,
-            height: exact_expanded_height(row_span, row_spacing),
-        })
+        let allocated = card.root.allocated_width();
+        let width = if allocated > 0 {
+            allocated
+        } else {
+            self.column_fallback_width().unwrap_or(CARD_MEASURE_WIDTH)
+        };
+        Some(card.expanded_natural_height(width).max(COMPACT_CARD_HEIGHT))
     }
 
-    fn anchor_for(&self, server_id: &str) -> Option<GridAnchor> {
+    fn column_fallback_width(&self) -> Option<i32> {
         let groups = self.groups.borrow();
-        let group = groups
+        let total = groups
             .iter()
-            .find(|group| group.cards.iter().any(|(id, _)| id == server_id))?;
-        let card = group
-            .cards
-            .iter()
-            .find(|(id, _)| id == server_id)
-            .map(|(_, card)| card)?;
-        let (column, row, _, _) = group.grid.query_child(card);
-        Some(GridAnchor { column, row })
+            .map(|group| group.columns_box.allocated_width())
+            .find(|width| *width > 0)?;
+        let columns = self.columns.get().max(1) as i32;
+        Some(
+            total
+                .saturating_sub(CARD_COLUMN_SPACING.saturating_mul(columns - 1))
+                .checked_div(columns)
+                .unwrap_or(total),
+        )
     }
 
-    /// Set the grid column count (clamped 1..=3). No-op if unchanged so a
-    /// stream of size-allocations doesn't reflow the cards on every pixel.
-    pub fn set_columns(&self, count: usize) {
-        let count = count.clamp(1, 3);
-        if self.columns.get() == count {
-            return;
-        }
-        self.columns.set(count);
-        self.pending_columns.set(count);
-        let selected = self.selected.borrow().clone();
-        let geometry = selected
-            .as_deref()
-            .and_then(|id| self.expanded_geometry_for(id));
-        for group in self.groups.borrow().iter() {
-            fill_grid(group, count, selected.as_deref(), None, geometry, true);
-        }
-        *self.selected_anchor.borrow_mut() = self
-            .selected
-            .borrow()
-            .as_deref()
-            .and_then(|id| self.anchor_for(id));
-        if let (Some(server_id), Some(geometry)) = (selected, geometry)
-            && let Some(card) = self.cards.borrow().get(&server_id)
-        {
-            card.resize_expanded(geometry.height);
-        }
-    }
-
-    fn refresh_single_column_geometry(&self) {
-        if self.columns.get() != 1 {
-            return;
-        }
+    fn refresh_expanded_height(&self) {
         let Some(server_id) = self.selected.borrow().clone() else {
             return;
         };
-        let Some(geometry) = self.expanded_geometry_for(&server_id) else {
+        let Some(height) = self.expanded_target_height(&server_id) else {
             return;
         };
         if let Some(card) = self.cards.borrow().get(&server_id) {
-            card.resize_expanded(geometry.height);
+            card.resize_expanded(height);
         }
+    }
+
+    /// Re-measure the expanded card once the layout settles after a width or
+    /// column change; coalesces bursts of resize events.
+    fn schedule_expanded_remeasure(&self) {
+        let generation = self.resize_generation.get().wrapping_add(1);
+        self.resize_generation.set(generation);
+        let view = self.clone();
+        glib::timeout_add_local_once(Duration::from_millis(RESIZE_SETTLE_MS), move || {
+            if view.resize_generation.get() == generation {
+                view.refresh_expanded_height();
+            }
+        });
     }
 
     /// Manually capture and apply a latency order. Later measurements update only
@@ -726,30 +608,24 @@ impl ServersView {
         group.sort_generation.set(generation);
         group.sort_button.set_sensitive(false);
 
-        if !adw::is_animations_enabled(&group.grid) {
+        if !adw::is_animations_enabled(&group.columns_box) {
             *group.display_order.borrow_mut() = sorted;
-            let selected = self.selected.borrow();
-            let geometry = selected
-                .as_deref()
-                .and_then(|id| self.expanded_geometry_for(id));
-            fill_grid(
-                &group,
-                self.columns.get(),
-                selected.as_deref(),
-                *self.selected_anchor.borrow(),
-                geometry,
-                true,
-            );
+            repack_group(&group, self.columns.get());
             group.sort_button.set_sensitive(true);
             return;
         }
 
         let target = adw::CallbackAnimationTarget::new({
-            let grid = group.grid.clone();
-            move |value| grid.set_opacity(value)
+            let columns_box = group.columns_box.clone();
+            move |value| columns_box.set_opacity(value)
         });
-        let animation =
-            adw::TimedAnimation::new(&group.grid, group.grid.opacity(), 0.0, 90, target);
+        let animation = adw::TimedAnimation::new(
+            &group.columns_box,
+            group.columns_box.opacity(),
+            0.0,
+            90,
+            target,
+        );
         animation.set_easing(adw::Easing::EaseInCubic);
         animation.connect_done({
             let view = self.clone();
@@ -759,26 +635,14 @@ impl ServersView {
                     return;
                 }
                 *group.display_order.borrow_mut() = sorted.clone();
-                let selected = view.selected.borrow();
-                let selected_anchor = *view.selected_anchor.borrow();
-                let geometry = selected
-                    .as_deref()
-                    .and_then(|id| view.expanded_geometry_for(id));
-                fill_grid(
-                    &group,
-                    view.columns.get(),
-                    selected.as_deref(),
-                    selected_anchor,
-                    geometry,
-                    true,
-                );
-                drop(selected);
+                repack_group(&group, view.columns.get());
 
                 let target = adw::CallbackAnimationTarget::new({
-                    let grid = group.grid.clone();
-                    move |value| grid.set_opacity(value)
+                    let columns_box = group.columns_box.clone();
+                    move |value| columns_box.set_opacity(value)
                 });
-                let fade_in = adw::TimedAnimation::new(&group.grid, 0.0, 1.0, 130, target);
+                let fade_in =
+                    adw::TimedAnimation::new(&group.columns_box, 0.0, 1.0, 130, target);
                 fade_in.set_easing(adw::Easing::EaseOutCubic);
                 fade_in.connect_done({
                     let group = group.clone();
@@ -795,191 +659,86 @@ impl ServersView {
     }
 }
 
-const MIN_EXPANDED_SPAN: i32 = 2;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExpandedGeometry {
-    row_span: i32,
-    height: i32,
+/// Round-robin distribution: card i goes to column i % n, keeping the visual
+/// reading order row-major because compact cards share one height.
+fn distribute_columns(count: usize, columns: usize) -> Vec<Vec<usize>> {
+    let columns = columns.max(1);
+    let mut assignment = vec![Vec::new(); columns];
+    for item in 0..count {
+        assignment[item % columns].push(item);
+    }
+    assignment
 }
 
-/// One child's position in the grid. Keeping the planner independent from GTK
-/// makes the hole-skipping behavior deterministic and easy to test.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GridCell {
-    item: usize,
-    column: i32,
-    row: i32,
-    row_span: i32,
+/// Whether collapsing the card at `prev` moves the card at `next` upward:
+/// only when it occupies vertical space above it — an earlier group, or an
+/// earlier slot of the same column within the same group.
+fn collapse_would_shift(prev: (usize, usize), next: (usize, usize), columns: usize) -> bool {
+    let columns = columns.max(1);
+    prev.0 < next.0
+        || (prev.0 == next.0 && prev.1 % columns == next.1 % columns && prev.1 < next.1)
 }
 
-fn exact_expanded_height(row_span: i32, row_spacing: i32) -> i32 {
-    let row_span = row_span.clamp(2, 3);
-    COMPACT_CARD_HEIGHT
-        .saturating_mul(row_span)
-        .saturating_add(row_spacing.max(0).saturating_mul(row_span - 1))
-}
-
-fn grid_column_width(grid: &gtk::Grid, columns: usize) -> i32 {
-    let columns = columns.max(1) as i32;
-    let spacing = i32::try_from(grid.column_spacing()).unwrap_or(i32::MAX);
-    let gaps = spacing.saturating_mul(columns - 1);
-    grid.allocated_width()
-        .saturating_sub(gaps)
-        .checked_div(columns)
-        .unwrap_or(0)
-}
-
-fn plan_grid(
-    item_count: usize,
-    columns: usize,
-    expanded_item: Option<usize>,
-    expanded_anchor: Option<GridAnchor>,
-    expanded_span: i32,
-) -> Vec<GridCell> {
-    let columns = columns.max(1) as i32;
-    let expanded_span = expanded_span.max(1);
-    let mut reserved: HashSet<(i32, i32)> = HashSet::new();
-    let mut cell = 0i32;
-    let mut placements = Vec::with_capacity(item_count);
-    let anchored = expanded_item.zip(expanded_anchor).map(|(item, anchor)| {
-        let anchor = GridAnchor {
-            column: anchor.column.clamp(0, columns - 1),
-            row: anchor.row.max(0),
-        };
-        reserved.insert((anchor.row, anchor.column));
-        for extra in 1..expanded_span {
-            reserved.insert((anchor.row + extra, anchor.column));
+/// Lay the group's visible cards out into its column boxes. Skips all widget
+/// churn when the assignment already matches, so running height animations
+/// and keyboard focus survive unrelated calls.
+fn repack_group(group: &GroupUi, columns: usize) {
+    let columns = columns.max(1);
+    {
+        let mut boxes = group.column_boxes.borrow_mut();
+        if boxes.len() != columns {
+            for (_, card) in &group.cards {
+                if let Some(parent) = card.parent().and_downcast::<gtk::Box>() {
+                    parent.remove(card);
+                }
+            }
+            while let Some(child) = group.columns_box.first_child() {
+                group.columns_box.remove(&child);
+            }
+            boxes.clear();
+            for _ in 0..columns {
+                let column = gtk::Box::new(gtk::Orientation::Vertical, CARD_ROW_SPACING);
+                column.set_hexpand(true);
+                group.columns_box.append(&column);
+                boxes.push(column);
+            }
         }
-        (item, anchor)
-    });
-
-    for item in 0..item_count {
-        if let Some((anchored_item, anchor)) = anchored
-            && item == anchored_item
-        {
-            placements.push(GridCell {
-                item,
-                column: anchor.column,
-                row: anchor.row,
-                row_span: expanded_span,
-            });
-            continue;
-        }
-
-        let (mut row, mut column) = (cell / columns, cell % columns);
-        while reserved.contains(&(row, column)) {
-            cell += 1;
-            row = cell / columns;
-            column = cell % columns;
-        }
-        let row_span = if Some(item) == expanded_item {
-            expanded_span
-        } else {
-            1
-        };
-        placements.push(GridCell {
-            item,
-            column,
-            row,
-            row_span,
-        });
-        for extra in 1..row_span {
-            reserved.insert((row + extra, column));
-        }
-        cell += 1;
     }
 
-    placements
-}
-
-/// Lay cards out in an N-column grid in the group's explicit display order. The single
-/// expanded card reserves every cell covered by its whole-row span.
-/// Existing children move through GridLayoutChild properties and are never
-/// detached, preserving card state and its animation.
-fn fill_grid(
-    group: &GroupUi,
-    n: usize,
-    expanded_id: Option<&str>,
-    expanded_anchor: Option<GridAnchor>,
-    geometry: Option<ExpandedGeometry>,
-    with_reserver: bool,
-) {
-    // Only visible (unfiltered) cards take a cell, so a search never leaves holes.
+    let boxes = group.column_boxes.borrow();
     let display_order = group.display_order.borrow();
-    let ordered: Vec<&(String, gtk::Widget)> = display_order
+    let ordered: Vec<&gtk::Widget> = display_order
         .iter()
         .filter_map(|id| group.cards.iter().find(|(card_id, _)| card_id == id))
         .filter(|(_, card)| card.get_visible())
+        .map(|(_, card)| card)
         .collect();
-    let expanded_item =
-        expanded_id.and_then(|id| ordered.iter().position(|(item_id, _)| item_id == id));
-    let expanded_span = geometry.map_or(MIN_EXPANDED_SPAN, |geometry| geometry.row_span);
-    let placements = plan_grid(
-        ordered.len(),
-        n,
-        expanded_item,
-        expanded_anchor,
-        expanded_span,
-    );
-    for placement in &placements {
-        let (_, card) = ordered[placement.item];
-        set_grid_cell(
-            &group.grid,
-            card,
-            placement.column,
-            placement.row,
-            placement.row_span,
-        );
-    }
+    let desired = distribute_columns(ordered.len(), columns);
 
-    // While a selection transition is animating (`with_reserver == false`) the
-    // expanded card's own animated measure holds its rows; the reserver is only
-    // needed as a steady-state stabilizer once the animation has committed.
-    let reserved = expanded_item
-        .zip(geometry)
-        .filter(|_| n > 1 && with_reserver)
-        .and_then(|(item, geometry)| {
-            placements
-                .iter()
-                .find(|placement| placement.item == item)
-                .map(|placement| (*placement, geometry))
-        });
-    if let Some((placement, geometry)) = reserved {
-        group.reserver.set_height_request(geometry.height);
-        set_grid_cell(
-            &group.grid,
-            group.reserver.upcast_ref(),
-            placement.column,
-            placement.row,
-            placement.row_span,
-        );
-        group.reserver.set_visible(true);
-    } else {
-        group.reserver.set_visible(false);
-        group.reserver.set_height_request(-1);
-    }
-}
-
-fn set_grid_cell(grid: &gtk::Grid, card: &gtk::Widget, column: i32, row: i32, row_span: i32) {
-    if card.parent().is_none() {
-        grid.attach(card, column, row, 1, row_span);
+    let unchanged = desired.iter().enumerate().all(|(column, items)| {
+        let mut child = boxes[column].first_child();
+        for &item in items {
+            match child {
+                Some(ref widget) if widget == ordered[item] => child = widget.next_sibling(),
+                _ => return false,
+            }
+        }
+        child.is_none()
+    });
+    if unchanged {
         return;
     }
 
-    let Some(manager) = grid.layout_manager() else {
-        return;
-    };
-    let Ok(layout_child) = manager
-        .layout_child(card)
-        .downcast::<gtk::GridLayoutChild>()
-    else {
-        return;
-    };
-    layout_child.set_column(column);
-    layout_child.set_row(row);
-    layout_child.set_column_span(1);
-    layout_child.set_row_span(row_span);
+    for (_, card) in &group.cards {
+        if let Some(parent) = card.parent().and_downcast::<gtk::Box>() {
+            parent.remove(card);
+        }
+    }
+    for (column, items) in desired.iter().enumerate() {
+        for &item in items {
+            boxes[column].append(ordered[item]);
+        }
+    }
 }
 
 /// Pick a masonry column count from the available content width so cards keep a
@@ -1052,116 +811,32 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        GridAnchor, GridCell, columns_for_width, columns_for_width_with_hysteresis,
-        exact_expanded_height, plan_grid, sorted_by_latency,
+        collapse_would_shift, columns_for_width, columns_for_width_with_hysteresis,
+        distribute_columns, sorted_by_latency,
     };
 
     #[test]
-    fn expanded_card_reserves_the_cell_below_it() {
+    fn distribution_reads_row_major_and_keeps_column_order() {
         assert_eq!(
-            plan_grid(7, 3, Some(2), None, 2),
-            vec![
-                GridCell {
-                    item: 0,
-                    column: 0,
-                    row: 0,
-                    row_span: 1
-                },
-                GridCell {
-                    item: 1,
-                    column: 1,
-                    row: 0,
-                    row_span: 1
-                },
-                GridCell {
-                    item: 2,
-                    column: 2,
-                    row: 0,
-                    row_span: 2
-                },
-                GridCell {
-                    item: 3,
-                    column: 0,
-                    row: 1,
-                    row_span: 1
-                },
-                GridCell {
-                    item: 4,
-                    column: 1,
-                    row: 1,
-                    row_span: 1
-                },
-                GridCell {
-                    item: 5,
-                    column: 0,
-                    row: 2,
-                    row_span: 1
-                },
-                GridCell {
-                    item: 6,
-                    column: 1,
-                    row: 2,
-                    row_span: 1
-                },
-            ]
+            distribute_columns(7, 3),
+            vec![vec![0, 3, 6], vec![1, 4], vec![2, 5]]
         );
+        assert_eq!(distribute_columns(3, 1), vec![vec![0, 1, 2]]);
+        assert_eq!(distribute_columns(0, 2), vec![Vec::<usize>::new(); 2]);
     }
 
     #[test]
-    fn layouts_stay_dense_for_each_column_count() {
-        assert_eq!(
-            plan_grid(3, 1, None, None, 2).last().map(|cell| cell.row),
-            Some(2)
-        );
-        assert_eq!(
-            plan_grid(4, 2, None, None, 2).last().map(|cell| cell.row),
-            Some(1)
-        );
-        assert_eq!(
-            plan_grid(6, 3, None, None, 2).last().map(|cell| cell.row),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn expanded_card_keeps_its_clicked_cell() {
-        let cells = plan_grid(7, 3, Some(4), Some(GridAnchor { column: 2, row: 1 }), 2);
-        assert_eq!(
-            cells[4],
-            GridCell {
-                item: 4,
-                column: 2,
-                row: 1,
-                row_span: 2,
-            }
-        );
-        assert!(
-            cells
-                .iter()
-                .enumerate()
-                .all(|(index, cell)| index == 4 || (cell.column, cell.row) != (2, 1))
-        );
-    }
-
-    #[test]
-    fn expanded_height_uses_exact_64_pixel_rows_and_12_pixel_gaps() {
-        assert_eq!(exact_expanded_height(2, 12), 140);
-        assert_eq!(exact_expanded_height(3, 12), 216);
-    }
-
-    #[test]
-    fn single_column_grid_does_not_reserve_artificial_rows() {
-        assert_eq!(plan_grid(3, 1, Some(1), None, 1)[1].row_span, 1);
-    }
-
-    #[test]
-    fn taller_expanded_card_reserves_each_covered_cell() {
-        let cells = plan_grid(7, 3, Some(2), None, 3);
-        assert_eq!(cells[2].row_span, 3);
-        assert_eq!((cells[3].column, cells[3].row), (0, 1));
-        assert_eq!((cells[4].column, cells[4].row), (1, 1));
-        assert_eq!((cells[5].column, cells[5].row), (0, 2));
-        assert_eq!((cells[6].column, cells[6].row), (1, 2));
+    fn collapse_shifts_only_cards_above_in_the_same_column_or_earlier_groups() {
+        // Earlier group always sits above.
+        assert!(collapse_would_shift((0, 5), (1, 0), 3));
+        // Same group, same column (0 and 3 with n=3), earlier slot.
+        assert!(collapse_would_shift((1, 0), (1, 3), 3));
+        // Same group, different column.
+        assert!(!collapse_would_shift((1, 1), (1, 3), 3));
+        // Same column but below.
+        assert!(!collapse_would_shift((1, 3), (1, 0), 3));
+        // Later group never shifts an earlier one.
+        assert!(!collapse_would_shift((2, 0), (1, 0), 3));
     }
 
     #[test]
@@ -1196,37 +871,21 @@ mod tests {
 
     #[test]
     fn three_columns_start_only_after_the_wider_breakpoint() {
-        assert_eq!(columns_for_width(651), 1);
-        assert_eq!(columns_for_width(652), 2);
-        assert_eq!(columns_for_width(983), 2);
-        assert_eq!(columns_for_width(984), 3);
+        assert_eq!(columns_for_width(511), 1);
+        assert_eq!(columns_for_width(512), 2);
+        assert_eq!(columns_for_width(773), 2);
+        assert_eq!(columns_for_width(774), 3);
     }
 
     #[test]
     fn column_hysteresis_prevents_threshold_flapping() {
-        assert_eq!(columns_for_width_with_hysteresis(667, 1, 16), 1);
-        assert_eq!(columns_for_width_with_hysteresis(668, 1, 16), 2);
-        assert_eq!(columns_for_width_with_hysteresis(651, 2, 16), 2);
-        assert_eq!(columns_for_width_with_hysteresis(635, 2, 16), 1);
-        assert_eq!(columns_for_width_with_hysteresis(999, 2, 16), 2);
-        assert_eq!(columns_for_width_with_hysteresis(1000, 2, 16), 3);
-        assert_eq!(columns_for_width_with_hysteresis(969, 3, 16), 3);
-        assert_eq!(columns_for_width_with_hysteresis(967, 3, 16), 2);
-    }
-
-    #[test]
-    fn filtering_and_rebuild_keep_source_order_dense() {
-        let filtered = plan_grid(4, 2, Some(1), Some(GridAnchor { column: 1, row: 0 }), 2);
-        assert_eq!(
-            filtered
-                .iter()
-                .map(|cell| (cell.item, cell.column, cell.row))
-                .collect::<Vec<_>>(),
-            vec![(0, 0, 0), (1, 1, 0), (2, 0, 1), (3, 0, 2)]
-        );
-        assert_eq!(
-            plan_grid(4, 2, None, None, 1),
-            plan_grid(4, 2, None, None, 1)
-        );
+        assert_eq!(columns_for_width_with_hysteresis(527, 1, 16), 1);
+        assert_eq!(columns_for_width_with_hysteresis(528, 1, 16), 2);
+        assert_eq!(columns_for_width_with_hysteresis(511, 2, 16), 2);
+        assert_eq!(columns_for_width_with_hysteresis(495, 2, 16), 1);
+        assert_eq!(columns_for_width_with_hysteresis(789, 2, 16), 2);
+        assert_eq!(columns_for_width_with_hysteresis(790, 2, 16), 3);
+        assert_eq!(columns_for_width_with_hysteresis(759, 3, 16), 3);
+        assert_eq!(columns_for_width_with_hysteresis(757, 3, 16), 2);
     }
 }

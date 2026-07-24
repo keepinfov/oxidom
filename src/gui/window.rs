@@ -94,6 +94,17 @@ fn responsive_mode_for_width(width: f64) -> ResponsiveMode {
     }
 }
 
+/// Width the servers view actually gets: in compact mode the sidebar overlays
+/// the content, in wide mode OverlaySplitView carves out its fraction
+/// (25% clamped to the configured 230..=280 range).
+fn servers_available_width(window_width: i32, compact: bool) -> i32 {
+    if compact {
+        return window_width;
+    }
+    let sidebar = (window_width / 4).clamp(230, 280);
+    window_width.saturating_sub(sidebar)
+}
+
 fn active_probe_is_due(
     now: Instant,
     next_probe: Option<Instant>,
@@ -220,7 +231,6 @@ pub fn build(app: &adw::Application) {
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Search")
         .max_width_chars(24)
-        .width_request(220)
         .css_classes(["compact-search"])
         .build();
     let compact_search = gtk::SearchEntry::builder()
@@ -358,6 +368,27 @@ pub fn build(app: &adw::Application) {
     controller.refresh_status();
     controller.add_breakpoint();
     controller.start_timer();
+
+    // Column count follows the window width (see push_servers_width).
+    window.connect_realize({
+        let weak = Rc::downgrade(&controller);
+        move |window| {
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            if let Some(surface) = window.surface() {
+                surface.connect_width_notify({
+                    let weak = weak.clone();
+                    move |_| {
+                        if let Some(controller) = weak.upgrade() {
+                            controller.push_servers_width();
+                        }
+                    }
+                });
+            }
+            controller.push_servers_width();
+        }
+    });
 
     // Shut the tunnel down and restore the desktop proxy on SIGINT/SIGTERM,
     // not just on a clean window close.
@@ -703,6 +734,22 @@ impl Controller {
         self.header.set_show_title(!enabled);
         self.sync_search_chrome();
         self.refresh_status();
+        // Sidebar visibility changed the width the servers view gets.
+        self.push_servers_width();
+    }
+
+    /// Feed the servers view the width it can use. Driven from the window
+    /// geometry — never from the view's own allocation, which cannot shrink
+    /// below the current column count's minimum and would deadlock.
+    fn push_servers_width(&self) {
+        let width = self.window.width();
+        let width = if width > 0 {
+            width
+        } else {
+            self.window.default_width()
+        };
+        self.servers
+            .set_available_width(servers_available_width(width, self.compact.get()));
     }
 
     fn add_breakpoint(self: &Rc<Self>) {

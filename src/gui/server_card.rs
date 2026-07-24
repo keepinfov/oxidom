@@ -132,7 +132,6 @@ pub struct ServerCard {
     status: gtk::Label,
     connect_button: gtk::Button,
     expanded: Rc<Cell<bool>>,
-    expanded_span: Rc<Cell<Option<i32>>>,
     latency_generation: Rc<Cell<u64>>,
     height_generation: Rc<Cell<u64>>,
 }
@@ -393,7 +392,6 @@ impl ServerCard {
             status,
             connect_button,
             expanded,
-            expanded_span: Rc::new(Cell::new(None)),
             latency_generation: Rc::new(Cell::new(0)),
             height_generation: Rc::new(Cell::new(0)),
         };
@@ -523,28 +521,12 @@ impl ServerCard {
         }
     }
 
-    pub fn compact_height(&self) -> i32 {
-        COMPACT_CARD_HEIGHT
-    }
-
     pub fn expanded_natural_height(&self, width: i32) -> i32 {
         let (minimum_width, _, _, _) = self.detail.measure(gtk::Orientation::Horizontal, -1);
         let (minimum, natural, _, _) = self
             .detail
             .measure(gtk::Orientation::Vertical, width.max(minimum_width).max(1));
         COMPACT_CARD_HEIGHT.saturating_add(natural.max(minimum).max(0))
-    }
-
-    /// Choose the multi-column row span once for this expansion. Resizes reuse
-    /// the cached answer; only a later collapse permits a new measurement.
-    pub fn expanded_span(&self, row_spacing: i32) -> i32 {
-        if let Some(span) = self.expanded_span.get() {
-            return span;
-        }
-        let natural_height = self.expanded_natural_height(CARD_MEASURE_WIDTH);
-        let span = expanded_span_for_natural_height(natural_height, row_spacing);
-        self.expanded_span.set(Some(span));
-        span
     }
 
     pub fn resize_expanded(&self, target_height: i32) {
@@ -618,37 +600,66 @@ impl ServerCard {
         );
     }
 
-    pub fn collapse(&self, on_done: Option<Box<dyn FnOnce()>>) {
+    /// Collapse back to the compact height. `on_shrink` receives the height
+    /// delta of every animation frame; the servers view uses it to compensate
+    /// the scroll position so the selected card stays pinned on screen while a
+    /// card above it shrinks.
+    pub fn collapse(&self, on_shrink: Option<Rc<dyn Fn(i32)>>) {
         let generation = self.height_generation.get().wrapping_add(1);
         self.height_generation.set(generation);
         let current_height = self.root.allocated_height().max(COMPACT_CARD_HEIGHT);
 
         if !adw::is_animations_enabled(&self.root) {
             self.finish_collapse();
-            if let Some(on_done) = on_done {
-                on_done();
+            if let Some(on_shrink) = on_shrink {
+                on_shrink(current_height - COMPACT_CARD_HEIGHT);
             }
             return;
         }
-        self.animate_height(
-            generation,
-            HeightTransition {
-                from: current_height,
-                to: COMPACT_CARD_HEIGHT,
-                duration: COLLAPSE_DURATION_MS,
-                easing: adw::Easing::EaseInCubic,
-            },
-            Some({
-                let card = self.clone();
-                let mut on_done = on_done;
-                Box::new(move || {
-                    card.finish_collapse();
-                    if let Some(on_done) = on_done.take() {
-                        on_done();
+
+        let last_height = Rc::new(Cell::new(current_height));
+        let target = adw::CallbackAnimationTarget::new({
+            let card = self.clone();
+            let last_height = last_height.clone();
+            let on_shrink = on_shrink.clone();
+            move |value| {
+                if card.height_generation.get() != generation {
+                    return;
+                }
+                let height = value.round() as i32;
+                card.root.set_animated_height(height);
+                if let Some(on_shrink) = &on_shrink {
+                    let delta = last_height.replace(height) - height;
+                    if delta != 0 {
+                        on_shrink(delta);
                     }
-                })
-            }),
+                }
+            }
+        });
+        let animation = adw::TimedAnimation::new(
+            &self.root,
+            f64::from(current_height),
+            f64::from(COMPACT_CARD_HEIGHT),
+            COLLAPSE_DURATION_MS,
+            target,
         );
+        animation.set_easing(adw::Easing::EaseInCubic);
+        animation.connect_done({
+            let card = self.clone();
+            move |_| {
+                if card.height_generation.get() != generation {
+                    return;
+                }
+                card.finish_collapse();
+                if let Some(on_shrink) = &on_shrink {
+                    let delta = last_height.replace(COMPACT_CARD_HEIGHT) - COMPACT_CARD_HEIGHT;
+                    if delta != 0 {
+                        on_shrink(delta);
+                    }
+                }
+            }
+        });
+        animation.play();
     }
 
     fn finish_collapse(&self) {
@@ -658,7 +669,6 @@ impl ServerCard {
         self.detail_region.set_can_target(false);
         self.detail_region.set_visible(false);
         self.expanded.set(false);
-        self.expanded_span.set(None);
     }
 
     fn animate_height(
@@ -723,17 +733,6 @@ impl ServerCard {
     }
 }
 
-fn expanded_span_for_natural_height(natural_height: i32, row_spacing: i32) -> i32 {
-    let spacing = row_spacing.max(0);
-    let stride = COMPACT_CARD_HEIGHT.saturating_add(spacing);
-    natural_height
-        .saturating_add(spacing)
-        .saturating_add(stride - 1)
-        .checked_div(stride)
-        .unwrap_or(3)
-        .clamp(2, 3)
-}
-
 fn click_plan_for_press(button: u32, n_press: i32) -> ClickPlan {
     match (button, n_press) {
         (gtk::gdk::BUTTON_PRIMARY, 1) => ClickPlan::ToggleDetails,
@@ -767,20 +766,7 @@ fn flag_widget(country: Option<&str>) -> gtk::Widget {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        COMPACT_CARD_HEIGHT, CardConnectionState, ClickPlan, click_plan_for_press,
-        expanded_span_for_natural_height,
-    };
-
-    #[test]
-    fn expanded_span_is_two_or_three_exact_rows() {
-        let gap = 12;
-        assert_eq!(expanded_span_for_natural_height(140, gap), 2);
-        assert_eq!(expanded_span_for_natural_height(141, gap), 3);
-        assert_eq!(expanded_span_for_natural_height(10_000, gap), 3);
-        assert_eq!(COMPACT_CARD_HEIGHT * 2 + gap, 140);
-        assert_eq!(COMPACT_CARD_HEIGHT * 3 + gap * 2, 216);
-    }
+    use super::{CardConnectionState, ClickPlan, click_plan_for_press};
 
     #[test]
     fn primary_click_toggles_and_double_click_activates() {
