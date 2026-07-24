@@ -19,10 +19,24 @@ impl Page {
             Self::Logs => "logs",
         }
     }
+
+    /// Row position in the navigation list; inverse of the mapping in
+    /// `connect_row_selected`.
+    pub fn index(self) -> i32 {
+        match self {
+            Self::General => 0,
+            Self::Subscriptions => 1,
+            Self::Settings => 2,
+            Self::Logs => 3,
+        }
+    }
 }
 
 pub struct Sidebar {
     pub root: gtk::Box,
+    /// Exposed so the window can move the selection programmatically, e.g.
+    /// from an error toast offering "Open Settings".
+    pub list: gtk::ListBox,
     pub status_button: gtk::Button,
     pub status_icon: gtk::Image,
     pub status_label: gtk::Label,
@@ -121,6 +135,7 @@ impl Sidebar {
 
         Self {
             root,
+            list,
             status_button,
             status_icon,
             status_label,

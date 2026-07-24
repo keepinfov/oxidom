@@ -11,16 +11,16 @@ use gtk::glib;
 
 use crate::APP_ID;
 use crate::config::Config;
-use crate::ipc::{ProbeState, StatusInfo};
+use crate::ipc::{self, ProbeState, StatusInfo};
 use crate::model::Subscription;
 use crate::xray::core::Status;
 use crate::{paths, sysproxy};
 
 use super::client::DaemonClient;
 use super::operation::{UiOperation, UiOperationKind};
-use super::tray::{OxidomTray, TrayCommand};
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
+use super::tray::{OxidomTray, TrayCommand};
 use super::views::logs::LogsView;
 use super::views::servers::ServersView;
 use super::views::settings::{SettingsValues, SettingsView};
@@ -132,6 +132,9 @@ struct AppState {
     pending_status: Option<Status>,
     /// Latest status reported by the daemon.
     daemon_status: Status,
+    /// Last daemon error already shown to the user, so the 500 ms poll does
+    /// not re-toast the same failure on every tick.
+    notified_error: Option<String>,
 }
 
 struct Controller {
@@ -158,6 +161,7 @@ struct Controller {
     sidebar_status: gtk::Button,
     sidebar_status_icon: gtk::Image,
     sidebar_status_label: gtk::Label,
+    sidebar_list: gtk::ListBox,
     servers: ServersView,
     subscriptions: SubscriptionsView,
     settings: SettingsView,
@@ -202,6 +206,9 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
     let subscriptions_snapshot = client.subscriptions().unwrap_or_default();
     let initial_status = client.status().unwrap_or_default();
     let initial_config = client.settings().unwrap_or_default();
+    // A daemon older than RuntimeInfo answers UnknownMethod; `None` just
+    // leaves the settings rows unlocked and the effective path unknown.
+    let initial_runtime = client.runtime_info().ok();
     let selected_id = initial_status.active_id.clone();
     let state = Rc::new(RefCell::new(AppState {
         client,
@@ -215,6 +222,9 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
         operation: None,
         pending_status: None,
         daemon_status: initial_status.to_status(),
+        // Left unset on purpose: a GUI opening onto an already-broken daemon
+        // should toast once, on its first poll.
+        notified_error: None,
     }));
 
     let servers = ServersView::new();
@@ -241,6 +251,7 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
             }
         }
     });
+    settings.set_runtime_info(initial_runtime.as_ref());
     let settings_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     settings_actions.append(&settings.reset_button());
     settings_actions.append(&settings.apply_button());
@@ -389,6 +400,7 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
         sidebar_status: sidebar.status_button,
         sidebar_status_icon: sidebar.status_icon,
         sidebar_status_label: sidebar.status_label,
+        sidebar_list: sidebar.list,
         servers,
         subscriptions,
         settings,
@@ -556,7 +568,7 @@ impl Controller {
             let weak = Rc::downgrade(self);
             move |_| {
                 if let Some(controller) = weak.upgrade() {
-                    controller.disconnect_if_active();
+                    controller.handle_status_clicked();
                 }
             }
         });
@@ -564,7 +576,7 @@ impl Controller {
             let weak = Rc::downgrade(self);
             move |_| {
                 if let Some(controller) = weak.upgrade() {
-                    controller.disconnect_if_active();
+                    controller.handle_status_clicked();
                 }
             }
         });
@@ -1019,13 +1031,17 @@ impl Controller {
             move |client| client.connect_server(&work_id),
             move |controller, result| {
                 if let Err(error) = result {
+                    let message = format!("{error:#}");
                     {
                         let mut state = controller.state.borrow_mut();
-                        state.pending_status = Some(Status::Error(error.to_string()));
+                        state.pending_status = Some(Status::Error(message.clone()));
                         state.connected_id = None;
                     }
                     controller.set_cards_connection(None, None);
-                    controller.show_message(&format!("Could not connect: {error}"));
+                    // The daemon reports the same failure on its next poll;
+                    // claim it now so it is not toasted twice.
+                    controller.mark_error_notified(&message);
+                    controller.show_error("Could not connect", &message);
                 }
                 controller.reconcile_system_proxy();
                 controller.refresh_status();
@@ -1182,14 +1198,27 @@ impl Controller {
             latency_method: values.latency_method,
             latency_test_url: values.latency_test_url.clone(),
             subscription_user_agent: values.subscription_user_agent.clone(),
+            xray_binary: values.xray_binary.clone(),
         };
         self.client_job(
             UiOperation::new(UiOperationKind::ApplySettings),
-            move |client| client.apply_settings(&config),
+            move |client| {
+                let outcome = client.apply_settings(&config)?;
+                // Applying can move the Xray path or be refused outright; ask
+                // the daemon what it ended up with instead of assuming.
+                Ok((outcome, client.runtime_info().ok()))
+            },
             move |controller, result| {
                 match result {
-                    Ok(outcome) => {
+                    Ok((outcome, runtime)) => {
                         controller.settings.mark_applied(values.clone());
+                        controller.settings.set_runtime_info(runtime.as_ref());
+                        if !outcome.ignored_ports.is_empty() {
+                            controller.show_message(&format!(
+                                "{} left unchanged — fixed by the system service unit",
+                                outcome.ignored_ports.join(" and ")
+                            ));
+                        }
                         if let Some(error) = outcome.reconnect_error {
                             {
                                 let mut state = controller.state.borrow_mut();
@@ -1197,9 +1226,11 @@ impl Controller {
                                 state.connected_id = None;
                             }
                             controller.set_cards_connection(None, None);
-                            controller.show_message(&format!(
-                                "Settings saved, but the connection could not restart: {error}"
-                            ));
+                            controller.mark_error_notified(&error);
+                            controller.show_error(
+                                "Settings saved, but the connection could not restart",
+                                &error,
+                            );
                         }
                         controller.reconcile_system_proxy();
                         if controller.close_after_apply.replace(false) {
@@ -1209,7 +1240,7 @@ impl Controller {
                     Err(error) => {
                         controller.settings.set_apply_in_progress(false);
                         controller.close_after_apply.set(false);
-                        controller.show_message(&format!("Could not save settings: {error}"));
+                        controller.show_error("Could not save settings", &format!("{error:#}"));
                     }
                 }
                 controller.refresh_status();
@@ -1324,6 +1355,7 @@ impl Controller {
     fn apply_snapshot(self: &Rc<Self>, snapshot: PolledSnapshot) {
         let mut latency_updates: Vec<(String, LatencyState)> = Vec::new();
         let mut toast_unreachable = false;
+        let mut new_error: Option<String> = None;
         {
             let mut state = self.state.borrow_mut();
             for (id, value) in &snapshot.probe.latencies {
@@ -1378,6 +1410,19 @@ impl Controller {
                 }
             }
             state.daemon_status = snapshot.status.to_status();
+            // Key off the daemon's own view, not `current_status`: the latter
+            // prefers `pending_status`, which a failed connect leaves pinned.
+            let error = match &state.daemon_status {
+                Status::Error(message) => Some(message.clone()),
+                _ => None,
+            };
+            if error != state.notified_error {
+                state.notified_error = error.clone();
+                // Record the transition either way, but stay quiet while
+                // hidden: ToastOverlay queues, and `gui --background` would
+                // otherwise dump an hour of stale toasts when first opened.
+                new_error = error.filter(|_| self.window.is_visible());
+            }
             // While no optimistic transition is in flight, the daemon's view
             // of the active server wins.
             if state.operation.is_none()
@@ -1395,6 +1440,11 @@ impl Controller {
         }
         if toast_unreachable {
             self.show_message("Server is unreachable or did not respond");
+        }
+        // Failures the user never triggered — a crashed core, a tunnel torn
+        // down by its own latency check — reach the screen only here.
+        if let Some(error) = new_error {
+            self.show_error("Connection error", &error);
         }
         self.logs.set_logs(&snapshot.logs);
         self.sync_connection_cards();
@@ -1680,6 +1730,93 @@ impl Controller {
             .unwrap_or_else(|| state.daemon_status.clone())
     }
 
+    /// The status buttons double as the only always-visible carrier of a
+    /// failure: the detail otherwise lives in a tooltip, which is unreachable
+    /// by keyboard and hidden entirely in wide mode.
+    fn handle_status_clicked(self: &Rc<Self>) {
+        let status = {
+            let state = self.state.borrow();
+            self.current_status(&state)
+        };
+        match status {
+            Status::Error(error) => self.show_error_details("Connection error", &error),
+            _ => self.disconnect_if_active(),
+        }
+    }
+
+    /// A failure the user did not directly trigger, or one too long for a
+    /// toast: one line, the full text behind Details, and a shortcut to the
+    /// place that can fix it when the message names one.
+    fn show_error(self: &Rc<Self>, title: &str, detail: &str) {
+        let toast = adw::Toast::new(&summarize_error(title, detail));
+        toast.set_priority(adw::ToastPriority::High);
+        toast.set_timeout(8);
+        let open_settings = ipc::error_action(detail) == ipc::ErrorAction::OpenSettings;
+        toast.set_button_label(Some(if open_settings {
+            "Open Settings"
+        } else {
+            "Details"
+        }));
+        // `set_action_name` would need a GActionMap the window does not
+        // register; a direct handler keeps this self-contained.
+        toast.connect_button_clicked({
+            let weak = Rc::downgrade(self);
+            let title = title.to_string();
+            let detail = detail.to_string();
+            move |_| {
+                let Some(controller) = weak.upgrade() else {
+                    return;
+                };
+                if open_settings {
+                    controller.navigate_to(Page::Settings);
+                } else {
+                    controller.show_error_details(&title, &detail);
+                }
+            }
+        });
+        self.toasts.add_toast(toast);
+    }
+
+    /// Full error text, selectable and dismissible.
+    fn show_error_details(self: &Rc<Self>, title: &str, detail: &str) {
+        let dialog = adw::MessageDialog::new(Some(&self.window), Some(title), Some(detail));
+        dialog.set_body_use_markup(false);
+        dialog.add_response("close", "Close");
+        if ipc::error_action(detail) == ipc::ErrorAction::OpenSettings {
+            dialog.add_response("settings", "Open Settings");
+            dialog.set_response_appearance("settings", adw::ResponseAppearance::Suggested);
+        }
+        dialog.set_default_response(Some("close"));
+        dialog.set_close_response("close");
+        dialog.connect_response(None, {
+            let weak = Rc::downgrade(self);
+            move |dialog, response| {
+                dialog.close();
+                if response == "settings"
+                    && let Some(controller) = weak.upgrade()
+                {
+                    controller.navigate_to(Page::Settings);
+                }
+            }
+        });
+        dialog.present();
+    }
+
+    /// Records an error the caller has already surfaced, so the poll loop does
+    /// not toast the identical message a second time. Both paths format the
+    /// same anyhow error with `{:#}`, so the strings match exactly.
+    fn mark_error_notified(&self, message: &str) {
+        self.state.borrow_mut().notified_error = Some(message.to_string());
+    }
+
+    fn navigate_to(&self, page: Page) {
+        // Drive the sidebar rather than the stack directly, so its selection
+        // and the visible page cannot disagree.
+        if let Some(row) = self.sidebar_list.row_at_index(page.index()) {
+            self.sidebar_list.select_row(Some(&row));
+        }
+    }
+
     fn show_message(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
@@ -1693,6 +1830,24 @@ fn gui_proxy_marker() -> Option<std::path::PathBuf> {
 
 fn gui_proxy_marker_exists() -> bool {
     gui_proxy_marker().is_some_and(|marker| marker.exists())
+}
+
+/// Toasts are one line; anyhow cause chains are not. Keep the headline and
+/// enough of the detail to recognize the failure, leaving the rest to Details.
+fn summarize_error(title: &str, detail: &str) -> String {
+    const MAX_DETAIL: usize = 110;
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return title.to_string();
+    }
+    if detail.chars().count() <= MAX_DETAIL {
+        return format!("{title}: {detail}");
+    }
+    // Truncate on a char boundary — error text carries non-ASCII (e.g. the
+    // "›" in "Settings › Xray binary", and em dashes from our own messages).
+    let cut: String = detail.chars().take(MAX_DETAIL).collect();
+    let cut = cut.trim_end();
+    format!("{title}: {cut}…")
 }
 
 fn set_status_tone<W: IsA<gtk::Widget>>(widget: &W, tone: StatusTone) {
@@ -1816,7 +1971,20 @@ fn install_css() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResponsiveMode, SearchState, responsive_mode_for_width};
+    use super::{ResponsiveMode, SearchState, responsive_mode_for_width, summarize_error};
+
+    #[test]
+    fn summarize_error_truncates_on_char_boundaries() {
+        assert_eq!(summarize_error("Failed", ""), "Failed");
+        assert_eq!(summarize_error("Failed", "  short  "), "Failed: short");
+
+        // Multi-byte throughout: a byte-based cut would panic here.
+        let long = "путь ".repeat(40);
+        let summary = summarize_error("Could not connect", &long);
+        assert!(summary.starts_with("Could not connect: путь"), "{summary}");
+        assert!(summary.ends_with('…'), "{summary}");
+        assert!(summary.chars().count() < long.chars().count(), "{summary}");
+    }
 
     #[test]
     fn responsive_modes_include_their_upper_boundaries() {

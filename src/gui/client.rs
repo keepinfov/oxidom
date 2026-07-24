@@ -6,7 +6,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::ipc::{ApplySettingsResult, BUS_NAME, INTERFACE, OBJECT_PATH, ProbeState, StatusInfo};
+use crate::ipc::{
+    ApplySettingsResult, BUS_NAME, INTERFACE, OBJECT_PATH, ProbeState, RuntimeInfo, StatusInfo,
+};
 use crate::model::Subscription;
 
 #[derive(Clone)]
@@ -130,6 +132,14 @@ impl DaemonClient {
 
     pub fn probe_state(&self) -> Result<ProbeState> {
         let json: String = self.proxy.call("ProbeState", &()).map_err(friendly)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Daemon-side facts (resolved Xray path, unit-pinned ports). A daemon
+    /// older than this method answers `UnknownMethod`; callers must degrade
+    /// gracefully rather than treat that as fatal.
+    pub fn runtime_info(&self) -> Result<RuntimeInfo> {
+        let json: String = self.proxy.call("RuntimeInfo", &()).map_err(friendly)?;
         Ok(serde_json::from_str(&json)?)
     }
 
