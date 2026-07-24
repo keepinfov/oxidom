@@ -12,7 +12,7 @@ use zbus::fdo;
 
 use crate::config::Config;
 use crate::engine::Engine;
-use crate::ipc::{ApplySettingsResult, BUS_NAME, OBJECT_PATH, ProbeState, StatusInfo};
+use crate::ipc::{ApplySettingsResult, BUS_NAME, OBJECT_PATH, ProbeState, RuntimeInfo, StatusInfo};
 use crate::model::Server;
 use crate::probe;
 use crate::xray::core::Status;
@@ -35,16 +35,21 @@ struct Shared {
     /// Layered over the core status, e.g. when the confirming probe after a
     /// connect fails and the daemon shuts the tunnel back down.
     override_status: Arc<Mutex<Option<Status>>>,
+    /// Ports pinned by `--socks-port`/`--http-port`, i.e. by the service unit.
+    socks_port_locked: bool,
+    http_port_locked: bool,
 }
 
 impl Shared {
-    fn new(engine: Engine) -> Self {
+    fn new(engine: Engine, socks_port_locked: bool, http_port_locked: bool) -> Self {
         Shared {
             engine: Arc::new(Mutex::new(engine)),
             latencies: Arc::new(Mutex::new(HashMap::new())),
             checking: Arc::new(Mutex::new(HashSet::new())),
             probe_queue: Arc::new(Mutex::new(VecDeque::new())),
             override_status: Arc::new(Mutex::new(None)),
+            socks_port_locked,
+            http_port_locked,
         }
     }
 
@@ -53,12 +58,35 @@ impl Shared {
             return StatusInfo::from_status(&status, None);
         }
         let mut engine = self.engine.lock().unwrap();
-        let mut status = engine.status();
-        if status == Status::Connected && !engine.core.is_alive() {
-            status = Status::Error("Xray exited unexpectedly".to_string());
+        if engine.status() == Status::Connected && !engine.core.is_alive() {
+            // Record the death once rather than re-deriving it on every poll,
+            // so the log keeps one line and the GUI toasts one transition.
+            engine.core.fail("Xray exited unexpectedly");
         }
+        let status = engine.status();
         let active = engine.state.active_server_id.clone();
         StatusInfo::from_status(&status, active)
+    }
+
+    fn runtime_info(&self) -> RuntimeInfo {
+        let engine = self.engine.lock().unwrap();
+        let (xray_path, xray_error, xray_source) = match engine.core.resolve_binary() {
+            Ok(resolved) => (
+                Some(resolved.path.display().to_string()),
+                None,
+                Some(resolved.source),
+            ),
+            Err(error) => (None, Some(format!("{error:#}")), None),
+        };
+        RuntimeInfo {
+            xray_path,
+            xray_error,
+            xray_source,
+            socks_port_locked: self.socks_port_locked,
+            http_port_locked: self.http_port_locked,
+            socks_port: engine.config.socks_port,
+            http_port: engine.config.http_port,
+        }
     }
 
     fn probe_target(&self, server_id: &str) -> Option<(Server, Config)> {
@@ -128,10 +156,13 @@ impl Shared {
                 let mut engine = shared.engine.lock().unwrap();
                 let still_active = engine.state.active_server_id.as_deref() == Some(&server_id);
                 if still_active && engine.status() == Status::Connected {
+                    const REASON: &str = "active server did not pass its latency check";
+                    // Leave the reason in the log buffer too: the tunnel is
+                    // torn down below, so the core's own status is lost.
+                    engine.core.note(REASON);
                     engine.disconnect();
-                    *shared.override_status.lock().unwrap() = Some(Status::Error(
-                        "active server did not pass its latency check".to_string(),
-                    ));
+                    *shared.override_status.lock().unwrap() =
+                        Some(Status::Error(REASON.to_string()));
                 }
             }
         });
@@ -166,8 +197,10 @@ struct Service {
     shared: Shared,
 }
 
+/// `{:#}` keeps anyhow's cause chain; `to_string()` would send only the
+/// outermost context ("spawning xray") and drop the reason it failed.
 fn failed(error: impl std::fmt::Display) -> fdo::Error {
-    fdo::Error::Failed(error.to_string())
+    fdo::Error::Failed(format!("{error:#}"))
 }
 
 fn json<T: serde::Serialize>(value: &T) -> fdo::Result<String> {
@@ -304,24 +337,55 @@ impl Service {
     }
 
     fn set_settings(&self, config_json: String) -> fdo::Result<String> {
-        let config: Config = serde_json::from_str(&config_json).map_err(failed)?;
+        let raw: serde_json::Value = serde_json::from_str(&config_json).map_err(failed)?;
+        let mut config: Config = serde_json::from_value(raw.clone()).map_err(failed)?;
         let mut engine = self.shared.engine.lock().unwrap();
+
+        // A GUI older than this key sends a payload without it; treat that as
+        // "leave it alone" rather than clearing the path the daemon may need
+        // to start xray at all.
+        if raw.get("xray_binary").is_none() {
+            config.xray_binary = engine.config.xray_binary.clone();
+        }
+
+        // Ports fixed on the command line by the service unit are refused
+        // here, not just greyed out in the GUI: accepting the write would move
+        // the inbound until the next restart silently put it back, breaking
+        // anything pointed at the old port in the meantime.
+        let mut ignored_ports = Vec::new();
+        if self.shared.socks_port_locked && config.socks_port != engine.config.socks_port {
+            config.socks_port = engine.config.socks_port;
+            ignored_ports.push("SOCKS port".to_string());
+        }
+        if self.shared.http_port_locked && config.http_port != engine.config.http_port {
+            config.http_port = engine.config.http_port;
+            ignored_ports.push("HTTP port".to_string());
+        }
+
         let ports_changed = engine.config.socks_port != config.socks_port
             || engine.config.http_port != config.http_port;
         engine.config = config;
         engine.core.socks_port = engine.config.socks_port;
         engine.core.http_port = engine.config.http_port;
+        engine.core.xray_binary = engine.config.xray_binary.clone();
         engine.save().map_err(failed)?;
         let reconnect_error = if ports_changed && engine.status() == Status::Connected {
             let active = engine.state.active_server_id.clone();
             active
                 .as_deref()
                 .and_then(|id| engine.connect(id).err())
-                .map(|error| error.to_string())
+                .map(|error| format!("{error:#}"))
         } else {
             None
         };
-        json(&ApplySettingsResult { reconnect_error })
+        json(&ApplySettingsResult {
+            reconnect_error,
+            ignored_ports,
+        })
+    }
+
+    fn runtime_info(&self) -> fdo::Result<String> {
+        json(&self.shared.runtime_info())
     }
 
     fn recent_logs(&self) -> fdo::Result<Vec<String>> {
@@ -348,7 +412,22 @@ pub fn run(options: DaemonOptions) -> Result<()> {
         engine.core.http_port = port;
     }
 
-    let shared = Shared::new(engine);
+    // Report the core up front: `journalctl -u oxidom` should show a missing
+    // binary before anyone clicks Connect and wonders why it failed.
+    match engine.core.resolve_binary() {
+        Ok(resolved) => log::info!(
+            "using the Xray core at {} (from {})",
+            resolved.path.display(),
+            resolved.source.label()
+        ),
+        Err(error) => log::warn!("no usable Xray core: {error:#}"),
+    }
+
+    let shared = Shared::new(
+        engine,
+        options.socks_port.is_some(),
+        options.http_port.is_some(),
+    );
     shared.spawn_active_probe_loop();
 
     let service = Service {

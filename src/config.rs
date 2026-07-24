@@ -16,6 +16,9 @@ pub struct Config {
     /// "app not supported" page to unknown clients, so we default to a widely
     /// recognized client identifier rather than our own.
     pub subscription_user_agent: String,
+    /// Path (or bare command name) of the Xray core. Empty falls back to
+    /// `$OXIDOM_XRAY_BIN` — set by the nix wrapper — and then `xray` on `$PATH`.
+    pub xray_binary: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +39,7 @@ impl Default for Config {
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".to_string(),
             subscription_user_agent: "v2rayNG/1.9.5".to_string(),
+            xray_binary: String::new(),
         }
     }
 }

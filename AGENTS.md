@@ -19,8 +19,10 @@ idiomatic, small, and robust. Do not add features beyond this spec without notin
 - **Commits:** Conventional Commits, **no AI/Co-Authored-By trailer** (strict). Commit only when
   the user asks.
 - Must build with `cargo build` against `Cargo.toml`. Fix all warnings. Keep `Cargo.lock`.
-- Xray binary path comes from the `OXIDOM_XRAY_BIN` env var (set by the nix wrapper/devShell);
-  fall back to `xray` on `PATH`.
+- Xray binary path resolves in priority order: the `xray_binary` config key, then the
+  `OXIDOM_XRAY_BIN` env var (set by the nix wrapper/devShell), then `xray` on `PATH`. Resolution
+  is a preflight (`xray::resolve`) that runs before spawning, so a missing core is reported as
+  an actionable error naming both the path tried and where it came from.
 
 ## Build / dev
 - `nix develop` gives a shell with gtk4/libadwaita/glib + rust toolchain + `xray`.
@@ -43,6 +45,8 @@ http_port  = 10809            # local HTTP inbound
 system_proxy = false          # toggle GNOME/env system proxy on connect
 latency_method = "http_get"   # one of: icmp | tcp | http_head | http_get
 latency_test_url = "https://www.gstatic.com/generate_204"
+subscription_user_agent = "v2rayNG/1.9.5"  # panels gate the body on this
+xray_binary = ""              # empty: use $OXIDOM_XRAY_BIN, then xray on PATH
 ```
 
 ## Data model
@@ -110,8 +114,10 @@ Generate the protocol-specific `outbounds[0]` from `OutboundSpec` (streamSetting
 tcp/ws/grpc/xhttp; tlsSettings/realitySettings/xtls as needed).
 
 ## Xray process supervisor
-- Spawn `$OXIDOM_XRAY_BIN run -c <configfile>` (fallback `xray`). Capture stdout/stderr to an
-  in-memory ring buffer surfaced in a "Logs" view.
+- Resolve the binary (see above), then spawn `<resolved> run -c <configfile>`. Capture
+  stdout/stderr to an in-memory ring buffer surfaced in a "Logs" view; oxidom's own failure
+  reasons go into the same buffer prefixed `oxidom:`, so the Logs view explains a failure even
+  when xray never started.
 - Track state: `Disconnected | Connecting | Connected | Error(msg)`. Consider "Connected" once
   the process is up and a latency probe through the SOCKS inbound succeeds.
 - Stop cleanly on disconnect/app-exit (SIGTERM, then SIGKILL after timeout).

@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::model::Server;
 use crate::xray::config;
+use crate::xray::resolve::{self, ResolvedXray};
 use crate::{fsutil, paths};
 
 const LOG_CAP: usize = 500;
@@ -20,11 +21,6 @@ pub enum Status {
     Error(String),
 }
 
-/// Resolve the Xray binary: `$OXIDOM_XRAY_BIN` (set by the nix wrapper) else `xray` on PATH.
-fn xray_bin() -> String {
-    std::env::var("OXIDOM_XRAY_BIN").unwrap_or_else(|_| "xray".to_string())
-}
-
 /// Supervises a single Xray core process (one active server at a time).
 pub struct XrayCore {
     child: Option<Child>,
@@ -32,19 +28,44 @@ pub struct XrayCore {
     pub logs: Arc<Mutex<Vec<String>>>,
     pub socks_port: u16,
     pub http_port: u16,
+    /// Configured path to the Xray binary; empty falls back to the environment
+    /// and then `PATH`. See [`crate::xray::resolve`].
+    pub xray_binary: String,
     pub active: Option<Server>,
 }
 
 impl XrayCore {
-    pub fn new(socks_port: u16, http_port: u16) -> Self {
+    pub fn new(socks_port: u16, http_port: u16, xray_binary: String) -> Self {
         XrayCore {
             child: None,
             status: Arc::new(Mutex::new(Status::Disconnected)),
             logs: Arc::new(Mutex::new(Vec::new())),
             socks_port,
             http_port,
+            xray_binary,
             active: None,
         }
+    }
+
+    /// Locate the Xray binary without starting it. Used as a preflight before
+    /// spawning, for the daemon's startup log, and to report the effective
+    /// path to the GUI — which runs in a different process and environment and
+    /// therefore cannot work this out for itself.
+    pub fn resolve_binary(&self) -> Result<ResolvedXray> {
+        resolve::resolve(&self.xray_binary)
+    }
+
+    /// Record an oxidom-side message in the same ring buffer as xray's output,
+    /// so the Logs view can explain a failure even when xray never started.
+    pub fn note(&self, message: &str) {
+        push_log(&self.logs, format!("oxidom: {message}"));
+    }
+
+    /// Move to a failed state once, recording why. Callers that detect the
+    /// failure on a poll must not re-derive it on every tick.
+    pub fn fail(&mut self, message: &str) {
+        self.note(message);
+        self.set_status(Status::Error(message.to_string()));
     }
 
     pub fn status(&self) -> Status {
@@ -80,13 +101,19 @@ impl XrayCore {
         match self.try_connect(server) {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.set_status(Status::Error(error.to_string()));
+                // `{:#}` keeps the anyhow cause chain: the outermost context
+                // alone ("spawning xray") never says *why* it failed.
+                let message = format!("{error:#}");
+                self.note(&message);
+                self.set_status(Status::Error(message));
                 Err(error)
             }
         }
     }
 
     fn try_connect(&mut self, server: &Server) -> Result<()> {
+        // Resolve before checking ports: a busy port must not mask a missing core.
+        let xray = self.resolve_binary()?;
         self.ensure_ports_free()?;
         let cfg = config::generate(server, self.socks_port, self.http_port);
         let path = Self::config_path()?;
@@ -94,14 +121,14 @@ impl XrayCore {
         fsutil::write_private_atomic(&path, serde_json::to_string_pretty(&cfg)?.as_bytes())
             .context("writing xray config")?;
 
-        let mut child = Command::new(xray_bin())
+        let mut child = Command::new(&xray.path)
             .arg("run")
             .arg("-c")
             .arg(&path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("spawning xray ({})", xray_bin()))?;
+            .with_context(|| format!("spawning xray ({})", xray.path.display()))?;
 
         // Pump stdout and stderr into the ring buffer.
         if let Some(out) = child.stdout.take() {
@@ -161,11 +188,15 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, logs: Arc<Mutex<Ve
     thread::spawn(move || {
         let buf = BufReader::new(reader);
         for line in buf.lines().map_while(Result::ok) {
-            let mut l = logs.lock().unwrap();
-            if l.len() >= LOG_CAP {
-                l.remove(0);
-            }
-            l.push(line);
+            push_log(&logs, line);
         }
     });
+}
+
+fn push_log(logs: &Arc<Mutex<Vec<String>>>, line: String) {
+    let mut logs = logs.lock().unwrap();
+    if logs.len() >= LOG_CAP {
+        logs.remove(0);
+    }
+    logs.push(line);
 }

@@ -26,7 +26,11 @@ pub struct Engine {
 impl Engine {
     pub fn load() -> Self {
         let config = Config::load();
-        let core = XrayCore::new(config.socks_port, config.http_port);
+        let core = XrayCore::new(
+            config.socks_port,
+            config.http_port,
+            config.xray_binary.clone(),
+        );
         let state = State::load();
         let (subscriptions, store_warning) = store::load();
         let mut engine = Engine {
@@ -137,7 +141,7 @@ impl Engine {
                     None
                 };
                 if let Err(error) = subscription::refresh(sub, &ua, hwid) {
-                    errors.push(format!("{}: {error}", sub.name));
+                    errors.push(format!("{}: {error:#}", sub.name));
                 }
             }
         }
@@ -221,8 +225,10 @@ impl Engine {
         &mut self,
         covers: impl Fn(&str, &[Subscription]) -> bool,
     ) -> bool {
+        // `Error` counts as active: a crashed core still leaves the server
+        // recorded as the active one, and deleting it must clear that.
         let active = match (&self.state.active_server_id, self.core.status()) {
-            (Some(id), Status::Connected | Status::Connecting) => id.clone(),
+            (Some(id), Status::Connected | Status::Connecting | Status::Error(_)) => id.clone(),
             _ => return false,
         };
         if covers(&active, &self.subscriptions) {

@@ -4,6 +4,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use crate::config::{Config, LatencyMethod};
+use crate::ipc::RuntimeInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsValues {
@@ -13,6 +14,8 @@ pub struct SettingsValues {
     pub latency_method: LatencyMethod,
     pub latency_test_url: String,
     pub subscription_user_agent: String,
+    /// Empty means "let the daemon fall back to $OXIDOM_XRAY_BIN, then $PATH".
+    pub xray_binary: String,
 }
 
 impl From<&Config> for SettingsValues {
@@ -24,6 +27,7 @@ impl From<&Config> for SettingsValues {
             latency_method: config.latency_method,
             latency_test_url: config.latency_test_url.clone(),
             subscription_user_agent: config.subscription_user_agent.clone(),
+            xray_binary: config.xray_binary.clone(),
         }
     }
 }
@@ -39,11 +43,12 @@ pub struct SettingsState {
 pub struct SettingsValidation {
     pub ports: Option<&'static str>,
     pub latency_url: Option<&'static str>,
+    pub xray_binary: Option<&'static str>,
 }
 
 impl SettingsValidation {
     pub fn is_valid(self) -> bool {
-        self.ports.is_none() && self.latency_url.is_none()
+        self.ports.is_none() && self.latency_url.is_none() && self.xray_binary.is_none()
     }
 }
 
@@ -90,8 +95,11 @@ struct SettingsWidgets {
     test_url: adw::EntryRow,
     user_agent: adw::EntryRow,
     ua_preset: adw::ComboRow,
+    xray_binary: adw::EntryRow,
+    xray_effective: adw::ActionRow,
     ports_error: gtk::Label,
     url_error: gtk::Label,
+    xray_error: gtk::Label,
     apply: gtk::Button,
     reset: gtk::Button,
 }
@@ -110,6 +118,9 @@ impl SettingsWidgets {
             },
             latency_test_url: self.test_url.text().to_string(),
             subscription_user_agent: self.user_agent.text().to_string(),
+            // Trimmed here so trailing whitespace never counts as an edit and
+            // never reaches the daemon's path resolution.
+            xray_binary: self.xray_binary.text().trim().to_string(),
         }
     }
 
@@ -125,6 +136,7 @@ impl SettingsWidgets {
         });
         self.test_url.set_text(&values.latency_test_url);
         self.user_agent.set_text(&values.subscription_user_agent);
+        self.xray_binary.set_text(&values.xray_binary);
     }
 }
 
@@ -216,8 +228,22 @@ impl SettingsView {
             .selected(selected_preset)
             .build();
 
+        let xray_binary = adw::EntryRow::builder()
+            .title("Xray binary")
+            .text(&applied.xray_binary)
+            .build();
+        // Filled from the daemon over D-Bus, never computed here: the daemon
+        // is a separate process, usually a different user, with its own $PATH.
+        let xray_effective = adw::ActionRow::builder()
+            .title("In use by the daemon")
+            .subtitle("Checking…")
+            .subtitle_selectable(true)
+            .build();
+        xray_effective.add_css_class("property");
+
         let ports_error = validation_label();
         let url_error = validation_label();
+        let xray_error = validation_label();
 
         let proxy_group = adw::PreferencesGroup::builder()
             .title("Local proxy")
@@ -226,6 +252,16 @@ impl SettingsView {
         proxy_group.add(&http);
         proxy_group.add(&ports_error);
         proxy_group.add(&system_proxy);
+        let xray_group = adw::PreferencesGroup::builder()
+            .title("Xray core")
+            .description(
+                "Leave empty to use $OXIDOM_XRAY_BIN, then the first xray on PATH. \
+                 A system-wide oxidom service cannot read paths under /home.",
+            )
+            .build();
+        xray_group.add(&xray_binary);
+        xray_group.add(&xray_error);
+        xray_group.add(&xray_effective);
         let latency_group = adw::PreferencesGroup::builder()
             .title("Latency")
             .description("HTTP checks use the active local SOCKS proxy")
@@ -245,6 +281,7 @@ impl SettingsView {
 
         let root = adw::PreferencesPage::new();
         root.add(&proxy_group);
+        root.add(&xray_group);
         root.add(&latency_group);
         root.add(&advanced_group);
 
@@ -269,8 +306,11 @@ impl SettingsView {
             test_url,
             user_agent,
             ua_preset,
+            xray_binary,
+            xray_effective,
             ports_error,
             url_error,
+            xray_error,
             apply,
             reset,
         };
@@ -402,6 +442,83 @@ impl SettingsView {
         refresh_state(&self.widgets, &self.model, &self.state_callbacks);
     }
 
+    /// Adopts what the daemon reports about itself: the Xray path it actually
+    /// resolved, and any ports pinned by its service unit. Locked rows go
+    /// insensitive and snap to the daemon's values, so a field can never claim
+    /// something the daemon would silently override.
+    ///
+    /// `None` means the daemon predates this call — leave everything editable
+    /// rather than guessing.
+    pub fn set_runtime_info(&self, info: Option<&RuntimeInfo>) {
+        let widgets = &self.widgets;
+        let Some(info) = info else {
+            widgets
+                .xray_effective
+                .set_subtitle("Unavailable — this daemon is older than the app");
+            widgets.xray_effective.remove_css_class("error");
+            return;
+        };
+
+        match (&info.xray_path, &info.xray_error) {
+            (Some(path), _) => {
+                let source = info
+                    .xray_source
+                    .map(|source| format!(" (from {})", source.label()))
+                    .unwrap_or_default();
+                widgets
+                    .xray_effective
+                    .set_subtitle(&format!("{path}{source}"));
+                widgets.xray_effective.remove_css_class("error");
+            }
+            (None, Some(error)) => {
+                widgets.xray_effective.set_subtitle(error);
+                widgets.xray_effective.add_css_class("error");
+            }
+            (None, None) => {
+                widgets.xray_effective.set_subtitle("Unknown");
+                widgets.xray_effective.remove_css_class("error");
+            }
+        }
+
+        const LOCKED: &str = "Fixed by the system service unit";
+        for (locked, port, row, editable) in [
+            (
+                info.socks_port_locked,
+                info.socks_port,
+                &widgets.socks,
+                "Local port other apps can use as a SOCKS5 proxy",
+            ),
+            (
+                info.http_port_locked,
+                info.http_port,
+                &widgets.http,
+                "Local port other apps can use as an HTTP proxy",
+            ),
+        ] {
+            row.set_sensitive(!locked);
+            row.set_subtitle(if locked { LOCKED } else { editable });
+            if locked && port != 0 {
+                self.updating_widgets.set(true);
+                row.set_value(f64::from(port));
+                self.updating_widgets.set(false);
+            }
+        }
+
+        if info.socks_port_locked || info.http_port_locked {
+            let mut model = self.model.borrow_mut();
+            let SettingsModel { applied, draft, .. } = &mut *model;
+            for values in [applied, draft] {
+                if info.socks_port_locked && info.socks_port != 0 {
+                    values.socks_port = info.socks_port;
+                }
+                if info.http_port_locked && info.http_port != 0 {
+                    values.http_port = info.http_port;
+                }
+            }
+        }
+        refresh_state(&self.widgets, &self.model, &self.state_callbacks);
+    }
+
     /// Discards the draft and restores the last successfully applied values.
     pub fn reset_draft(&self) {
         if self.model.borrow().applying {
@@ -495,6 +612,10 @@ fn connect_draft_signals(
             }
         }
     });
+    widgets.xray_binary.connect_changed({
+        let update = update.clone();
+        move |_| update()
+    });
     widgets.user_agent.connect_changed({
         let widgets = widgets.clone();
         move |_| {
@@ -516,6 +637,7 @@ fn refresh_state(
 
     set_validation_message(&widgets.ports_error, validation.ports);
     set_validation_message(&widgets.url_error, validation.latency_url);
+    set_validation_message(&widgets.xray_error, validation.xray_binary);
     widgets
         .apply
         .set_sensitive(state.dirty && state.valid && !state.applying);
@@ -568,7 +690,21 @@ fn validate(values: &SettingsValues) -> SettingsValidation {
         }
         _ => Some("Enter a valid HTTP or HTTPS URL"),
     };
-    SettingsValidation { ports, latency_url }
+    // Syntax only. Whether the file exists and runs is the daemon's verdict —
+    // it may be another user with another $PATH and no access to /home.
+    let path = values.xray_binary.trim();
+    let xray_binary = if path.starts_with('~') {
+        Some("Use a full path — ~ is not expanded")
+    } else if path.contains('/') && !path.starts_with('/') {
+        Some("Enter an absolute path, or a bare command name to search PATH")
+    } else {
+        None
+    };
+    SettingsValidation {
+        ports,
+        latency_url,
+        xray_binary,
+    }
 }
 
 #[cfg(test)]
@@ -583,6 +719,7 @@ mod tests {
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".into(),
             subscription_user_agent: "oxidom/test".into(),
+            xray_binary: String::new(),
         }
     }
 
@@ -643,6 +780,28 @@ mod tests {
             draft.latency_test_url = valid.into();
             assert!(
                 validate(&draft).latency_url.is_none(),
+                "{valid:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_validation_checks_xray_path_syntax_only() {
+        // Existence is the daemon's call; only unusable syntax is rejected here.
+        for invalid in ["~/bin/xray", "bin/xray", "./xray"] {
+            let mut draft = values();
+            draft.xray_binary = invalid.into();
+            assert!(
+                validate(&draft).xray_binary.is_some(),
+                "{invalid:?} should be rejected"
+            );
+        }
+
+        for valid in ["", "xray", "/nix/store/abc-xray/bin/xray", "/usr/bin/xray"] {
+            let mut draft = values();
+            draft.xray_binary = valid.into();
+            assert!(
+                validate(&draft).xray_binary.is_none(),
                 "{valid:?} should be accepted"
             );
         }
