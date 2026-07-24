@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -742,12 +743,34 @@ fn click_plan_for_press(button: u32, n_press: i32) -> ClickPlan {
     }
 }
 
+thread_local! {
+    /// Decoded flags, keyed by normalized country code. `rebuild()` recreates
+    /// every card, so without this a subscription with hundreds of servers
+    /// decodes hundreds of PNGs on the main thread on every refresh. Textures
+    /// are immutable and shareable, and the set is bounded by the ~250
+    /// embedded flags. Thread-local because GDK types are not `Send`.
+    static FLAG_TEXTURES: RefCell<HashMap<String, Option<gtk::gdk::Texture>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn flag_texture(country: &str) -> Option<gtk::gdk::Texture> {
+    let key = country.trim().to_ascii_lowercase();
+    FLAG_TEXTURES.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| {
+                super::flags::flag_png(country)
+                    .and_then(|bytes| gtk::gdk_pixbuf::Pixbuf::from_read(bytes).ok())
+                    .map(|pixbuf| gtk::gdk::Texture::for_pixbuf(&pixbuf))
+            })
+            .clone()
+    })
+}
+
 /// A square flag icon for the country, falling back to a globe symbol.
 pub(crate) fn flag_widget(country: Option<&str>, flag_size: i32, globe_size: i32) -> gtk::Widget {
-    let texture = country
-        .and_then(super::flags::flag_png)
-        .and_then(|bytes| gtk::gdk_pixbuf::Pixbuf::from_read(bytes).ok())
-        .map(|pixbuf| gtk::gdk::Texture::for_pixbuf(&pixbuf));
+    let texture = country.and_then(flag_texture);
     match texture {
         Some(texture) => gtk::Image::builder()
             .paintable(&texture)
