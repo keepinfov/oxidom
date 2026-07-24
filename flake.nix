@@ -28,6 +28,8 @@
               $out/share/icons/hicolor/symbolic/apps/dev.keepinfov.oxidom-symbolic.svg
             install -Dm444 data/dev.keepinfov.oxidom.desktop \
               $out/share/applications/dev.keepinfov.oxidom.desktop
+            install -Dm444 data/dev.keepinfov.oxidom.metainfo.xml \
+              $out/share/metainfo/dev.keepinfov.oxidom.metainfo.xml
           '';
         };
       in {

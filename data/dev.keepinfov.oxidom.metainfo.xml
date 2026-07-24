@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.keepinfov.oxidom</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>oxidom</name>
+  <summary>Xray client for the GNOME desktop</summary>
+  <description>
+    <p>
+      oxidom ("oxided freedom") is a native Xray / v2ray client. It manages
+      subscriptions and servers, runs the Xray core for you, and routes
+      traffic through a local proxy with an optional system-proxy toggle.
+    </p>
+    <p>
+      Supports VLESS (including Reality), VMess, Trojan and Shadowsocks
+      servers, subscription formats from common panels, country flags,
+      latency checks and latency sorting.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.keepinfov.oxidom.desktop</launchable>
+  <url type="homepage">https://github.com/keepinfov/oxidom</url>
+  <url type="bugtracker">https://github.com/keepinfov/oxidom/issues</url>
+  <developer id="dev.keepinfov">
+    <name>keepinfov</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>Network</category>
+  </categories>
+  <keywords>
+    <keyword>vpn</keyword>
+    <keyword>proxy</keyword>
+    <keyword>xray</keyword>
+    <keyword>vless</keyword>
+    <keyword>reality</keyword>
+  </keywords>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+  <releases>
+    <release version="0.1.0" date="2026-07-24">
+      <description>
+        <p>Initial release: subscriptions, server browser, latency probes,
+        GNOME system proxy toggle.</p>
+      </description>
+    </release>
+  </releases>
+</component>
