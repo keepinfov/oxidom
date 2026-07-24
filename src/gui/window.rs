@@ -131,6 +131,10 @@ struct AppState {
     /// Server the tunnel is (optimistically) running for; drives the highlight.
     connected_id: Option<String>,
     latencies: HashMap<String, Option<u32>>,
+    /// Last successful measurement of the connected server. Shown in the
+    /// status chip even while a periodic re-probe fails, so the reading does
+    /// not flicker away; reset when the connection changes.
+    last_active_latency: Option<u32>,
     checking: HashSet<String>,
     /// Servers waiting for a probe slot (see MAX_CONCURRENT_PROBES).
     probe_queue: VecDeque<String>,
@@ -152,6 +156,7 @@ struct Controller {
     sidebar_toggle: gtk::Button,
     header_status: gtk::Button,
     header_status_icon: gtk::Image,
+    header_status_flag: gtk::Box,
     header_status_label: gtk::Label,
     header_status_spinner: gtk::Spinner,
     subscription_actions: gtk::Box,
@@ -190,6 +195,7 @@ pub fn build(app: &adw::Application) {
         selected_id,
         connected_id: None,
         latencies: HashMap::new(),
+        last_active_latency: None,
         checking: HashSet::new(),
         probe_queue: VecDeque::new(),
         next_active_probe: None,
@@ -262,6 +268,11 @@ pub fn build(app: &adw::Application) {
         .visible(false)
         .css_classes(["header-status-icon"])
         .build();
+    let header_status_flag = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
     let header_status_label = gtk::Label::builder()
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .max_width_chars(18)
@@ -269,6 +280,7 @@ pub fn build(app: &adw::Application) {
         .build();
     let header_status_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     header_status_content.append(&header_status_spinner);
+    header_status_content.append(&header_status_flag);
     header_status_content.append(&header_status_icon);
     header_status_content.append(&header_status_label);
     let header_status = gtk::Button::builder()
@@ -335,6 +347,7 @@ pub fn build(app: &adw::Application) {
         sidebar_toggle,
         header_status,
         header_status_icon,
+        header_status_flag,
         header_status_label,
         header_status_spinner,
         subscription_actions,
@@ -1059,6 +1072,11 @@ impl Controller {
                     connection_failed = true;
                 }
             }
+            if state.connected_id.as_deref() == Some(server_id)
+                && let Some(ms) = latency
+            {
+                state.last_active_latency = Some(ms);
+            }
             if !connection_failed && state.connected_id.as_deref() == Some(server_id) {
                 state.next_active_probe = Some(Instant::now() + ACTIVE_PROBE_INTERVAL);
             }
@@ -1095,6 +1113,7 @@ impl Controller {
             state.connected_id = Some(server_id.clone());
             state.pending_status = Some(Status::Connecting);
             state.next_active_probe = None;
+            state.last_active_latency = None;
         }
         self.servers
             .set_connection(Some(&server_id), Some(&server_id));
@@ -1129,6 +1148,7 @@ impl Controller {
             state.pending_status = Some(Status::Disconnected);
             state.connected_id = None;
             state.next_active_probe = None;
+            state.last_active_latency = None;
         }
         self.servers.set_connection(None, None);
         self.refresh_status();
@@ -1235,6 +1255,7 @@ impl Controller {
                         let mut state = self.state.borrow_mut();
                         state.connected_id = None;
                         state.next_active_probe = None;
+                        state.last_active_latency = None;
                     }
                     self.servers.set_connection(None, None);
                     self.show_message("Disconnected — the active server was removed");
@@ -1499,7 +1520,8 @@ impl Controller {
             .as_ref()
             .and_then(|id| state.latencies.get(id))
             .copied()
-            .flatten();
+            .flatten()
+            .or(state.last_active_latency);
         drop(state);
 
         self.update_header_connection_status(&status, active_latency);
@@ -1507,55 +1529,73 @@ impl Controller {
     }
 
     fn active_server_name(&self, state: &AppState) -> Option<String> {
+        self.active_server_display(state).map(|(name, _)| name)
+    }
+
+    /// Display name and country of the connected server.
+    fn active_server_display(&self, state: &AppState) -> Option<(String, Option<String>)> {
         let active = state.connected_id.as_deref()?;
         state
             .subscriptions
             .iter()
             .flat_map(|subscription| subscription.servers.iter())
             .find(|server| server.id == active)
-            .map(|server| crate::model::name_without_flag(&server.name).to_string())
+            .map(|server| {
+                (
+                    crate::model::name_without_flag(&server.name).to_string(),
+                    server.country.clone(),
+                )
+            })
     }
 
+    /// The compact-mode status chip: as small as possible — a flag plus the
+    /// latency reading; everything verbose lives in the tooltip.
     fn update_header_connection_status(&self, status: &Status, active_latency: Option<u32>) {
         self.header_status_spinner.set_spinning(false);
         self.header_status_spinner.set_visible(false);
         self.header_status_icon.set_visible(false);
+        while let Some(child) = self.header_status_flag.first_child() {
+            self.header_status_flag.remove(&child);
+        }
+        self.header_status_flag.set_visible(false);
         self.header_status_label.set_label("");
+        self.header_status_label.set_visible(false);
         set_status_tone(&self.header_status, StatusTone::Neutral);
         self.header_status
             .set_visible(self.compact.get() && !matches!(status, Status::Disconnected));
         self.header_status.set_sensitive(false);
 
-        let name = self.active_server_name(&self.state.borrow());
+        let display = self.active_server_display(&self.state.borrow());
+        let name = display.as_ref().map(|(name, _)| name.clone());
+        let country = display.and_then(|(_, country)| country);
         match status {
             Status::Disconnected => {}
             Status::Connecting => {
                 set_status_tone(&self.header_status, StatusTone::Working);
                 self.header_status_spinner.set_visible(true);
                 self.header_status_spinner.set_spinning(true);
-                let label = name.as_deref().map_or_else(
+                let tooltip = name.as_deref().map_or_else(
                     || "Connecting…".to_string(),
                     |name| format!("Connecting · {name}"),
                 );
-                self.header_status_label.set_label(&label);
-                self.header_status.set_tooltip_text(Some(&label));
+                self.header_status.set_tooltip_text(Some(&tooltip));
                 self.header_status
-                    .update_property(&[gtk::accessible::Property::Label(&label)]);
+                    .update_property(&[gtk::accessible::Property::Label(&tooltip)]);
             }
             Status::Connected => {
                 set_status_tone(&self.header_status, StatusTone::Connected);
-                let label = match (name.as_deref(), active_latency) {
-                    (Some(name), Some(ms)) => format!("{name} · {ms} ms"),
-                    (Some(name), None) => name.to_string(),
-                    (None, Some(ms)) => format!("Connected · {ms} ms"),
-                    (None, None) => "Connected".to_string(),
-                };
-                self.header_status_icon
-                    .set_icon_name(Some("network-vpn-symbolic"));
-                self.header_status_icon.set_visible(true);
-                self.header_status_label.set_label(&label);
-                self.header_status
-                    .set_tooltip_text(Some(&format!("{label} — click to disconnect")));
+                self.header_status_flag
+                    .append(&super::server_card::flag_widget(country.as_deref(), 16, 14));
+                self.header_status_flag.set_visible(true);
+                if let Some(ms) = active_latency {
+                    self.header_status_label.set_label(&format!("{ms} ms"));
+                    self.header_status_label.set_visible(true);
+                }
+                let tooltip = format!(
+                    "{} — click to disconnect",
+                    name.as_deref().unwrap_or("Connected")
+                );
+                self.header_status.set_tooltip_text(Some(&tooltip));
                 self.header_status.set_sensitive(true);
                 self.header_status
                     .update_property(&[gtk::accessible::Property::Label("Disconnect VPN")]);
@@ -1565,7 +1605,6 @@ impl Controller {
                 self.header_status_icon
                     .set_icon_name(Some("dialog-warning-symbolic"));
                 self.header_status_icon.set_visible(true);
-                self.header_status_label.set_label("Connection error");
                 self.header_status.set_tooltip_text(Some(error));
                 self.header_status
                     .update_property(&[gtk::accessible::Property::Label("Connection error")]);
@@ -1702,12 +1741,19 @@ fn install_css() {
         headerbar button.header-status,
         headerbar button.header-status:disabled {
             min-width: 0;
-            min-height: 32px;
-            padding: 4px 10px;
-            border-radius: 10px;
+            min-height: 24px;
+            padding: 2px 8px;
+            border-radius: 8px;
             box-shadow: none;
             opacity: 1;
             font-weight: 500;
+            font-size: 0.85em;
+        }
+        headerbar button.header-status .server-flag,
+        headerbar button.header-status .server-globe {
+            min-width: 0;
+            min-height: 0;
+            border-radius: 3px;
         }
         headerbar button.header-status.status-working { color: @accent_color; background: alpha(@accent_color, 0.16); }
         headerbar button.header-status.status-connected { color: @success_color; background: alpha(@success_color, 0.16); }
@@ -1756,6 +1802,7 @@ fn install_css() {
         .server-name { font-weight: 600; font-size: 0.98em; }
         .server-subtitle { font-size: 0.82em; }
         .latency-badge { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; font-weight: 500; }
+        .latency-badge.latency-error { font-size: 1.05em; padding: 1px 8px; font-weight: 700; }
         .latency-spinner { color: @accent_color; }
         .latency-reachable { color: @accent_color; background: alpha(@accent_color, 0.12); }
         .latency-error { color: @error_color; background: alpha(@error_color, 0.13); }

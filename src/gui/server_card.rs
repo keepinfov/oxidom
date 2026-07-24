@@ -145,7 +145,7 @@ impl ServerCard {
         on_activate: impl Fn() + 'static,
         on_ping: impl Fn() + 'static,
     ) -> Self {
-        let flag = flag_widget(server.country.as_deref());
+        let flag = flag_widget(server.country.as_deref(), 26, 20);
 
         let name = gtk::Label::builder()
             .label(crate::model::name_without_flag(&server.name))
@@ -743,7 +743,7 @@ fn click_plan_for_press(button: u32, n_press: i32) -> ClickPlan {
 }
 
 /// A square flag icon for the country, falling back to a globe symbol.
-fn flag_widget(country: Option<&str>) -> gtk::Widget {
+pub(crate) fn flag_widget(country: Option<&str>, flag_size: i32, globe_size: i32) -> gtk::Widget {
     let texture = country
         .and_then(super::flags::flag_png)
         .and_then(|bytes| gtk::gdk_pixbuf::Pixbuf::from_read(bytes).ok())
@@ -751,13 +751,13 @@ fn flag_widget(country: Option<&str>) -> gtk::Widget {
     match texture {
         Some(texture) => gtk::Image::builder()
             .paintable(&texture)
-            .pixel_size(26)
+            .pixel_size(flag_size)
             .css_classes(["server-flag"])
             .build()
             .upcast::<gtk::Widget>(),
         None => gtk::Image::builder()
             .icon_name("web-browser-symbolic")
-            .pixel_size(20)
+            .pixel_size(globe_size)
             .css_classes(["server-globe"])
             .build()
             .upcast::<gtk::Widget>(),
