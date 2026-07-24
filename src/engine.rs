@@ -6,7 +6,6 @@ use anyhow::{Result, anyhow};
 use crate::config::Config;
 use crate::model::{Server, Subscription};
 use crate::state::{self, State, store};
-use crate::sysproxy;
 use crate::xray::core::{Status, XrayCore};
 use crate::{link, probe, subscription};
 
@@ -19,8 +18,6 @@ pub struct Engine {
     pub state: State,
     pub subscriptions: Vec<Subscription>,
     pub core: XrayCore,
-    /// True while we currently hold the desktop system proxy set to our ports.
-    proxy_applied: bool,
     /// Non-fatal problems found while loading (e.g. a quarantined corrupt
     /// subscriptions file). The GUI surfaces these once at startup.
     pub load_warnings: Vec<String>,
@@ -37,31 +34,19 @@ impl Engine {
             subscriptions,
             core,
             config,
-            proxy_applied: false,
             load_warnings: store_warning.into_iter().collect(),
         };
         engine.recover_from_unclean_shutdown();
         engine
     }
 
-    /// Undo whatever a crashed previous instance left behind: an orphaned xray
-    /// child keeping the tunnel open, and a desktop proxy pointing at it.
+    /// Undo whatever a crashed previous instance left behind: an orphaned
+    /// xray child keeping the tunnel open.
     fn recover_from_unclean_shutdown(&mut self) {
-        let mut dirty = false;
         if let Some(pid) = self.state.xray_pid.take() {
-            dirty = true;
             if kill_stale_xray(pid) {
                 log::info!("stopped orphaned xray process {pid} from a previous run");
             }
-        }
-        if self.state.system_proxy_applied {
-            self.state.system_proxy_applied = false;
-            dirty = true;
-            if sysproxy::clear().is_ok() {
-                log::info!("restored the desktop proxy left enabled by a previous run");
-            }
-        }
-        if dirty {
             self.state.save().ok();
         }
     }
@@ -256,7 +241,6 @@ impl Engine {
         self.state.active_server_id = Some(server_id.to_string());
         self.state.xray_pid = self.core.child_pid();
         self.state.save().ok();
-        self.reconcile_system_proxy();
         Ok(())
     }
 
@@ -265,27 +249,6 @@ impl Engine {
         self.state.active_server_id = None;
         self.state.xray_pid = None;
         self.state.save().ok();
-        self.reconcile_system_proxy();
-    }
-
-    /// Make the desktop system proxy match desired state: on only when the user
-    /// enabled it AND the tunnel is connected. Best-effort; failures (e.g. a
-    /// non-GNOME session) are ignored so they never block connect/disconnect.
-    /// The applied flag is persisted so a crash can be repaired on restart.
-    pub fn reconcile_system_proxy(&mut self) {
-        let want = self.config.system_proxy && self.core.status() == Status::Connected;
-        if want && !self.proxy_applied {
-            if sysproxy::apply(self.config.socks_port, self.config.http_port).is_ok() {
-                self.proxy_applied = true;
-                self.state.system_proxy_applied = true;
-                self.state.save().ok();
-            }
-        } else if !want && self.proxy_applied {
-            let _ = sysproxy::clear();
-            self.proxy_applied = false;
-            self.state.system_proxy_applied = false;
-            self.state.save().ok();
-        }
     }
 
     pub fn status(&self) -> Status {
@@ -305,16 +268,11 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // Stop the child before the struct fields drop so the recovery flags
+        // Stop the child before the struct fields drop so the recovery flag
         // can be persisted as clean in the same pass.
         self.core.disconnect();
-        if self.proxy_applied {
-            let _ = sysproxy::clear();
-            self.proxy_applied = false;
-        }
-        if self.state.xray_pid.is_some() || self.state.system_proxy_applied {
+        if self.state.xray_pid.is_some() {
             self.state.xray_pid = None;
-            self.state.system_proxy_applied = false;
             self.state.save().ok();
         }
     }

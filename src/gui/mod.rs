@@ -3,6 +3,7 @@ use anyhow::Result;
 
 use crate::APP_ID;
 
+mod client;
 mod flags;
 mod group;
 mod operation;
@@ -11,7 +12,7 @@ mod sidebar;
 mod views;
 mod window;
 
-pub fn run() -> Result<()> {
+pub fn run(_background: bool) -> Result<()> {
     gtk::glib::set_prgname(Some(APP_ID));
     gtk::glib::set_application_name("oxidom");
     #[cfg(debug_assertions)]

@@ -15,9 +15,6 @@ pub struct State {
     /// PID of the xray child of the last run, so a crash never leaves an
     /// orphaned tunnel: the next start kills it if it is still an xray process.
     pub xray_pid: Option<u32>,
-    /// True while the desktop system proxy points at our local ports. Survives
-    /// a crash so the next start can restore the desktop to direct networking.
-    pub system_proxy_applied: bool,
 }
 
 impl State {

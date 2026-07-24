@@ -14,7 +14,24 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Launch the graphical interface (default).
-    Gui,
+    Gui {
+        /// Start without showing the window (for autostart; the tray/daemon
+        /// keep working, activating the app again presents the window).
+        #[arg(long)]
+        background: bool,
+    },
+    /// Run the headless daemon that owns the tunnel and serves D-Bus.
+    Daemon {
+        /// Serve on the system bus (systemd service) instead of the session bus.
+        #[arg(long)]
+        system: bool,
+        /// Override the local SOCKS inbound port from config.toml.
+        #[arg(long)]
+        socks_port: Option<u16>,
+        /// Override the local HTTP inbound port from config.toml.
+        #[arg(long)]
+        http_port: Option<u16>,
+    },
     /// Run a single process routed through the active proxy (via a network namespace).
     Run {
         /// The command and arguments to run, e.g. `oxidom run -- curl https://ifconfig.me`.

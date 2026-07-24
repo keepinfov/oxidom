@@ -1,19 +1,22 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use adw::prelude::*;
 use anyhow::Result;
 use gtk::glib;
 
 use crate::APP_ID;
-use crate::engine::Engine;
+use crate::config::Config;
+use crate::ipc::{ProbeState, StatusInfo};
 use crate::model::Subscription;
-use crate::probe;
 use crate::xray::core::Status;
+use crate::{paths, sysproxy};
 
+use super::client::DaemonClient;
 use super::operation::{UiOperation, UiOperationKind};
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
@@ -25,11 +28,6 @@ use super::views::subscriptions::SubscriptionsView;
 type SettingsCallback = Rc<dyn Fn(SettingsValues)>;
 
 const SIDEBAR_BREAKPOINT_WIDTH: u32 = 700;
-const ACTIVE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
-/// Cap for simultaneously running latency probes; "check all" on a large
-/// subscription queues the rest instead of spawning hundreds of threads and
-/// connections at once.
-const MAX_CONCURRENT_PROBES: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResponsiveMode {
@@ -105,25 +103,15 @@ fn servers_available_width(window_width: i32, compact: bool) -> i32 {
     window_width.saturating_sub(sidebar)
 }
 
-fn active_probe_is_due(
-    now: Instant,
-    next_probe: Option<Instant>,
-    connected: bool,
-    has_active_server: bool,
-    active_probe_running: bool,
-    engine_available: bool,
-    operation_active: bool,
-) -> bool {
-    connected
-        && has_active_server
-        && !active_probe_running
-        && engine_available
-        && !operation_active
-        && next_probe.is_some_and(|deadline| now >= deadline)
+/// One round of daemon polling, produced off the main thread.
+struct PolledSnapshot {
+    status: StatusInfo,
+    probe: ProbeState,
+    logs: Vec<String>,
 }
 
 struct AppState {
-    engine: Option<Engine>,
+    client: DaemonClient,
     subscriptions: Vec<Subscription>,
     /// Card the user is inspecting/expanded. Also the target of the header
     /// Connect button. Distinct from the server that is actually connected.
@@ -136,11 +124,13 @@ struct AppState {
     /// not flicker away; reset when the connection changes.
     last_active_latency: Option<u32>,
     checking: HashSet<String>,
-    /// Servers waiting for a probe slot (see MAX_CONCURRENT_PROBES).
-    probe_queue: VecDeque<String>,
-    next_active_probe: Option<Instant>,
+    /// Ids whose failed probe should raise a toast (explicit per-card ping).
+    notify_probe: HashSet<String>,
     operation: Option<UiOperation>,
+    /// Optimistic status shown while a job is in flight.
     pending_status: Option<Status>,
+    /// Latest status reported by the daemon.
+    daemon_status: Status,
 }
 
 struct Controller {
@@ -174,6 +164,13 @@ struct Controller {
     toasts: adw::ToastOverlay,
     force_close: Cell<bool>,
     close_after_apply: Cell<bool>,
+    /// True while this GUI holds the GNOME system proxy applied.
+    proxy_applied: Cell<bool>,
+    /// Last (active, connecting) pair pushed to the cards, to avoid an
+    /// O(cards) pass on every poll tick.
+    applied_connection: RefCell<(Option<String>, Option<String>)>,
+    poll_in_flight: Arc<AtomicBool>,
+    poll_snapshot: Arc<Mutex<Option<PolledSnapshot>>>,
 }
 
 pub fn build(app: &adw::Application) {
@@ -185,22 +182,35 @@ pub fn build(app: &adw::Application) {
     }
     gtk::Window::set_default_icon_name(APP_ID);
 
-    let engine = Engine::load();
-    let subscriptions_snapshot = engine.subscriptions.clone();
-    let selected_id = engine.state.active_server_id.clone();
-    let initial_config = engine.config.clone();
+    let client = match DaemonClient::connect_any() {
+        Ok(client) => client,
+        Err(error) => {
+            let dialog = adw::MessageDialog::new(
+                None::<&gtk::Window>,
+                Some("oxidom daemon unavailable"),
+                Some(&error.to_string()),
+            );
+            dialog.add_response("close", "Close");
+            dialog.present();
+            return;
+        }
+    };
+    let subscriptions_snapshot = client.subscriptions().unwrap_or_default();
+    let initial_status = client.status().unwrap_or_default();
+    let initial_config = client.settings().unwrap_or_default();
+    let selected_id = initial_status.active_id.clone();
     let state = Rc::new(RefCell::new(AppState {
-        engine: Some(engine),
+        client,
         subscriptions: subscriptions_snapshot,
         selected_id,
-        connected_id: None,
+        connected_id: initial_status.active_id.clone(),
         latencies: HashMap::new(),
         last_active_latency: None,
         checking: HashSet::new(),
-        probe_queue: VecDeque::new(),
-        next_active_probe: None,
+        notify_probe: HashSet::new(),
         operation: None,
         pending_status: None,
+        daemon_status: initial_status.to_status(),
     }));
 
     let servers = ServersView::new();
@@ -365,6 +375,10 @@ pub fn build(app: &adw::Application) {
         toasts,
         force_close: Cell::new(false),
         close_after_apply: Cell::new(false),
+        proxy_applied: Cell::new(gui_proxy_marker_exists()),
+        applied_connection: RefCell::new((None, None)),
+        poll_in_flight: Arc::new(AtomicBool::new(false)),
+        poll_snapshot: Arc::new(Mutex::new(None)),
     });
     *controller_holder.borrow_mut() = Rc::downgrade(&controller);
 
@@ -403,34 +417,12 @@ pub fn build(app: &adw::Application) {
         }
     });
 
-    // Shut the tunnel down and restore the desktop proxy on SIGINT/SIGTERM,
-    // not just on a clean window close.
-    for signal in [libc::SIGINT, libc::SIGTERM] {
-        glib::unix_signal_add_local(signal, {
-            let weak = Rc::downgrade(&controller);
-            move || {
-                if let Some(controller) = weak.upgrade() {
-                    controller.shutdown_engine();
-                    controller.force_close.set(true);
-                    controller.window.close();
-                }
-                glib::ControlFlow::Break
-            }
-        });
-    }
-
     window.present();
 
-    let warnings = controller
-        .state
-        .borrow_mut()
-        .engine
-        .as_mut()
-        .map(|engine| std::mem::take(&mut engine.load_warnings))
-        .unwrap_or_default();
-    for warning in warnings {
-        controller.show_message(&warning);
-    }
+    // Repair a system proxy left over from a previous GUI run and reflect
+    // the daemon's current connection on the cards.
+    controller.reconcile_system_proxy();
+    controller.sync_connection_cards();
 }
 
 fn set_window_icon(window: &adw::ApplicationWindow) {
@@ -553,10 +545,11 @@ impl Controller {
         self.logs.connect_clear_requested({
             let weak = Rc::downgrade(self);
             move || {
-                if let Some(controller) = weak.upgrade()
-                    && let Some(engine) = controller.state.borrow().engine.as_ref()
-                {
-                    engine.core.clear_logs();
+                if let Some(controller) = weak.upgrade() {
+                    let client = controller.state.borrow().client.clone();
+                    std::thread::spawn(move || {
+                        let _ = client.clear_logs();
+                    });
                 }
             }
         });
@@ -567,27 +560,14 @@ impl Controller {
                     return glib::Propagation::Proceed;
                 };
                 if controller.force_close.get() || !controller.settings.has_unsaved_changes() {
-                    // Dropping the engine here (not at some uncertain point of
-                    // Rc teardown) guarantees the xray child is killed and the
-                    // desktop proxy restored before the process exits.
-                    controller.shutdown_engine();
+                    // The daemon owns the tunnel; closing the GUI leaves the
+                    // connection (and the system proxy) as they are.
                     return glib::Propagation::Proceed;
                 }
                 controller.confirm_close_with_unsaved_settings();
                 glib::Propagation::Stop
             }
         });
-    }
-
-    /// Take and drop the engine: kills the xray child and restores the system
-    /// proxy. When a worker thread currently owns the engine there is nothing
-    /// safe to do here — the persisted recovery flags repair things on the
-    /// next start instead.
-    fn shutdown_engine(&self) {
-        let engine = self.state.borrow_mut().engine.take();
-        if engine.is_none() {
-            log::warn!("exiting while a background operation owns the engine");
-        }
     }
 
     fn confirm_close_with_unsaved_settings(self: &Rc<Self>) {
@@ -953,190 +933,74 @@ impl Controller {
         self.refresh_status();
     }
 
-    /// Queue a batch of latency probes, running at most MAX_CONCURRENT_PROBES
-    /// at a time.
-    fn enqueue_probes(self: &Rc<Self>, ids: Vec<String>) {
+    /// Mark a card as checking and ask the daemon for a probe. Results come
+    /// back through the poll snapshot; the daemon caps concurrency.
+    fn probe_one(self: &Rc<Self>, server_id: String, notify_failure: bool) {
         {
             let mut state = self.state.borrow_mut();
-            for id in ids {
-                if !state.checking.contains(&id) && !state.probe_queue.contains(&id) {
-                    state.probe_queue.push_back(id);
-                }
-            }
-        }
-        self.pump_probe_queue();
-    }
-
-    fn pump_probe_queue(self: &Rc<Self>) {
-        loop {
-            let next = {
-                let mut state = self.state.borrow_mut();
-                if state.checking.len() >= MAX_CONCURRENT_PROBES {
-                    return;
-                }
-                state.probe_queue.pop_front()
-            };
-            let Some(id) = next else {
+            if state.checking.contains(&server_id) {
                 return;
-            };
-            self.probe_one(id, false);
-        }
-    }
-
-    fn probe_one(self: &Rc<Self>, server_id: String, notify_failure: bool) {
-        if self.state.borrow().checking.contains(&server_id) {
-            return;
-        }
-        let server = self
-            .state
-            .borrow()
-            .subscriptions
-            .iter()
-            .flat_map(|subscription| subscription.servers.iter())
-            .find(|server| server.id == server_id)
-            .cloned();
-        let Some(server) = server else {
-            return;
-        };
-        let (method, socks_port, test_url) = {
-            let state = self.state.borrow();
-            match state.engine.as_ref() {
-                Some(engine) => (
-                    engine.config.latency_method,
-                    engine.config.socks_port,
-                    engine.config.latency_test_url.clone(),
-                ),
-                None => return,
             }
-        };
-        self.state.borrow_mut().checking.insert(server_id.clone());
+            state.checking.insert(server_id.clone());
+            if notify_failure {
+                state.notify_probe.insert(server_id.clone());
+            }
+        }
         self.servers
             .set_latency_state(&server_id, LatencyState::Checking);
         self.refresh_activity_status();
-
-        let (sender, receiver) = mpsc::channel();
+        let client = self.state.borrow().client.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(probe::measure(&server, method, socks_port, &test_url));
-        });
-        let weak = Rc::downgrade(self);
-        let id = server_id;
-        glib::timeout_add_local(Duration::from_millis(50), move || {
-            match receiver.try_recv() {
-                Ok(latency) => {
-                    if let Some(controller) = weak.upgrade() {
-                        controller.finish_probe(&id, latency, notify_failure);
-                    }
-                    glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if let Some(controller) = weak.upgrade() {
-                        controller.finish_probe(&id, None, notify_failure);
-                    }
-                    glib::ControlFlow::Break
-                }
-            }
+            let _ = client.request_probe(&server_id);
         });
     }
 
-    fn finish_probe(self: &Rc<Self>, server_id: &str, latency: Option<u32>, notify_failure: bool) {
-        let mut connection_failed = false;
-        {
+    fn enqueue_probes(self: &Rc<Self>, ids: Vec<String>) {
+        let new_ids: Vec<String> = {
             let mut state = self.state.borrow_mut();
-            state.checking.remove(server_id);
-            state.latencies.insert(server_id.to_string(), latency);
-            let confirming_connection = state.connected_id.as_deref() == Some(server_id)
-                && state.pending_status == Some(Status::Connecting);
-            if let Some(engine) = state.engine.as_mut() {
-                if let Some(server) = engine
-                    .subscriptions
-                    .iter_mut()
-                    .flat_map(|subscription| subscription.servers.iter_mut())
-                    .find(|server| server.id == server_id)
-                {
-                    server.latency_ms = latency;
-                }
-                if confirming_connection && latency.is_none() {
-                    engine.disconnect();
-                }
-            }
-            if confirming_connection {
-                if latency.is_some() {
-                    state.pending_status = None;
-                } else {
-                    state.pending_status = Some(Status::Error(
-                        "active server did not pass its latency check".into(),
-                    ));
-                    state.connected_id = None;
-                    state.next_active_probe = None;
-                    connection_failed = true;
-                }
-            }
-            if state.connected_id.as_deref() == Some(server_id)
-                && let Some(ms) = latency
-            {
-                state.last_active_latency = Some(ms);
-            }
-            if !connection_failed && state.connected_id.as_deref() == Some(server_id) {
-                state.next_active_probe = Some(Instant::now() + ACTIVE_PROBE_INTERVAL);
-            }
+            ids.into_iter()
+                .filter(|id| state.checking.insert(id.clone()))
+                .collect()
+        };
+        if new_ids.is_empty() {
+            return;
         }
-        self.servers.set_latency_state(
-            server_id,
-            match latency {
-                Some(ms) => LatencyState::Reachable(ms),
-                None => LatencyState::Unreachable,
-            },
-        );
-        if connection_failed {
-            self.servers.set_connection(None, None);
-            self.show_message("Connection failed: the active server did not respond");
-        } else if self.state.borrow().pending_status.is_none()
-            && self.state.borrow().connected_id.as_deref() == Some(server_id)
-        {
-            self.servers.set_connection(Some(server_id), None);
-        } else if notify_failure && latency.is_none() {
-            self.show_message("Server is unreachable or did not respond");
+        for id in &new_ids {
+            self.servers.set_latency_state(id, LatencyState::Checking);
         }
-        self.refresh_status();
-        self.pump_probe_queue();
+        self.refresh_activity_status();
+        let client = self.state.borrow().client.clone();
+        std::thread::spawn(move || {
+            let _ = client.request_probes(&new_ids);
+        });
     }
 
     fn connect_server(self: &Rc<Self>, server_id: String) {
-        if self.state.borrow().engine.is_none() {
-            self.show_message("Another operation is still running");
-            return;
-        }
         {
             let mut state = self.state.borrow_mut();
             state.selected_id = Some(server_id.clone());
             state.connected_id = Some(server_id.clone());
             state.pending_status = Some(Status::Connecting);
-            state.next_active_probe = None;
             state.last_active_latency = None;
         }
-        self.servers
-            .set_connection(Some(&server_id), Some(&server_id));
+        self.set_cards_connection(Some(&server_id), Some(&server_id));
         self.servers.set_selected(Some(&server_id));
         self.refresh_status();
         let work_id = server_id.clone();
-        self.engine_job(
-            UiOperation::for_server(UiOperationKind::Connect, server_id.clone()),
-            move |engine| engine.connect(&work_id),
+        self.client_job(
+            UiOperation::for_server(UiOperationKind::Connect, server_id),
+            move |client| client.connect_server(&work_id),
             move |controller, result| {
                 if let Err(error) = result {
                     {
                         let mut state = controller.state.borrow_mut();
                         state.pending_status = Some(Status::Error(error.to_string()));
                         state.connected_id = None;
-                        state.next_active_probe = None;
                     }
-                    controller.servers.set_connection(None, None);
+                    controller.set_cards_connection(None, None);
                     controller.show_message(&format!("Could not connect: {error}"));
-                } else {
-                    controller.state.borrow_mut().pending_status = Some(Status::Connecting);
-                    controller.probe_one(server_id.clone(), false);
                 }
+                controller.reconcile_system_proxy();
                 controller.refresh_status();
             },
         );
@@ -1147,38 +1011,35 @@ impl Controller {
             let mut state = self.state.borrow_mut();
             state.pending_status = Some(Status::Disconnected);
             state.connected_id = None;
-            state.next_active_probe = None;
             state.last_active_latency = None;
         }
-        self.servers.set_connection(None, None);
+        self.set_cards_connection(None, None);
         self.refresh_status();
-        self.engine_job(
+        self.client_job(
             UiOperation::new(UiOperationKind::Disconnect),
-            |engine| {
-                engine.disconnect();
-                Ok(())
-            },
+            |client| client.disconnect(),
             |controller, result| {
                 if let Err(error) = result {
                     controller.show_message(&format!("Could not disconnect: {error}"));
                 }
+                controller.reconcile_system_proxy();
             },
         );
     }
 
     fn add_subscription(self: &Rc<Self>, url: String, name: Option<String>, send_hwid: bool) {
-        self.engine_job(
+        self.client_job(
             UiOperation::new(UiOperationKind::AddSubscription),
-            move |engine| engine.add_subscription(url, name, send_hwid),
+            move |client| client.add_subscription(&url, name.as_deref(), send_hwid),
             |controller, result| controller.finish_subscription_change("add subscription", result),
         );
     }
 
     fn refresh_subscription(self: &Rc<Self>, subscription_id: String) {
         let work_id = subscription_id.clone();
-        self.engine_job(
+        self.client_job(
             UiOperation::for_subscription(UiOperationKind::UpdateSubscription, subscription_id),
-            move |engine| engine.refresh(&work_id),
+            move |client| client.refresh(&work_id),
             |controller, result| {
                 controller.finish_subscription_change("update subscription", result)
             },
@@ -1186,9 +1047,9 @@ impl Controller {
     }
 
     fn refresh_all_subscriptions(self: &Rc<Self>) {
-        self.engine_job(
+        self.client_job(
             UiOperation::new(UiOperationKind::UpdateAllSubscriptions),
-            |engine| engine.refresh_all(),
+            |client| client.refresh_all(),
             |controller, result| {
                 controller.finish_subscription_change("update subscriptions", result)
             },
@@ -1197,9 +1058,9 @@ impl Controller {
 
     fn remove_subscription(self: &Rc<Self>, subscription_id: String) {
         let work_id = subscription_id.clone();
-        self.engine_job(
+        self.client_job(
             UiOperation::for_subscription(UiOperationKind::DeleteSubscription, subscription_id),
-            move |engine| engine.remove_subscription(&work_id),
+            move |client| client.remove_subscription(&work_id),
             |controller, result| {
                 controller.finish_removal("delete subscription", result);
             },
@@ -1207,9 +1068,9 @@ impl Controller {
     }
 
     fn import_servers(self: &Rc<Self>, text: String) {
-        self.engine_job(
+        self.client_job(
             UiOperation::new(UiOperationKind::ImportServers),
-            move |engine| engine.import_links(&text),
+            move |client| client.import_links(&text),
             |controller, result| match result {
                 Ok((count, unsupported)) => {
                     controller.rebuild_views();
@@ -1230,9 +1091,9 @@ impl Controller {
 
     fn remove_server(self: &Rc<Self>, server_id: String) {
         let work_id = server_id.clone();
-        self.engine_job(
+        self.client_job(
             UiOperation::for_server(UiOperationKind::DeleteServer, server_id),
-            move |engine| engine.remove_server(&work_id),
+            move |client| client.remove_server(&work_id),
             |controller, result| controller.finish_removal("remove server", result),
         );
     }
@@ -1254,11 +1115,11 @@ impl Controller {
                     {
                         let mut state = self.state.borrow_mut();
                         state.connected_id = None;
-                        state.next_active_probe = None;
                         state.last_active_latency = None;
                     }
-                    self.servers.set_connection(None, None);
+                    self.set_cards_connection(None, None);
                     self.show_message("Disconnected — the active server was removed");
+                    self.reconcile_system_proxy();
                     self.refresh_status();
                 }
                 self.rebuild_views();
@@ -1268,28 +1129,17 @@ impl Controller {
     }
 
     fn set_hwid(self: &Rc<Self>, subscription_id: String, enabled: bool) {
-        let result = {
-            let mut state = self.state.borrow_mut();
-            let Some(engine) = state.engine.as_mut() else {
-                drop(state);
-                self.show_message("Another operation is still running");
-                self.rebuild_views();
-                return;
-            };
-            if let Some(subscription) = engine
-                .subscriptions
-                .iter_mut()
-                .find(|subscription| subscription.id == subscription_id)
-            {
-                subscription.send_hwid = enabled;
-            }
-            let result = engine.save();
-            state.subscriptions = engine.subscriptions.clone();
-            result
-        };
-        if let Err(error) = result {
-            self.show_message(&format!("Could not save HWID preference: {error}"));
-        }
+        let work_id = subscription_id;
+        self.client_job(
+            UiOperation::new(UiOperationKind::ApplySettings),
+            move |client| client.set_hwid(&work_id, enabled),
+            |controller, result| {
+                if let Err(error) = result {
+                    controller.show_message(&format!("Could not save HWID preference: {error}"));
+                }
+                controller.rebuild_views();
+            },
+        );
     }
 
     fn save_settings(self: &Rc<Self>, values: SettingsValues) {
@@ -1298,63 +1148,33 @@ impl Controller {
             self.settings.set_apply_in_progress(false);
             return;
         }
-        let applied = self.settings.applied();
-        let ports_changed =
-            applied.socks_port != values.socks_port || applied.http_port != values.http_port;
-        let active_id = self.state.borrow().connected_id.clone();
-        let work_values = values.clone();
-        let work_active = active_id.clone();
-        self.engine_job(
+        let config = Config {
+            socks_port: values.socks_port,
+            http_port: values.http_port,
+            system_proxy: values.system_proxy,
+            latency_method: values.latency_method,
+            latency_test_url: values.latency_test_url.clone(),
+            subscription_user_agent: values.subscription_user_agent.clone(),
+        };
+        self.client_job(
             UiOperation::new(UiOperationKind::ApplySettings),
-            move |engine| {
-                engine.config.socks_port = work_values.socks_port;
-                engine.config.http_port = work_values.http_port;
-                engine.config.system_proxy = work_values.system_proxy;
-                engine.config.latency_method = work_values.latency_method;
-                engine.config.latency_test_url = work_values.latency_test_url;
-                engine.config.subscription_user_agent = work_values.subscription_user_agent;
-                engine.core.socks_port = work_values.socks_port;
-                engine.core.http_port = work_values.http_port;
-                engine.save()?;
-                let reconnect_error = if ports_changed && engine.core.status() == Status::Connected
-                {
-                    work_active
-                        .as_deref()
-                        .and_then(|active| engine.connect(active).err())
-                        .map(|error| error.to_string())
-                } else {
-                    None
-                };
-                engine.reconcile_system_proxy();
-                Ok(reconnect_error)
-            },
+            move |client| client.apply_settings(&config),
             move |controller, result| {
                 match result {
-                    Ok(reconnect_error) => {
+                    Ok(outcome) => {
                         controller.settings.mark_applied(values.clone());
-                        if !ports_changed && active_id.is_some() {
-                            controller.state.borrow_mut().next_active_probe =
-                                Some(Instant::now() + ACTIVE_PROBE_INTERVAL);
-                        }
-                        if let Some(error) = reconnect_error {
+                        if let Some(error) = outcome.reconnect_error {
                             {
                                 let mut state = controller.state.borrow_mut();
                                 state.pending_status = Some(Status::Error(error.clone()));
                                 state.connected_id = None;
-                                state.next_active_probe = None;
                             }
-                            controller.servers.set_connection(None, None);
+                            controller.set_cards_connection(None, None);
                             controller.show_message(&format!(
                                 "Settings saved, but the connection could not restart: {error}"
                             ));
-                        } else if ports_changed && let Some(active) = active_id.clone() {
-                            let mut state = controller.state.borrow_mut();
-                            state.pending_status = Some(Status::Connecting);
-                            state.next_active_probe = None;
-                            drop(state);
-                            controller.servers.set_connection(None, Some(&active));
-                            controller.probe_one(active, false);
                         }
+                        controller.reconcile_system_proxy();
                         if controller.close_after_apply.replace(false) {
                             controller.force_close.set(true);
                             controller.window.close();
@@ -1371,52 +1191,52 @@ impl Controller {
         );
     }
 
-    fn engine_job<R, Work, Complete>(
+    /// Run one daemon call on a worker thread with the operation spinner up.
+    /// The fresh subscriptions snapshot is fetched on the same thread right
+    /// after the call, so completions see consistent state.
+    fn client_job<R, Work, Complete>(
         self: &Rc<Self>,
         operation: UiOperation,
         work: Work,
         complete: Complete,
     ) where
         R: Send + 'static,
-        Work: FnOnce(&mut Engine) -> Result<R> + Send + 'static,
+        Work: FnOnce(&DaemonClient) -> Result<R> + Send + 'static,
         Complete: FnOnce(&Rc<Self>, Result<R>) + 'static,
     {
-        let displayed_operation = operation.clone();
-        let mut engine = {
+        {
             let mut state = self.state.borrow_mut();
-            let previous_status = self.current_status(&state);
-            let Some(engine) = state.engine.take() else {
+            if state.operation.is_some() {
                 drop(state);
                 self.show_message("Another operation is still running");
                 return;
-            };
-            if state.pending_status.is_none() {
-                state.pending_status = Some(previous_status.clone());
             }
-            state.operation = Some(operation);
-            engine
-        };
-        self.subscriptions.set_operation(Some(displayed_operation));
+            state.operation = Some(operation.clone());
+        }
+        self.subscriptions.set_operation(Some(operation));
         self.refresh_activity_status();
 
+        let client = self.state.borrow().client.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let result = work(&mut engine);
-            let _ = sender.send((engine, result));
+            let result = work(&client);
+            let subscriptions = client.subscriptions();
+            let _ = sender.send((result, subscriptions));
         });
 
         let weak = Rc::downgrade(self);
         let mut complete = Some(complete);
         glib::timeout_add_local(Duration::from_millis(40), move || {
             match receiver.try_recv() {
-                Ok((engine, result)) => {
+                Ok((result, subscriptions)) => {
                     let Some(controller) = weak.upgrade() else {
                         return glib::ControlFlow::Break;
                     };
                     {
                         let mut state = controller.state.borrow_mut();
-                        state.subscriptions = engine.subscriptions.clone();
-                        state.engine = Some(engine);
+                        if let Ok(subscriptions) = subscriptions {
+                            state.subscriptions = subscriptions;
+                        }
                         state.pending_status = None;
                         state.operation = None;
                     }
@@ -1431,13 +1251,11 @@ impl Controller {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if let Some(controller) = weak.upgrade() {
                         let mut state = controller.state.borrow_mut();
-                        state.engine = Some(Engine::load());
-                        state.pending_status = Some(Status::Error(
-                            "background operation stopped unexpectedly".to_string(),
-                        ));
+                        state.pending_status = None;
                         state.operation = None;
                         drop(state);
                         controller.subscriptions.set_operation(None);
+                        controller.show_message("Background operation stopped unexpectedly");
                         controller.refresh_status();
                     }
                     glib::ControlFlow::Break
@@ -1446,75 +1264,175 @@ impl Controller {
         });
     }
 
-    fn maybe_probe_active(self: &Rc<Self>) {
-        let now = Instant::now();
-        let server_id = {
-            let mut state = self.state.borrow_mut();
-            let status = state
-                .pending_status
-                .clone()
-                .or_else(|| state.engine.as_ref().map(Engine::status))
-                .unwrap_or(Status::Disconnected);
-            let active_id = state.connected_id.clone();
-            let active_probe_running = active_id
-                .as_ref()
-                .is_some_and(|id| state.checking.contains(id));
-            let due = active_probe_is_due(
-                now,
-                state.next_active_probe,
-                status == Status::Connected,
-                active_id.is_some(),
-                active_probe_running,
-                state.engine.is_some(),
-                state.operation.is_some(),
-            );
-            if !matches!(status, Status::Connected | Status::Connecting) {
-                state.next_active_probe = None;
-            }
-            if due {
-                state.next_active_probe = Some(now + ACTIVE_PROBE_INTERVAL);
-                active_id
-            } else {
-                None
-            }
-        };
-        if let Some(server_id) = server_id {
-            self.probe_one(server_id, false);
-        }
-    }
-
+    /// 500ms tick: apply the last poll snapshot, then start the next poll on
+    /// a worker thread (never block the UI on D-Bus).
     fn start_timer(self: &Rc<Self>) {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_millis(500), move || {
             if !controller.window.is_visible() {
                 return glib::ControlFlow::Break;
             }
-            controller.refresh_status();
-            controller.maybe_probe_active();
-            let logs = controller
-                .state
-                .borrow()
-                .engine
-                .as_ref()
-                .map(|engine| engine.core.recent_logs())
-                .unwrap_or_default();
-            controller.logs.set_logs(&logs);
+            if let Some(snapshot) = controller.poll_snapshot.lock().unwrap().take() {
+                controller.apply_snapshot(snapshot);
+            }
+            if !controller.poll_in_flight.swap(true, Ordering::SeqCst) {
+                let client = controller.state.borrow().client.clone();
+                let slot = controller.poll_snapshot.clone();
+                let in_flight = controller.poll_in_flight.clone();
+                std::thread::spawn(move || {
+                    let snapshot = (|| {
+                        Ok::<PolledSnapshot, anyhow::Error>(PolledSnapshot {
+                            status: client.status()?,
+                            probe: client.probe_state()?,
+                            logs: client.recent_logs()?,
+                        })
+                    })();
+                    if let Ok(snapshot) = snapshot {
+                        *slot.lock().unwrap() = Some(snapshot);
+                    }
+                    in_flight.store(false, Ordering::SeqCst);
+                });
+            }
             glib::ControlFlow::Continue
         });
     }
 
-    fn refresh_status(&self) {
-        let mut state = self.state.borrow_mut();
-        let mut status = self.current_status(&state);
-        if status == Status::Connected
-            && state
-                .engine
-                .as_mut()
-                .is_some_and(|engine| !engine.core.is_alive())
+    fn apply_snapshot(self: &Rc<Self>, snapshot: PolledSnapshot) {
+        let mut latency_updates: Vec<(String, LatencyState)> = Vec::new();
+        let mut toast_unreachable = false;
         {
-            status = Status::Error("Xray exited unexpectedly".to_string());
-            state.pending_status = Some(status.clone());
+            let mut state = self.state.borrow_mut();
+            for (id, value) in &snapshot.probe.latencies {
+                if state.latencies.get(id) != Some(value) {
+                    state.latencies.insert(id.clone(), *value);
+                    latency_updates.push((
+                        id.clone(),
+                        match value {
+                            Some(ms) => LatencyState::Reachable(*ms),
+                            None => LatencyState::Unreachable,
+                        },
+                    ));
+                    if state.connected_id.as_deref() == Some(id)
+                        && let Some(ms) = value
+                    {
+                        state.last_active_latency = Some(*ms);
+                    }
+                    if state.notify_probe.remove(id) && value.is_none() {
+                        toast_unreachable = true;
+                    }
+                }
+            }
+            // Mirror the daemon's checking set: new entries show spinners,
+            // ids that finished (have a result and are no longer checking)
+            // leave the local set.
+            let daemon_checking: HashSet<String> =
+                snapshot.probe.checking.iter().cloned().collect();
+            for id in &daemon_checking {
+                if state.checking.insert(id.clone()) {
+                    latency_updates.push((id.clone(), LatencyState::Checking));
+                }
+            }
+            let finished: Vec<String> = state
+                .checking
+                .iter()
+                .filter(|id| {
+                    !daemon_checking.contains(*id) && snapshot.probe.latencies.contains_key(*id)
+                })
+                .cloned()
+                .collect();
+            for id in finished {
+                state.checking.remove(&id);
+                if !latency_updates.iter().any(|(updated, _)| updated == &id) {
+                    let value = snapshot.probe.latencies.get(&id).copied().flatten();
+                    latency_updates.push((
+                        id,
+                        match value {
+                            Some(ms) => LatencyState::Reachable(ms),
+                            None => LatencyState::Unreachable,
+                        },
+                    ));
+                }
+            }
+            state.daemon_status = snapshot.status.to_status();
+            // While no optimistic transition is in flight, the daemon's view
+            // of the active server wins.
+            if state.operation.is_none()
+                && state.pending_status.is_none()
+                && snapshot.status.active_id != state.connected_id
+            {
+                state.connected_id = snapshot.status.active_id.clone();
+                if state.connected_id.is_none() {
+                    state.last_active_latency = None;
+                }
+            }
         }
+        for (id, latency_state) in latency_updates {
+            self.servers.set_latency_state(&id, latency_state);
+        }
+        if toast_unreachable {
+            self.show_message("Server is unreachable or did not respond");
+        }
+        self.logs.set_logs(&snapshot.logs);
+        self.sync_connection_cards();
+        self.reconcile_system_proxy();
+        self.refresh_status();
+    }
+
+    /// Push the current connection onto the cards, skipping the O(cards)
+    /// pass when nothing changed.
+    fn sync_connection_cards(&self) {
+        let (active, status) = {
+            let state = self.state.borrow();
+            (state.connected_id.clone(), self.current_status(&state))
+        };
+        let desired = match status {
+            Status::Connecting => (active.clone(), active),
+            Status::Connected => (active, None),
+            _ => (None, None),
+        };
+        if *self.applied_connection.borrow() == desired {
+            return;
+        }
+        *self.applied_connection.borrow_mut() = desired.clone();
+        self.servers
+            .set_connection(desired.0.as_deref(), desired.1.as_deref());
+    }
+
+    fn set_cards_connection(&self, active: Option<&str>, connecting: Option<&str>) {
+        *self.applied_connection.borrow_mut() =
+            (active.map(str::to_string), connecting.map(str::to_string));
+        self.servers.set_connection(active, connecting);
+    }
+
+    /// The GNOME system proxy is a session concern, so the GUI (not the
+    /// daemon, which may run as a system service) applies and clears it. A
+    /// marker file survives crashes so the next start can undo a stale proxy.
+    fn reconcile_system_proxy(&self) {
+        let applied_settings = self.settings.applied();
+        let status = {
+            let state = self.state.borrow();
+            self.current_status(&state)
+        };
+        let want = applied_settings.system_proxy && status == Status::Connected;
+        if want && !self.proxy_applied.get() {
+            if sysproxy::apply(applied_settings.socks_port, applied_settings.http_port).is_ok() {
+                self.proxy_applied.set(true);
+                if let Some(marker) = gui_proxy_marker() {
+                    let _ = std::fs::write(marker, b"1");
+                }
+            }
+        } else if !want && self.proxy_applied.get() {
+            let _ = sysproxy::clear();
+            self.proxy_applied.set(false);
+            if let Some(marker) = gui_proxy_marker() {
+                let _ = std::fs::remove_file(marker);
+            }
+        }
+    }
+
+    fn refresh_status(&self) {
+        let state = self.state.borrow();
+        let status = self.current_status(&state);
         let active_latency = state
             .connected_id
             .as_ref()
@@ -1692,13 +1610,22 @@ impl Controller {
         state
             .pending_status
             .clone()
-            .or_else(|| state.engine.as_ref().map(Engine::status))
-            .unwrap_or(Status::Disconnected)
+            .unwrap_or_else(|| state.daemon_status.clone())
     }
 
     fn show_message(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
+}
+
+fn gui_proxy_marker() -> Option<std::path::PathBuf> {
+    paths::data_dir()
+        .ok()
+        .map(|dir| dir.join("gui-proxy-applied"))
+}
+
+fn gui_proxy_marker_exists() -> bool {
+    gui_proxy_marker().is_some_and(|marker| marker.exists())
 }
 
 fn set_status_tone<W: IsA<gtk::Widget>>(widget: &W, tone: StatusTone) {
@@ -1822,9 +1749,7 @@ fn install_css() {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
-    use super::{ResponsiveMode, SearchState, active_probe_is_due, responsive_mode_for_width};
+    use super::{ResponsiveMode, SearchState, responsive_mode_for_width};
 
     #[test]
     fn responsive_modes_include_their_upper_boundaries() {
@@ -1832,33 +1757,6 @@ mod tests {
         assert_eq!(responsive_mode_for_width(680.0), ResponsiveMode::Compact);
         assert_eq!(responsive_mode_for_width(700.0), ResponsiveMode::Compact);
         assert_eq!(responsive_mode_for_width(701.0), ResponsiveMode::Wide);
-    }
-
-    #[test]
-    fn periodic_probe_requires_one_due_active_server() {
-        let now = Instant::now();
-        let due = Some(now - Duration::from_secs(1));
-        assert!(active_probe_is_due(
-            now, due, true, true, false, true, false
-        ));
-        assert!(!active_probe_is_due(
-            now, due, true, true, true, true, false
-        ));
-        assert!(!active_probe_is_due(
-            now, due, true, false, false, true, false
-        ));
-        assert!(!active_probe_is_due(
-            now, due, true, true, false, true, true
-        ));
-        assert!(!active_probe_is_due(
-            now,
-            Some(now + Duration::from_secs(1)),
-            true,
-            true,
-            false,
-            true,
-            false
-        ));
     }
 
     #[test]

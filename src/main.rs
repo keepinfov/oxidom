@@ -4,9 +4,11 @@
 
 mod cli;
 mod config;
+mod daemon;
 mod engine;
 mod fsutil;
 mod gui;
+mod ipc;
 mod link;
 mod model;
 mod netns;
@@ -29,8 +31,17 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Gui) {
-        Command::Gui => gui::run(),
+    match cli.command.unwrap_or(Command::Gui { background: false }) {
+        Command::Gui { background } => gui::run(background),
+        Command::Daemon {
+            system,
+            socks_port,
+            http_port,
+        } => daemon::run(daemon::DaemonOptions {
+            system_bus: system,
+            socks_port,
+            http_port,
+        }),
         Command::Run { args } => netns::run(&args),
     }
 }

@@ -641,8 +641,7 @@ impl ServersView {
                     let columns_box = group.columns_box.clone();
                     move |value| columns_box.set_opacity(value)
                 });
-                let fade_in =
-                    adw::TimedAnimation::new(&group.columns_box, 0.0, 1.0, 130, target);
+                let fade_in = adw::TimedAnimation::new(&group.columns_box, 0.0, 1.0, 130, target);
                 fade_in.set_easing(adw::Easing::EaseOutCubic);
                 fade_in.connect_done({
                     let group = group.clone();
@@ -675,8 +674,7 @@ fn distribute_columns(count: usize, columns: usize) -> Vec<Vec<usize>> {
 /// earlier slot of the same column within the same group.
 fn collapse_would_shift(prev: (usize, usize), next: (usize, usize), columns: usize) -> bool {
     let columns = columns.max(1);
-    prev.0 < next.0
-        || (prev.0 == next.0 && prev.1 % columns == next.1 % columns && prev.1 < next.1)
+    prev.0 < next.0 || (prev.0 == next.0 && prev.1 % columns == next.1 % columns && prev.1 < next.1)
 }
 
 /// Lay the group's visible cards out into its column boxes. Skips all widget
