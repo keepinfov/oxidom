@@ -46,6 +46,8 @@ struct GroupUi {
     sort_generation: Rc<Cell<u64>>,
 }
 
+type BrowseCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+
 #[derive(Clone)]
 pub struct ServersView {
     pub root: gtk::ScrolledWindow,
@@ -67,6 +69,12 @@ pub struct ServersView {
     /// The card whose inline details are open (at most one).
     selected: Rc<RefCell<Option<String>>>,
     requested_selected: Rc<RefCell<Option<String>>>,
+    /// Shown when a search hides every card. Kept as one persistent widget
+    /// rather than rebuilt, so toggling it costs nothing on each keystroke.
+    no_matches: adw::StatusPage,
+    /// Invoked by the "no servers yet" page; the window routes it to the
+    /// Subscriptions page.
+    on_browse_subscriptions: BrowseCallback,
 }
 
 impl ServersView {
@@ -89,9 +97,19 @@ impl ServersView {
             .propagate_natural_width(false)
             .vexpand(true)
             .build();
+        let no_matches = adw::StatusPage::builder()
+            .icon_name("system-search-symbolic")
+            .title("No matching servers")
+            .description("Try a different name, country, or protocol.")
+            .vexpand(true)
+            .visible(false)
+            .build();
+
         Self {
             root,
             content,
+            no_matches,
+            on_browse_subscriptions: Rc::new(RefCell::new(None)),
             cards: Rc::new(RefCell::new(HashMap::new())),
             groups: Rc::new(RefCell::new(Vec::new())),
             search_texts: Rc::new(RefCell::new(HashMap::new())),
@@ -177,6 +195,22 @@ impl ServersView {
                 .description("Add a subscription to start browsing servers.")
                 .vexpand(true)
                 .build();
+            // Without this the user has to discover the Subscriptions page
+            // unaided; an empty state that names the next step should offer it.
+            let action = gtk::Button::builder()
+                .label("Add a subscription")
+                .halign(gtk::Align::Center)
+                .css_classes(["suggested-action", "pill"])
+                .build();
+            action.connect_clicked({
+                let callback = self.on_browse_subscriptions.clone();
+                move |_| {
+                    if let Some(callback) = callback.borrow().as_ref() {
+                        callback();
+                    }
+                }
+            });
+            empty.set_child(Some(&action));
             self.content.append(&empty);
             return;
         }
@@ -347,6 +381,8 @@ impl ServersView {
             repack_group(&group_ui, self.columns.get());
             self.groups.borrow_mut().push(group_ui);
         }
+        // Last child, so it sits below the groups it stands in for.
+        self.content.append(&self.no_matches);
         self.apply_filter();
         if let Some(server_id) = selected_id {
             self.set_selected_immediately(server_id);
@@ -359,9 +395,15 @@ impl ServersView {
         self.apply_filter();
     }
 
+    /// Wires the "no servers yet" page's action button.
+    pub fn connect_browse_subscriptions(&self, callback: impl Fn() + 'static) {
+        *self.on_browse_subscriptions.borrow_mut() = Some(Box::new(callback));
+    }
+
     fn apply_filter(&self) {
         let query = self.query.borrow().clone();
         let selected = self.selected.borrow().clone();
+        let mut total_visible = 0usize;
         {
             let search_texts = self.search_texts.borrow();
             for group in self.groups.borrow().iter() {
@@ -377,8 +419,12 @@ impl ServersView {
                     }
                 }
                 group.root.set_visible(visible > 0);
+                total_visible += visible;
             }
         }
+        // A query that matches nothing used to leave a blank page.
+        self.no_matches
+            .set_visible(!query.is_empty() && total_visible == 0);
         // Cards mid-collapse from a recent selection switch reflow anyway —
         // snap them closed before repacking.
         for (id, card) in self.cards.borrow().iter() {

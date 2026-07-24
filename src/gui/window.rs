@@ -27,6 +27,7 @@ use super::views::settings::{SettingsValues, SettingsView};
 use super::views::subscriptions::SubscriptionsView;
 
 type SettingsCallback = Rc<dyn Fn(SettingsValues)>;
+type ShortcutHandler = Box<dyn Fn(&Rc<Controller>)>;
 
 const SIDEBAR_BREAKPOINT_WIDTH: u32 = 700;
 
@@ -168,6 +169,9 @@ struct Controller {
     logs: LogsView,
     toasts: adw::ToastOverlay,
     close_after_apply: Cell<bool>,
+    /// True when the pending close came from Quit rather than the window
+    /// button, so finishing it must end the process instead of hiding.
+    quit_after_close: Cell<bool>,
     tray: RefCell<Option<ksni::blocking::Handle<OxidomTray>>>,
     tray_commands: mpsc::Receiver<TrayCommand>,
     /// Last (connected, text) pushed to the tray, to skip no-op updates.
@@ -196,9 +200,26 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
             let dialog = adw::MessageDialog::new(
                 None::<&gtk::Window>,
                 Some("oxidom daemon unavailable"),
-                Some(&error.to_string()),
+                Some(&format!("{error:#}")),
             );
-            dialog.add_response("close", "Close");
+            dialog.add_responses(&[("quit", "Quit"), ("retry", "Try Again")]);
+            dialog.set_response_appearance("retry", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("retry"));
+            // Escape must quit, not dismiss: the hold guard is already taken
+            // in `gui::run`, so a dismissed dialog would otherwise leave a
+            // held process with no window and no tray to close it with.
+            dialog.set_close_response("quit");
+            dialog.connect_response(None, {
+                let app = app.clone();
+                move |dialog, response| {
+                    dialog.close();
+                    if response == "retry" {
+                        app.activate();
+                    } else {
+                        app.quit();
+                    }
+                }
+            });
             dialog.present();
             return None;
         }
@@ -407,6 +428,7 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
         logs,
         toasts,
         close_after_apply: Cell::new(false),
+        quit_after_close: Cell::new(false),
         tray: RefCell::new(tray_handle),
         tray_commands,
         tray_pushed: RefCell::new((false, String::new())),
@@ -496,7 +518,94 @@ fn set_window_icon(window: &adw::ApplicationWindow) {
 }
 
 impl Controller {
+    /// Keyboard access to everything reachable from the header and sidebar.
+    /// GTK needs a `GActionMap` on the window plus app-level accelerators;
+    /// neither existed before, so every shortcut lives here.
+    fn install_shortcuts(self: &Rc<Self>) {
+        let Some(app) = self.window.application() else {
+            return;
+        };
+        let actions = gtk::gio::SimpleActionGroup::new();
+
+        let add = |name: &str, accels: &[&str], handler: ShortcutHandler| {
+            let action = gtk::gio::SimpleAction::new(name, None);
+            action.connect_activate({
+                let weak = Rc::downgrade(self);
+                move |_, _| {
+                    if let Some(controller) = weak.upgrade() {
+                        handler(&controller);
+                    }
+                }
+            });
+            actions.add_action(&action);
+            app.set_accels_for_action(&format!("win.{name}"), accels);
+        };
+
+        add(
+            "search",
+            &["<Control>f"],
+            Box::new(|controller| controller.focus_search()),
+        );
+        add(
+            "refresh",
+            &["<Control>r", "F5"],
+            Box::new(|controller| controller.refresh_all_subscriptions()),
+        );
+        add(
+            "quit",
+            &["<Control>q"],
+            Box::new(|controller| controller.request_quit()),
+        );
+        add(
+            "close",
+            &["<Control>w"],
+            Box::new(|controller| {
+                controller.window.close();
+            }),
+        );
+        for (index, page) in [
+            Page::General,
+            Page::Subscriptions,
+            Page::Settings,
+            Page::Logs,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            add(
+                &format!("page{}", index + 1),
+                &[&format!("<Control>{}", index + 1)],
+                Box::new(move |controller| controller.navigate_to(page)),
+            );
+        }
+
+        self.window.insert_action_group("win", Some(&actions));
+    }
+
+    /// Puts the cursor in whichever search entry the current layout uses.
+    fn focus_search(self: &Rc<Self>) {
+        self.navigate_to(Page::General);
+        if self.compact.get() {
+            self.search_toggle.set_active(true);
+            let search = self.compact_search.clone();
+            glib::idle_add_local_once(move || {
+                search.grab_focus();
+            });
+        } else {
+            self.search.grab_focus();
+        }
+    }
+
     fn wire_actions(self: &Rc<Self>) {
+        self.install_shortcuts();
+        self.servers.connect_browse_subscriptions({
+            let weak = Rc::downgrade(self);
+            move || {
+                if let Some(controller) = weak.upgrade() {
+                    controller.navigate_to(Page::Subscriptions);
+                }
+            }
+        });
         self.search.connect_search_changed({
             let weak = Rc::downgrade(self);
             move |entry| {
@@ -645,9 +754,10 @@ impl Controller {
                     }
                     "discard" => {
                         controller.settings.reset_draft();
-                        controller.window.set_visible(false);
+                        controller.finish_close();
                     }
-                    _ => {}
+                    // Cancelling abandons a Quit as well as a close.
+                    _ => controller.quit_after_close.set(false),
                 }
             }
         });
@@ -1234,7 +1344,7 @@ impl Controller {
                         }
                         controller.reconcile_system_proxy();
                         if controller.close_after_apply.replace(false) {
-                            controller.window.set_visible(false);
+                            controller.finish_close();
                         }
                     }
                     Err(error) => {
@@ -1509,12 +1619,34 @@ impl Controller {
             match command {
                 TrayCommand::ShowWindow => self.window.present(),
                 TrayCommand::Disconnect => self.disconnect_if_active(),
-                TrayCommand::Quit => {
-                    if let Some(app) = self.window.application() {
-                        app.quit();
-                    }
-                }
+                // Quitting from the tray must respect the same unsaved-settings
+                // guard as closing the window, or a draft is silently lost.
+                TrayCommand::Quit => self.request_quit(),
             }
+        }
+    }
+
+    /// Quit, confirming first when a settings draft would be lost. Shared by
+    /// the tray menu and the Ctrl+Q accelerator.
+    fn request_quit(self: &Rc<Self>) {
+        self.quit_after_close.set(true);
+        if !self.settings.has_unsaved_changes() {
+            self.finish_close();
+            return;
+        }
+        self.window.present();
+        self.confirm_close_with_unsaved_settings();
+    }
+
+    /// Completes a close: quit when it started as Quit, otherwise just hide —
+    /// the tray keeps the process and the daemon keeps the tunnel.
+    fn finish_close(&self) {
+        if self.quit_after_close.replace(false) {
+            if let Some(app) = self.window.application() {
+                app.quit();
+            }
+        } else {
+            self.window.set_visible(false);
         }
     }
 
