@@ -30,6 +30,8 @@
               $out/share/applications/dev.keepinfov.oxidom.desktop
             install -Dm444 data/dev.keepinfov.oxidom.metainfo.xml \
               $out/share/metainfo/dev.keepinfov.oxidom.metainfo.xml
+            install -Dm444 data/dev.keepinfov.oxidom.Daemon.conf \
+              $out/share/dbus-1/system.d/dev.keepinfov.oxidom.Daemon.conf
           '';
         };
       in {
