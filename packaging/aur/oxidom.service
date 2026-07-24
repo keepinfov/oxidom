@@ -1,0 +1,19 @@
+[Unit]
+Description=oxidom Xray tunnel daemon
+Wants=network-online.target
+After=network-online.target dbus.service
+
+[Service]
+ExecStart=/usr/bin/oxidom daemon --system
+User=oxidom
+Group=oxidom
+StateDirectory=oxidom
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -25,12 +25,37 @@ runs fully unprivileged.
 - Crash-safe: an orphaned xray child or a stuck GNOME system proxy left by a
   killed instance is repaired on the next start.
 
+## Architecture
+
+`oxidom daemon` owns the tunnel (subscriptions, Xray core, probes) and serves
+D-Bus (`dev.keepinfov.oxidom.Daemon`); the GUI is a thin client with a tray
+icon. Closing the window keeps the connection; the daemon can run as a
+system service that starts at boot and survives logout. Launching the GUI
+without a daemon auto-spawns a session one.
+
+## Install
+
+**NixOS (flake):**
+
+```nix
+inputs.oxidom.url = "github:keepinfov/oxidom";
+# ...
+imports = [ inputs.oxidom.nixosModules.default ];
+programs.oxidom.enable = true;          # GUI
+programs.oxidom.trayAutostart = true;   # tray at login
+services.oxidom.enable = true;          # system daemon at boot
+services.oxidom.socksPort = 20172;      # optional
+```
+
+**Arch (AUR):** `packaging/aur/PKGBUILD` (`oxidom-git`), then
+`systemctl enable --now oxidom.service`.
+
 ## Build & run
 
 With nix (recommended — provides GTK, libadwaita, and the Xray core):
 
 ```sh
-nix develop -c cargo run       # development
+nix develop -c cargo run       # development (auto-spawns a session daemon)
 nix build                      # wrapped release binary in ./result/bin
 ```
 
@@ -40,8 +65,10 @@ Without nix you need GTK4 ≥ 4.14, libadwaita ≥ 1.4, a Rust toolchain, and an
 ## CLI
 
 ```sh
-oxidom            # launch the GUI (default)
-oxidom run -- CMD # (planned) run one command routed through the active proxy
+oxidom                     # launch the GUI (default)
+oxidom gui --background    # start hidden (tray only)
+oxidom daemon [--system]   # headless daemon (session bus by default)
+oxidom run -- CMD          # (planned) run one command through the proxy
 ```
 
 ## Status
