@@ -1,32 +1,64 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
 
 use crate::engine::LOCAL_ID;
-use crate::model::Subscription;
+use crate::gui::operation::{UiOperation, UiOperationKind};
+use crate::model::{Subscription, UserInfo};
 
 use super::super::group::subscription_description;
 
 /// Callbacks the subscriptions view invokes.
 #[derive(Clone)]
 pub struct SubscriptionCallbacks {
-    pub add: Rc<dyn Fn(String, Option<String>)>,
+    pub add: Rc<dyn Fn(String, Option<String>, bool)>,
     pub import: Rc<dyn Fn(String)>,
     pub refresh: Rc<dyn Fn(String)>,
+    pub refresh_all: Rc<dyn Fn()>,
     pub remove: Rc<dyn Fn(String)>,
     pub remove_server: Rc<dyn Fn(String)>,
     pub hwid: Rc<dyn Fn(String, bool)>,
 }
 
 #[derive(Clone)]
+struct HeaderControls {
+    root: gtk::Box,
+    add_subscription: gtk::Button,
+    import_server: gtk::Button,
+    update_all: gtk::Button,
+    update_label: gtk::Label,
+    update_spinner: gtk::Spinner,
+}
+
+#[derive(Clone)]
+struct RowControls {
+    row: adw::ActionRow,
+    spinner: gtk::Spinner,
+}
+
+#[derive(Default)]
+struct OperationWidgets {
+    subscriptions: HashMap<String, RowControls>,
+    local_servers: Option<RowControls>,
+}
+
+#[derive(Clone)]
 pub struct SubscriptionsView {
     pub root: gtk::ScrolledWindow,
     content: gtk::Box,
+    callbacks: Rc<RefCell<Option<SubscriptionCallbacks>>>,
+    header: HeaderControls,
+    header_embedded: Rc<Cell<bool>>,
+    operation: Rc<RefCell<Option<UiOperation>>>,
+    operation_widgets: Rc<RefCell<OperationWidgets>>,
 }
 
 impl SubscriptionsView {
     pub fn new() -> Self {
         let content = gtk::Box::new(gtk::Orientation::Vertical, 22);
+        content.set_hexpand(true);
         content.set_margin_top(24);
         content.set_margin_bottom(32);
         content.set_margin_start(28);
@@ -36,153 +68,814 @@ impl SubscriptionsView {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
-        Self { root, content }
+        let callbacks = Rc::new(RefCell::new(None::<SubscriptionCallbacks>));
+        let header = make_header_controls(&root, callbacks.clone());
+
+        Self {
+            root,
+            content,
+            callbacks,
+            header,
+            header_embedded: Rc::new(Cell::new(true)),
+            operation: Rc::new(RefCell::new(None)),
+            operation_widgets: Rc::new(RefCell::new(OperationWidgets::default())),
+        }
+    }
+
+    /// Controls intended for the subscriptions page's header bar.
+    ///
+    /// They are embedded in the list header by default so the page remains
+    /// usable before its containing window adopts them. Call
+    /// [`Self::set_header_actions_embedded`] with `false` before the first
+    /// rebuild when placing this widget in the window header.
+    pub fn header_actions(&self) -> gtk::Box {
+        self.header.root.clone()
+    }
+
+    pub fn set_header_actions_embedded(&self, embedded: bool) {
+        self.header_embedded.set(embedded);
     }
 
     pub fn rebuild(&self, subscriptions: &[Subscription], callbacks: SubscriptionCallbacks) {
+        *self.callbacks.borrow_mut() = Some(callbacks.clone());
+
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
-
-        let add_group = adw::PreferencesGroup::builder()
-            .title("Add subscription")
-            .description("Paste a subscription URL. Device identification stays off by default.")
-            .build();
-        let url = adw::EntryRow::builder().title("Subscription URL").build();
-        let name = adw::EntryRow::builder().title("Name (optional)").build();
-        let add = gtk::Button::builder()
-            .label("Add")
-            .halign(gtk::Align::End)
-            .css_classes(["suggested-action", "pill"])
-            .build();
-        add_group.add(&url);
-        add_group.add(&name);
-        add_group.add(&add);
-        let url_for_add = url.clone();
-        let name_for_add = name.clone();
-        let on_add = callbacks.add.clone();
-        add.connect_clicked(move |_| {
-            let value = url_for_add.text().trim().to_string();
-            if value.is_empty() {
-                return;
-            }
-            let title = name_for_add.text().trim().to_string();
-            on_add(value, (!title.is_empty()).then_some(title));
-            url_for_add.set_text("");
-            name_for_add.set_text("");
-        });
-        self.content.append(&add_group);
-
-        // Standalone servers: paste one or more share-links, no subscription.
-        let server_group = adw::PreferencesGroup::builder()
-            .title("Add server")
-            .description("Paste share-links (vless://, vmess://, trojan://, ss://), one per line.")
-            .build();
-        let buffer = gtk::TextBuffer::new(None);
-        let editor = gtk::TextView::builder()
-            .buffer(&buffer)
-            .monospace(true)
-            .top_margin(6)
-            .bottom_margin(6)
-            .left_margin(8)
-            .right_margin(8)
-            .wrap_mode(gtk::WrapMode::Char)
-            .build();
-        let scroller = gtk::ScrolledWindow::builder()
-            .min_content_height(76)
-            .max_content_height(180)
-            .propagate_natural_height(true)
-            .child(&editor)
-            .build();
-        let frame = gtk::Frame::builder()
-            .child(&scroller)
-            .css_classes(["card"])
-            .build();
-        let import = gtk::Button::builder()
-            .label("Import")
-            .halign(gtk::Align::End)
-            .css_classes(["suggested-action", "pill"])
-            .build();
-        server_group.add(&frame);
-        server_group.add(&import);
-        let on_import = callbacks.import.clone();
-        import.connect_clicked(move |_| {
-            let (start, end) = buffer.bounds();
-            let text = buffer.text(&start, &end, false).to_string();
-            if text.trim().is_empty() {
-                return;
-            }
-            on_import(text);
-            buffer.set_text("");
-        });
-        self.content.append(&server_group);
+        *self.operation_widgets.borrow_mut() = OperationWidgets::default();
 
         let list = adw::PreferencesGroup::builder()
             .title("Subscriptions")
+            .description("Manage providers and standalone share links")
             .build();
-        for subscription in subscriptions {
-            let expander = adw::ExpanderRow::builder()
-                .title(&subscription.name)
-                .subtitle(subscription_description(subscription))
-                .build();
-
-            if subscription.id == LOCAL_ID {
-                for server in &subscription.servers {
-                    let row = adw::ActionRow::builder()
-                        .title(&server.name)
-                        .subtitle(format!(
-                            "{}:{} · {}",
-                            server.address,
-                            server.port,
-                            server.protocol.as_str()
-                        ))
-                        .build();
-                    let trash = gtk::Button::builder()
-                        .icon_name("user-trash-symbolic")
-                        .tooltip_text("Remove server")
-                        .valign(gtk::Align::Center)
-                        .css_classes(["flat"])
-                        .build();
-                    let id = server.id.clone();
-                    let remove_server = callbacks.remove_server.clone();
-                    trash.connect_clicked(move |_| remove_server(id.clone()));
-                    row.add_suffix(&trash);
-                    expander.add_row(&row);
-                }
-                list.add(&expander);
-                continue;
-            }
-
-            let privacy = adw::SwitchRow::builder()
-                .title("Send HWID")
-                .subtitle("Only sends this install's identifier to this subscription when enabled")
-                .active(subscription.send_hwid)
-                .build();
-            let id = subscription.id.clone();
-            let callback = callbacks.hwid.clone();
-            privacy.connect_active_notify(move |row| callback(id.clone(), row.is_active()));
-            expander.add_row(&privacy);
-
-            let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            actions.set_margin_top(8);
-            actions.set_margin_bottom(8);
-            actions.set_margin_start(12);
-            actions.set_margin_end(12);
-            actions.set_halign(gtk::Align::End);
-            let update = gtk::Button::with_label("Update");
-            let delete = gtk::Button::with_label("Delete");
-            delete.add_css_class("destructive-action");
-            let refresh_id = subscription.id.clone();
-            let refresh = callbacks.refresh.clone();
-            update.connect_clicked(move |_| refresh(refresh_id.clone()));
-            let remove_id = subscription.id.clone();
-            let remove = callbacks.remove.clone();
-            delete.connect_clicked(move |_| remove(remove_id.clone()));
-            actions.append(&update);
-            actions.append(&delete);
-            expander.add_row(&actions);
-            list.add(&expander);
+        if self.header_embedded.get() {
+            list.set_header_suffix(Some(&self.header.root));
         }
+
+        if subscriptions.is_empty() {
+            let empty = adw::ActionRow::builder()
+                .title("No subscriptions")
+                .subtitle("Use + to add a subscription or import a server")
+                .activatable(false)
+                .build();
+            list.add(&empty);
+        }
+
+        for subscription in subscriptions {
+            if subscription.id == LOCAL_ID {
+                self.add_local_servers_row(&list, subscription, callbacks.clone());
+            } else {
+                self.add_subscription_row(&list, subscription, callbacks.clone());
+            }
+        }
+
         self.content.append(&list);
+        self.apply_operation();
     }
+
+    /// Updates row-level progress without requiring a page rebuild.
+    pub fn set_operation(&self, operation: Option<UiOperation>) {
+        *self.operation.borrow_mut() = operation;
+        self.apply_operation();
+    }
+
+    fn add_subscription_row(
+        &self,
+        list: &adw::PreferencesGroup,
+        subscription: &Subscription,
+        callbacks: SubscriptionCallbacks,
+    ) {
+        let row = adw::ActionRow::builder()
+            .title(&subscription.name)
+            .subtitle(subscription_description(subscription))
+            .title_lines(1)
+            .subtitle_lines(2)
+            .activatable(true)
+            .build();
+        let spinner = gtk::Spinner::builder()
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        let chevron = gtk::Image::from_icon_name("go-next-symbolic");
+        chevron.set_accessible_role(gtk::AccessibleRole::Presentation);
+        row.add_suffix(&spinner);
+        row.add_suffix(&chevron);
+
+        let snapshot = subscription.clone();
+        row.connect_activated(move |row| {
+            show_subscription_details(row, snapshot.clone(), callbacks.clone());
+        });
+        self.operation_widgets.borrow_mut().subscriptions.insert(
+            subscription.id.clone(),
+            RowControls {
+                row: row.clone(),
+                spinner,
+            },
+        );
+        list.add(&row);
+    }
+
+    fn add_local_servers_row(
+        &self,
+        list: &adw::PreferencesGroup,
+        subscription: &Subscription,
+        callbacks: SubscriptionCallbacks,
+    ) {
+        let count = subscription.servers.len();
+        let row = adw::ActionRow::builder()
+            .title("Local servers")
+            .subtitle(format!(
+                "{count} imported {}",
+                if count == 1 { "server" } else { "servers" }
+            ))
+            .activatable(true)
+            .build();
+        let spinner = gtk::Spinner::builder()
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        let chevron = gtk::Image::from_icon_name("go-next-symbolic");
+        chevron.set_accessible_role(gtk::AccessibleRole::Presentation);
+        row.add_suffix(&spinner);
+        row.add_suffix(&chevron);
+
+        let snapshot = subscription.clone();
+        row.connect_activated(move |row| {
+            show_local_servers(row, snapshot.clone(), callbacks.clone());
+        });
+        self.operation_widgets.borrow_mut().local_servers = Some(RowControls {
+            row: row.clone(),
+            spinner,
+        });
+        list.add(&row);
+    }
+
+    fn apply_operation(&self) {
+        let operation = self.operation.borrow().clone();
+
+        self.header.add_subscription.set_sensitive(!matches!(
+            operation.as_ref().map(|operation| operation.kind),
+            Some(UiOperationKind::AddSubscription)
+        ));
+        self.header.import_server.set_sensitive(!matches!(
+            operation.as_ref().map(|operation| operation.kind),
+            Some(UiOperationKind::ImportServers)
+        ));
+
+        let updating_all = matches!(
+            operation.as_ref().map(|operation| operation.kind),
+            Some(UiOperationKind::UpdateAllSubscriptions)
+        );
+        self.header.update_all.set_sensitive(!updating_all);
+        self.header.update_spinner.set_spinning(updating_all);
+        self.header.update_spinner.set_visible(updating_all);
+
+        let widgets = self.operation_widgets.borrow();
+        for (id, controls) in &widgets.subscriptions {
+            let affected = operation
+                .as_ref()
+                .and_then(|operation| operation.subscription_id.as_deref())
+                .is_some_and(|target| target == id);
+            controls.row.set_sensitive(!affected);
+            controls.spinner.set_spinning(affected);
+            controls.spinner.set_visible(affected);
+        }
+        if let Some(controls) = widgets.local_servers.as_ref() {
+            let affected = matches!(
+                operation.as_ref().map(|operation| operation.kind),
+                Some(UiOperationKind::ImportServers | UiOperationKind::DeleteServer)
+            );
+            controls.row.set_sensitive(!affected);
+            controls.spinner.set_spinning(affected);
+            controls.spinner.set_visible(affected);
+        }
+    }
+
+    pub fn set_ultra_compact(&self, enabled: bool) {
+        self.content.set_spacing(if enabled { 16 } else { 22 });
+        self.header.update_label.set_visible(!enabled);
+        if enabled {
+            self.header.update_all.add_css_class("header-icon-button");
+        } else {
+            self.header
+                .update_all
+                .remove_css_class("header-icon-button");
+        }
+    }
+}
+
+fn make_header_controls(
+    root: &gtk::ScrolledWindow,
+    callbacks: Rc<RefCell<Option<SubscriptionCallbacks>>>,
+) -> HeaderControls {
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    actions.set_valign(gtk::Align::Center);
+
+    let add_menu = gtk::MenuButton::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Add subscription or server")
+        .focusable(true)
+        .build();
+    add_menu.add_css_class("flat");
+    add_menu.add_css_class("header-icon-button");
+    add_menu.update_property(&[gtk::accessible::Property::Label(
+        "Add subscription or server",
+    )]);
+
+    let menu_content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu_content.set_margin_top(6);
+    menu_content.set_margin_bottom(6);
+    menu_content.set_margin_start(6);
+    menu_content.set_margin_end(6);
+    let add_subscription = gtk::Button::builder()
+        .label("Add subscription")
+        .halign(gtk::Align::Fill)
+        .focusable(true)
+        .build();
+    add_subscription.add_css_class("flat");
+    let import_server = gtk::Button::builder()
+        .label("Import server")
+        .halign(gtk::Align::Fill)
+        .focusable(true)
+        .build();
+    import_server.add_css_class("flat");
+    menu_content.append(&add_subscription);
+    menu_content.append(&import_server);
+    let popover = gtk::Popover::builder().child(&menu_content).build();
+    add_menu.set_popover(Some(&popover));
+
+    let update_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let update_spinner = gtk::Spinner::builder().visible(false).build();
+    let update_icon = gtk::Image::from_icon_name("view-refresh-symbolic");
+    let update_label = gtk::Label::new(Some("Update all"));
+    update_content.append(&update_spinner);
+    update_content.append(&update_icon);
+    update_content.append(&update_label);
+    let update_all = gtk::Button::builder()
+        .child(&update_content)
+        .tooltip_text("Update all subscriptions")
+        .focusable(true)
+        .build();
+    update_all.add_css_class("flat");
+    update_all.update_property(&[gtk::accessible::Property::Label("Update all subscriptions")]);
+
+    let root_weak = root.downgrade();
+    let callbacks_for_add = callbacks.clone();
+    let popover_for_add = popover.clone();
+    add_subscription.connect_clicked(move |_| {
+        popover_for_add.popdown();
+        let Some(root) = root_weak.upgrade() else {
+            return;
+        };
+        let Some(callbacks) = callbacks_for_add.borrow().clone() else {
+            return;
+        };
+        show_add_subscription(&root, callbacks);
+    });
+
+    let root_weak = root.downgrade();
+    let callbacks_for_import = callbacks.clone();
+    let popover_for_import = popover.clone();
+    import_server.connect_clicked(move |_| {
+        popover_for_import.popdown();
+        let Some(root) = root_weak.upgrade() else {
+            return;
+        };
+        let Some(callbacks) = callbacks_for_import.borrow().clone() else {
+            return;
+        };
+        show_import_servers(&root, callbacks);
+    });
+
+    update_all.connect_clicked(move |_| {
+        if let Some(callbacks) = callbacks.borrow().as_ref() {
+            (callbacks.refresh_all)();
+        }
+    });
+
+    actions.append(&add_menu);
+    actions.append(&update_all);
+    HeaderControls {
+        root: actions,
+        add_subscription,
+        import_server,
+        update_all,
+        update_label,
+        update_spinner,
+    }
+}
+
+fn show_add_subscription(parent: &impl IsA<gtk::Widget>, callbacks: SubscriptionCallbacks) {
+    let window = adw::Window::builder()
+        .title("Add Subscription")
+        .modal(true)
+        .default_width(480)
+        .default_height(390)
+        .build();
+    set_transient_parent(&window, parent);
+
+    let header = adw::HeaderBar::new();
+    let cancel = gtk::Button::with_label("Cancel");
+    let add = gtk::Button::with_label("Add");
+    add.add_css_class("suggested-action");
+    add.set_sensitive(false);
+    header.pack_start(&cancel);
+    header.pack_end(&add);
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Subscription")
+        .description("Device identification remains off unless you enable it.")
+        .build();
+    let url_entry = adw::EntryRow::builder()
+        .title("Subscription URL")
+        .activates_default(true)
+        .build();
+    let name_entry = adw::EntryRow::builder().title("Name (optional)").build();
+    let send_hwid = adw::SwitchRow::builder()
+        .title("Send HWID")
+        .subtitle("Share this install's random identifier only with this provider")
+        .subtitle_lines(2)
+        .active(false)
+        .build();
+    group.add(&url_entry);
+    group.add(&name_entry);
+    group.add(&send_hwid);
+
+    let validation = validation_label();
+    let content = dialog_content(&group, &validation);
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.append(&header);
+    page.append(&content);
+    window.set_content(Some(&page));
+    window.set_default_widget(Some(&add));
+
+    let validation_for_change = validation.clone();
+    let add_for_change = add.clone();
+    url_entry.connect_changed(move |entry| {
+        let value = entry.text();
+        let valid = is_valid_subscription_url(value.trim());
+        add_for_change.set_sensitive(valid);
+        if value.trim().is_empty() || valid {
+            set_validation(&validation_for_change, None);
+        } else {
+            set_validation(
+                &validation_for_change,
+                Some("Enter a complete HTTP or HTTPS URL."),
+            );
+        }
+    });
+
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    let window_for_add = window.clone();
+    add.connect_clicked(move |_| {
+        let url = url_entry.text().trim().to_string();
+        if !is_valid_subscription_url(&url) {
+            return;
+        }
+        let name = name_entry.text().trim().to_string();
+        (callbacks.add)(
+            url,
+            (!name.is_empty()).then_some(name),
+            send_hwid.is_active(),
+        );
+        window_for_add.close();
+    });
+    window.present();
+}
+
+fn show_import_servers(parent: &impl IsA<gtk::Widget>, callbacks: SubscriptionCallbacks) {
+    let window = adw::Window::builder()
+        .title("Import Server")
+        .modal(true)
+        .default_width(520)
+        .default_height(430)
+        .build();
+    set_transient_parent(&window, parent);
+
+    let header = adw::HeaderBar::new();
+    let cancel = gtk::Button::with_label("Cancel");
+    let import = gtk::Button::with_label("Import");
+    import.add_css_class("suggested-action");
+    import.set_sensitive(false);
+    header.pack_start(&cancel);
+    header.pack_end(&import);
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Share links")
+        .description("Paste one vless, vmess, trojan, Shadowsocks, SOCKS, or HTTP link per line.")
+        .build();
+    let buffer = gtk::TextBuffer::new(None);
+    let editor = gtk::TextView::builder()
+        .buffer(&buffer)
+        .monospace(true)
+        .top_margin(10)
+        .bottom_margin(10)
+        .left_margin(12)
+        .right_margin(12)
+        .wrap_mode(gtk::WrapMode::Char)
+        .build();
+    editor.update_property(&[gtk::accessible::Property::Label("Server share links")]);
+    let editor_scroller = gtk::ScrolledWindow::builder()
+        .min_content_height(130)
+        .max_content_height(240)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&editor)
+        .build();
+    let frame = gtk::Frame::builder()
+        .child(&editor_scroller)
+        .css_classes(["card"])
+        .build();
+    group.add(&frame);
+
+    let validation = validation_label();
+    let content = dialog_content(&group, &validation);
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.append(&header);
+    page.append(&content);
+    window.set_content(Some(&page));
+    window.set_default_widget(Some(&import));
+
+    let import_for_change = import.clone();
+    let validation_for_change = validation.clone();
+    buffer.connect_changed(move |buffer| {
+        let (start, end) = buffer.bounds();
+        let text = buffer.text(&start, &end, false);
+        let issue = validate_share_links(&text);
+        import_for_change.set_sensitive(!text.trim().is_empty() && issue.is_none());
+        set_validation(&validation_for_change, issue);
+    });
+
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    let window_for_import = window.clone();
+    import.connect_clicked(move |_| {
+        let (start, end) = buffer.bounds();
+        let text = buffer.text(&start, &end, false).to_string();
+        if text.trim().is_empty() || validate_share_links(&text).is_some() {
+            return;
+        }
+        (callbacks.import)(text);
+        window_for_import.close();
+    });
+    window.present();
+}
+
+fn show_subscription_details(
+    parent: &impl IsA<gtk::Widget>,
+    subscription: Subscription,
+    callbacks: SubscriptionCallbacks,
+) {
+    let window = adw::Window::builder()
+        .title(&subscription.name)
+        .modal(true)
+        .default_width(560)
+        .default_height(560)
+        .build();
+    set_transient_parent(&window, parent);
+
+    let header = adw::HeaderBar::new();
+    let close = gtk::Button::with_label("Close");
+    header.pack_start(&close);
+    let update = gtk::Button::with_label("Update");
+    update.add_css_class("suggested-action");
+    header.pack_end(&update);
+
+    let details = adw::PreferencesGroup::builder().title("Details").build();
+    let url_row = adw::ActionRow::builder()
+        .title("URL")
+        .subtitle(&subscription.url)
+        .subtitle_selectable(true)
+        .subtitle_lines(3)
+        .build();
+    let copy = icon_button("edit-copy-symbolic", "Copy subscription URL");
+    let url_for_copy = subscription.url.clone();
+    copy.connect_clicked(move |button| {
+        button.display().clipboard().set_text(&url_for_copy);
+    });
+    url_row.add_suffix(&copy);
+    details.add(&url_row);
+
+    let quota = adw::ActionRow::builder()
+        .title("Quota")
+        .subtitle(format_quota(subscription.userinfo.as_ref()))
+        .build();
+    details.add(&quota);
+    let expiry = adw::ActionRow::builder()
+        .title("Expiry")
+        .subtitle(
+            subscription
+                .userinfo
+                .as_ref()
+                .and_then(|info| info.expire)
+                .map(format_timestamp)
+                .unwrap_or_else(|| "Not provided".to_string()),
+        )
+        .build();
+    details.add(&expiry);
+    let updated = adw::ActionRow::builder()
+        .title("Last updated")
+        .subtitle(
+            subscription
+                .updated_at
+                .map(format_timestamp)
+                .unwrap_or_else(|| "Never".to_string()),
+        )
+        .build();
+    details.add(&updated);
+    let server_count = adw::ActionRow::builder()
+        .title("Servers")
+        .subtitle(subscription.servers.len().to_string())
+        .build();
+    details.add(&server_count);
+
+    let privacy = adw::PreferencesGroup::builder()
+        .title("Privacy")
+        .description("HWID is never sent unless this switch is enabled.")
+        .build();
+    let send_hwid = adw::SwitchRow::builder()
+        .title("Send HWID")
+        .subtitle("Share this install's random identifier with this provider")
+        .subtitle_lines(2)
+        .active(subscription.send_hwid)
+        .build();
+    let hwid_id = subscription.id.clone();
+    let hwid_callback = callbacks.hwid.clone();
+    send_hwid.connect_active_notify(move |row| {
+        hwid_callback(hwid_id.clone(), row.is_active());
+    });
+    privacy.add(&send_hwid);
+
+    let danger = adw::PreferencesGroup::builder().title("Remove").build();
+    let delete = gtk::Button::with_label("Delete Subscription");
+    delete.set_halign(gtk::Align::Start);
+    delete.add_css_class("destructive-action");
+    danger.add(&delete);
+
+    let groups = gtk::Box::new(gtk::Orientation::Vertical, 24);
+    groups.append(&details);
+    groups.append(&privacy);
+    groups.append(&danger);
+    let content = scrollable_dialog_content(&groups);
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.append(&header);
+    page.append(&content);
+    window.set_content(Some(&page));
+
+    let window_for_close = window.clone();
+    close.connect_clicked(move |_| window_for_close.close());
+    let refresh_id = subscription.id.clone();
+    let refresh = callbacks.refresh.clone();
+    let window_for_update = window.clone();
+    update.connect_clicked(move |_| {
+        refresh(refresh_id.clone());
+        window_for_update.close();
+    });
+
+    let remove_id = subscription.id.clone();
+    let remove_name = subscription.name.clone();
+    let remove = callbacks.remove.clone();
+    let details_window = window.clone();
+    delete.connect_clicked(move |_| {
+        let dialog = adw::MessageDialog::new(
+            Some(&details_window),
+            Some("Delete subscription?"),
+            Some(&format!(
+                "“{remove_name}” and all of its servers will be removed."
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let remove = remove.clone();
+        let remove_id = remove_id.clone();
+        let details_window = details_window.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "delete" {
+                remove(remove_id.clone());
+                details_window.close();
+            }
+        });
+        dialog.present();
+    });
+    window.present();
+}
+
+fn show_local_servers(
+    parent: &impl IsA<gtk::Widget>,
+    subscription: Subscription,
+    callbacks: SubscriptionCallbacks,
+) {
+    let window = adw::Window::builder()
+        .title("Local Servers")
+        .modal(true)
+        .default_width(540)
+        .default_height(500)
+        .build();
+    set_transient_parent(&window, parent);
+
+    let header = adw::HeaderBar::new();
+    let close = gtk::Button::with_label("Close");
+    header.pack_start(&close);
+
+    let servers = adw::PreferencesGroup::builder()
+        .title("Imported servers")
+        .description("These entries are stored locally and do not update automatically.")
+        .build();
+    if subscription.servers.is_empty() {
+        let empty = adw::ActionRow::builder()
+            .title("No local servers")
+            .activatable(false)
+            .build();
+        servers.add(&empty);
+    }
+    for server in subscription.servers {
+        let row = adw::ActionRow::builder()
+            .title(&server.name)
+            .subtitle(format!(
+                "{}:{} · {}",
+                server.address,
+                server.port,
+                server.protocol.as_str()
+            ))
+            .title_lines(1)
+            .subtitle_lines(2)
+            .build();
+        let remove = icon_button("user-trash-symbolic", "Remove server");
+        remove.add_css_class("destructive-action");
+        let server_id = server.id;
+        let server_name = server.name.clone();
+        let callback = callbacks.remove_server.clone();
+        let window_for_remove = window.clone();
+        remove.connect_clicked(move |_| {
+            // Deleting is irreversible (there is no undo), so mirror the
+            // subscription-delete confirmation.
+            let dialog = adw::MessageDialog::new(
+                Some(&window_for_remove),
+                Some("Remove server?"),
+                Some(&format!("“{server_name}” will be removed permanently.")),
+            );
+            dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
+            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            dialog.connect_response(None, {
+                let callback = callback.clone();
+                let server_id = server_id.clone();
+                let window_for_remove = window_for_remove.clone();
+                move |dialog, response| {
+                    dialog.close();
+                    if response == "remove" {
+                        callback(server_id.clone());
+                        window_for_remove.close();
+                    }
+                }
+            });
+            dialog.present();
+        });
+        row.add_suffix(&remove);
+        servers.add(&row);
+    }
+
+    let content = scrollable_dialog_content(&servers);
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.append(&header);
+    page.append(&content);
+    window.set_content(Some(&page));
+    let window_for_close = window.clone();
+    close.connect_clicked(move |_| window_for_close.close());
+    window.present();
+}
+
+fn dialog_content(group: &impl IsA<gtk::Widget>, validation: &gtk::Label) -> gtk::ScrolledWindow {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(24);
+    content.set_margin_bottom(24);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+    content.append(group);
+    content.append(validation);
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&content)
+        .build()
+}
+
+fn scrollable_dialog_content(content: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
+    let clamp = adw::Clamp::builder()
+        .maximum_size(640)
+        .tightening_threshold(500)
+        .child(content)
+        .build();
+    clamp.set_margin_top(24);
+    clamp.set_margin_bottom(24);
+    clamp.set_margin_start(24);
+    clamp.set_margin_end(24);
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&clamp)
+        .build()
+}
+
+fn validation_label() -> gtk::Label {
+    let label = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .visible(false)
+        .build();
+    label.add_css_class("error");
+    label
+}
+
+fn set_validation(label: &gtk::Label, message: Option<&str>) {
+    label.set_label(message.unwrap_or_default());
+    label.set_visible(message.is_some());
+}
+
+fn set_transient_parent(window: &adw::Window, parent: &impl IsA<gtk::Widget>) {
+    if let Some(parent_window) = parent.root().and_downcast::<gtk::Window>() {
+        window.set_transient_for(Some(&parent_window));
+    }
+}
+
+fn icon_button(icon_name: &str, label: &str) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .icon_name(icon_name)
+        .tooltip_text(label)
+        .focusable(true)
+        .build();
+    button.add_css_class("flat");
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+    button
+}
+
+fn is_valid_subscription_url(value: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(value) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some()
+}
+
+fn validate_share_links(text: &str) -> Option<&'static str> {
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if ![
+            "vless://",
+            "vmess://",
+            "trojan://",
+            "ss://",
+            "socks://",
+            "http://",
+            "https://",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+        {
+            return Some("One or more lines is not a supported server share link.");
+        }
+    }
+    None
+}
+
+fn format_quota(info: Option<&UserInfo>) -> String {
+    let Some(info) = info else {
+        return "Not provided".to_string();
+    };
+    let used = info.upload.saturating_add(info.download);
+    if info.total > 0 {
+        format!(
+            "{} used of {}",
+            format_bytes(used),
+            format_bytes(info.total)
+        )
+    } else if used > 0 {
+        format!("{} used", format_bytes(used))
+    } else {
+        "Not provided".to_string()
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_timestamp(timestamp: i64) -> String {
+    gtk::glib::DateTime::from_unix_local(timestamp)
+        .and_then(|value| value.format("%c"))
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| timestamp.to_string())
 }

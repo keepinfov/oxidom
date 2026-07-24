@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 pub fn config_dir() -> Result<PathBuf> {
     Ok(dirs::config_dir()

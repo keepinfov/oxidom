@@ -5,6 +5,7 @@
 mod cli;
 mod config;
 mod engine;
+mod fsutil;
 mod gui;
 mod link;
 mod model;
@@ -13,6 +14,8 @@ mod paths;
 mod probe;
 mod state;
 mod subscription;
+mod subscription_format;
+mod sysproxy;
 mod xray;
 
 use anyhow::Result;

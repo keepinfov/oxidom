@@ -9,13 +9,38 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Measure latency for `server` using `method`. `socks_port` is used by the
 /// HTTP methods, which route through the active Xray SOCKS inbound.
-pub fn measure(server: &Server, method: LatencyMethod, socks_port: u16, test_url: &str) -> Option<u32> {
+pub fn measure(
+    server: &Server,
+    method: LatencyMethod,
+    socks_port: u16,
+    test_url: &str,
+) -> Option<u32> {
     match method {
         LatencyMethod::Icmp => icmp_ping(&server.address),
         LatencyMethod::Tcp => tcp_ping(&server.address, server.port),
-        LatencyMethod::HttpHead => http_ping(socks_port, test_url, "HEAD"),
-        LatencyMethod::HttpGet => http_ping(socks_port, test_url, "GET"),
+        LatencyMethod::HttpHead => {
+            if socks_up(socks_port) {
+                http_ping(socks_port, test_url, "HEAD")
+            } else {
+                tcp_ping(&server.address, server.port)
+            }
+        }
+        LatencyMethod::HttpGet => {
+            if socks_up(socks_port) {
+                http_ping(socks_port, test_url, "GET")
+            } else {
+                tcp_ping(&server.address, server.port)
+            }
+        }
     }
+}
+
+fn socks_up(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &(std::net::Ipv4Addr::LOCALHOST, port).into(),
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok()
 }
 
 /// Raw TCP connect latency to host:port.
@@ -39,7 +64,10 @@ pub fn icmp_ping(host: &str) -> Option<u32> {
     // Parse "time=12.3 ms".
     let idx = text.find("time=")?;
     let rest = &text[idx + 5..];
-    let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let num: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
     num.parse::<f64>().ok().map(|ms| ms.round() as u32)
 }
 

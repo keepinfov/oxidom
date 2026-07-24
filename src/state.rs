@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::paths;
+use crate::{fsutil, paths};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -12,6 +12,12 @@ pub struct State {
     pub active_server_id: Option<String>,
     /// Remembered per-app route choices (desktop-id/binary -> server id).
     pub app_routes: HashMap<String, String>,
+    /// PID of the xray child of the last run, so a crash never leaves an
+    /// orphaned tunnel: the next start kills it if it is still an xray process.
+    pub xray_pid: Option<u32>,
+    /// True while the desktop system proxy points at our local ports. Survives
+    /// a crash so the next start can restore the desktop to direct networking.
+    pub system_proxy_applied: bool,
 }
 
 impl State {
@@ -20,18 +26,25 @@ impl State {
             return State::default();
         };
         match std::fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).unwrap_or_default(),
+            Ok(s) => match toml::from_str(&s) {
+                Ok(state) => state,
+                Err(error) => {
+                    let moved = fsutil::quarantine(&path);
+                    log::warn!(
+                        "state.toml is not valid ({error}); moved aside to {:?}",
+                        moved
+                    );
+                    State::default()
+                }
+            },
             Err(_) => State::default(),
         }
     }
 
     pub fn save(&self) -> Result<()> {
         let path = paths::state_file()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
         let s = toml::to_string_pretty(self).context("serializing state")?;
-        std::fs::write(&path, s).context("writing state")?;
+        fsutil::write_private_atomic(&path, s.as_bytes()).context("writing state")?;
         Ok(())
     }
 }
@@ -41,25 +54,39 @@ pub mod store {
     use anyhow::{Context, Result};
 
     use crate::model::Subscription;
-    use crate::paths;
+    use crate::{fsutil, paths};
 
-    pub fn load() -> Vec<Subscription> {
+    /// Load the cached subscriptions. On a corrupt file the data is moved
+    /// aside instead of being silently replaced; the returned warning is
+    /// surfaced to the user by the GUI.
+    pub fn load() -> (Vec<Subscription>, Option<String>) {
         let Ok(path) = paths::subscriptions_file() else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-            Err(_) => Vec::new(),
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(subs) => (subs, None),
+                Err(error) => {
+                    let moved = fsutil::quarantine(&path);
+                    log::warn!("subscriptions.json is not valid ({error}); moved to {moved:?}");
+                    let warning = match moved {
+                        Some(moved) => format!(
+                            "Saved subscriptions could not be read and were moved to {}",
+                            moved.display()
+                        ),
+                        None => "Saved subscriptions could not be read".to_string(),
+                    };
+                    (Vec::new(), Some(warning))
+                }
+            },
+            Err(_) => (Vec::new(), None),
         }
     }
 
     pub fn save(subs: &[Subscription]) -> Result<()> {
         let path = paths::subscriptions_file()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
         let s = serde_json::to_string_pretty(subs).context("serializing subscriptions")?;
-        std::fs::write(&path, s).context("writing subscriptions")?;
+        fsutil::write_private_atomic(&path, s.as_bytes()).context("writing subscriptions")?;
         Ok(())
     }
 }
@@ -75,10 +102,7 @@ pub fn hwid() -> Result<String> {
         }
     }
     let id = generate_hwid();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, &id).context("writing hwid")?;
+    fsutil::write_private_atomic(&path, id.as_bytes()).context("writing hwid")?;
     Ok(id)
 }
 

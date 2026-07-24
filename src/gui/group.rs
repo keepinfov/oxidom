@@ -2,10 +2,10 @@ use crate::model::Subscription;
 
 pub fn subscription_description(subscription: &Subscription) -> String {
     let mut parts = Vec::new();
-    if let Some(description) = subscription.description.as_deref() {
-        if !description.trim().is_empty() {
-            parts.push(description.trim().to_string());
-        }
+    if let Some(description) = subscription.description.as_deref()
+        && !description.trim().is_empty()
+    {
+        parts.push(description.trim().to_string());
     }
     if let Some(info) = &subscription.userinfo {
         let used = info.upload.saturating_add(info.download);

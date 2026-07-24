@@ -1,5 +1,7 @@
 use adw::prelude::*;
 
+use crate::APP_ID;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     General,
@@ -21,14 +23,16 @@ impl Page {
 
 pub struct Sidebar {
     pub root: gtk::Box,
+    pub status_button: gtk::Button,
     pub status_icon: gtk::Image,
     pub status_label: gtk::Label,
 }
 
 impl Sidebar {
     pub fn new(on_page: impl Fn(Page) + Clone + 'static) -> Self {
+        let title_icon_name = format!("{APP_ID}-symbolic");
         let title_icon = gtk::Image::builder()
-            .icon_name("network-vpn-symbolic")
+            .icon_name(&title_icon_name)
             .pixel_size(28)
             .build();
         let title = gtk::Label::builder()
@@ -53,7 +57,7 @@ impl Sidebar {
             (Page::General, "network-server-symbolic", "General"),
             (
                 Page::Subscriptions,
-                "view-refresh-symbolic",
+                "x-office-address-book-symbolic",
                 "Subscriptions",
             ),
             (Page::Settings, "preferences-system-symbolic", "Settings"),
@@ -80,20 +84,32 @@ impl Sidebar {
             on_page(page);
         });
 
-        let status_icon = gtk::Image::from_icon_name("network-offline-symbolic");
+        let status_icon = gtk::Image::builder()
+            .icon_name("network-vpn-symbolic")
+            .pixel_size(18)
+            .width_request(18)
+            .height_request(18)
+            .css_classes(["sidebar-status-icon"])
+            .build();
         let status_label = gtk::Label::builder()
-            .label("Disconnected")
+            .label("Ready")
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
-        let status = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        status.add_css_class("sidebar-status");
-        status.set_margin_top(12);
-        status.set_margin_bottom(14);
-        status.set_margin_start(14);
-        status.set_margin_end(14);
-        status.append(&status_icon);
-        status.append(&status_label);
+        let status_content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        status_content.append(&status_icon);
+        status_content.append(&status_label);
+        let status_button = gtk::Button::builder()
+            .child(&status_content)
+            .tooltip_text("Connection status")
+            .css_classes(["flat", "sidebar-status"])
+            .focus_on_click(true)
+            .build();
+        status_button.update_property(&[gtk::accessible::Property::Label("Connection status")]);
+        status_button.set_margin_top(12);
+        status_button.set_margin_bottom(14);
+        status_button.set_margin_start(14);
+        status_button.set_margin_end(14);
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.set_width_request(245);
@@ -101,10 +117,11 @@ impl Sidebar {
         root.append(&brand);
         root.append(&list);
         list.set_vexpand(true);
-        root.append(&status);
+        root.append(&status_button);
 
         Self {
             root,
+            status_button,
             status_icon,
             status_label,
         }

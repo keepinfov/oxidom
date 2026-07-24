@@ -12,7 +12,7 @@
 //! error instead of silently running the process un-proxied (which would leak
 //! traffic).
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::config::Config;
 

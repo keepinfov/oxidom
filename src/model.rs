@@ -28,7 +28,7 @@ impl Protocol {
 }
 
 /// Transport + security settings shared by vless/vmess/trojan.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSettings {
     /// tcp | ws | grpc | xhttp | splithttp | h2
     pub network: String,
@@ -53,7 +53,7 @@ pub struct StreamSettings {
 }
 
 /// Everything needed to emit an Xray outbound for one server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum OutboundSpec {
     Vless {
@@ -86,6 +86,14 @@ pub enum OutboundSpec {
         username: Option<String>,
         password: Option<String>,
     },
+    /// A provider-supplied Xray profile that needs multiple proxy outbounds and
+    /// an Xray balancer. Local inbounds and safe routing remain owned by oxidom.
+    XrayProfile {
+        proxy_outbounds: Vec<serde_json::Value>,
+        balancers: Vec<serde_json::Value>,
+        burst_observatory: Option<serde_json::Value>,
+        balancer_tag: String,
+    },
 }
 
 fn default_none_encryption() -> String {
@@ -107,8 +115,10 @@ pub struct Server {
     /// ISO 3166-1 alpha-2 code parsed from a leading flag emoji / name, if any.
     pub country: Option<String>,
     pub spec: OutboundSpec,
-    /// Original share link (kept for debugging / re-parsing).
-    pub link: String,
+    /// Original or normalized share link. Composite profiles cannot be expressed
+    /// as one share link and therefore store `None`.
+    #[serde(default)]
+    pub link: Option<String>,
     /// Last latency probe result (runtime only, not persisted).
     #[serde(skip)]
     pub latency_ms: Option<u32>,
@@ -119,6 +129,15 @@ impl Server {
         let mut h = DefaultHasher::new();
         link.hash(&mut h);
         format!("{:016x}", h.finish())
+    }
+
+    /// Whether two subscription entries describe the same Xray connection.
+    /// Display names and share-link formatting are deliberately ignored.
+    pub fn same_connection_as(&self, other: &Self) -> bool {
+        self.protocol == other.protocol
+            && self.address == other.address
+            && self.port == other.port
+            && self.spec == other.spec
     }
 }
 
@@ -181,6 +200,21 @@ pub fn country_from_name(name: &str) -> Option<String> {
     Some(format!("{ai}{bi}"))
 }
 
+/// Drop a leading flag emoji (and the whitespace after it) from a display name;
+/// the flag is now shown as a separate icon. Returns the name unchanged when it
+/// has no leading flag.
+pub fn name_without_flag(name: &str) -> &str {
+    let trimmed = name.trim_start();
+    let mut chars = trimmed.chars();
+    if let (Some(a), Some(b)) = (chars.next(), chars.next())
+        && regional_indicator_to_letter(a).is_some()
+        && regional_indicator_to_letter(b).is_some()
+    {
+        return chars.as_str().trim_start();
+    }
+    name
+}
+
 fn regional_indicator_to_letter(c: char) -> Option<char> {
     let cp = c as u32;
     if (0x1F1E6..=0x1F1FF).contains(&cp) {
@@ -204,4 +238,21 @@ pub fn transport_label(protocol: Protocol, stream: Option<&StreamSettings>) -> S
         }
     }
     parts.join(" + ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Server;
+
+    #[test]
+    fn old_cached_string_link_deserializes_as_some() {
+        let json = r#"{
+          "id":"server","name":"Example","protocol":"vless","address":"example.com","port":443,
+          "transport_label":"vless","country":null,
+          "spec":{"kind":"vless","uuid":"id","encryption":"none","stream":{"network":"tcp","security":"none","sni":null,"alpn":null,"fingerprint":null,"allow_insecure":false,"public_key":null,"short_id":null,"spider_x":null,"path":null,"host":null,"service_name":null,"header_type":null,"flow":null}},
+          "link":"vless://id@example.com:443"
+        }"#;
+        let server: Server = serde_json::from_str(json).unwrap();
+        assert_eq!(server.link.as_deref(), Some("vless://id@example.com:443"));
+    }
 }

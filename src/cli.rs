@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "oxidom", version, about = "oxided freedom — a GTK4 Xray client")]
+#[command(
+    name = "oxidom",
+    version,
+    about = "oxided freedom — a GTK4 Xray client"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

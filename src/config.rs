@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::paths;
+use crate::{fsutil, paths};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -46,18 +46,22 @@ impl Config {
             return Config::default();
         };
         match std::fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).unwrap_or_default(),
+            Ok(s) => match toml::from_str(&s) {
+                Ok(config) => config,
+                Err(error) => {
+                    let moved = fsutil::quarantine(&path);
+                    log::warn!("config.toml is not valid ({error}); moved aside to {moved:?}");
+                    Config::default()
+                }
+            },
             Err(_) => Config::default(),
         }
     }
 
     pub fn save(&self) -> Result<()> {
         let path = paths::config_file()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
         let s = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(&path, s).context("writing config")?;
+        fsutil::write_private_atomic(&path, s.as_bytes()).context("writing config")?;
         Ok(())
     }
 }

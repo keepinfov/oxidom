@@ -1,14 +1,14 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::model::Server;
-use crate::paths;
 use crate::xray::config;
+use crate::{fsutil, paths};
 
 const LOG_CAP: usize = 500;
 
@@ -56,9 +56,20 @@ impl XrayCore {
     }
 
     fn config_path() -> Result<PathBuf> {
-        let dir = paths::data_dir()?;
-        std::fs::create_dir_all(&dir).ok();
-        Ok(dir.join("current-config.json"))
+        Ok(paths::data_dir()?.join("current-config.json"))
+    }
+
+    /// Refuse to start when a local inbound port is already taken; otherwise
+    /// Xray exits instantly and the only symptom would be a failed probe.
+    fn ensure_ports_free(&self) -> Result<()> {
+        for (port, label) in [(self.socks_port, "SOCKS"), (self.http_port, "HTTP")] {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+                bail!(
+                    "local {label} port {port} is already in use — pick a different port in Settings"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Start (or restart) the core for `server`.
@@ -66,11 +77,22 @@ impl XrayCore {
         self.disconnect();
         self.set_status(Status::Connecting);
         self.logs.lock().unwrap().clear();
+        match self.try_connect(server) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.set_status(Status::Error(error.to_string()));
+                Err(error)
+            }
+        }
+    }
 
+    fn try_connect(&mut self, server: &Server) -> Result<()> {
+        self.ensure_ports_free()?;
         let cfg = config::generate(server, self.socks_port, self.http_port);
         let path = Self::config_path()?;
-        let mut f = std::fs::File::create(&path).context("writing xray config")?;
-        f.write_all(serde_json::to_string_pretty(&cfg)?.as_bytes())?;
+        // The generated config embeds the server credentials — keep it private.
+        fsutil::write_private_atomic(&path, serde_json::to_string_pretty(&cfg)?.as_bytes())
+            .context("writing xray config")?;
 
         let mut child = Command::new(xray_bin())
             .arg("run")
@@ -97,6 +119,12 @@ impl XrayCore {
         Ok(())
     }
 
+    /// PID of the running xray child, persisted so a crashed instance's tunnel
+    /// can be reaped on the next start.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
     pub fn disconnect(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -116,6 +144,10 @@ impl XrayCore {
 
     pub fn recent_logs(&self) -> Vec<String> {
         self.logs.lock().unwrap().clone()
+    }
+
+    pub fn clear_logs(&self) {
+        self.logs.lock().unwrap().clear();
     }
 }
 
