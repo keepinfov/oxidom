@@ -1,5 +1,9 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use adw::prelude::*;
 use anyhow::Result;
+use gtk::gio;
 
 use crate::APP_ID;
 
@@ -9,17 +13,34 @@ mod group;
 mod operation;
 mod server_card;
 mod sidebar;
+mod tray;
 mod views;
 mod window;
 
-pub fn run(_background: bool) -> Result<()> {
+pub fn run(background: bool) -> Result<()> {
     gtk::glib::set_prgname(Some(APP_ID));
     gtk::glib::set_application_name("oxidom");
     #[cfg(debug_assertions)]
     install_development_desktop_integration();
 
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(window::build);
+    // The GUI hosts the tray and the system-proxy toggle, so the process
+    // stays alive with the window hidden; the hold guard is released only by
+    // an explicit Quit (app.quit()).
+    let hold: Rc<RefCell<Option<gio::ApplicationHoldGuard>>> = Rc::new(RefCell::new(None));
+    let existing: Rc<RefCell<Option<adw::ApplicationWindow>>> = Rc::new(RefCell::new(None));
+    app.connect_activate(move |app| {
+        if hold.borrow().is_none() {
+            *hold.borrow_mut() = Some(app.hold());
+        }
+        // Re-activation (dock click, second `oxidom` invocation) presents the
+        // existing window instead of building a second one.
+        if let Some(window) = existing.borrow().as_ref() {
+            window.present();
+            return;
+        }
+        *existing.borrow_mut() = window::build(app, background);
+    });
 
     // Clap already consumed the process arguments; keep only argv[0]. GLib
     // requires it to activate the application reliably.

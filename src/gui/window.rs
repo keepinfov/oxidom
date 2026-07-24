@@ -18,6 +18,7 @@ use crate::{paths, sysproxy};
 
 use super::client::DaemonClient;
 use super::operation::{UiOperation, UiOperationKind};
+use super::tray::{OxidomTray, TrayCommand};
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
 use super::views::logs::LogsView;
@@ -162,8 +163,11 @@ struct Controller {
     settings: SettingsView,
     logs: LogsView,
     toasts: adw::ToastOverlay,
-    force_close: Cell<bool>,
     close_after_apply: Cell<bool>,
+    tray: RefCell<Option<ksni::blocking::Handle<OxidomTray>>>,
+    tray_commands: mpsc::Receiver<TrayCommand>,
+    /// Last (connected, text) pushed to the tray, to skip no-op updates.
+    tray_pushed: RefCell<(bool, String)>,
     /// True while this GUI holds the GNOME system proxy applied.
     proxy_applied: Cell<bool>,
     /// Last (active, connecting) pair pushed to the cards, to avoid an
@@ -173,7 +177,7 @@ struct Controller {
     poll_snapshot: Arc<Mutex<Option<PolledSnapshot>>>,
 }
 
-pub fn build(app: &adw::Application) {
+pub fn build(app: &adw::Application, background: bool) -> Option<adw::ApplicationWindow> {
     install_css();
     #[cfg(debug_assertions)]
     if let Some(display) = gtk::gdk::Display::default() {
@@ -192,7 +196,7 @@ pub fn build(app: &adw::Application) {
             );
             dialog.add_response("close", "Close");
             dialog.present();
-            return;
+            return None;
         }
     };
     let subscriptions_snapshot = client.subscriptions().unwrap_or_default();
@@ -332,6 +336,23 @@ pub fn build(app: &adw::Application) {
         .max_sidebar_width(280.0)
         .build();
 
+    let (tray_sender, tray_commands) = mpsc::channel();
+    let tray_handle = {
+        use ksni::blocking::TrayMethods;
+        let tray = OxidomTray {
+            connected: false,
+            status_text: "Disconnected".to_string(),
+            commands: tray_sender,
+        };
+        match tray.spawn() {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                log::warn!("no StatusNotifier tray available: {error}");
+                None
+            }
+        }
+    };
+
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&split));
     let window = adw::ApplicationWindow::builder()
@@ -373,8 +394,10 @@ pub fn build(app: &adw::Application) {
         settings,
         logs,
         toasts,
-        force_close: Cell::new(false),
         close_after_apply: Cell::new(false),
+        tray: RefCell::new(tray_handle),
+        tray_commands,
+        tray_pushed: RefCell::new((false, String::new())),
         proxy_applied: Cell::new(gui_proxy_marker_exists()),
         applied_connection: RefCell::new((None, None)),
         poll_in_flight: Arc::new(AtomicBool::new(false)),
@@ -417,12 +440,15 @@ pub fn build(app: &adw::Application) {
         }
     });
 
-    window.present();
+    if !background {
+        window.present();
+    }
 
     // Repair a system proxy left over from a previous GUI run and reflect
     // the daemon's current connection on the cards.
     controller.reconcile_system_proxy();
     controller.sync_connection_cards();
+    Some(window)
 }
 
 fn set_window_icon(window: &adw::ApplicationWindow) {
@@ -559,10 +585,12 @@ impl Controller {
                 let Some(controller) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                if controller.force_close.get() || !controller.settings.has_unsaved_changes() {
-                    // The daemon owns the tunnel; closing the GUI leaves the
-                    // connection (and the system proxy) as they are.
-                    return glib::Propagation::Proceed;
+                if !controller.settings.has_unsaved_changes() {
+                    // Closing hides the window; the process stays for the
+                    // tray and the daemon keeps the tunnel. Quit lives in
+                    // the tray menu.
+                    controller.window.set_visible(false);
+                    return glib::Propagation::Stop;
                 }
                 controller.confirm_close_with_unsaved_settings();
                 glib::Propagation::Stop
@@ -605,8 +633,7 @@ impl Controller {
                     }
                     "discard" => {
                         controller.settings.reset_draft();
-                        controller.force_close.set(true);
-                        controller.window.close();
+                        controller.window.set_visible(false);
                     }
                     _ => {}
                 }
@@ -1176,8 +1203,7 @@ impl Controller {
                         }
                         controller.reconcile_system_proxy();
                         if controller.close_after_apply.replace(false) {
-                            controller.force_close.set(true);
-                            controller.window.close();
+                            controller.window.set_visible(false);
                         }
                     }
                     Err(error) => {
@@ -1269,9 +1295,7 @@ impl Controller {
     fn start_timer(self: &Rc<Self>) {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_millis(500), move || {
-            if !controller.window.is_visible() {
-                return glib::ControlFlow::Break;
-            }
+            controller.drain_tray_commands();
             if let Some(snapshot) = controller.poll_snapshot.lock().unwrap().take() {
                 controller.apply_snapshot(snapshot);
             }
@@ -1430,6 +1454,48 @@ impl Controller {
         }
     }
 
+    fn drain_tray_commands(self: &Rc<Self>) {
+        while let Ok(command) = self.tray_commands.try_recv() {
+            match command {
+                TrayCommand::ShowWindow => self.window.present(),
+                TrayCommand::Disconnect => self.disconnect_if_active(),
+                TrayCommand::Quit => {
+                    if let Some(app) = self.window.application() {
+                        app.quit();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mirror the connection into the tray tooltip/menu, skipping no-ops.
+    fn update_tray(&self, status: &Status) {
+        let Some(handle) = self.tray.borrow().clone() else {
+            return;
+        };
+        let connected = matches!(status, Status::Connected | Status::Connecting);
+        let text = match status {
+            Status::Disconnected => "Disconnected".to_string(),
+            Status::Connecting => "Connecting…".to_string(),
+            Status::Connected => {
+                let name = self.active_server_name(&self.state.borrow());
+                match name {
+                    Some(name) => format!("Connected · {name}"),
+                    None => "Connected".to_string(),
+                }
+            }
+            Status::Error(error) => format!("Error: {error}"),
+        };
+        if *self.tray_pushed.borrow() == (connected, text.clone()) {
+            return;
+        }
+        *self.tray_pushed.borrow_mut() = (connected, text.clone());
+        handle.update(move |tray| {
+            tray.connected = connected;
+            tray.status_text = text.clone();
+        });
+    }
+
     fn refresh_status(&self) {
         let state = self.state.borrow();
         let status = self.current_status(&state);
@@ -1442,6 +1508,7 @@ impl Controller {
             .or(state.last_active_latency);
         drop(state);
 
+        self.update_tray(&status);
         self.update_header_connection_status(&status, active_latency);
         self.refresh_activity_status();
     }
