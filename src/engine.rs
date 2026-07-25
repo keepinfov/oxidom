@@ -103,19 +103,22 @@ impl Engine {
     }
 
     pub fn refresh(&mut self, sub_id: &str) -> Result<()> {
-        let hwid_val = state::hwid().ok();
         let ua = self.config.subscription_user_agent.clone();
         let sub = self
             .subscriptions
             .iter_mut()
             .find(|s| s.id == sub_id)
             .ok_or_else(|| anyhow!("subscription not found"))?;
+        // Generate the device id only for a subscription that opted in: the
+        // file is itself a per-install identifier, so an opt-out user must not
+        // end up with one sitting on disk.
         let hwid = if sub.send_hwid {
-            hwid_val.as_deref()
+            state::hwid().ok()
         } else {
             None
         };
-        subscription::refresh(sub, &ua, hwid)?;
+        subscription::refresh(sub, &ua, hwid.as_deref())?;
+        self.disconnect_if_active_gone();
         store::save(&self.subscriptions)?;
         Ok(())
     }
@@ -124,7 +127,14 @@ impl Engine {
     /// which has an empty URL). Collects per-subscription errors and still saves
     /// whatever succeeded; returns an error summarizing any failures.
     pub fn refresh_all(&mut self) -> Result<()> {
-        let hwid_val = state::hwid().ok();
+        // Only touch the hwid file when something actually opted in; reading it
+        // creates it. See the note in `refresh`.
+        let hwid_val = self
+            .subscriptions
+            .iter()
+            .any(|s| s.send_hwid && !s.url.is_empty())
+            .then(|| state::hwid().ok())
+            .flatten();
         let ua = self.config.subscription_user_agent.clone();
         let ids: Vec<String> = self
             .subscriptions
@@ -145,6 +155,7 @@ impl Engine {
                 }
             }
         }
+        self.disconnect_if_active_gone();
         store::save(&self.subscriptions)?;
         if errors.is_empty() {
             Ok(())
@@ -218,6 +229,23 @@ impl Engine {
         Ok(disconnected)
     }
 
+    /// Disconnect when a refresh took the active server away with it — the
+    /// panel rotated its credentials, renumbered it, or dropped it entirely.
+    /// Same invariant as a deletion: the tunnel must not keep running through
+    /// a server the user can no longer see, select or manage.
+    fn disconnect_if_active_gone(&mut self) -> bool {
+        let gone = self.disconnect_if_active_within(|active_id, subs| {
+            !subs
+                .iter()
+                .any(|s| s.servers.iter().any(|server| server.id == active_id))
+        });
+        if gone {
+            self.core
+                .note("the active server is no longer in its subscription — disconnected");
+        }
+        gone
+    }
+
     /// Disconnect when the tunnel is running and the active server matches
     /// `covers(active_id, &subscriptions)`. Never leave xray proxying through
     /// a server the user just deleted.
@@ -261,13 +289,15 @@ impl Engine {
         self.core.status()
     }
 
-    /// Probe one server with the configured latency method.
+    /// Probe one server with the configured latency method, measured against
+    /// that server rather than through the tunnel.
     pub fn probe(&self, server: &Server) -> Option<u32> {
         probe::measure(
             server,
             self.config.latency_method,
             self.config.socks_port,
             &self.config.latency_test_url,
+            probe::Route::Direct,
         )
     }
 }
@@ -285,12 +315,9 @@ impl Drop for Engine {
 }
 
 /// Kill a leftover xray process from a previous run, but only after verifying
-/// the PID still belongs to an xray binary — PIDs get recycled.
+/// the PID still belongs to our core — PIDs get recycled.
 fn kill_stale_xray(pid: u32) -> bool {
-    let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
-        return false;
-    };
-    if comm.trim() != "xray" {
+    if !is_our_xray(pid) {
         return false;
     }
     let Ok(pid) = i32::try_from(pid) else {
@@ -301,4 +328,27 @@ fn kill_stale_xray(pid: u32) -> bool {
         nix::sys::signal::Signal::SIGTERM,
     )
     .is_ok()
+}
+
+/// Does this PID belong to a core oxidom started?
+///
+/// The binary name is user-configurable (`xray_binary`, `$OXIDOM_XRAY_BIN`), so
+/// insisting on `comm == "xray"` would skip a core installed as, say,
+/// `xray-linux-amd64` and leave its tunnel up with no way to stop it. The
+/// generated config path is the reliable marker: nothing else is run against
+/// it. The name check stays as a fallback for when the data dir has moved.
+fn is_our_xray(pid: u32) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let cmdline = String::from_utf8_lossy(&raw);
+    if let Ok(config) = XrayCore::config_path()
+        && cmdline
+            .split('\0')
+            .any(|arg| !arg.is_empty() && std::path::Path::new(arg) == config)
+    {
+        return true;
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| comm.trim().starts_with("xray"))
 }
