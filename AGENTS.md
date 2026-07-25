@@ -51,7 +51,7 @@ xray_binary = ""              # empty: use $OXIDOM_XRAY_BIN, then xray on PATH
 
 ## Data model
 ```rust
-enum Protocol { Vless, Vmess, Trojan, Shadowsocks, Socks, Http }
+enum Protocol { Vless, Vmess, Trojan, Shadowsocks, Socks, Http, Hysteria2 }
 
 struct Server {
     id: String,            // stable hash of the link
@@ -99,6 +99,12 @@ struct UserInfo { upload: u64, download: u64, total: u64, expire: Option<i64> }
 - `trojan://password@host:port?<params>#name` — tls params like vless.
 - `ss://` — SIP002: `ss://base64(method:password)@host:port#name` or fully-base64 form.
 - `socks://` / `http://` — optional userinfo auth.
+- `hysteria2://` (alias `hy2://`) — `auth@host:port[,ranges]?<params>#name`. Params: `obfs`
+  (only `salamander`), `obfs-password`, `sni`, `insecure`, `pinSHA256`, `alpn`, `up`, `down`,
+  `hopInterval`, `congestion`. The port defaults to 443, the auth string is opaque and may
+  contain `:`, and the comma-separated port-hopping ranges must come off the authority before
+  `Url::parse` will accept the link. Settings live in `Hysteria2Settings`, not `StreamSettings`.
+  Bare `hysteria://` is **v1** and stays unsupported.
 Derive `country` from a leading flag emoji or country code in the name when present.
 
 ## Xray config generation
@@ -112,6 +118,16 @@ Emit Xray JSON to a temp file, then spawn the core. Structure:
   editor is Phase 3.
 Generate the protocol-specific `outbounds[0]` from `OutboundSpec` (streamSettings for
 tcp/ws/grpc/xhttp; tlsSettings/realitySettings/xtls as needed).
+
+Two Xray 26.x details that are easy to get wrong and are covered by tests — verify any change
+against a real core with `xray run -test -c <file>` rather than against documentation:
+- `allowInsecure` was **removed** and makes the core refuse to start when true. Never emit it;
+  the replacement is `tlsSettings.pinnedPeerCertSha256`, a bare **hex** string (not an array,
+  not base64).
+- hysteria2 is `protocol: "hysteria"` with `settings.version == 2`; the credential goes in
+  `streamSettings.hysteriaSettings.auth`, and salamander obfuscation is
+  `streamSettings.finalmask` — a single object beside `hysteriaSettings`, *not* the `udpmasks`
+  array that appears in Xray's protobuf.
 
 ## Xray process supervisor
 - Resolve the binary (see above), then spawn `<resolved> run -c <configfile>`. Capture
@@ -177,7 +193,7 @@ src/
   config.rs       # config.toml load/save
   state.rs        # state.toml (active server, per-app memory)
   model.rs        # Server/Subscription/OutboundSpec types
-  link.rs         # share-link parsers (vless/vmess/trojan/ss/socks/http)
+  link.rs         # share-link parsers (vless/vmess/trojan/ss/socks/http/hysteria2)
   subscription.rs # fetch + decode + userinfo headers + hwid
   xray/
     config.rs     # OutboundSpec -> Xray JSON

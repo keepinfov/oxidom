@@ -15,7 +15,8 @@ runs fully unprivileged.
   sing-box JSON, and Clash YAML responses (including native Xray balanced
   profiles); quota/expiry from `subscription-userinfo` headers.
 - **Protocols**: VLESS (Reality / XTLS-Vision / xhttp / ws / grpc / tcp),
-  VMess, Trojan, Shadowsocks (SIP002), SOCKS, HTTP.
+  VMess, Trojan, Shadowsocks (SIP002), SOCKS, HTTP, Hysteria2 (obfuscation and
+  port hopping; needs Xray 26.1+, which is where the native outbound landed).
 - **Server browser**: multi-column card grid with country flags, inline card
   details, search, per-subscription latency check and sort.
 - **Latency probes**: ICMP / TCP / HTTP HEAD / HTTP GET (through the tunnel),
