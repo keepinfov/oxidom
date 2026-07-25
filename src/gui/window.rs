@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use gtk::glib;
 
 use crate::APP_ID;
@@ -30,6 +30,11 @@ type SettingsCallback = Rc<dyn Fn(SettingsValues)>;
 type ShortcutHandler = Box<dyn Fn(&Rc<Controller>)>;
 
 const SIDEBAR_BREAKPOINT_WIDTH: u32 = 700;
+/// How long a card may wait for a probe result before the spinner is retired
+/// as lost. Generous on purpose: a "check all" over a large subscription runs
+/// eight at a time, each with its own timeout, so a long *legitimate* wait is
+/// normal and cutting it short would misreport a server as unmeasured.
+const PROBE_DEADLINE: Duration = Duration::from_secs(180);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResponsiveMode {
@@ -131,6 +136,11 @@ struct AppState {
     /// should resurface on reconnect.
     last_active_latency: Option<(String, u32)>,
     checking: HashSet<String>,
+    /// When each id entered `checking`. A probe is normally retired by its
+    /// result appearing in the daemon's `latencies`; if the daemon restarts
+    /// mid-probe that result never arrives, and without a deadline the card
+    /// would spin for the rest of the session.
+    checking_since: HashMap<String, Instant>,
     /// Ids whose failed probe should raise a toast (explicit per-card ping).
     notify_probe: HashSet<String>,
     operation: Option<UiOperation>,
@@ -244,6 +254,7 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
         latencies: HashMap::new(),
         last_active_latency: None,
         checking: HashSet::new(),
+        checking_since: HashMap::new(),
         notify_probe: HashSet::new(),
         operation: None,
         pending_status: None,
@@ -457,6 +468,7 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
     controller.refresh_status();
     controller.add_breakpoint();
     controller.start_timer();
+    controller.watch_termination();
 
     // Column count follows the window width (see push_servers_width).
     window.connect_realize({
@@ -1060,6 +1072,15 @@ impl Controller {
         };
         self.subscriptions.rebuild(&subscriptions, sub_callbacks);
         self.subscriptions.set_operation(operation);
+
+        // The fresh cards were built from `connected_id` alone, which is not
+        // the same thing as the connection state the cache says is on screen:
+        // a rebuild while connecting, or while a stale id is still recorded,
+        // would leave a card claiming "Connected" that `sync_connection_cards`
+        // then refuses to repair because its cache still matches. Record what
+        // the rebuild actually painted, then let the sync reconcile it.
+        *self.applied_connection.borrow_mut() = (connected_id, None);
+        self.sync_connection_cards();
     }
 
     fn activate_server(self: &Rc<Self>, server_id: String) {
@@ -1109,6 +1130,9 @@ impl Controller {
                 return;
             }
             state.checking.insert(server_id.clone());
+            state
+                .checking_since
+                .insert(server_id.clone(), Instant::now());
             if notify_failure {
                 state.notify_probe.insert(server_id.clone());
             }
@@ -1116,18 +1140,21 @@ impl Controller {
         self.servers
             .set_latency_state(&server_id, LatencyState::Checking);
         self.refresh_activity_status();
-        let client = self.state.borrow().client.clone();
-        std::thread::spawn(move || {
-            let _ = client.request_probe(&server_id);
-        });
+        self.request_probes(vec![server_id]);
     }
 
     fn enqueue_probes(self: &Rc<Self>, ids: Vec<String>) {
         let new_ids: Vec<String> = {
             let mut state = self.state.borrow_mut();
-            ids.into_iter()
-                .filter(|id| state.checking.insert(id.clone()))
-                .collect()
+            let now = Instant::now();
+            let mut new_ids = Vec::new();
+            for id in ids {
+                if state.checking.insert(id.clone()) {
+                    state.checking_since.insert(id.clone(), now);
+                    new_ids.push(id);
+                }
+            }
+            new_ids
         };
         if new_ids.is_empty() {
             return;
@@ -1136,10 +1163,67 @@ impl Controller {
             self.servers.set_latency_state(id, LatencyState::Checking);
         }
         self.refresh_activity_status();
+        self.request_probes(new_ids);
+    }
+
+    /// Ask the daemon to probe `ids` on a worker thread, and put the cards
+    /// back if the request never lands. The poll only ever clears ids the
+    /// daemon itself acknowledges, so a dropped request — daemon restarting,
+    /// bus call refused — would otherwise leave the spinner turning for the
+    /// rest of the session with no way to retry.
+    fn request_probes(self: &Rc<Self>, ids: Vec<String>) {
         let client = self.state.borrow().client.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let work_ids = ids.clone();
         std::thread::spawn(move || {
-            let _ = client.request_probes(&new_ids);
+            let result = match work_ids.as_slice() {
+                [single] => client.request_probe(single),
+                many => client.request_probes(many),
+            };
+            let _ = sender.send(result.err().map(|error| format!("{error:#}")));
         });
+
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(40), move || {
+            let failure = match receiver.try_recv() {
+                Ok(None) => return glib::ControlFlow::Break,
+                Ok(Some(error)) => error,
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    "the probe request did not complete".to_string()
+                }
+            };
+            if let Some(controller) = weak.upgrade() {
+                controller.abandon_probes(&ids, &failure);
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Give up on probes the daemon never accepted: clear the spinners and
+    /// restore whatever reading the cards had before.
+    fn abandon_probes(self: &Rc<Self>, ids: &[String], error: &str) {
+        let restored: Vec<(String, LatencyState)> = {
+            let mut state = self.state.borrow_mut();
+            let mut restored = Vec::new();
+            for id in ids {
+                if state.checking.remove(id) {
+                    state.checking_since.remove(id);
+                    state.notify_probe.remove(id);
+                    let latency = known_latency_state(&state.latencies, id);
+                    restored.push((id.clone(), latency));
+                }
+            }
+            restored
+        };
+        if restored.is_empty() {
+            return;
+        }
+        for (id, latency_state) in restored {
+            self.servers.set_latency_state(&id, latency_state);
+        }
+        self.refresh_activity_status();
+        self.show_message(&format!("Could not check latency: {error}"));
     }
 
     fn connect_server(self: &Rc<Self>, server_id: String) {
@@ -1390,7 +1474,12 @@ impl Controller {
             let mut state = self.state.borrow_mut();
             if state.operation.is_some() {
                 drop(state);
-                self.show_message("Another operation is still running");
+                // Hand the refusal to the completion handler instead of
+                // returning silently. It owns the per-call cleanup — clearing
+                // the settings spinner, dropping a queued close, rolling back
+                // the optimistic "connecting" card — and skipping it leaves
+                // the UI stuck in a state the user cannot undo.
+                complete(self, Err(anyhow!("another operation is still running")));
                 return;
             }
             state.operation = Some(operation.clone());
@@ -1461,6 +1550,24 @@ impl Controller {
         });
     }
 
+    /// Undo the session proxy when the process is asked to stop rather than
+    /// closed from the UI — `systemctl --user stop oxidom-tray`, a session
+    /// logout, Ctrl+C on a terminal run. Without this the proxy survives us
+    /// and every app on the desktop keeps pointing at a dead port.
+    fn watch_termination(self: &Rc<Self>) {
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            let weak = Rc::downgrade(self);
+            glib::unix_signal_add_local(signal, move || {
+                if let Some(controller) = weak.upgrade() {
+                    controller.clear_system_proxy();
+                    controller.quit_after_close.set(true);
+                    controller.finish_close();
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    }
+
     /// 500ms tick: apply the last poll snapshot, then start the next poll on
     /// a worker thread (never block the UI on D-Bus).
     fn start_timer(self: &Rc<Self>) {
@@ -1523,35 +1630,71 @@ impl Controller {
             // leave the local set.
             let daemon_checking: HashSet<String> =
                 snapshot.probe.checking.iter().cloned().collect();
+            let now = Instant::now();
             for id in &daemon_checking {
                 if state.checking.insert(id.clone()) {
+                    state.checking_since.insert(id.clone(), now);
                     latency_updates.push((id.clone(), LatencyState::Checking));
                 }
             }
+            // An id is done when the daemon stopped running it *and* left a
+            // result. The result is what distinguishes "finished" from "still
+            // queued": the daemon reports only the probes it is running, not
+            // the ones waiting behind `MAX_CONCURRENT_PROBES`. The deadline is
+            // the backstop for a result that will never arrive — a daemon that
+            // restarted mid-probe loses both its queue and its readings.
             let finished: Vec<String> = state
                 .checking
                 .iter()
                 .filter(|id| {
-                    !daemon_checking.contains(*id) && snapshot.probe.latencies.contains_key(*id)
+                    if daemon_checking.contains(*id) {
+                        return false;
+                    }
+                    snapshot.probe.latencies.contains_key(*id)
+                        || state
+                            .checking_since
+                            .get(*id)
+                            .is_none_or(|since| now.duration_since(*since) > PROBE_DEADLINE)
                 })
                 .cloned()
                 .collect();
             for id in finished {
                 state.checking.remove(&id);
+                state.checking_since.remove(&id);
                 if !latency_updates.iter().any(|(updated, _)| updated == &id) {
-                    let value = snapshot.probe.latencies.get(&id).copied().flatten();
+                    let value = snapshot.probe.latencies.get(&id).copied();
                     latency_updates.push((
                         id,
                         match value {
-                            Some(ms) => LatencyState::Reachable(ms),
-                            None => LatencyState::Unreachable,
+                            Some(Some(ms)) => LatencyState::Reachable(ms),
+                            Some(None) => LatencyState::Unreachable,
+                            // Timed out waiting for the daemon: no reading was
+                            // ever taken, so claiming "unreachable" would be a
+                            // lie about the server.
+                            None => LatencyState::Unmeasured,
                         },
                     ));
                 }
             }
             state.daemon_status = snapshot.status.to_status();
+            // A completion handler can pin a terminal `pending_status` — a
+            // failed connect, a settings apply whose reconnect failed — to
+            // show the outcome before the daemon's own poll catches up. Retire
+            // it once the daemon has stopped disagreeing: left in place it
+            // outranks every later daemon status forever, and freezes the
+            // `connected_id` resync below with it.
+            if state.operation.is_none()
+                && matches!(
+                    state.pending_status,
+                    Some(Status::Error(_) | Status::Disconnected)
+                )
+                && !matches!(state.daemon_status, Status::Connected | Status::Connecting)
+            {
+                state.pending_status = None;
+            }
             // Key off the daemon's own view, not `current_status`: the latter
-            // prefers `pending_status`, which a failed connect leaves pinned.
+            // prefers `pending_status`, which may still hold an optimistic
+            // transition the daemon has not confirmed yet.
             let error = match &state.daemon_status {
                 Status::Error(message) => Some(message.clone()),
                 _ => None,
@@ -1636,12 +1779,21 @@ impl Controller {
                     let _ = std::fs::write(marker, b"1");
                 }
             }
-        } else if !want && self.proxy_applied.get() {
-            let _ = sysproxy::clear();
-            self.proxy_applied.set(false);
-            if let Some(marker) = gui_proxy_marker() {
-                let _ = std::fs::remove_file(marker);
-            }
+        } else if !want {
+            self.clear_system_proxy();
+        }
+    }
+
+    /// Point the session back at a direct connection. Idempotent, and safe to
+    /// call from a signal handler.
+    fn clear_system_proxy(&self) {
+        if !self.proxy_applied.get() {
+            return;
+        }
+        let _ = sysproxy::clear();
+        self.proxy_applied.set(false);
+        if let Some(marker) = gui_proxy_marker() {
+            let _ = std::fs::remove_file(marker);
         }
     }
 
@@ -1673,6 +1825,11 @@ impl Controller {
     /// the tray keeps the process and the daemon keeps the tunnel.
     fn finish_close(&self) {
         if self.quit_after_close.replace(false) {
+            // Nothing else will undo the GNOME proxy: the daemon may keep the
+            // tunnel up after we exit, but it does not own this setting, and
+            // the marker file only repairs it on the *next* GUI start. Leaving
+            // it set points the whole session at a port that may be gone.
+            self.clear_system_proxy();
             if let Some(app) = self.window.application() {
                 app.quit();
             }
@@ -2013,6 +2170,16 @@ fn summarize_error(title: &str, detail: &str) -> String {
     let cut: String = detail.chars().take(MAX_DETAIL).collect();
     let cut = cut.trim_end();
     format!("{title}: {cut}…")
+}
+
+/// What a card should show when it is not being checked: the last reading if
+/// we have one, otherwise "unmeasured" — never a spinner.
+fn known_latency_state(latencies: &HashMap<String, Option<u32>>, id: &str) -> LatencyState {
+    match latencies.get(id) {
+        Some(Some(ms)) => LatencyState::Reachable(*ms),
+        Some(None) => LatencyState::Unreachable,
+        None => LatencyState::Unmeasured,
+    }
 }
 
 /// Latency to show for the connected server, and whether it's a carried-over

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 
 use crate::link::b64_decode;
@@ -7,6 +9,12 @@ use crate::subscription_format;
 /// Fallback User-Agent when neither the subscription nor config specify one.
 /// Panels commonly gate the response on a recognized client string.
 const DEFAULT_USER_AGENT: &str = "v2rayNG/1.9.5";
+
+/// Overall cap on a subscription fetch. ureq's default agent has *no* read
+/// timeout, so a panel that completes the handshake and then goes quiet would
+/// block this thread forever — and the daemon holds its engine lock across
+/// this call, which would take the whole tunnel down with it.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Result of fetching + parsing a subscription URL.
 #[derive(Debug)]
@@ -39,7 +47,8 @@ pub fn fetch(
     if send_hwid && hwid.is_none() {
         bail!("Send HWID is enabled, but the per-install identifier is unavailable");
     }
-    let mut req = ureq::get(url).set("User-Agent", ua);
+    let agent = ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).build();
+    let mut req = agent.get(url).set("User-Agent", ua);
     if send_hwid && let Some(id) = hwid {
         // Happ/Remnawave device identification headers. Only x-hwid is
         // required; the rest help the panel label the device. Sent solely

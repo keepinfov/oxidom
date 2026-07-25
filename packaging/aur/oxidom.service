@@ -4,7 +4,11 @@ Wants=network-online.target
 After=network-online.target dbus.service
 
 [Service]
-ExecStart=/usr/bin/oxidom daemon --system
+# Passing the ports on the command line pins them: with the daemon reachable
+# over the system bus, an unpinned port is a setting any client can rewrite,
+# which moves the inbound out from under everyone else using it. Edit the
+# numbers here (systemctl edit oxidom) rather than in the GUI.
+ExecStart=/usr/bin/oxidom daemon --system --socks-port 10808 --http-port 10809
 User=oxidom
 Group=oxidom
 StateDirectory=oxidom

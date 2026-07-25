@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -12,6 +13,8 @@ use crate::xray::resolve::{self, ResolvedXray};
 use crate::{fsutil, paths};
 
 const LOG_CAP: usize = 500;
+/// How long the core gets to exit on SIGTERM before it is killed outright.
+const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// Said before every hysteria2 connect. Cheaper and more reliable than probing
 /// the core's version: a git build or a fork can report anything, and the cost
@@ -90,7 +93,7 @@ impl XrayCore {
         *self.status.lock().unwrap() = s;
     }
 
-    fn config_path() -> Result<PathBuf> {
+    pub(crate) fn config_path() -> Result<PathBuf> {
         Ok(paths::data_dir()?.join("current-config.json"))
     }
 
@@ -208,8 +211,7 @@ impl XrayCore {
 
     pub fn disconnect(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_child(&mut child);
         }
         self.active = None;
         self.set_status(Status::Disconnected);
@@ -236,6 +238,31 @@ impl Drop for XrayCore {
     fn drop(&mut self) {
         self.disconnect();
     }
+}
+
+/// Stop the core the way the spec requires: SIGTERM, then SIGKILL once the
+/// grace period is up. `Child::kill` alone is an unconditional SIGKILL, which
+/// severs every in-flight connection instead of letting xray close them.
+fn stop_child(child: &mut Child) {
+    let signalled = i32::try_from(child.id()).is_ok_and(|pid| {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .is_ok()
+    });
+    if signalled {
+        let deadline = Instant::now() + STOP_GRACE;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(25)),
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, logs: Arc<Mutex<Vec<String>>>) {

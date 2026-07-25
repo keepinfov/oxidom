@@ -33,7 +33,8 @@ pub fn subscription_description(subscription: &Subscription) -> String {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+/// Human-readable byte count, in the SI units panels quote their quotas in.
+pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;

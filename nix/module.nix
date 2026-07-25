@@ -50,6 +50,21 @@ in
       default = 10809;
       description = "Local HTTP proxy inbound port (127.0.0.1).";
     };
+
+    users = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "alice" ];
+      description = ''
+        Accounts added to the `oxidom` group, i.e. allowed to drive the daemon
+        over the system bus: connect, disconnect, edit subscriptions and change
+        the machine's proxy settings.
+
+        Members of `wheel` and root are already allowed by the D-Bus policy —
+        they can reach the same capabilities through sudo anyway — so this is
+        only needed for accounts that are not administrators.
+      '';
+    };
   };
 
   config = lib.mkMerge [
@@ -75,7 +90,7 @@ in
         group = "oxidom";
         description = "oxidom tunnel daemon";
       };
-      users.groups.oxidom = { };
+      users.groups.oxidom.members = daemonCfg.users;
 
       # Lets the daemon own its system-bus name and users talk to it.
       services.dbus.packages = [ daemonCfg.package ];

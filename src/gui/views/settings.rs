@@ -140,15 +140,12 @@ impl SettingsWidgets {
     }
 }
 
-type StateCallback = Rc<dyn Fn(SettingsState)>;
-
 #[derive(Clone)]
 pub struct SettingsView {
     pub root: adw::PreferencesPage,
     widgets: SettingsWidgets,
     model: Rc<RefCell<SettingsModel>>,
     updating_widgets: Rc<Cell<bool>>,
-    state_callbacks: Rc<RefCell<Vec<StateCallback>>>,
 }
 
 /// Recognized subscription client identifiers. Picking one fills the editable
@@ -316,13 +313,11 @@ impl SettingsView {
         };
         let model = Rc::new(RefCell::new(SettingsModel::new(applied)));
         let updating_widgets = Rc::new(Cell::new(false));
-        let state_callbacks = Rc::new(RefCell::new(Vec::new()));
 
-        connect_draft_signals(&widgets, &model, &updating_widgets, &state_callbacks);
+        connect_draft_signals(&widgets, &model, &updating_widgets);
         widgets.apply.connect_clicked({
             let model = model.clone();
             let widgets = widgets.clone();
-            let state_callbacks = state_callbacks.clone();
             move |_| {
                 let draft = {
                     let mut model = model.borrow_mut();
@@ -333,7 +328,7 @@ impl SettingsView {
                     model.applying = true;
                     model.draft.clone()
                 };
-                refresh_state(&widgets, &model, &state_callbacks);
+                refresh_state(&widgets, &model);
                 on_apply(draft);
             }
         });
@@ -341,7 +336,6 @@ impl SettingsView {
             let model = model.clone();
             let widgets = widgets.clone();
             let updating_widgets = updating_widgets.clone();
-            let state_callbacks = state_callbacks.clone();
             move |_| {
                 let values = {
                     let mut model = model.borrow_mut();
@@ -355,17 +349,16 @@ impl SettingsView {
                 widgets.set_values(&values);
                 sync_preset(&widgets);
                 updating_widgets.set(false);
-                refresh_state(&widgets, &model, &state_callbacks);
+                refresh_state(&widgets, &model);
             }
         });
-        refresh_state(&widgets, &model, &state_callbacks);
+        refresh_state(&widgets, &model);
 
         Self {
             root,
             widgets,
             model,
             updating_widgets,
-            state_callbacks,
         }
     }
 
@@ -420,26 +413,18 @@ impl SettingsView {
         self.widgets.apply.emit_clicked();
     }
 
-    /// Notifies the window whenever dirty, valid, or applying state changes.
-    /// The current state is delivered immediately.
-    pub fn connect_state_changed(&self, callback: impl Fn(SettingsState) + 'static) {
-        let callback: StateCallback = Rc::new(callback);
-        callback(self.state());
-        self.state_callbacks.borrow_mut().push(callback);
-    }
-
     /// Completes a successful asynchronous apply. If the user edited another
     /// value while the operation was running, that newer draft remains dirty.
     pub fn mark_applied(&self, values: SettingsValues) {
         self.model.borrow_mut().mark_applied(values);
-        refresh_state(&self.widgets, &self.model, &self.state_callbacks);
+        refresh_state(&self.widgets, &self.model);
     }
 
     /// Completes a failed/cancelled asynchronous apply without accepting the
     /// draft, allowing the user to try again.
     pub fn set_apply_in_progress(&self, applying: bool) {
         self.model.borrow_mut().applying = applying;
-        refresh_state(&self.widgets, &self.model, &self.state_callbacks);
+        refresh_state(&self.widgets, &self.model);
     }
 
     /// Adopts what the daemon reports about itself: the Xray path it actually
@@ -516,7 +501,7 @@ impl SettingsView {
                 }
             }
         }
-        refresh_state(&self.widgets, &self.model, &self.state_callbacks);
+        refresh_state(&self.widgets, &self.model);
     }
 
     /// Discards the draft and restores the last successfully applied values.
@@ -533,7 +518,7 @@ impl SettingsView {
         self.widgets.set_values(&values);
         sync_preset(&self.widgets);
         self.updating_widgets.set(false);
-        refresh_state(&self.widgets, &self.model, &self.state_callbacks);
+        refresh_state(&self.widgets, &self.model);
     }
 }
 
@@ -567,19 +552,17 @@ fn connect_draft_signals(
     widgets: &SettingsWidgets,
     model: &Rc<RefCell<SettingsModel>>,
     updating_widgets: &Rc<Cell<bool>>,
-    callbacks: &Rc<RefCell<Vec<StateCallback>>>,
 ) {
     let update = {
         let widgets = widgets.clone();
         let model = model.clone();
         let updating_widgets = updating_widgets.clone();
-        let callbacks = callbacks.clone();
         Rc::new(move || {
             if updating_widgets.get() {
                 return;
             }
             model.borrow_mut().draft = widgets.values();
-            refresh_state(&widgets, &model, &callbacks);
+            refresh_state(&widgets, &model);
         })
     };
     widgets.socks.connect_value_notify({
@@ -625,11 +608,7 @@ fn connect_draft_signals(
     });
 }
 
-fn refresh_state(
-    widgets: &SettingsWidgets,
-    model: &Rc<RefCell<SettingsModel>>,
-    callbacks: &Rc<RefCell<Vec<StateCallback>>>,
-) {
+fn refresh_state(widgets: &SettingsWidgets, model: &Rc<RefCell<SettingsModel>>) {
     let model = model.borrow();
     let validation = validate(&model.draft);
     let state = model.state();
@@ -642,10 +621,6 @@ fn refresh_state(
         .apply
         .set_sensitive(state.dirty && state.valid && !state.applying);
     widgets.reset.set_sensitive(state.dirty && !state.applying);
-    let callbacks = callbacks.borrow().clone();
-    for callback in callbacks {
-        callback(state);
-    }
 }
 
 fn set_validation_message(label: &gtk::Label, message: Option<&str>) {

@@ -9,7 +9,7 @@ use crate::gui::operation::{UiOperation, UiOperationKind};
 use crate::link;
 use crate::model::{Subscription, UserInfo};
 
-use super::super::group::subscription_description;
+use super::super::group::{format_bytes, subscription_description};
 
 /// Callbacks the subscriptions view invokes.
 #[derive(Clone)]
@@ -824,13 +824,21 @@ fn is_valid_subscription_url(value: &str) -> bool {
     matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some()
 }
 
+/// Refuse a paste the importer would silently drop lines from. Ask the real
+/// parser rather than matching prefixes: a hand-kept list drifts from what
+/// `link::parse_link` accepts, and this one already rejected `socks5://` links
+/// and anything whose scheme was not spelled in lower case — both of which
+/// import perfectly well.
 fn validate_share_links(text: &str) -> Option<&'static str> {
-    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if !link::is_supported_scheme(line) {
-            return Some("One or more lines is not a supported server share link.");
-        }
+    // Validate by parsing rather than by scheme prefix: a `vless://` with no
+    // uuid uses a supported scheme but is still not an importable server.
+    let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+    let (parsed, _) = link::parse_links_counting(text);
+    if parsed.len() == lines {
+        None
+    } else {
+        Some("One or more lines is not a supported server share link.")
     }
-    None
 }
 
 fn format_quota(info: Option<&UserInfo>) -> String {
@@ -848,21 +856,6 @@ fn format_quota(info: Option<&UserInfo>) -> String {
         format!("{} used", format_bytes(used))
     } else {
         "Not provided".to_string()
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
-        value /= 1000.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
