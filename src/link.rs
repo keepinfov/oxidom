@@ -6,8 +6,8 @@ use serde_json::Value;
 use url::Url;
 
 use crate::model::{
-    OutboundSpec, Protocol, Server, StreamSettings, country_from_name, normalize_pin_sha256,
-    transport_label,
+    Hysteria2Obfs, Hysteria2Settings, OutboundSpec, PortRange, Protocol, Server, StreamSettings,
+    country_from_name, normalize_pin_sha256, parse_bandwidth_mbps, transport_label,
 };
 
 /// Try several base64 alphabets/paddings and return decoded bytes.
@@ -107,6 +107,8 @@ const SCHEMES: &[(&str, Option<&str>)] = &[
     ("socks5", None),
     ("http", Some("HTTP")),
     ("https", None),
+    ("hysteria2", Some("Hysteria2")),
+    ("hy2", None),
 ];
 
 /// Whether a line uses a scheme oxidom can parse. Case-insensitive and
@@ -142,6 +144,7 @@ pub fn parse_link(link: &str) -> Option<Server> {
         "ss" => parse_ss(link),
         "socks" | "socks5" => parse_socks(link),
         "http" | "https" => parse_http(link),
+        "hysteria2" | "hy2" => parse_hysteria2(link),
         _ => None,
     }
 }
@@ -296,6 +299,132 @@ fn parse_ss(link: &str) -> Option<Server> {
     Some(finish(link, name, Protocol::Shadowsocks, host, port, spec))
 }
 
+/// Split a hysteria2 port-hopping suffix out of the authority.
+///
+/// `hysteria2://pw@host:443,5000-6000` is a legal share link but not a legal
+/// URL — `Url::parse` rejects the comma with `InvalidPort` — so the ranges have
+/// to come off before parsing. Returns the URL-parseable link and the extra
+/// ranges; a link without a suffix comes back unchanged.
+fn split_port_hop(link: &str) -> (String, Vec<PortRange>) {
+    let Some(scheme_end) = link.find("://") else {
+        return (link.to_string(), Vec::new());
+    };
+    let start = scheme_end + 3;
+    let end = link[start..]
+        .find(['/', '?', '#'])
+        .map(|i| start + i)
+        .unwrap_or(link.len());
+    let authority = &link[start..end];
+
+    // The userinfo may itself contain '@', so the host starts after the last one.
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(at) => (&authority[..=at], &authority[at + 1..]),
+        None => ("", authority),
+    };
+    // A comma cannot occur inside a bracketed IPv6 literal or a port number,
+    // so one split is enough and stays correct for `[::1]:443,5000-6000`.
+    let Some((hostport, extra)) = hostport.split_once(',') else {
+        return (link.to_string(), Vec::new());
+    };
+
+    let ranges = extra.split(',').filter_map(PortRange::parse).collect();
+    let sanitized = format!("{}{userinfo}{hostport}{}", &link[..start], &link[end..]);
+    (sanitized, ranges)
+}
+
+fn parse_hysteria2(link: &str) -> Option<Server> {
+    // Normalize the `hy2://` alias so both spellings of one server produce the
+    // same stable id and dedupe against each other.
+    let canonical = match link.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("hy2") => format!("hysteria2://{rest}"),
+        _ => link.to_string(),
+    };
+    let (sanitized, mut port_hop) = split_port_hop(&canonical);
+    let url = Url::parse(&sanitized).ok()?;
+    let q = query_map(&url);
+    let get = |k: &str| q.get(k).cloned().filter(|s| !s.is_empty());
+
+    // Hysteria2 auth is one opaque string that may contain ':'. `Url` splits it
+    // into username and password at the first colon, so put it back together.
+    let user = percent_decode_str(url.username())
+        .decode_utf8_lossy()
+        .into_owned();
+    let auth = match url.password() {
+        Some(password) => format!(
+            "{user}:{}",
+            percent_decode_str(password).decode_utf8_lossy()
+        ),
+        None => user,
+    };
+    // Some panels put the credential in the query instead of the userinfo.
+    let auth = if auth.is_empty() {
+        get("auth").or_else(|| get("password")).unwrap_or_default()
+    } else {
+        auth
+    };
+    if auth.is_empty() {
+        return None;
+    }
+
+    // `Url` keeps IPv6 literals bracketed; Xray's `address` wants them bare.
+    let host = url
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    // Unlike the other schemes here, hysteria2 defines a default port.
+    let port = url.port().unwrap_or(443);
+
+    // Port hopping also travels as a query parameter in some exporters.
+    for key in ["mport", "ports"] {
+        if let Some(value) = get(key) {
+            port_hop.extend(value.split(',').filter_map(PortRange::parse));
+        }
+    }
+
+    let obfs = get("obfs").map(|kind| Hysteria2Obfs {
+        kind,
+        password: get("obfs-password").unwrap_or_default(),
+    });
+
+    let settings = Hysteria2Settings {
+        sni: get("sni").or_else(|| get("peer")),
+        alpn: get("alpn").map(|a| a.split(',').map(|s| s.trim().to_string()).collect()),
+        allow_insecure: get("insecure")
+            .or_else(|| get("allowInsecure"))
+            .is_some_and(|v| v == "1" || v == "true"),
+        pin_sha256: get("pinSHA256").as_deref().and_then(normalize_pin_sha256),
+        obfs,
+        up_mbps: get("up")
+            .or_else(|| get("upmbps"))
+            .as_deref()
+            .and_then(parse_bandwidth_mbps),
+        down_mbps: get("down")
+            .or_else(|| get("downmbps"))
+            .as_deref()
+            .and_then(parse_bandwidth_mbps),
+        port_hop,
+        hop_interval_secs: get("hopInterval").and_then(|v| v.parse().ok()),
+        congestion: get("congestion"),
+        udp_idle_timeout_secs: None,
+    };
+
+    let name = {
+        let f = decode_fragment(&url);
+        if f.is_empty() { host.clone() } else { f }
+    };
+    let spec = OutboundSpec::Hysteria2 { auth, settings };
+    // Store the canonical link, commas and all: it is what round-trips.
+    Some(finish(
+        &canonical,
+        name,
+        Protocol::Hysteria2,
+        host,
+        port,
+        spec,
+    ))
+}
+
 fn parse_socks(link: &str) -> Option<Server> {
     let url = Url::parse(link).ok()?;
     let host = url.host_str()?.to_string();
@@ -346,7 +475,7 @@ pub fn parse_links(text: &str) -> Vec<Server> {
 }
 
 /// Like `parse_links`, but also counts lines that look like share links yet
-/// use an unsupported or malformed scheme (hysteria2://, tuic://, …), so the
+/// use an unsupported or malformed scheme (tuic://, ssh://, …), so the
 /// caller can tell the user instead of dropping servers silently.
 pub fn parse_links_counting(text: &str) -> (Vec<Server>, usize) {
     let mut servers = Vec::new();
@@ -540,6 +669,128 @@ mod tests {
         for line in ["", "hello", "example.com", "tuic://x@y:443"] {
             assert!(!is_supported_scheme(line), "{line:?}");
         }
+    }
+
+    fn hy2_settings(server: &Server) -> &Hysteria2Settings {
+        match &server.spec {
+            OutboundSpec::Hysteria2 { settings, .. } => settings,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn hy2_auth(server: &Server) -> &str {
+        match &server.spec {
+            OutboundSpec::Hysteria2 { auth, .. } => auth,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hysteria2_minimal_link_defaults_to_port_443() {
+        let server = parse_link("hysteria2://pw@h.example/").unwrap();
+        assert_eq!(server.protocol, Protocol::Hysteria2);
+        assert_eq!(server.address, "h.example");
+        assert_eq!(server.port, 443, "hysteria2 defines a default port");
+        assert_eq!(hy2_auth(&server), "pw");
+        assert_eq!(server.transport_label, "hysteria2");
+    }
+
+    /// Both spellings name the same server, so they must collapse to one entry
+    /// rather than showing up twice after an import.
+    #[test]
+    fn hy2_alias_normalizes_to_hysteria2() {
+        let short = parse_link("hy2://pw@h.example:8443#Node").unwrap();
+        let long = parse_link("hysteria2://pw@h.example:8443#Node").unwrap();
+        assert_eq!(short.id, long.id);
+        assert!(short.link.as_deref().unwrap().starts_with("hysteria2://"));
+        assert!(short.same_connection_as(&long));
+    }
+
+    /// The auth string is opaque and may contain ':' — which `Url` would
+    /// otherwise split off as a password and silently truncate.
+    #[test]
+    fn auth_survives_colons_and_percent_encoding() {
+        let server = parse_link("hysteria2://us%3Aer%40x%2Fy@h.example:443").unwrap();
+        assert_eq!(hy2_auth(&server), "us:er@x/y");
+
+        let split = parse_link("hysteria2://user:pass@h.example:443").unwrap();
+        assert_eq!(hy2_auth(&split), "user:pass");
+    }
+
+    #[test]
+    fn port_hopping_suffix_is_parsed_and_preserved() {
+        let link = "hysteria2://pw@h.example:443,5000-6000,7000/?hopInterval=30";
+        let server = parse_link(link).unwrap();
+
+        assert_eq!(
+            server.port, 443,
+            "the primary port stays the advertised one"
+        );
+        assert_eq!(
+            hy2_settings(&server).port_hop,
+            vec![
+                PortRange {
+                    start: 5000,
+                    end: 6000
+                },
+                PortRange {
+                    start: 7000,
+                    end: 7000
+                },
+            ]
+        );
+        assert_eq!(hy2_settings(&server).hop_interval_secs, Some(30));
+        // The stored link must still round-trip, commas and all.
+        assert_eq!(server.link.as_deref(), Some(link));
+    }
+
+    #[test]
+    fn ipv6_literals_lose_their_brackets() {
+        let server = parse_link("hysteria2://pw@[2001:db8::1]:443,5000-6000/").unwrap();
+        assert_eq!(server.address, "2001:db8::1");
+        assert_eq!(server.port, 443);
+        assert_eq!(hy2_settings(&server).port_hop.len(), 1);
+    }
+
+    #[test]
+    fn hysteria2_query_parameters_map_to_settings() {
+        let link = "hysteria2://pw@h.example:443/?obfs=salamander&obfs-password=o\
+                    &sni=real.example&insecure=1&alpn=h3\
+                    &pinSHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\
+                    &up=100%20mbps&down=1%20gbps&congestion=bbr#Obfuscated";
+        let server = parse_link(link).unwrap();
+        let s = hy2_settings(&server);
+
+        assert_eq!(server.name, "Obfuscated");
+        assert_eq!(server.transport_label, "hysteria2 + salamander");
+        let obfs = s.obfs.as_ref().unwrap();
+        assert_eq!(obfs.kind, "salamander");
+        assert_eq!(obfs.password, "o");
+        assert_eq!(s.sni.as_deref(), Some("real.example"));
+        assert!(s.allow_insecure);
+        assert_eq!(s.alpn.as_deref(), Some(["h3".to_string()].as_slice()));
+        assert_eq!(
+            s.pin_sha256.as_deref(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        assert_eq!(s.up_mbps, Some(100));
+        assert_eq!(s.down_mbps, Some(1000));
+        assert_eq!(s.congestion.as_deref(), Some("bbr"));
+    }
+
+    #[test]
+    fn hysteria2_without_credentials_is_rejected() {
+        assert!(parse_link("hysteria2://h.example:443").is_none());
+    }
+
+    /// Hysteria v1 is a different wire protocol that Xray's version-2 outbound
+    /// cannot speak, so it must stay unsupported rather than be mis-served.
+    #[test]
+    fn hysteria_v1_is_not_treated_as_hysteria2() {
+        assert!(parse_link("hysteria://pw@h.example:443").is_none());
+        let (servers, unsupported) = parse_links_counting("hysteria://pw@h.example:443");
+        assert!(servers.is_empty());
+        assert_eq!(unsupported, 1);
     }
 
     #[test]
