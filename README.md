@@ -50,6 +50,13 @@ services.oxidom.socksPort = 20172;      # optional
 **Arch (AUR):** `packaging/aur/PKGBUILD` (`oxidom-git`), then
 `systemctl enable --now oxidom.service`.
 
+The system daemon rewrites the machine's proxy configuration and runs the
+core, so its D-Bus policy admits root, `wheel`, and the `oxidom` group only —
+an unprivileged service account on the same machine cannot redirect your
+traffic. Administrators need no setup; to let a non-admin account drive it,
+add them to the `oxidom` group (`services.oxidom.users = [ "alice" ];` on
+NixOS, `gpasswd -a alice oxidom` elsewhere).
+
 ## Build & run
 
 With nix (recommended — provides GTK, libadwaita, and the Xray core):
