@@ -43,3 +43,10 @@ pub fn state_file() -> Result<PathBuf> {
 pub fn hwid_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("hwid"))
 }
+
+/// GUI-only display preferences (e.g. collapsed subscription groups). Unlike
+/// `config.toml`/`state.toml`, this file is owned and written directly by the
+/// GUI process itself, never by the daemon.
+pub fn gui_prefs_file() -> Result<PathBuf> {
+    Ok(config_dir()?.join("gui_prefs.toml"))
+}

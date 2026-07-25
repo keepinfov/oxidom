@@ -11,6 +11,7 @@ mod client;
 mod flags;
 mod group;
 mod operation;
+mod prefs;
 mod server_card;
 mod sidebar;
 mod tray;

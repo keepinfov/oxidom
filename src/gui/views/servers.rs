@@ -9,6 +9,7 @@ use gtk::glib;
 use crate::model::Subscription;
 
 use super::super::group::subscription_description;
+use super::super::prefs::GuiPrefs;
 use super::super::server_card::{
     CARD_MEASURE_WIDTH, COMPACT_CARD_HEIGHT, CardConnectionState, LatencyState, ServerCard,
 };
@@ -16,6 +17,7 @@ use super::super::server_card::{
 const CARD_COLUMN_SPACING: i32 = 12;
 const CARD_ROW_SPACING: i32 = 12;
 const MIN_CARD_WIDTH: i32 = 250;
+const MIN_CARD_WIDTH_FOR_THREE_COLUMNS: i32 = 300;
 const COLUMN_HYSTERESIS: i32 = 16;
 const RESIZE_SETTLE_MS: u64 = 120;
 
@@ -75,6 +77,9 @@ pub struct ServersView {
     /// Invoked by the "no servers yet" page; the window routes it to the
     /// Subscriptions page.
     on_browse_subscriptions: BrowseCallback,
+    /// Which subscription groups are collapsed, persisted to disk so it
+    /// survives restarts.
+    prefs: Rc<RefCell<GuiPrefs>>,
 }
 
 impl ServersView {
@@ -121,6 +126,7 @@ impl ServersView {
             latencies: Rc::new(RefCell::new(HashMap::new())),
             selected: Rc::new(RefCell::new(None)),
             requested_selected: Rc::new(RefCell::new(None)),
+            prefs: Rc::new(RefCell::new(GuiPrefs::load())),
         }
     }
 
@@ -270,12 +276,28 @@ impl ServersView {
                 let view = self.clone();
                 move |_| view.sort_group(index)
             });
+            let collapsed = Rc::new(Cell::new(
+                self.prefs
+                    .borrow()
+                    .collapsed_subscriptions
+                    .contains(&subscription.id),
+            ));
+            let collapse_toggle = gtk::Button::builder()
+                .icon_name(collapse_icon(collapsed.get()))
+                .tooltip_text(collapse_tooltip(collapsed.get()))
+                .valign(gtk::Align::Center)
+                .css_classes(["flat", "circular", "server-action"])
+                .build();
+            collapse_toggle.update_property(&[gtk::accessible::Property::Label(collapse_tooltip(
+                collapsed.get(),
+            ))]);
             let name_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             name_row.set_hexpand(true);
             name_row.append(&heading);
             name_row.append(&update);
             name_row.append(&speed);
             name_row.append(&sort);
+            name_row.append(&collapse_toggle);
 
             let description = gtk::Label::builder()
                 .label(subscription_description(subscription))
@@ -299,7 +321,35 @@ impl ServersView {
                 .spacing(CARD_COLUMN_SPACING)
                 .homogeneous(true)
                 .hexpand(true)
+                .visible(!collapsed.get())
                 .build();
+            collapse_toggle.connect_clicked({
+                let collapsed = collapsed.clone();
+                let columns_box = columns_box.clone();
+                let prefs = self.prefs.clone();
+                let subscription_id = subscription.id.clone();
+                move |button| {
+                    let now_collapsed = !collapsed.get();
+                    collapsed.set(now_collapsed);
+                    columns_box.set_visible(!now_collapsed);
+                    button.set_icon_name(collapse_icon(now_collapsed));
+                    button.set_tooltip_text(Some(collapse_tooltip(now_collapsed)));
+                    button.update_property(&[gtk::accessible::Property::Label(collapse_tooltip(
+                        now_collapsed,
+                    ))]);
+                    let mut prefs = prefs.borrow_mut();
+                    if now_collapsed {
+                        prefs
+                            .collapsed_subscriptions
+                            .insert(subscription_id.clone());
+                    } else {
+                        prefs.collapsed_subscriptions.remove(&subscription_id);
+                    }
+                    if let Err(error) = prefs.save() {
+                        log::warn!("could not save gui prefs: {error:#}");
+                    }
+                }
+            });
 
             let mut group_cards: Vec<(String, gtk::Widget)> = Vec::new();
             for server in &subscription.servers {
@@ -788,7 +838,7 @@ fn repack_group(group: &GroupUi, columns: usize) {
 /// Pick a masonry column count from the available content width so cards keep a
 /// comfortable minimum size: 3 wide, 2 mid, 1 when cramped.
 fn columns_for_width(width: i32) -> usize {
-    let three_columns = MIN_CARD_WIDTH
+    let three_columns = MIN_CARD_WIDTH_FOR_THREE_COLUMNS
         .saturating_mul(3)
         .saturating_add(CARD_COLUMN_SPACING.saturating_mul(2));
     let two_columns = MIN_CARD_WIDTH
@@ -808,7 +858,7 @@ fn columns_for_width_with_hysteresis(width: i32, current: usize, hysteresis: i32
     let two_columns = MIN_CARD_WIDTH
         .saturating_mul(2)
         .saturating_add(CARD_COLUMN_SPACING);
-    let three_columns = MIN_CARD_WIDTH
+    let three_columns = MIN_CARD_WIDTH_FOR_THREE_COLUMNS
         .saturating_mul(3)
         .saturating_add(CARD_COLUMN_SPACING.saturating_mul(2));
     match current.clamp(1, 3) {
@@ -823,6 +873,18 @@ fn columns_for_width_with_hysteresis(width: i32, current: usize, hysteresis: i32
         3 => 3,
         _ => columns_for_width(width),
     }
+}
+
+fn collapse_icon(collapsed: bool) -> &'static str {
+    if collapsed {
+        "pan-end-symbolic"
+    } else {
+        "pan-down-symbolic"
+    }
+}
+
+fn collapse_tooltip(collapsed: bool) -> &'static str {
+    if collapsed { "Expand" } else { "Collapse" }
 }
 
 fn latency_state(
@@ -917,8 +979,8 @@ mod tests {
     fn three_columns_start_only_after_the_wider_breakpoint() {
         assert_eq!(columns_for_width(511), 1);
         assert_eq!(columns_for_width(512), 2);
-        assert_eq!(columns_for_width(773), 2);
-        assert_eq!(columns_for_width(774), 3);
+        assert_eq!(columns_for_width(923), 2);
+        assert_eq!(columns_for_width(924), 3);
     }
 
     #[test]
@@ -927,9 +989,9 @@ mod tests {
         assert_eq!(columns_for_width_with_hysteresis(528, 1, 16), 2);
         assert_eq!(columns_for_width_with_hysteresis(511, 2, 16), 2);
         assert_eq!(columns_for_width_with_hysteresis(495, 2, 16), 1);
-        assert_eq!(columns_for_width_with_hysteresis(789, 2, 16), 2);
-        assert_eq!(columns_for_width_with_hysteresis(790, 2, 16), 3);
-        assert_eq!(columns_for_width_with_hysteresis(759, 3, 16), 3);
-        assert_eq!(columns_for_width_with_hysteresis(757, 3, 16), 2);
+        assert_eq!(columns_for_width_with_hysteresis(939, 2, 16), 2);
+        assert_eq!(columns_for_width_with_hysteresis(940, 2, 16), 3);
+        assert_eq!(columns_for_width_with_hysteresis(909, 3, 16), 3);
+        assert_eq!(columns_for_width_with_hysteresis(907, 3, 16), 2);
     }
 }

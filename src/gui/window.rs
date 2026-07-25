@@ -121,10 +121,15 @@ struct AppState {
     /// Server the tunnel is (optimistically) running for; drives the highlight.
     connected_id: Option<String>,
     latencies: HashMap<String, Option<u32>>,
-    /// Last successful measurement of the connected server. Shown in the
-    /// status chip even while a periodic re-probe fails, so the reading does
-    /// not flicker away; reset when the connection changes.
-    last_active_latency: Option<u32>,
+    /// Last successful measurement of the connected server, tagged with the
+    /// server id it belongs to. Shown (dimmed) in the status chips whenever
+    /// no probe has confirmed a fresh reading for the *current* connection
+    /// yet, so the chip never goes blank right after a (re)connect; the id
+    /// tag is what keeps a previous server's number from leaking onto a
+    /// different one — it is intentionally never reset on disconnect, since
+    /// a stale-but-correct reading for the same server is exactly what
+    /// should resurface on reconnect.
+    last_active_latency: Option<(String, u32)>,
     checking: HashSet<String>,
     /// Ids whose failed probe should raise a toast (explicit per-card ping).
     notify_probe: HashSet<String>,
@@ -463,9 +468,9 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
             if let Some(surface) = window.surface() {
                 surface.connect_width_notify({
                     let weak = weak.clone();
-                    move |_| {
+                    move |surface| {
                         if let Some(controller) = weak.upgrade() {
-                            controller.push_servers_width();
+                            controller.push_servers_width_from(surface.width());
                         }
                     }
                 });
@@ -884,7 +889,20 @@ impl Controller {
     /// geometry — never from the view's own allocation, which cannot shrink
     /// below the current column count's minimum and would deadlock.
     fn push_servers_width(&self) {
-        let width = self.window.width();
+        self.push_servers_width_from(self.window.width());
+    }
+
+    /// Like `push_servers_width`, but takes an already-known-fresh width
+    /// instead of reading `window.width()`. The widget's own width lags one
+    /// or more main-loop turns behind the `GdkSurface`'s width on some
+    /// compositors (observed on niri): a single discrete resize like
+    /// maximizing fires exactly one `surface` width-notify, and if
+    /// `window.width()` hadn't caught up yet at that instant, the column
+    /// count would compute from a stale, narrower width and never get
+    /// corrected — nothing re-triggers it until the next resize. Passing the
+    /// surface's own width (which is definitionally current, since it is
+    /// what just changed) avoids that race entirely.
+    fn push_servers_width_from(&self, width: i32) {
         let width = if width > 0 {
             width
         } else {
@@ -1130,7 +1148,6 @@ impl Controller {
             state.selected_id = Some(server_id.clone());
             state.connected_id = Some(server_id.clone());
             state.pending_status = Some(Status::Connecting);
-            state.last_active_latency = None;
         }
         self.set_cards_connection(Some(&server_id), Some(&server_id));
         self.servers.set_selected(Some(&server_id));
@@ -1164,7 +1181,6 @@ impl Controller {
             let mut state = self.state.borrow_mut();
             state.pending_status = Some(Status::Disconnected);
             state.connected_id = None;
-            state.last_active_latency = None;
         }
         self.set_cards_connection(None, None);
         self.refresh_status();
@@ -1268,7 +1284,6 @@ impl Controller {
                     {
                         let mut state = self.state.borrow_mut();
                         state.connected_id = None;
-                        state.last_active_latency = None;
                     }
                     self.set_cards_connection(None, None);
                     self.show_message("Disconnected — the active server was removed");
@@ -1388,14 +1403,26 @@ impl Controller {
         std::thread::spawn(move || {
             let result = work(&client);
             let subscriptions = client.subscriptions();
-            let _ = sender.send((result, subscriptions));
+            // Fetch a fresh status/probe snapshot on the same thread right
+            // after the call, so the completion handler can apply it
+            // immediately instead of waiting for the next 500ms poll tick —
+            // that gap is what let the header/sidebar/card flash a stale
+            // state right after an operation the user is watching finished.
+            let snapshot = (|| {
+                Ok::<PolledSnapshot, anyhow::Error>(PolledSnapshot {
+                    status: client.status()?,
+                    probe: client.probe_state()?,
+                    logs: client.recent_logs()?,
+                })
+            })();
+            let _ = sender.send((result, subscriptions, snapshot));
         });
 
         let weak = Rc::downgrade(self);
         let mut complete = Some(complete);
         glib::timeout_add_local(Duration::from_millis(40), move || {
             match receiver.try_recv() {
-                Ok((result, subscriptions)) => {
+                Ok((result, subscriptions, snapshot)) => {
                     let Some(controller) = weak.upgrade() else {
                         return glib::ControlFlow::Break;
                     };
@@ -1408,7 +1435,10 @@ impl Controller {
                         state.operation = None;
                     }
                     controller.subscriptions.set_operation(None);
-                    controller.refresh_status();
+                    match snapshot {
+                        Ok(snapshot) => controller.apply_snapshot(snapshot),
+                        Err(_) => controller.refresh_status(),
+                    }
                     if let Some(complete) = complete.take() {
                         complete(&controller, result);
                     }
@@ -1481,7 +1511,7 @@ impl Controller {
                     if state.connected_id.as_deref() == Some(id)
                         && let Some(ms) = value
                     {
-                        state.last_active_latency = Some(*ms);
+                        state.last_active_latency = Some((id.clone(), *ms));
                     }
                     if state.notify_probe.remove(id) && value.is_none() {
                         toast_unreachable = true;
@@ -1539,10 +1569,11 @@ impl Controller {
                 && state.pending_status.is_none()
                 && snapshot.status.active_id != state.connected_id
             {
+                // `last_active_latency` is tagged with the id it belongs to
+                // and only ever read when that tag matches `connected_id`
+                // (see its doc comment), so it self-invalidates here without
+                // needing an explicit reset.
                 state.connected_id = snapshot.status.active_id.clone();
-                if state.connected_id.is_none() {
-                    state.last_active_latency = None;
-                }
             }
         }
         for (id, latency_state) in latency_updates {
@@ -1681,17 +1712,11 @@ impl Controller {
     fn refresh_status(&self) {
         let state = self.state.borrow();
         let status = self.current_status(&state);
-        let active_latency = state
-            .connected_id
-            .as_ref()
-            .and_then(|id| state.latencies.get(id))
-            .copied()
-            .flatten()
-            .or(state.last_active_latency);
+        let (active_latency, latency_stale) = active_latency_for(&state);
         drop(state);
 
         self.update_tray(&status);
-        self.update_header_connection_status(&status, active_latency);
+        self.update_header_connection_status(&status, active_latency, latency_stale);
         self.refresh_activity_status();
     }
 
@@ -1717,7 +1742,12 @@ impl Controller {
 
     /// The compact-mode status chip: as small as possible — a flag plus the
     /// latency reading; everything verbose lives in the tooltip.
-    fn update_header_connection_status(&self, status: &Status, active_latency: Option<u32>) {
+    fn update_header_connection_status(
+        &self,
+        status: &Status,
+        active_latency: Option<u32>,
+        latency_stale: bool,
+    ) {
         self.header_status_spinner.set_spinning(false);
         self.header_status_spinner.set_visible(false);
         self.header_status_icon.set_visible(false);
@@ -1727,6 +1757,7 @@ impl Controller {
         self.header_status_flag.set_visible(false);
         self.header_status_label.set_label("");
         self.header_status_label.set_visible(false);
+        self.header_status_label.remove_css_class("latency-stale");
         set_status_tone(&self.header_status, StatusTone::Neutral);
         self.header_status
             .set_visible(self.compact.get() && !matches!(status, Status::Disconnected));
@@ -1757,6 +1788,9 @@ impl Controller {
                 if let Some(ms) = active_latency {
                     self.header_status_label.set_label(&format!("{ms} ms"));
                     self.header_status_label.set_visible(true);
+                    if latency_stale {
+                        self.header_status_label.add_css_class("latency-stale");
+                    }
                 }
                 let tooltip = format!(
                     "{} — click to disconnect",
@@ -1781,13 +1815,9 @@ impl Controller {
 
     fn update_sidebar_connection_status(&self, state: &AppState) {
         let status = self.current_status(state);
-        let active_latency = state
-            .connected_id
-            .as_ref()
-            .and_then(|id| state.latencies.get(id))
-            .copied()
-            .flatten();
+        let (active_latency, latency_stale) = active_latency_for(state);
         self.sidebar_status.set_sensitive(false);
+        self.sidebar_status_label.remove_css_class("latency-stale");
         match status {
             Status::Disconnected => {
                 set_status_tone(&self.sidebar_status, StatusTone::Neutral);
@@ -1814,6 +1844,9 @@ impl Controller {
                     .map(|ms| format!("{name} · {ms} ms"))
                     .unwrap_or(name);
                 self.sidebar_status_label.set_label(&label);
+                if active_latency.is_some() && latency_stale {
+                    self.sidebar_status_label.add_css_class("latency-stale");
+                }
                 self.sidebar_status.set_tooltip_text(Some("Disconnect VPN"));
                 self.sidebar_status.set_sensitive(true);
                 self.sidebar_status
@@ -1982,6 +2015,22 @@ fn summarize_error(title: &str, detail: &str) -> String {
     format!("{title}: {cut}…")
 }
 
+/// Latency to show for the connected server, and whether it's a carried-over
+/// fallback (no probe has confirmed a fresh reading for this connection yet)
+/// rather than a live `state.latencies` entry.
+fn active_latency_for(state: &AppState) -> (Option<u32>, bool) {
+    let Some(id) = state.connected_id.as_deref() else {
+        return (None, false);
+    };
+    if let Some(ms) = state.latencies.get(id).copied().flatten() {
+        return (Some(ms), false);
+    }
+    match &state.last_active_latency {
+        Some((last_id, ms)) if last_id == id => (Some(*ms), true),
+        _ => (None, false),
+    }
+}
+
 fn set_status_tone<W: IsA<gtk::Widget>>(widget: &W, tone: StatusTone) {
     let widget = widget.as_ref();
     for class in [
@@ -2043,6 +2092,8 @@ fn install_css() {
         headerbar button.header-status.status-error { color: @error_color; background: alpha(@error_color, 0.17); }
         .header-status-icon { color: currentColor; -gtk-icon-size: 16px; }
         headerbar button.header-status label { padding: 0; margin: 0; }
+        headerbar button.header-status label.latency-stale,
+        .sidebar-status label.latency-stale { opacity: 0.6; }
         button.flat { min-height: 24px; font-weight: normal; }
         button.pill { font-weight: 500; }
         button.slim-pill { min-height: 24px; padding: 2px 16px; }
