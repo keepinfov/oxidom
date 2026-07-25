@@ -533,30 +533,45 @@ mod tests {
     #[ignore = "requires an xray binary"]
     fn generated_configs_are_accepted_by_xray() {
         let xray = std::env::var("OXIDOM_XRAY_BIN").unwrap_or_else(|_| "xray".to_string());
-        let servers = [
-            hysteria2(Hysteria2Settings {
-                sni: Some("h.example".to_string()),
-                alpn: Some(vec!["h3".to_string()]),
-                pin_sha256: Some(
-                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-                ),
-                obfs: Some(Hysteria2Obfs {
-                    kind: "salamander".to_string(),
-                    password: "obfspw".to_string(),
+        // Start from real share links too, so the whole path from what a user
+        // pastes to what the core reads is covered, not just the generator.
+        let from_links = [
+            "hysteria2://pa%3Ass@h.example:443,5000-6000/?obfs=salamander&obfs-password=o\
+             &sni=real.example&insecure=1&up=100%20mbps&down=1%20gbps&hopInterval=30#HY2",
+            "hy2://pw@h.example/",
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443\
+             ?type=ws&security=tls&sni=cdn.example&path=%2Fws&allowInsecure=1#WS",
+        ]
+        .into_iter()
+        .map(|link| crate::link::parse_link(link).expect("sample link should parse"));
+
+        let servers: Vec<Server> = from_links
+            .chain([
+                hysteria2(Hysteria2Settings {
+                    sni: Some("h.example".to_string()),
+                    alpn: Some(vec!["h3".to_string()]),
+                    pin_sha256: Some(
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                            .to_string(),
+                    ),
+                    obfs: Some(Hysteria2Obfs {
+                        kind: "salamander".to_string(),
+                        password: "obfspw".to_string(),
+                    }),
+                    up_mbps: Some(100),
+                    down_mbps: Some(300),
+                    port_hop: vec![PortRange {
+                        start: 5000,
+                        end: 6000,
+                    }],
+                    hop_interval_secs: Some(30),
+                    congestion: Some("bbr".to_string()),
+                    udp_idle_timeout_secs: Some(60),
+                    allow_insecure: true,
                 }),
-                up_mbps: Some(100),
-                down_mbps: Some(300),
-                port_hop: vec![PortRange {
-                    start: 5000,
-                    end: 6000,
-                }],
-                hop_interval_secs: Some(30),
-                congestion: Some("bbr".to_string()),
-                udp_idle_timeout_secs: Some(60),
-                allow_insecure: true,
-            }),
-            tls_vless(true, None),
-        ];
+                tls_vless(true, None),
+            ])
+            .collect();
 
         for server in &servers {
             let config = generate(server, 10808, 10809);
