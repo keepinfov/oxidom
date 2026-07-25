@@ -2,7 +2,7 @@
 pkgname=oxidom-git
 pkgver=0.1.0.r0.g0000000
 pkgrel=1
-pkgdesc="oxided freedom - a GTK4/libadwaita Xray client (GUI + D-Bus daemon)"
+pkgdesc="Native Linux desktop Xray / v2ray client built with GTK4 + libadwaita in Rust"
 arch=(x86_64 aarch64)
 url="https://github.com/keepinfov/oxidom"
 license=(MIT)
@@ -14,8 +14,8 @@ source=("$pkgname::git+$url.git"
         oxidom.service
         oxidom-git.sysusers)
 sha256sums=('SKIP'
-            'SKIP'
-            'SKIP')
+            'e50c4cde3e6f7c3dad7644001e089147610fc8689419e775871baa913ab02c28'
+            'cfd693db52fc6f98e0c16a3ac2071b6551e0e2d7e500721b6976ab49bfb4ec5a')
 
 pkgver() {
   cd "$pkgname"
@@ -32,7 +32,6 @@ prepare() {
 
 build() {
   cd "$pkgname"
-  export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release
 }
