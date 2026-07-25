@@ -11,6 +11,14 @@ use crate::ipc::{
 };
 use crate::model::Subscription;
 
+/// Ceiling on any single daemon call. zbus waits forever by default, and a
+/// daemon that stops replying — wedged on its engine lock, killed mid-call —
+/// would otherwise pin the UI's operation slot for the rest of the session,
+/// refusing every later action with "another operation is still running".
+/// Sized past the slowest legitimate call: `RefreshAll` fetches each
+/// subscription in turn, each with its own 30s HTTP cap.
+const METHOD_TIMEOUT: Duration = Duration::from_secs(300);
+
 #[derive(Clone)]
 pub struct DaemonClient {
     proxy: zbus::blocking::Proxy<'static>,
@@ -25,11 +33,12 @@ fn friendly(error: zbus::Error) -> anyhow::Error {
 
 impl DaemonClient {
     fn try_bus(system: bool) -> Result<Self> {
-        let connection = if system {
-            zbus::blocking::Connection::system()?
+        let builder = if system {
+            zbus::blocking::connection::Builder::system()?
         } else {
-            zbus::blocking::Connection::session()?
+            zbus::blocking::connection::Builder::session()?
         };
+        let connection = builder.method_timeout(METHOD_TIMEOUT).build()?;
         let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE)?;
         // Reject name owners that don't answer: a real daemon replies fast.
         let _: String = proxy.call("Status", &())?;

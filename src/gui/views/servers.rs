@@ -801,11 +801,18 @@ fn repack_group(group: &GroupUi, columns: usize) {
 
     let boxes = group.column_boxes.borrow();
     let display_order = group.display_order.borrow();
+    // Index once: this runs on every resize and every expand/collapse, and a
+    // linear scan per id turns a large subscription into O(cards²) work in
+    // the middle of an animation.
+    let by_id: HashMap<&str, &gtk::Widget> = group
+        .cards
+        .iter()
+        .map(|(id, card)| (id.as_str(), card))
+        .collect();
     let ordered: Vec<&gtk::Widget> = display_order
         .iter()
-        .filter_map(|id| group.cards.iter().find(|(card_id, _)| card_id == id))
-        .filter(|(_, card)| card.get_visible())
-        .map(|(_, card)| card)
+        .filter_map(|id| by_id.get(id.as_str()).copied())
+        .filter(|card| card.get_visible())
         .collect();
     let desired = distribute_columns(ordered.len(), columns);
 
