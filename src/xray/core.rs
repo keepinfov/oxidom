@@ -6,12 +6,26 @@ use std::thread;
 
 use anyhow::{Context, Result, bail};
 
-use crate::model::Server;
+use crate::model::{OutboundSpec, Server};
 use crate::xray::config;
 use crate::xray::resolve::{self, ResolvedXray};
 use crate::{fsutil, paths};
 
 const LOG_CAP: usize = 500;
+
+/// Said before every hysteria2 connect. Cheaper and more reliable than probing
+/// the core's version: a git build or a fork can report anything, and the cost
+/// would be an extra process spawn on every connect.
+pub const HYSTERIA2_CORE_HINT: &str = "hysteria2 needs Xray 26.1 or newer, which is where the native \"hysteria\" protocol \
+     landed; an older core exits immediately instead of connecting";
+
+/// What an Xray too old for hysteria2 says on the way out. Used to turn a
+/// failed latency check into an explanation.
+pub const UNSUPPORTED_PROTOCOL_MARKERS: &[&str] = &[
+    "unknown protocol",
+    "Failed to build Hysteria config",
+    "unknown transport protocol",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -115,10 +129,33 @@ impl XrayCore {
     /// core. None of these stop the connection, but each one changes what
     /// "connected" will mean and the user has no other way to find out.
     fn preflight_notes(&self, server: &Server) {
-        if let Some(stream) = server.spec.stream()
-            && stream.allow_insecure
-            && stream.pin_sha256.is_none()
-        {
+        let (insecure, pinned) = match &server.spec {
+            OutboundSpec::Hysteria2 { settings, .. } => {
+                self.note(HYSTERIA2_CORE_HINT);
+                if let Some(obfs) = &settings.obfs {
+                    if obfs.kind.eq_ignore_ascii_case("salamander") {
+                        self.note(
+                            "this server uses salamander obfuscation; Xray's implementation is \
+                             not known to interoperate with every hysteria2 server, so if the \
+                             handshake times out ask the provider for a plain endpoint",
+                        );
+                    } else {
+                        self.note(&format!(
+                            "ignoring unknown \"{}\" obfuscation — Xray only implements \
+                             salamander, and an unknown type stops the core from starting",
+                            obfs.kind
+                        ));
+                    }
+                }
+                (settings.allow_insecure, settings.pin_sha256.is_some())
+            }
+            spec => match spec.stream() {
+                Some(stream) => (stream.allow_insecure, stream.pin_sha256.is_some()),
+                None => (false, false),
+            },
+        };
+
+        if insecure && !pinned {
             self.note(
                 "this link asks to skip certificate verification, but Xray 26.x removed \
                  \"allowInsecure\" — the certificate will be verified normally, so expect a TLS \

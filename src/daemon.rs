@@ -156,13 +156,21 @@ impl Shared {
                 let mut engine = shared.engine.lock().unwrap();
                 let still_active = engine.state.active_server_id.as_deref() == Some(&server_id);
                 if still_active && engine.status() == Status::Connected {
-                    const REASON: &str = "active server did not pass its latency check";
+                    // A core that rejected the config exited at once, so the
+                    // probe failure is a symptom. Say the actual cause instead.
+                    let reason = if core_rejected_the_protocol(&engine.core.recent_logs()) {
+                        format!(
+                            "the core does not support this server's protocol — {}",
+                            crate::xray::core::HYSTERIA2_CORE_HINT
+                        )
+                    } else {
+                        "active server did not pass its latency check".to_string()
+                    };
                     // Leave the reason in the log buffer too: the tunnel is
                     // torn down below, so the core's own status is lost.
-                    engine.core.note(REASON);
+                    engine.core.note(&reason);
                     engine.disconnect();
-                    *shared.override_status.lock().unwrap() =
-                        Some(Status::Error(REASON.to_string()));
+                    *shared.override_status.lock().unwrap() = Some(Status::Error(reason));
                 }
             }
         });
@@ -470,4 +478,14 @@ pub fn run(options: DaemonOptions) -> Result<()> {
     shared.engine.lock().unwrap().disconnect();
     log::info!("oxidom daemon stopped");
     Ok(())
+}
+
+/// Whether the core's own output says it could not build the outbound at all —
+/// which is what an Xray older than the hysteria2 support does.
+fn core_rejected_the_protocol(logs: &[String]) -> bool {
+    logs.iter().any(|line| {
+        crate::xray::core::UNSUPPORTED_PROTOCOL_MARKERS
+            .iter()
+            .any(|marker| line.contains(marker))
+    })
 }

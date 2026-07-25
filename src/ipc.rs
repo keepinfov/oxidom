@@ -106,6 +106,9 @@ const SETTINGS_HINTS: &[&str] = &[
     "Xray binary",
     "not found on $PATH",
     "$PATH is empty",
+    // A core too old for the server's protocol is fixed by pointing oxidom at
+    // a newer one, which is also a Settings field.
+    "Xray 26.1",
 ];
 
 pub fn error_action(message: &str) -> ErrorAction {
@@ -137,6 +140,21 @@ mod tests {
                 "{message:?}"
             );
         }
+    }
+
+    /// Built from the constant the daemon actually uses, so rewording the hint
+    /// cannot quietly drop the Settings shortcut it depends on.
+    #[test]
+    fn an_outdated_core_points_at_settings() {
+        let message = format!(
+            "the core does not support this server's protocol — {}",
+            crate::xray::core::HYSTERIA2_CORE_HINT
+        );
+        assert_eq!(
+            error_action(&message),
+            ErrorAction::OpenSettings,
+            "{message}"
+        );
     }
 
     #[test]

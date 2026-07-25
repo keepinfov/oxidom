@@ -3,7 +3,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::config::LatencyMethod;
-use crate::model::Server;
+use crate::model::{Protocol, Server};
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -17,22 +17,36 @@ pub fn measure(
 ) -> Option<u32> {
     match method {
         LatencyMethod::Icmp => icmp_ping(&server.address),
-        LatencyMethod::Tcp => tcp_ping(&server.address, server.port),
+        LatencyMethod::Tcp => direct_ping(server),
         LatencyMethod::HttpHead => {
             if socks_up(socks_port) {
                 http_ping(socks_port, test_url, "HEAD")
             } else {
-                tcp_ping(&server.address, server.port)
+                direct_ping(server)
             }
         }
         LatencyMethod::HttpGet => {
             if socks_up(socks_port) {
                 http_ping(socks_port, test_url, "GET")
             } else {
-                tcp_ping(&server.address, server.port)
+                direct_ping(server)
             }
         }
     }
+}
+
+/// Reach the server without going through the tunnel.
+///
+/// Hysteria2 is QUIC over UDP, so a TCP connect to its port proves nothing and
+/// would report every healthy server as unreachable. Try TCP anyway — plenty of
+/// deployments co-host a masquerade site on the same port — and fall back to
+/// ICMP, which at least distinguishes a dead host from a live one.
+fn direct_ping(server: &Server) -> Option<u32> {
+    let tcp = tcp_ping(&server.address, server.port);
+    if tcp.is_some() || server.protocol != Protocol::Hysteria2 {
+        return tcp;
+    }
+    icmp_ping(&server.address)
 }
 
 fn socks_up(port: u16) -> bool {
