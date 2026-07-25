@@ -10,6 +10,11 @@ depends=(gtk4 libadwaita xray)
 makedepends=(git cargo)
 provides=(oxidom)
 conflicts=(oxidom)
+# makepkg's -flto=auto leaks into CFLAGS, and ring's build script hands those to
+# cc(1). GCC then emits slim LTO objects: the C symbols live in .gnu.lto_* IR
+# sections instead of the ELF symbol table, so the linker cannot resolve them
+# (undefined ring_core_0_17_14__*). Cargo does its own LTO via [profile.release].
+options=(!lto)
 source=("$pkgname::git+$url.git"
         oxidom.service
         oxidom-git.sysusers)
