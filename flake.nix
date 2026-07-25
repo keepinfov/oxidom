@@ -3,20 +3,24 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    flake-parts.url = "github:hercules-ci/flake-parts";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs { inherit system; };
+  outputs = {
+    self,
+    flake-parts,
+    ...
+  } @ inputs:
+    flake-parts.lib.mkFlake {inherit inputs;} {
+      systems = ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
+      perSystem = {pkgs, ...}: let
         oxidom = pkgs.rustPlatform.buildRustPackage {
           pname = "oxidom";
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          nativeBuildInputs = with pkgs; [ pkg-config wrapGAppsHook4 ];
-          buildInputs = with pkgs; [ gtk4 libadwaita glib ];
+          nativeBuildInputs = with pkgs; [pkg-config wrapGAppsHook4];
+          buildInputs = with pkgs; [gtk4 libadwaita glib];
           # Point the binary at the nix-provided Xray core at build time.
           preFixup = ''
             gappsWrapperArgs+=(--set-default OXIDOM_XRAY_BIN ${pkgs.xray}/bin/xray)
@@ -37,12 +41,21 @@
       in {
         packages.default = oxidom;
         packages.oxidom = oxidom;
-        apps.default = { type = "app"; program = "${oxidom}/bin/oxidom"; };
+        apps.default = {
+          type = "app";
+          program = "${oxidom}/bin/oxidom";
+        };
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [ pkg-config wrapGAppsHook4 ];
+          nativeBuildInputs = with pkgs; [pkg-config wrapGAppsHook4];
           buildInputs = with pkgs; [
-            gtk4 libadwaita glib
-            cargo rustc rust-analyzer clippy rustfmt
+            gtk4
+            libadwaita
+            glib
+            cargo
+            rustc
+            rust-analyzer
+            clippy
+            rustfmt
             xray
           ];
           # In the dev shell, find Xray on PATH from the shell.
@@ -50,8 +63,8 @@
             export OXIDOM_XRAY_BIN=${pkgs.xray}/bin/xray
           '';
         };
-      })
-    // {
-      nixosModules.default = import ./nix/module.nix self;
+        formatter = pkgs.alejandra;
+      };
+      flake.nixosModules.default = import ./nix/module.nix self;
     };
 }
