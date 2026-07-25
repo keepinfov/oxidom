@@ -4,7 +4,7 @@ self:
 let
   cfg = config.programs.oxidom;
   daemonCfg = config.services.oxidom;
-  pkg = self.packages.${pkgs.system}.oxidom;
+  pkg = self.packages.${pkgs.stdenv.hostPlatform.system}.oxidom;
 in
 {
   options.programs.oxidom = {
