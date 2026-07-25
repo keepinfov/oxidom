@@ -1,12 +1,13 @@
-self:
-{ config, lib, pkgs, ... }:
-
-let
+self: {
+  config,
+  lib,
+  pkgs,
+  ...
+}: let
   cfg = config.programs.oxidom;
   daemonCfg = config.services.oxidom;
   pkg = self.packages.${pkgs.stdenv.hostPlatform.system}.oxidom;
-in
-{
+in {
   options.programs.oxidom = {
     enable = lib.mkEnableOption "oxidom, a GTK4 Xray client";
 
@@ -53,8 +54,8 @@ in
 
     users = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ ];
-      example = [ "alice" ];
+      default = [];
+      example = ["alice"];
       description = ''
         Accounts added to the `oxidom` group, i.e. allowed to drive the daemon
         over the system bus: connect, disconnect, edit subscriptions and change
@@ -69,13 +70,13 @@ in
 
   config = lib.mkMerge [
     (lib.mkIf cfg.enable {
-      environment.systemPackages = [ cfg.package ];
+      environment.systemPackages = [cfg.package];
 
       systemd.user.services.oxidom-tray = lib.mkIf cfg.trayAutostart {
         description = "oxidom tray and background GUI";
-        wantedBy = [ "graphical-session.target" ];
-        partOf = [ "graphical-session.target" ];
-        after = [ "graphical-session.target" ];
+        wantedBy = ["graphical-session.target"];
+        partOf = ["graphical-session.target"];
+        after = ["graphical-session.target"];
         serviceConfig = {
           ExecStart = "${cfg.package}/bin/oxidom gui --background";
           Restart = "on-failure";
@@ -93,13 +94,13 @@ in
       users.groups.oxidom.members = daemonCfg.users;
 
       # Lets the daemon own its system-bus name and users talk to it.
-      services.dbus.packages = [ daemonCfg.package ];
+      services.dbus.packages = [daemonCfg.package];
 
       systemd.services.oxidom = {
         description = "oxidom Xray tunnel daemon";
-        wantedBy = [ "multi-user.target" ];
-        wants = [ "network-online.target" ];
-        after = [ "network-online.target" "dbus.service" ];
+        wantedBy = ["multi-user.target"];
+        wants = ["network-online.target"];
+        after = ["network-online.target" "dbus.service"];
         serviceConfig = {
           ExecStart = lib.concatStringsSep " " [
             "${daemonCfg.package}/bin/oxidom"
