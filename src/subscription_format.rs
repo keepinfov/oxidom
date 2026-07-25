@@ -139,13 +139,17 @@ fn parse_xray_configs(configs: &[Value]) -> Vec<Server> {
         });
 
         if proxy_outbounds.len() > 1 && !balancers.is_empty() {
-            if let Some(tag) = balancer_tag
-                && let Some(server) =
-                    xray_profile_server(config, &name, proxy_outbounds, balancers, tag)
-            {
+            let profile = balancer_tag.and_then(|tag| {
+                xray_profile_server(config, &name, proxy_outbounds.clone(), balancers, tag)
+            });
+            // Only let the profile swallow the individual outbounds once it has
+            // actually materialized. A balancer with no resolvable tag, or one
+            // whose first outbound fails to parse, used to drop every server in
+            // the config and import the subscription as empty.
+            if let Some(server) = profile {
                 servers.push(server);
+                continue;
             }
-            continue;
         }
 
         for (index, outbound) in proxy_outbounds.iter().enumerate() {
@@ -592,7 +596,10 @@ fn canonical_share_link(server: &Server) -> Option<String> {
             Some(url.into())
         }
         OutboundSpec::Shadowsocks { method, password } => {
-            let credentials = base64::engine::general_purpose::STANDARD_NO_PAD
+            // SIP002 mandates the URL-safe alphabet here. The standard one can
+            // emit `+` and `/`, which `Url::set_username` then percent-escapes
+            // into `%2F` — not valid base64 for any decoder on the other side.
+            let credentials = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(format!("{method}:{password}"));
             let mut url = endpoint_url("ss", &server.address, server.port)?;
             url.set_username(&credentials).ok()?;
@@ -783,6 +790,53 @@ proxies:
         let servers = parse(body).unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].address, "example.com");
+    }
+
+    #[test]
+    fn balancer_without_a_usable_tag_still_imports_its_outbounds() {
+        // The profile branch used to `continue` unconditionally, so a balancer
+        // it could not turn into a single server took every outbound in the
+        // config down with it and the subscription imported as empty.
+        let body = r#"[{
+          "remarks": "Auto",
+          "outbounds": [
+            {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"one.example","port":443,"users":[{"id":"id-1","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+            {"tag":"proxy-2","protocol":"vless","settings":{"vnext":[{"address":"two.example","port":443,"users":[{"id":"id-2","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}}
+          ],
+          "routing": {"balancers": [{"selector": ["proxy"]}]}
+        }]"#;
+        let servers = parse(body).unwrap();
+        let addresses: Vec<&str> = servers.iter().map(|s| s.address.as_str()).collect();
+        assert_eq!(addresses, ["one.example", "two.example"]);
+    }
+
+    #[test]
+    fn generated_shadowsocks_links_parse_back() {
+        // SIP002 wants the URL-safe alphabet: the standard one emits `/`, which
+        // `Url` escapes to `%2F` and no base64 decoder accepts.
+        let body = r#"
+proxies:
+  - name: SS
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: "pa/ss+word"
+"#;
+        let servers = parse(body).unwrap();
+        let link = servers[0].link.as_deref().expect("a canonical share link");
+        assert!(
+            !link.contains('%'),
+            "generated link should need no escaping: {link}"
+        );
+        let reparsed = crate::link::parse_link(link).expect("generated link must parse back");
+        assert_eq!(reparsed.address, "example.com");
+        assert_eq!(reparsed.port, 8388);
+        let OutboundSpec::Shadowsocks { method, password } = &reparsed.spec else {
+            panic!("expected a shadowsocks outbound");
+        };
+        assert_eq!(method, "aes-256-gcm");
+        assert_eq!(password, "pa/ss+word");
     }
 
     #[test]

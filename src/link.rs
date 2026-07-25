@@ -26,6 +26,23 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// Strip the brackets `Url` keeps around an IPv6 literal.
+///
+/// `[2001:db8::1]` is the right spelling inside a URL and the wrong one
+/// everywhere downstream: `to_socket_addrs` and `ping` both reject it, so a
+/// bracketed address means a server that can never be measured. Xray strips
+/// the brackets itself, which is why the tunnel works while the card does not.
+fn normalize_host(host: &str) -> String {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_string()
+}
+
+fn host_of(url: &Url) -> Option<String> {
+    Some(normalize_host(url.host_str()?))
+}
+
 fn decode_fragment(url: &Url) -> String {
     url.fragment()
         .map(|f| percent_decode_str(f).decode_utf8_lossy().into_owned())
@@ -112,7 +129,7 @@ fn parse_vless(link: &str) -> Option<Server> {
     if uuid.is_empty() {
         return None;
     }
-    let host = url.host_str()?.to_string();
+    let host = host_of(&url)?;
     let port = url.port()?;
     let q = query_map(&url);
     let stream = stream_from_query(&q);
@@ -148,7 +165,7 @@ fn parse_trojan(link: &str) -> Option<Server> {
     if password.is_empty() {
         return None;
     }
-    let host = url.host_str()?.to_string();
+    let host = host_of(&url)?;
     let port = url.port()?;
     let q = query_map(&url);
     let mut stream = stream_from_query(&q);
@@ -188,8 +205,10 @@ fn parse_vmess(link: &str) -> Option<Server> {
         })
     };
 
-    let host = s("add")?;
-    let port = num("port")? as u16;
+    let host = normalize_host(&s("add")?);
+    // `as u16` silently wraps: a panel emitting 65536 would produce port 0 and
+    // a config xray refuses to load, with nothing on screen to explain it.
+    let port = u16::try_from(num("port")?).ok()?;
     let uuid = s("id")?;
     let alter_id = num("aid").unwrap_or(0) as u32;
     let security = s("scy").unwrap_or_else(|| "auto".to_string());
@@ -259,10 +278,17 @@ fn parse_ss(link: &str) -> Option<Server> {
         .unwrap_or_default();
 
     let (method, password, host, port) = if let Some((userinfo, hostport)) = main.rsplit_once('@') {
-        // SIP002: userinfo is base64(method:password), hostport is host:port
-        let decoded = b64_decode(userinfo)
+        // SIP002: userinfo is base64(method:password), hostport is host:port.
+        // Percent-decode first — a URL-safe base64 blob still gets its `-`/`_`
+        // (and any `/` from the standard alphabet) escaped by generators, and
+        // `%2F` is not in any base64 alphabet, so decoding it as-is fails and
+        // the whole userinfo would be mistaken for a plaintext method.
+        let raw = percent_decode_str(userinfo)
+            .decode_utf8_lossy()
+            .into_owned();
+        let decoded = b64_decode(&raw)
             .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_else(|| userinfo.to_string());
+            .unwrap_or(raw);
         let (method, password) = decoded.split_once(':')?;
         let (host, port) = split_host_port(hostport)?;
         (method.to_string(), password.to_string(), host, port)
@@ -290,7 +316,7 @@ fn parse_ss(link: &str) -> Option<Server> {
 
 fn parse_socks(link: &str) -> Option<Server> {
     let url = Url::parse(link).ok()?;
-    let host = url.host_str()?.to_string();
+    let host = host_of(&url)?;
     let port = url.port()?;
     let username = opt(url.username());
     let password = url.password().map(|p| p.to_string());
@@ -304,7 +330,7 @@ fn parse_socks(link: &str) -> Option<Server> {
 
 fn parse_http(link: &str) -> Option<Server> {
     let url = Url::parse(link).ok()?;
-    let host = url.host_str()?.to_string();
+    let host = host_of(&url)?;
     let port = url
         .port()
         .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
@@ -327,9 +353,17 @@ fn opt(s: &str) -> Option<String> {
 }
 
 fn split_host_port(s: &str) -> Option<(String, u16)> {
-    let (host, port) = s.rsplit_once(':')?;
+    let (host, port) = match s.trim().strip_prefix('[') {
+        // Bracketed IPv6: the port separator is the colon after the closing
+        // bracket, not the last colon in the address.
+        Some(rest) => {
+            let (host, tail) = rest.split_once(']')?;
+            (host, tail.strip_prefix(':')?)
+        }
+        None => s.rsplit_once(':')?,
+    };
     let port: u16 = port.trim().parse().ok()?;
-    Some((host.to_string(), port))
+    Some((normalize_host(host), port))
 }
 
 /// Parse a newline list of share links into servers, skipping unrecognized lines.
@@ -355,4 +389,74 @@ pub fn parse_links_counting(text: &str) -> (Vec<Server>, usize) {
         }
     }
     (servers, unsupported)
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine as _;
+
+    use super::{parse_link, parse_links};
+    use crate::model::{OutboundSpec, Protocol};
+
+    fn vmess_link(json: &str) -> String {
+        let payload = base64::engine::general_purpose::STANDARD_NO_PAD.encode(json.as_bytes());
+        format!("vmess://{payload}")
+    }
+
+    #[test]
+    fn ipv6_literals_lose_their_url_brackets() {
+        // `to_socket_addrs` and `ping` both reject the bracketed spelling, so a
+        // server that kept them could connect but never be measured.
+        for (link, port) in [
+            (
+                "vless://uuid@[2001:db8::1]:443?encryption=none&type=tcp#Six",
+                443,
+            ),
+            ("trojan://secret@[2001:db8::1]:443#Six", 443),
+            ("socks://[2001:db8::1]:1080#Six", 1080),
+            ("ss://YWVzLTI1Ni1nY206cGFzcw@[2001:db8::1]:8388#Six", 8388),
+        ] {
+            let server = parse_link(link).unwrap_or_else(|| panic!("failed to parse {link}"));
+            assert_eq!(server.address, "2001:db8::1", "for {link}");
+            assert_eq!(server.port, port, "for {link}");
+        }
+    }
+
+    #[test]
+    fn shadowsocks_userinfo_survives_percent_encoding() {
+        // Generators percent-escape the base64 blob; `%2F` and `%3D` are in no
+        // base64 alphabet, so decoding before unescaping mistakes the whole
+        // thing for a plaintext method and drops the server.
+        let plain = parse_link("ss://YWVzLTI1Ni1nY206cGEvc3M@example.com:8388#SS").unwrap();
+        let escaped = parse_link("ss://YWVzLTI1Ni1nY206cGEvc3M%3D@example.com:8388#SS").unwrap();
+        for server in [&plain, &escaped] {
+            let OutboundSpec::Shadowsocks { method, password } = &server.spec else {
+                panic!("expected a shadowsocks outbound");
+            };
+            assert_eq!(method, "aes-256-gcm");
+            assert_eq!(password, "pa/ss");
+        }
+    }
+
+    #[test]
+    fn vmess_rejects_a_port_that_does_not_fit() {
+        // `as u16` used to wrap 65536 to 0 and hand xray a config it refuses.
+        let link = vmess_link(r#"{"add":"example.com","port":"65536","id":"uuid","ps":"Wrapped"}"#);
+        assert!(parse_link(&link).is_none());
+    }
+
+    #[test]
+    fn vmess_hosts_are_normalized_like_every_other_scheme() {
+        let link = vmess_link(r#"{"add":"[2001:db8::1]","port":"443","id":"uuid","ps":"Six"}"#);
+        let server = parse_link(&link).unwrap();
+        assert_eq!(server.address, "2001:db8::1");
+    }
+
+    #[test]
+    fn socks5_and_mixed_case_schemes_are_accepted() {
+        let servers = parse_links("socks5://example.com:1080#One\nVLESS://u@example.com:443#Two");
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].protocol, Protocol::Socks);
+        assert_eq!(servers[1].protocol, Protocol::Vless);
+    }
 }
