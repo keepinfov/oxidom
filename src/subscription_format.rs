@@ -206,6 +206,8 @@ fn server_from_xray_outbound(name: &str, outbound: &Value) -> Option<Server> {
     let protocol = protocol_from_name(protocol_name)?;
     let mut stream = stream_from_xray(outbound.get("streamSettings"));
     match protocol {
+        // Hysteria2 needs its own extraction; wired up separately.
+        Protocol::Hysteria2 => None,
         Protocol::Vless | Protocol::Vmess => {
             let endpoint = outbound.pointer("/settings/vnext/0")?;
             let user = endpoint.pointer("/users/0")?;
@@ -343,6 +345,8 @@ fn server_from_sing_box(outbound: &Value) -> Option<Server> {
     let port = u16_value(outbound.get("server_port")?)?;
     let stream = stream_from_sing_box(outbound);
     let spec = match protocol {
+        // Hysteria2 needs its own extraction; wired up separately.
+        Protocol::Hysteria2 => return None,
         Protocol::Vless => OutboundSpec::Vless {
             uuid: string(outbound, "uuid")?,
             encryption: "none".to_string(),
@@ -431,6 +435,8 @@ fn server_from_clash(proxy: &Value) -> Option<Server> {
     let port = u16_value(proxy.get("port")?)?;
     let stream = stream_from_clash(proxy);
     let spec = match protocol {
+        // Hysteria2 needs its own extraction; wired up separately.
+        Protocol::Hysteria2 => return None,
         Protocol::Vless => OutboundSpec::Vless {
             uuid: string(proxy, "uuid")?,
             encryption: "none".to_string(),
@@ -538,6 +544,8 @@ fn finish_server(
 
 fn canonical_share_link(server: &Server) -> Option<String> {
     match &server.spec {
+        // Emitted separately; see `hysteria2_share_link`.
+        OutboundSpec::Hysteria2 { .. } => None,
         OutboundSpec::Vless {
             uuid,
             encryption,

@@ -12,6 +12,7 @@ pub enum Protocol {
     Shadowsocks,
     Socks,
     Http,
+    Hysteria2,
 }
 
 impl Protocol {
@@ -23,8 +24,98 @@ impl Protocol {
             Protocol::Shadowsocks => "shadowsocks",
             Protocol::Socks => "socks",
             Protocol::Http => "http",
+            Protocol::Hysteria2 => "hysteria2",
         }
     }
+}
+
+/// An inclusive port range, for hysteria2 port hopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRange {
+    /// Parse one range. Share links and Clash write `5000-6000`, sing-box
+    /// writes `5000:6000`, and a bare `5000` is a range of one.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        let (start, end) = match raw.split_once(['-', ':']) {
+            Some((start, end)) => (start.trim().parse().ok()?, end.trim().parse().ok()?),
+            None => {
+                let only: u16 = raw.parse().ok()?;
+                (only, only)
+            }
+        };
+        (start <= end && start != 0).then_some(PortRange { start, end })
+    }
+
+    /// The `5000-6000` spelling Xray's `udpHop.ports` expects.
+    pub fn to_xray(self) -> String {
+        if self.start == self.end {
+            self.start.to_string()
+        } else {
+            format!("{}-{}", self.start, self.end)
+        }
+    }
+}
+
+/// Hysteria2 obfuscation. Only `salamander` exists today, but the type is
+/// carried verbatim so an unknown one can be reported rather than guessed at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hysteria2Obfs {
+    pub kind: String,
+    pub password: String,
+}
+
+/// Settings for a hysteria2 outbound.
+///
+/// Deliberately not a [`StreamSettings`]: hysteria2 is QUIC, so all but three
+/// of that struct's fields (reality keys, websocket path, grpc service name,
+/// vless flow…) are meaningless here, and its `network`/`security` pair does
+/// not describe anything a user typed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hysteria2Settings {
+    pub sni: Option<String>,
+    pub alpn: Option<Vec<String>>,
+    /// Xray 26.x removed `allowInsecure`; kept only to drive a warning.
+    #[serde(default)]
+    pub allow_insecure: bool,
+    /// Hex SHA-256 of the peer certificate, normalized by [`normalize_pin_sha256`].
+    pub pin_sha256: Option<String>,
+    pub obfs: Option<Hysteria2Obfs>,
+    /// Bandwidth hints, normalized to whole mbps so that the same server
+    /// written as `100`, `"100 Mbps"` and `"100mbps"` stays one server.
+    pub up_mbps: Option<u32>,
+    pub down_mbps: Option<u32>,
+    /// Extra ranges for port hopping. The primary port lives on `Server.port`.
+    #[serde(default)]
+    pub port_hop: Vec<PortRange>,
+    pub hop_interval_secs: Option<u32>,
+    pub congestion: Option<String>,
+    pub udp_idle_timeout_secs: Option<u32>,
+}
+
+/// Normalize a bandwidth hint to whole mbps.
+///
+/// Providers spell the same number as `100`, `"100 Mbps"`, `"100mbps"` or
+/// `"1 gbps"`. Storing the text verbatim would make two identical servers
+/// compare unequal and orphan the user's saved node on the next refresh.
+pub fn parse_bandwidth_mbps(raw: &str) -> Option<u32> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let digits: String = raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let value: u64 = digits.parse().ok()?;
+    let unit = raw[digits.len()..].trim();
+    let mbps = match unit {
+        "g" | "gbps" | "gb" | "gbit" => value * 1000,
+        "k" | "kbps" | "kb" | "kbit" => value.div_ceil(1000),
+        // Bare numbers are mbps by convention in every format we import.
+        _ => value,
+    };
+    // A zero would read as "unlimited" to hysteria; treat a rounded-down
+    // sub-mbps value as the smallest meaningful hint instead.
+    Some(mbps.clamp(1, u32::MAX as u64) as u32)
 }
 
 /// Transport + security settings shared by vless/vmess/trojan.
@@ -93,6 +184,10 @@ pub enum OutboundSpec {
         username: Option<String>,
         password: Option<String>,
     },
+    Hysteria2 {
+        auth: String,
+        settings: Hysteria2Settings,
+    },
     /// A provider-supplied Xray profile that needs multiple proxy outbounds and
     /// an Xray balancer. Local inbounds and safe routing remain owned by oxidom.
     XrayProfile {
@@ -114,6 +209,8 @@ impl OutboundSpec {
             OutboundSpec::Shadowsocks { .. }
             | OutboundSpec::Socks { .. }
             | OutboundSpec::Http { .. }
+            // Hysteria2 carries its own settings type; see `Hysteria2Settings`.
+            | OutboundSpec::Hysteria2 { .. }
             | OutboundSpec::XrayProfile { .. } => None,
         }
     }
@@ -283,6 +380,15 @@ fn regional_indicator_to_letter(c: char) -> Option<char> {
 /// [`StreamSettings`], and those that don't still have something to say.
 pub fn transport_label(protocol: Protocol, spec: &OutboundSpec) -> String {
     let mut parts = vec![protocol.as_str().to_string()];
+    if let OutboundSpec::Hysteria2 { settings, .. } = spec {
+        // Not "+ tls" (always true, so it carries no information) and not the
+        // Xray-internal transport name "hysteria" — but the obfuscation is
+        // worth surfacing, since it is the usual reason a server won't connect.
+        if let Some(obfs) = &settings.obfs {
+            parts.push(obfs.kind.clone());
+        }
+        return parts.join(" + ");
+    }
     if let Some(s) = spec.stream() {
         if !s.network.is_empty() && s.network != "tcp" {
             parts.push(s.network.clone());
@@ -297,7 +403,7 @@ pub fn transport_label(protocol: Protocol, spec: &OutboundSpec) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Server, StreamSettings, normalize_pin_sha256};
+    use super::*;
 
     const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -337,6 +443,112 @@ mod tests {
         let stream: StreamSettings = serde_json::from_str(json).unwrap();
         assert!(stream.allow_insecure);
         assert_eq!(stream.pin_sha256, None);
+    }
+
+    #[test]
+    fn port_ranges_accept_every_separator_in_use() {
+        // `-` in share links and Clash, `:` in sing-box, bare = a range of one.
+        assert_eq!(
+            PortRange::parse("5000-6000"),
+            Some(PortRange {
+                start: 5000,
+                end: 6000
+            })
+        );
+        assert_eq!(
+            PortRange::parse(" 5000 : 6000 "),
+            Some(PortRange {
+                start: 5000,
+                end: 6000
+            })
+        );
+        assert_eq!(
+            PortRange::parse("7000"),
+            Some(PortRange {
+                start: 7000,
+                end: 7000
+            })
+        );
+        for bad in ["", "abc", "6000-5000", "0-100", "70000"] {
+            assert_eq!(PortRange::parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn port_ranges_render_the_way_xray_reads_them() {
+        assert_eq!(
+            PortRange {
+                start: 5000,
+                end: 6000
+            }
+            .to_xray(),
+            "5000-6000"
+        );
+        assert_eq!(
+            PortRange {
+                start: 443,
+                end: 443
+            }
+            .to_xray(),
+            "443"
+        );
+    }
+
+    /// The same bandwidth written four ways must land on one value, or two
+    /// identical servers stop comparing equal and the saved one is orphaned.
+    #[test]
+    fn bandwidth_normalizes_to_whole_mbps() {
+        for raw in ["100", "100mbps", "100 Mbps", " 100 MBPS "] {
+            assert_eq!(parse_bandwidth_mbps(raw), Some(100), "{raw}");
+        }
+        assert_eq!(parse_bandwidth_mbps("1 gbps"), Some(1000));
+        // Sub-mbps rounds up: zero would read as "unlimited" to hysteria.
+        assert_eq!(parse_bandwidth_mbps("512 kbps"), Some(1));
+        assert_eq!(parse_bandwidth_mbps("0"), Some(1));
+        assert_eq!(parse_bandwidth_mbps("fast"), None);
+    }
+
+    #[test]
+    fn hysteria2_label_names_the_obfuscation_and_nothing_else() {
+        let plain = OutboundSpec::Hysteria2 {
+            auth: "pw".to_string(),
+            settings: Hysteria2Settings::default(),
+        };
+        assert_eq!(transport_label(Protocol::Hysteria2, &plain), "hysteria2");
+
+        let obfuscated = OutboundSpec::Hysteria2 {
+            auth: "pw".to_string(),
+            settings: Hysteria2Settings {
+                obfs: Some(Hysteria2Obfs {
+                    kind: "salamander".to_string(),
+                    password: "o".to_string(),
+                }),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            transport_label(Protocol::Hysteria2, &obfuscated),
+            "hysteria2 + salamander"
+        );
+    }
+
+    #[test]
+    fn hysteria2_spec_round_trips_through_serde() {
+        let spec = OutboundSpec::Hysteria2 {
+            auth: "pw".to_string(),
+            settings: Hysteria2Settings {
+                sni: Some("h.example".to_string()),
+                port_hop: vec![PortRange {
+                    start: 5000,
+                    end: 6000,
+                }],
+                up_mbps: Some(100),
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains(r#""kind":"hysteria2""#), "{json}");
+        assert_eq!(serde_json::from_str::<OutboundSpec>(&json).unwrap(), spec);
     }
 
     #[test]
