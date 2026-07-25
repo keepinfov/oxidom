@@ -1,12 +1,13 @@
 use anyhow::{Result, bail};
 use base64::Engine as _;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 use url::Url;
 
 use crate::link::{b64_decode, parse_links};
 use crate::model::{
-    OutboundSpec, Protocol, Server, StreamSettings, country_from_name, normalize_pin_sha256,
-    transport_label,
+    Hysteria2Obfs, Hysteria2Settings, OutboundSpec, PortRange, Protocol, Server, StreamSettings,
+    country_from_name, normalize_pin_sha256, parse_bandwidth_mbps, transport_label,
 };
 
 /// Parse the response formats commonly selected by subscription panels from the
@@ -103,13 +104,7 @@ fn parse_xray_configs(configs: &[Value]) -> Vec<Server> {
         };
         let proxy_outbounds: Vec<Value> = outbounds
             .iter()
-            .filter(|outbound| {
-                outbound
-                    .get("protocol")
-                    .and_then(Value::as_str)
-                    .and_then(protocol_from_name)
-                    .is_some()
-            })
+            .filter(|outbound| xray_outbound_protocol(outbound).is_some())
             .cloned()
             .collect();
         if proxy_outbounds.is_empty() {
@@ -202,12 +197,13 @@ fn xray_profile_server(
 }
 
 fn server_from_xray_outbound(name: &str, outbound: &Value) -> Option<Server> {
-    let protocol_name = outbound.get("protocol")?.as_str()?;
-    let protocol = protocol_from_name(protocol_name)?;
+    let protocol = xray_outbound_protocol(outbound)?;
+    if protocol == Protocol::Hysteria2 {
+        return hysteria2_from_xray(name, outbound);
+    }
     let mut stream = stream_from_xray(outbound.get("streamSettings"));
     match protocol {
-        // Hysteria2 needs its own extraction; wired up separately.
-        Protocol::Hysteria2 => None,
+        Protocol::Hysteria2 => unreachable!("handled above"),
         Protocol::Vless | Protocol::Vmess => {
             let endpoint = outbound.pointer("/settings/vnext/0")?;
             let user = endpoint.pointer("/users/0")?;
@@ -342,11 +338,13 @@ fn server_from_sing_box(outbound: &Value) -> Option<Server> {
     let protocol = protocol_from_name(outbound.get("type")?.as_str()?)?;
     let name = string(outbound, "tag").unwrap_or_else(|| protocol.as_str().to_string());
     let address = string(outbound, "server")?;
+    if protocol == Protocol::Hysteria2 {
+        return hysteria2_from_sing_box(&name, address, outbound);
+    }
     let port = u16_value(outbound.get("server_port")?)?;
     let stream = stream_from_sing_box(outbound);
     let spec = match protocol {
-        // Hysteria2 needs its own extraction; wired up separately.
-        Protocol::Hysteria2 => return None,
+        Protocol::Hysteria2 => unreachable!("handled above"),
         Protocol::Vless => OutboundSpec::Vless {
             uuid: string(outbound, "uuid")?,
             encryption: "none".to_string(),
@@ -432,11 +430,13 @@ fn server_from_clash(proxy: &Value) -> Option<Server> {
     let protocol = protocol_from_name(&type_name)?;
     let name = string(proxy, "name").unwrap_or_else(|| protocol.as_str().to_string());
     let address = string(proxy, "server")?;
+    if protocol == Protocol::Hysteria2 {
+        return hysteria2_from_clash(&name, address, proxy);
+    }
     let port = u16_value(proxy.get("port")?)?;
     let stream = stream_from_clash(proxy);
     let spec = match protocol {
-        // Hysteria2 needs its own extraction; wired up separately.
-        Protocol::Hysteria2 => return None,
+        Protocol::Hysteria2 => unreachable!("handled above"),
         Protocol::Vless => OutboundSpec::Vless {
             uuid: string(proxy, "uuid")?,
             encryption: "none".to_string(),
@@ -544,8 +544,9 @@ fn finish_server(
 
 fn canonical_share_link(server: &Server) -> Option<String> {
     match &server.spec {
-        // Emitted separately; see `hysteria2_share_link`.
-        OutboundSpec::Hysteria2 { .. } => None,
+        OutboundSpec::Hysteria2 { auth, settings } => {
+            Some(hysteria2_share_link(server, auth, settings))
+        }
         OutboundSpec::Vless {
             uuid,
             encryption,
@@ -679,8 +680,255 @@ fn protocol_from_name(name: &str) -> Option<Protocol> {
         "shadowsocks" | "ss" => Some(Protocol::Shadowsocks),
         "socks" | "socks5" => Some(Protocol::Socks),
         "http" | "https" => Some(Protocol::Http),
+        // Deliberately not bare "hysteria": in Clash and sing-box that names
+        // v1, a different wire protocol Xray's v2 outbound cannot speak.
+        "hysteria2" | "hy2" => Some(Protocol::Hysteria2),
         _ => None,
     }
+}
+
+/// The protocol of an Xray outbound.
+///
+/// Xray calls hysteria2 `"hysteria"` and distinguishes the versions by a field,
+/// so unlike the other formats the whole outbound is needed to tell them apart.
+fn xray_outbound_protocol(outbound: &Value) -> Option<Protocol> {
+    let name = outbound.get("protocol")?.as_str()?.to_ascii_lowercase();
+    if name == "hysteria" {
+        return (u32_value(outbound.pointer("/settings/version")) == Some(2))
+            .then_some(Protocol::Hysteria2);
+    }
+    protocol_from_name(&name)
+}
+
+/// Parse a duration that may be a plain number of seconds or a Go-style
+/// `"30s"` string, as sing-box and Clash respectively write `hop_interval`.
+fn seconds_value(value: Option<&Value>) -> Option<u32> {
+    let value = value?;
+    if let Some(number) = u32_value(Some(value)) {
+        return Some(number);
+    }
+    let text = value.as_str()?.trim().trim_end_matches('s');
+    text.parse().ok()
+}
+
+/// Bandwidth written either as a number of mbps or as `"100 Mbps"`.
+fn bandwidth_value(value: Option<&Value>) -> Option<u32> {
+    let value = value?;
+    if let Some(number) = u32_value(Some(value)) {
+        return Some(number.max(1));
+    }
+    parse_bandwidth_mbps(value.as_str()?)
+}
+
+fn port_ranges(raw: Option<&Value>) -> Vec<PortRange> {
+    string_vec(raw)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|item| item.split(','))
+        .filter_map(PortRange::parse)
+        .collect()
+}
+
+fn hysteria2_from_xray(name: &str, outbound: &Value) -> Option<Server> {
+    let address = string(outbound.pointer("/settings")?, "address")?;
+    let port = u16_value(outbound.pointer("/settings/port")?)?;
+    let hy = outbound.pointer("/streamSettings/hysteriaSettings")?;
+    let tls = outbound
+        .pointer("/streamSettings/tlsSettings")
+        .unwrap_or(&Value::Null);
+    let mask = outbound
+        .pointer("/streamSettings/finalmask")
+        .unwrap_or(&Value::Null);
+
+    let settings = Hysteria2Settings {
+        sni: string(tls, "serverName"),
+        alpn: string_vec(tls.get("alpn")),
+        allow_insecure: bool_value(tls.get("allowInsecure")).unwrap_or(false),
+        pin_sha256: string(tls, "pinnedPeerCertSha256")
+            .as_deref()
+            .and_then(normalize_pin_sha256),
+        obfs: string(mask, "type").map(|kind| Hysteria2Obfs {
+            kind,
+            password: mask
+                .pointer("/settings/password")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        up_mbps: bandwidth_value(hy.get("up")),
+        down_mbps: bandwidth_value(hy.get("down")),
+        port_hop: port_ranges(hy.pointer("/udpHop/ports")),
+        hop_interval_secs: seconds_value(hy.pointer("/udpHop/interval")),
+        congestion: string(hy, "congestion"),
+        udp_idle_timeout_secs: u32_value(hy.get("udpIdleTimeout")),
+    };
+    let spec = OutboundSpec::Hysteria2 {
+        auth: string(hy, "auth")?,
+        settings,
+    };
+    Some(finish_server(
+        name,
+        Protocol::Hysteria2,
+        address,
+        port,
+        spec,
+    ))
+}
+
+fn hysteria2_from_sing_box(name: &str, address: String, outbound: &Value) -> Option<Server> {
+    let tls = outbound.get("tls").unwrap_or(&Value::Null);
+    let obfs = outbound.get("obfs").and_then(|obfs| {
+        // Either `"obfs": "salamander"` or `{"type": …, "password": …}`.
+        let kind = obfs
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| string(obfs, "type"))?;
+        Some(Hysteria2Obfs {
+            kind,
+            password: string(obfs, "password").unwrap_or_default(),
+        })
+    });
+
+    let settings = Hysteria2Settings {
+        sni: string(tls, "server_name"),
+        alpn: string_vec(tls.get("alpn")),
+        allow_insecure: bool_value(tls.get("insecure")).unwrap_or(false),
+        pin_sha256: None,
+        obfs,
+        up_mbps: bandwidth_value(outbound.get("up_mbps").or_else(|| outbound.get("up"))),
+        down_mbps: bandwidth_value(outbound.get("down_mbps").or_else(|| outbound.get("down"))),
+        // sing-box separates a range with a colon: "5000:6000".
+        port_hop: port_ranges(outbound.get("server_ports")),
+        hop_interval_secs: seconds_value(outbound.get("hop_interval")),
+        congestion: None,
+        udp_idle_timeout_secs: None,
+    };
+    // A hysteria2 endpoint may advertise only a hopping range.
+    let port = u16_value(outbound.get("server_port").unwrap_or(&Value::Null))
+        .or_else(|| settings.port_hop.first().map(|range| range.start))
+        .unwrap_or(443);
+    let spec = OutboundSpec::Hysteria2 {
+        auth: string(outbound, "password")?,
+        settings,
+    };
+    Some(finish_server(
+        name,
+        Protocol::Hysteria2,
+        address,
+        port,
+        spec,
+    ))
+}
+
+fn hysteria2_from_clash(name: &str, address: String, proxy: &Value) -> Option<Server> {
+    let settings = Hysteria2Settings {
+        sni: string(proxy, "sni").or_else(|| string(proxy, "servername")),
+        alpn: string_vec(proxy.get("alpn")),
+        allow_insecure: bool_value(proxy.get("skip-cert-verify")).unwrap_or(false),
+        // On hysteria2 `fingerprint` is the certificate digest, not the uTLS
+        // profile that `client-fingerprint` names elsewhere in Clash.
+        pin_sha256: string(proxy, "fingerprint")
+            .as_deref()
+            .and_then(normalize_pin_sha256),
+        obfs: string(proxy, "obfs").map(|kind| Hysteria2Obfs {
+            kind,
+            password: string(proxy, "obfs-password").unwrap_or_default(),
+        }),
+        up_mbps: bandwidth_value(proxy.get("up")),
+        down_mbps: bandwidth_value(proxy.get("down")),
+        port_hop: port_ranges(proxy.get("ports")),
+        hop_interval_secs: seconds_value(proxy.get("hop-interval")),
+        congestion: None,
+        udp_idle_timeout_secs: None,
+    };
+    // `port` is optional when `ports` is present; the generic path would drop
+    // the whole server here.
+    let port = u16_value(proxy.get("port").unwrap_or(&Value::Null))
+        .or_else(|| settings.port_hop.first().map(|range| range.start))
+        .unwrap_or(443);
+    let spec = OutboundSpec::Hysteria2 {
+        auth: string(proxy, "password")?,
+        settings,
+    };
+    Some(finish_server(
+        name,
+        Protocol::Hysteria2,
+        address,
+        port,
+        spec,
+    ))
+}
+
+/// Everything but the RFC 3986 "unreserved" set is escaped. Keeping `-._~`
+/// literal avoids emitting noise like `sni=real%2Eexample`, which is legal but
+/// which other clients display verbatim.
+const SHARE_LINK_VALUE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Build a `hysteria2://` link for an imported server.
+///
+/// Hand-rolled rather than built with `Url`, which will not accept the comma in
+/// a port-hopping authority. **The key order is fixed on purpose**: this link
+/// becomes the server's stable id, so reordering it would give every saved
+/// hysteria2 server a new identity on the next subscription refresh.
+fn hysteria2_share_link(server: &Server, auth: &str, s: &Hysteria2Settings) -> String {
+    let encode = |value: &str| utf8_percent_encode(value, SHARE_LINK_VALUE).to_string();
+
+    let mut authority = format!("{}:{}", server.address, server.port);
+    for range in &s.port_hop {
+        authority.push(',');
+        authority.push_str(&range.to_xray());
+    }
+
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(obfs) = &s.obfs {
+        query.push(("obfs", obfs.kind.clone()));
+        if !obfs.password.is_empty() {
+            query.push(("obfs-password", obfs.password.clone()));
+        }
+    }
+    if let Some(sni) = &s.sni {
+        query.push(("sni", sni.clone()));
+    }
+    if s.allow_insecure {
+        query.push(("insecure", "1".to_string()));
+    }
+    if let Some(pin) = &s.pin_sha256 {
+        query.push(("pinSHA256", pin.clone()));
+    }
+    if let Some(alpn) = &s.alpn {
+        query.push(("alpn", alpn.join(",")));
+    }
+    if let Some(interval) = s.hop_interval_secs {
+        query.push(("hopInterval", interval.to_string()));
+    }
+    if let Some(up) = s.up_mbps {
+        query.push(("up", up.to_string()));
+    }
+    if let Some(down) = s.down_mbps {
+        query.push(("down", down.to_string()));
+    }
+    if let Some(congestion) = &s.congestion {
+        query.push(("congestion", congestion.clone()));
+    }
+
+    let query: Vec<String> = query
+        .iter()
+        .map(|(key, value)| format!("{key}={}", encode(value)))
+        .collect();
+    let query = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query.join("&"))
+    };
+    format!(
+        "hysteria2://{}@{authority}/{query}#{}",
+        encode(auth),
+        encode(&server.name)
+    )
 }
 
 fn string(value: &Value, key: &str) -> Option<String> {
@@ -732,7 +980,7 @@ fn string_vec(value: Option<&Value>) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::parse;
-    use crate::model::OutboundSpec;
+    use crate::model::{OutboundSpec, PortRange, Protocol};
 
     #[test]
     fn parses_xray_balanced_profile() {
@@ -789,5 +1037,167 @@ proxies:
     fn rejects_zero_server_documents_even_when_they_contain_urls() {
         let error = parse(r#"{"dns":["https://example.com"]}"#).unwrap_err();
         assert!(error.to_string().contains("no supported servers"));
+    }
+
+    fn hy2(server: &crate::model::Server) -> (&str, &crate::model::Hysteria2Settings) {
+        match &server.spec {
+            OutboundSpec::Hysteria2 { auth, settings } => (auth, settings),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_clash_hysteria2_without_an_explicit_port() {
+        let yaml = r#"
+proxies:
+  - name: "HY2"
+    type: hysteria2
+    server: h.example
+    ports: "5000-6000,7000"
+    password: secret
+    obfs: salamander
+    obfs-password: obfspw
+    up: 100
+    down: "1 gbps"
+    sni: real.example
+    skip-cert-verify: true
+    alpn: [h3]
+    hop-interval: 30
+    fingerprint: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+"#;
+        let servers = parse(yaml).unwrap();
+        assert_eq!(servers.len(), 1);
+        let server = &servers[0];
+        let (auth, s) = hy2(server);
+
+        assert_eq!(server.protocol, Protocol::Hysteria2);
+        assert_eq!(server.address, "h.example");
+        // No `port:` key — it must fall back to the first hopping range.
+        assert_eq!(server.port, 5000);
+        assert_eq!(auth, "secret");
+        assert_eq!(s.obfs.as_ref().unwrap().password, "obfspw");
+        assert_eq!(s.up_mbps, Some(100));
+        assert_eq!(s.down_mbps, Some(1000));
+        assert!(s.allow_insecure);
+        assert_eq!(s.hop_interval_secs, Some(30));
+        // `fingerprint` on hysteria2 is a certificate pin, not a uTLS profile.
+        assert!(s.pin_sha256.is_some());
+        assert_eq!(server.transport_label, "hysteria2 + salamander");
+    }
+
+    #[test]
+    fn parses_sing_box_hysteria2() {
+        let json = r#"{"outbounds":[{
+          "type":"hysteria2","tag":"SB","server":"h.example","server_port":443,
+          "password":"secret","up_mbps":100,"down_mbps":50,
+          "obfs":{"type":"salamander","password":"obfspw"},
+          "server_ports":["5000:6000"],"hop_interval":"30s",
+          "tls":{"enabled":true,"server_name":"real.example","insecure":true,"alpn":["h3"]}
+        }]}"#;
+        let servers = parse(json).unwrap();
+        assert_eq!(servers.len(), 1);
+        let (auth, s) = hy2(&servers[0]);
+
+        assert_eq!(auth, "secret");
+        assert_eq!(servers[0].port, 443);
+        assert_eq!(s.obfs.as_ref().unwrap().kind, "salamander");
+        assert_eq!(s.up_mbps, Some(100));
+        assert_eq!(s.down_mbps, Some(50));
+        // sing-box separates a range with a colon, not a dash.
+        assert_eq!(
+            s.port_hop,
+            vec![PortRange {
+                start: 5000,
+                end: 6000
+            }]
+        );
+        assert_eq!(s.hop_interval_secs, Some(30), "\"30s\" is a duration");
+        assert_eq!(s.sni.as_deref(), Some("real.example"));
+    }
+
+    #[test]
+    fn sing_box_accepts_a_bare_string_obfs() {
+        let json = r#"{"outbounds":[{"type":"hysteria2","tag":"X","server":"h.example",
+          "server_port":443,"password":"pw","obfs":"salamander"}]}"#;
+        let servers = parse(json).unwrap();
+        assert_eq!(hy2(&servers[0]).1.obfs.as_ref().unwrap().kind, "salamander");
+    }
+
+    #[test]
+    fn parses_xray_hysteria2_outbound_and_skips_v1() {
+        let json = r#"{"outbounds":[{
+          "tag":"hy2","protocol":"hysteria",
+          "settings":{"version":2,"address":"h.example","port":443},
+          "streamSettings":{"network":"hysteria","security":"tls",
+            "tlsSettings":{"serverName":"real.example"},
+            "hysteriaSettings":{"version":2,"auth":"secret","up":"100 mbps",
+                                "udpHop":{"ports":["443","5000-6000"],"interval":30}},
+            "finalmask":{"type":"salamander","settings":{"password":"obfspw"}}}
+        }]}"#;
+        let servers = parse(json).unwrap();
+        assert_eq!(servers.len(), 1);
+        let (auth, s) = hy2(&servers[0]);
+        assert_eq!(auth, "secret");
+        assert_eq!(s.up_mbps, Some(100));
+        assert_eq!(s.obfs.as_ref().unwrap().password, "obfspw");
+        assert_eq!(s.sni.as_deref(), Some("real.example"));
+
+        // Version 1 is a different wire protocol and must not be imported.
+        let v1 = r#"{"outbounds":[{"tag":"hy1","protocol":"hysteria",
+          "settings":{"version":1,"address":"h.example","port":443},
+          "streamSettings":{"hysteriaSettings":{"auth":"x"}}}]}"#;
+        assert!(parse(v1).is_err(), "hysteria v1 must not be imported");
+    }
+
+    /// The emitter and the parser must agree: the generated link becomes the
+    /// server's stable id, so a mismatch renames every server on each refresh.
+    #[test]
+    fn hysteria2_share_link_round_trips() {
+        let yaml = r#"
+proxies:
+  - name: "HY2"
+    type: hysteria2
+    server: h.example
+    port: 443
+    ports: "5000-6000"
+    password: "se:cr et"
+    obfs: salamander
+    obfs-password: obfspw
+    up: 100
+    down: 50
+    sni: real.example
+    skip-cert-verify: true
+    hop-interval: 30
+"#;
+        let imported = &parse(yaml).unwrap()[0];
+        let link = imported
+            .link
+            .as_deref()
+            .expect("hysteria2 links are emitable");
+        assert!(link.starts_with("hysteria2://"), "{link}");
+        assert!(link.contains(":443,5000-6000"), "{link}");
+
+        let reparsed = crate::link::parse_link(link).expect("emitted link must parse");
+        assert!(
+            reparsed.same_connection_as(imported),
+            "\n emitted: {:?}\n reparsed: {:?}",
+            imported.spec,
+            reparsed.spec
+        );
+    }
+
+    /// The query order is part of the identity; a reorder orphans saved servers.
+    #[test]
+    fn hysteria2_share_link_key_order_is_stable() {
+        let json = r#"{"outbounds":[{"type":"hysteria2","tag":"N","server":"h.example",
+          "server_port":443,"password":"pw","obfs":{"type":"salamander","password":"o"},
+          "up_mbps":100,"down_mbps":50,
+          "tls":{"enabled":true,"server_name":"real.example","insecure":true}}]}"#;
+        let server = &parse(json).unwrap()[0];
+        assert_eq!(
+            server.link.as_deref().unwrap(),
+            "hysteria2://pw@h.example:443/?obfs=salamander&obfs-password=o\
+             &sni=real.example&insecure=1&up=100&down=50#N"
+        );
     }
 }
