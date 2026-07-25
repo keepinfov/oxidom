@@ -91,6 +91,44 @@ fn finish(
     }
 }
 
+/// Every scheme [`parse_link`] understands, with the human name used in dialogs
+/// and error messages. A `None` label marks an alias that needs no separate
+/// mention (`socks5` alongside `socks`).
+///
+/// This is the one list. The import dialog, its validator and the engine's
+/// error message all read it, because three hand-maintained copies had already
+/// drifted apart from each other and from `parse_link`.
+const SCHEMES: &[(&str, Option<&str>)] = &[
+    ("vless", Some("vless")),
+    ("vmess", Some("vmess")),
+    ("trojan", Some("trojan")),
+    ("ss", Some("Shadowsocks")),
+    ("socks", Some("SOCKS")),
+    ("socks5", None),
+    ("http", Some("HTTP")),
+    ("https", None),
+];
+
+/// Whether a line uses a scheme oxidom can parse. Case-insensitive and
+/// BOM-tolerant, to match what [`parse_link`] actually accepts.
+pub fn is_supported_scheme(line: &str) -> bool {
+    let line = line.trim().trim_start_matches('\u{feff}').trim();
+    let Some((scheme, _)) = line.split_once("://") else {
+        return false;
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    SCHEMES.iter().any(|(name, _)| *name == scheme)
+}
+
+/// The supported schemes as prose, e.g. "vless, vmess, …, HTTP".
+pub fn supported_scheme_list() -> String {
+    SCHEMES
+        .iter()
+        .filter_map(|(_, label)| *label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parse any supported share link into a Server. Returns None if unrecognized.
 pub fn parse_link(link: &str) -> Option<Server> {
     // A UTF-8 BOM survives `trim` (it is not whitespace) and would turn the
@@ -461,6 +499,47 @@ mod tests {
     fn leading_bom_and_whitespace_are_tolerated() {
         let link = format!("\u{feff}  vless://{UUID}@example.com:443  ");
         assert!(parse_link(&link).is_some());
+    }
+
+    /// The scheme table and `parse_link`'s dispatch must not drift apart: a
+    /// scheme advertised in the import dialog has to actually parse.
+    #[test]
+    fn every_advertised_scheme_parses() {
+        let creds = base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:secret");
+        for (scheme, _) in SCHEMES {
+            let sample = match *scheme {
+                "ss" => format!("ss://{creds}@example.com:8388"),
+                "vmess" => format!(
+                    "vmess://{}",
+                    base64::engine::general_purpose::STANDARD.encode(
+                        serde_json::json!({"add":"example.com","port":"443","id":UUID}).to_string()
+                    )
+                ),
+                "http" | "https" => format!("{scheme}://example.com:8080"),
+                other => format!("{other}://{UUID}@example.com:443"),
+            };
+            assert!(
+                is_supported_scheme(&sample),
+                "{scheme} missing from is_supported_scheme"
+            );
+            assert!(parse_link(&sample).is_some(), "{scheme} failed to parse");
+        }
+    }
+
+    /// `parse_link` lowercases the scheme, so the dialog's check must too —
+    /// otherwise the GUI rejects a link the engine would have accepted.
+    #[test]
+    fn scheme_matching_is_case_insensitive() {
+        let link = format!("VLESS://{UUID}@example.com:443");
+        assert!(is_supported_scheme(&link));
+        assert!(parse_link(&link).is_some());
+    }
+
+    #[test]
+    fn unrelated_lines_are_not_mistaken_for_links() {
+        for line in ["", "hello", "example.com", "tuic://x@y:443"] {
+            assert!(!is_supported_scheme(line), "{line:?}");
+        }
     }
 
     #[test]

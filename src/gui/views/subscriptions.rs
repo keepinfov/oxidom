@@ -6,6 +6,7 @@ use adw::prelude::*;
 
 use crate::engine::LOCAL_ID;
 use crate::gui::operation::{UiOperation, UiOperationKind};
+use crate::link;
 use crate::model::{Subscription, UserInfo};
 
 use super::super::group::subscription_description;
@@ -463,7 +464,10 @@ fn show_import_servers(parent: &impl IsA<gtk::Widget>, callbacks: SubscriptionCa
 
     let group = adw::PreferencesGroup::builder()
         .title("Share links")
-        .description("Paste one vless, vmess, trojan, Shadowsocks, SOCKS, or HTTP link per line.")
+        .description(format!(
+            "Paste one {} link per line.",
+            link::supported_scheme_list()
+        ))
         .build();
     let buffer = gtk::TextBuffer::new(None);
     let editor = gtk::TextView::builder()
@@ -822,18 +826,7 @@ fn is_valid_subscription_url(value: &str) -> bool {
 
 fn validate_share_links(text: &str) -> Option<&'static str> {
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if ![
-            "vless://",
-            "vmess://",
-            "trojan://",
-            "ss://",
-            "socks://",
-            "http://",
-            "https://",
-        ]
-        .iter()
-        .any(|prefix| line.starts_with(prefix))
-        {
+        if !link::is_supported_scheme(line) {
             return Some("One or more lines is not a supported server share link.");
         }
     }

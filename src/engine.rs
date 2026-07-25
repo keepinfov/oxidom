@@ -174,7 +174,8 @@ impl Engine {
         if parsed.is_empty() {
             if unsupported > 0 {
                 return Err(anyhow!(
-                    "none of the links use a supported scheme (vless, vmess, trojan, ss, socks, http)"
+                    "none of the links use a supported scheme ({})",
+                    link::supported_scheme_list()
                 ));
             }
             return Err(anyhow!("no valid share-links found"));
