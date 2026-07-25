@@ -185,11 +185,16 @@ fn stream_settings(s: &StreamSettings) -> Value {
     match s.security.as_str() {
         "tls" => {
             v["security"] = json!("tls");
+            // `allowInsecure` is deliberately not emitted: Xray 26.x removed it
+            // ("has been removed and migrated to pinnedPeerCertSha256") and
+            // rejects the whole config when it is true, so emitting it turns an
+            // insecure-TLS server into a core that refuses to start. A pin is
+            // the only remaining way to accept an otherwise-untrusted cert.
             v["tlsSettings"] = trim_obj(json!({
                 "serverName": s.sni,
                 "alpn": s.alpn,
                 "fingerprint": s.fingerprint,
-                "allowInsecure": s.allow_insecure
+                "pinnedPeerCertSha256": s.pin_sha256
             }));
         }
         "reality" => {
@@ -226,7 +231,7 @@ mod tests {
     use serde_json::json;
 
     use super::generate;
-    use crate::model::{OutboundSpec, Protocol, Server};
+    use crate::model::{OutboundSpec, Protocol, Server, StreamSettings};
 
     #[test]
     fn balanced_profile_keeps_local_inbounds_and_safe_routing() {
@@ -257,5 +262,63 @@ mod tests {
         assert_eq!(config["routing"]["rules"][0]["ip"][0], "geoip:private");
         assert_eq!(config["routing"]["rules"][1]["balancerTag"], "balance");
         assert_eq!(config["burstObservatory"]["subjectSelector"][0], "proxy");
+    }
+
+    fn tls_vless(allow_insecure: bool, pin: Option<&str>) -> Server {
+        let stream = StreamSettings {
+            network: "tcp".to_string(),
+            security: "tls".to_string(),
+            sni: Some("example.com".to_string()),
+            allow_insecure,
+            pin_sha256: pin.map(str::to_string),
+            ..Default::default()
+        };
+        Server {
+            id: "s".to_string(),
+            name: "S".to_string(),
+            protocol: Protocol::Vless,
+            address: "example.com".to_string(),
+            port: 443,
+            transport_label: "vless + tls".to_string(),
+            country: None,
+            spec: OutboundSpec::Vless {
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
+                encryption: "none".to_string(),
+                stream,
+            },
+            link: None,
+            latency_ms: None,
+        }
+    }
+
+    /// Xray 26.x rejects the whole config when `allowInsecure` is true, so a
+    /// server that asks for it must still produce a config the core will start.
+    #[test]
+    fn allow_insecure_is_never_emitted() {
+        for insecure in [true, false] {
+            let config = generate(&tls_vless(insecure, None), 10808, 10809);
+            let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
+            assert!(
+                tls.get("allowInsecure").is_none(),
+                "allowInsecure leaked with insecure={insecure}: {tls}"
+            );
+            assert_eq!(tls["serverName"], "example.com");
+        }
+    }
+
+    #[test]
+    fn certificate_pin_is_emitted_as_a_bare_hex_string() {
+        let pin = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let config = generate(&tls_vless(true, Some(pin)), 10808, 10809);
+        let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
+        // A bare string, not an array: Xray 26.x fails to decode the array form.
+        assert_eq!(tls["pinnedPeerCertSha256"], json!(pin));
+    }
+
+    #[test]
+    fn absent_pin_leaves_the_key_out() {
+        let config = generate(&tls_vless(false, None), 10808, 10809);
+        let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
+        assert!(tls.get("pinnedPeerCertSha256").is_none(), "{tls}");
     }
 }

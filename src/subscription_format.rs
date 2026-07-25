@@ -5,7 +5,8 @@ use url::Url;
 
 use crate::link::{b64_decode, parse_links};
 use crate::model::{
-    OutboundSpec, Protocol, Server, StreamSettings, country_from_name, transport_label,
+    OutboundSpec, Protocol, Server, StreamSettings, country_from_name, normalize_pin_sha256,
+    transport_label,
 };
 
 /// Parse the response formats commonly selected by subscription panels from the
@@ -307,6 +308,15 @@ fn stream_from_xray(value: Option<&Value>) -> StreamSettings {
         alpn: string_vec(tls.get("alpn")),
         fingerprint: string(tls, "fingerprint"),
         allow_insecure: bool_value(tls.get("allowInsecure")).unwrap_or(false),
+        // Xray 26.x takes a bare string here; older configs used an array.
+        pin_sha256: string(tls, "pinnedPeerCertSha256")
+            .or_else(|| {
+                tls.pointer("/pinnedPeerCertSha256/0")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .as_deref()
+            .and_then(normalize_pin_sha256),
         public_key: string(tls, "publicKey"),
         short_id: string(tls, "shortId"),
         spider_x: string(tls, "spiderX"),
@@ -404,6 +414,8 @@ fn stream_from_sing_box(outbound: &Value) -> StreamSettings {
             .and_then(Value::as_str)
             .map(str::to_string),
         allow_insecure: bool_value(tls.get("insecure")).unwrap_or(false),
+        // sing-box pins whole PEM certificates, not digests — nothing to map.
+        pin_sha256: None,
         public_key: string(reality, "public_key"),
         short_id: string(reality, "short_id"),
         spider_x: None,
@@ -500,6 +512,11 @@ fn stream_from_clash(proxy: &Value) -> StreamSettings {
         alpn: string_vec(proxy.get("alpn")),
         fingerprint: string(proxy, "client-fingerprint"),
         allow_insecure: bool_value(proxy.get("skip-cert-verify")).unwrap_or(false),
+        // In Clash `fingerprint` is the certificate digest; the uTLS profile is
+        // the separate `client-fingerprint` read above.
+        pin_sha256: string(proxy, "fingerprint")
+            .as_deref()
+            .and_then(normalize_pin_sha256),
         public_key: string(reality, "public-key"),
         short_id: string(reality, "short-id"),
         spider_x: None,

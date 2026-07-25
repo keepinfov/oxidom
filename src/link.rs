@@ -6,7 +6,8 @@ use serde_json::Value;
 use url::Url;
 
 use crate::model::{
-    OutboundSpec, Protocol, Server, StreamSettings, country_from_name, transport_label,
+    OutboundSpec, Protocol, Server, StreamSettings, country_from_name, normalize_pin_sha256,
+    transport_label,
 };
 
 /// Try several base64 alphabets/paddings and return decoded bytes.
@@ -52,6 +53,10 @@ fn stream_from_query(q: &HashMap<String, String>) -> StreamSettings {
             .get("allowInsecure")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
+        pin_sha256: get("pinSHA256")
+            .or_else(|| get("pinsha256"))
+            .as_deref()
+            .and_then(normalize_pin_sha256),
         public_key: get("pbk"),
         short_id: get("sid"),
         spider_x: get("spx"),
@@ -208,6 +213,7 @@ fn parse_vmess(link: &str) -> Option<Server> {
         alpn: s("alpn").map(|a| a.split(',').map(|x| x.trim().to_string()).collect()),
         fingerprint: s("fp"),
         allow_insecure: false,
+        pin_sha256: None,
         public_key: None,
         short_id: None,
         spider_x: None,

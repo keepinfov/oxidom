@@ -111,9 +111,26 @@ impl XrayCore {
         }
     }
 
+    /// Record settings the link asked for that oxidom cannot pass on to the
+    /// core. None of these stop the connection, but each one changes what
+    /// "connected" will mean and the user has no other way to find out.
+    fn preflight_notes(&self, server: &Server) {
+        if let Some(stream) = server.spec.stream()
+            && stream.allow_insecure
+            && stream.pin_sha256.is_none()
+        {
+            self.note(
+                "this link asks to skip certificate verification, but Xray 26.x removed \
+                 \"allowInsecure\" — the certificate will be verified normally, so expect a TLS \
+                 failure if the server presents a self-signed certificate",
+            );
+        }
+    }
+
     fn try_connect(&mut self, server: &Server) -> Result<()> {
         // Resolve before checking ports: a busy port must not mask a missing core.
         let xray = self.resolve_binary()?;
+        self.preflight_notes(server);
         self.ensure_ports_free()?;
         let cfg = config::generate(server, self.socks_port, self.http_port);
         let path = Self::config_path()?;
