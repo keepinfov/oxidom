@@ -74,13 +74,12 @@ fn finish(
     protocol: Protocol,
     address: String,
     port: u16,
-    stream: Option<&StreamSettings>,
     spec: OutboundSpec,
 ) -> Server {
     let country = country_from_name(&name);
     Server {
         id: Server::stable_id(link),
-        transport_label: transport_label(protocol, stream),
+        transport_label: transport_label(protocol, &spec),
         country,
         name,
         protocol,
@@ -132,17 +131,9 @@ fn parse_vless(link: &str) -> Option<Server> {
     let spec = OutboundSpec::Vless {
         uuid,
         encryption,
-        stream: stream.clone(),
+        stream,
     };
-    Some(finish(
-        link,
-        name,
-        Protocol::Vless,
-        host,
-        port,
-        Some(&stream),
-        spec,
-    ))
+    Some(finish(link, name, Protocol::Vless, host, port, spec))
 }
 
 fn parse_trojan(link: &str) -> Option<Server> {
@@ -165,19 +156,8 @@ fn parse_trojan(link: &str) -> Option<Server> {
         let f = decode_fragment(&url);
         if f.is_empty() { host.clone() } else { f }
     };
-    let spec = OutboundSpec::Trojan {
-        password,
-        stream: stream.clone(),
-    };
-    Some(finish(
-        link,
-        name,
-        Protocol::Trojan,
-        host,
-        port,
-        Some(&stream),
-        spec,
-    ))
+    let spec = OutboundSpec::Trojan { password, stream };
+    Some(finish(link, name, Protocol::Trojan, host, port, spec))
 }
 
 fn parse_vmess(link: &str) -> Option<Server> {
@@ -227,17 +207,9 @@ fn parse_vmess(link: &str) -> Option<Server> {
         uuid,
         alter_id,
         security,
-        stream: stream.clone(),
+        stream,
     };
-    Some(finish(
-        link,
-        name,
-        Protocol::Vmess,
-        host,
-        port,
-        Some(&stream),
-        spec,
-    ))
+    Some(finish(link, name, Protocol::Vmess, host, port, spec))
 }
 
 fn parse_ss(link: &str) -> Option<Server> {
@@ -283,15 +255,7 @@ fn parse_ss(link: &str) -> Option<Server> {
 
     let name = if name.is_empty() { host.clone() } else { name };
     let spec = OutboundSpec::Shadowsocks { method, password };
-    Some(finish(
-        link,
-        name,
-        Protocol::Shadowsocks,
-        host,
-        port,
-        None,
-        spec,
-    ))
+    Some(finish(link, name, Protocol::Shadowsocks, host, port, spec))
 }
 
 fn parse_socks(link: &str) -> Option<Server> {
@@ -305,7 +269,7 @@ fn parse_socks(link: &str) -> Option<Server> {
         if f.is_empty() { host.clone() } else { f }
     };
     let spec = OutboundSpec::Socks { username, password };
-    Some(finish(link, name, Protocol::Socks, host, port, None, spec))
+    Some(finish(link, name, Protocol::Socks, host, port, spec))
 }
 
 fn parse_http(link: &str) -> Option<Server> {
@@ -321,7 +285,7 @@ fn parse_http(link: &str) -> Option<Server> {
         if f.is_empty() { host.clone() } else { f }
     };
     let spec = OutboundSpec::Http { username, password };
-    Some(finish(link, name, Protocol::Http, host, port, None, spec))
+    Some(finish(link, name, Protocol::Http, host, port, spec))
 }
 
 fn opt(s: &str) -> Option<String> {
@@ -361,4 +325,154 @@ pub fn parse_links_counting(text: &str) -> (Vec<Server>, usize) {
         }
     }
     (servers, unsupported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+
+    fn stream_of(server: &Server) -> &StreamSettings {
+        server.spec.stream().expect("spec should carry a stream")
+    }
+
+    #[test]
+    fn vless_reads_transport_and_reality_parameters() {
+        let link = format!(
+            "vless://{UUID}@example.com:443?type=ws&security=reality&sni=cdn.example\
+             &pbk=key&sid=ab&spx=%2F&path=%2Fws&host=cdn.example&fp=chrome\
+             &flow=xtls-rprx-vision#%F0%9F%87%B3%F0%9F%87%B1%20Node"
+        );
+        let server = parse_link(&link).unwrap();
+
+        assert_eq!(server.protocol, Protocol::Vless);
+        assert_eq!(server.address, "example.com");
+        assert_eq!(server.port, 443);
+        assert_eq!(server.name, "🇳🇱 Node");
+        assert_eq!(server.country.as_deref(), Some("NL"));
+        assert_eq!(server.transport_label, "vless + ws + reality");
+
+        let stream = stream_of(&server);
+        assert_eq!(stream.network, "ws");
+        assert_eq!(stream.security, "reality");
+        assert_eq!(stream.sni.as_deref(), Some("cdn.example"));
+        assert_eq!(stream.public_key.as_deref(), Some("key"));
+        assert_eq!(stream.short_id.as_deref(), Some("ab"));
+        assert_eq!(stream.spider_x.as_deref(), Some("/"));
+        assert_eq!(stream.path.as_deref(), Some("/ws"));
+        assert_eq!(stream.fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(stream.flow.as_deref(), Some("xtls-rprx-vision"));
+    }
+
+    /// Trojan is TLS even when the link says nothing about security.
+    #[test]
+    fn trojan_defaults_to_tls() {
+        let server = parse_link("trojan://pw@example.com:443#T").unwrap();
+        assert_eq!(server.protocol, Protocol::Trojan);
+        assert_eq!(stream_of(&server).security, "tls");
+        assert_eq!(server.transport_label, "trojan + tls");
+        match &server.spec {
+            OutboundSpec::Trojan { password, .. } => assert_eq!(password, "pw"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn vmess_reads_its_base64_json_payload() {
+        let payload = serde_json::json!({
+            "add": "example.com", "port": "443", "id": UUID, "aid": "0",
+            "scy": "auto", "net": "ws", "tls": "tls", "ps": "VM", "path": "/p",
+        })
+        .to_string();
+        let link = format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(payload)
+        );
+        let server = parse_link(&link).unwrap();
+
+        assert_eq!(server.protocol, Protocol::Vmess);
+        assert_eq!(server.address, "example.com");
+        assert_eq!(server.port, 443);
+        assert_eq!(server.name, "VM");
+        assert_eq!(server.transport_label, "vmess + ws + tls");
+        assert_eq!(stream_of(&server).path.as_deref(), Some("/p"));
+    }
+
+    #[test]
+    fn shadowsocks_accepts_both_sip002_and_legacy_encodings() {
+        let creds = base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:secret");
+        let sip002 = parse_link(&format!("ss://{creds}@example.com:8388#SS")).unwrap();
+
+        let legacy_body =
+            base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:secret@example.com:8388");
+        let legacy = parse_link(&format!("ss://{legacy_body}#SS")).unwrap();
+
+        for server in [&sip002, &legacy] {
+            assert_eq!(server.protocol, Protocol::Shadowsocks);
+            assert_eq!(server.address, "example.com");
+            assert_eq!(server.port, 8388);
+            assert_eq!(server.transport_label, "shadowsocks");
+            match &server.spec {
+                OutboundSpec::Shadowsocks { method, password } => {
+                    assert_eq!(method, "aes-256-gcm");
+                    assert_eq!(password, "secret");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn socks_and_http_carry_optional_credentials() {
+        let socks = parse_link("socks5://user:pass@example.com:1080#S").unwrap();
+        assert_eq!(socks.protocol, Protocol::Socks);
+        assert_eq!(socks.port, 1080);
+        match &socks.spec {
+            OutboundSpec::Socks { username, password } => {
+                assert_eq!(username.as_deref(), Some("user"));
+                assert_eq!(password.as_deref(), Some("pass"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A bare https link has no port; the scheme supplies the default.
+        let http = parse_link("https://example.com#H").unwrap();
+        assert_eq!(http.protocol, Protocol::Http);
+        assert_eq!(http.port, 443);
+        assert!(matches!(
+            &http.spec,
+            OutboundSpec::Http {
+                username: None,
+                password: None
+            }
+        ));
+    }
+
+    #[test]
+    fn links_without_credentials_are_rejected() {
+        assert!(parse_link("vless://@example.com:443").is_none());
+        assert!(parse_link("trojan://example.com:443").is_none());
+    }
+
+    /// A BOM or stray whitespace on the first line of a subscription must not
+    /// turn a valid scheme into an unknown one.
+    #[test]
+    fn leading_bom_and_whitespace_are_tolerated() {
+        let link = format!("\u{feff}  vless://{UUID}@example.com:443  ");
+        assert!(parse_link(&link).is_some());
+    }
+
+    #[test]
+    fn unsupported_schemes_are_counted_not_dropped_silently() {
+        let text = format!(
+            "vless://{UUID}@example.com:443\n\
+             tuic://x@y:443\n\
+             \n\
+             not a link at all\n"
+        );
+        let (servers, unsupported) = parse_links_counting(&text);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(unsupported, 1, "only the tuic line looks like a link");
+    }
 }

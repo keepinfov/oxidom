@@ -278,9 +278,12 @@ fn regional_indicator_to_letter(c: char) -> Option<char> {
 }
 
 /// Build the "vless + xhttp + reality"-style subtitle.
-pub fn transport_label(protocol: Protocol, stream: Option<&StreamSettings>) -> String {
+///
+/// Takes the whole spec rather than a stream: not every protocol has a
+/// [`StreamSettings`], and those that don't still have something to say.
+pub fn transport_label(protocol: Protocol, spec: &OutboundSpec) -> String {
     let mut parts = vec![protocol.as_str().to_string()];
-    if let Some(s) = stream {
+    if let Some(s) = spec.stream() {
         if !s.network.is_empty() && s.network != "tcp" {
             parts.push(s.network.clone());
         }

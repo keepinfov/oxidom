@@ -226,14 +226,7 @@ fn server_from_xray_outbound(name: &str, outbound: &Value) -> Option<Server> {
                     stream: stream.clone(),
                 }
             };
-            Some(finish_server(
-                name,
-                protocol,
-                address,
-                port,
-                Some(&stream),
-                spec,
-            ))
+            Some(finish_server(name, protocol, address, port, spec))
         }
         Protocol::Trojan | Protocol::Shadowsocks | Protocol::Socks | Protocol::Http => {
             let endpoint = outbound.pointer("/settings/servers/0")?;
@@ -267,10 +260,7 @@ fn server_from_xray_outbound(name: &str, outbound: &Value) -> Option<Server> {
                 }
                 _ => return None,
             };
-            let stream_ref = (protocol == Protocol::Trojan).then_some(&stream);
-            Some(finish_server(
-                name, protocol, address, port, stream_ref, spec,
-            ))
+            Some(finish_server(name, protocol, address, port, spec))
         }
     }
 }
@@ -382,14 +372,7 @@ fn server_from_sing_box(outbound: &Value) -> Option<Server> {
             }
         }
     };
-    let stream_ref = matches!(
-        protocol,
-        Protocol::Vless | Protocol::Vmess | Protocol::Trojan
-    )
-    .then_some(&stream);
-    Some(finish_server(
-        &name, protocol, address, port, stream_ref, spec,
-    ))
+    Some(finish_server(&name, protocol, address, port, spec))
 }
 
 fn stream_from_sing_box(outbound: &Value) -> StreamSettings {
@@ -478,14 +461,7 @@ fn server_from_clash(proxy: &Value) -> Option<Server> {
             }
         }
     };
-    let stream_ref = matches!(
-        protocol,
-        Protocol::Vless | Protocol::Vmess | Protocol::Trojan
-    )
-    .then_some(&stream);
-    Some(finish_server(
-        &name, protocol, address, port, stream_ref, spec,
-    ))
+    Some(finish_server(&name, protocol, address, port, spec))
 }
 
 fn stream_from_clash(proxy: &Value) -> StreamSettings {
@@ -536,7 +512,6 @@ fn finish_server(
     protocol: Protocol,
     address: String,
     port: u16,
-    stream: Option<&StreamSettings>,
     spec: OutboundSpec,
 ) -> Server {
     let mut server = Server {
@@ -545,7 +520,7 @@ fn finish_server(
         protocol,
         address,
         port,
-        transport_label: transport_label(protocol, stream),
+        transport_label: transport_label(protocol, &spec),
         country: country_from_name(name),
         spec,
         link: None,
