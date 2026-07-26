@@ -1,6 +1,28 @@
 use std::path::PathBuf;
+use std::sync::RwLock;
 
 use anyhow::{Result, anyhow};
+
+static TEST_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_test_root(dir: Option<PathBuf>) {
+    *TEST_ROOT
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = dir;
+}
+
+/// Serialises tests that install a root: it is process-global on purpose, so
+/// that worker threads spawned by the daemon see the same one.
+#[cfg(test)]
+pub(crate) static TEST_ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn test_root() -> Option<PathBuf> {
+    TEST_ROOT
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
 
 /// When running as a systemd system service, all state lives in the unit's
 /// StateDirectory (e.g. /var/lib/oxidom) instead of the user's XDG dirs.
@@ -11,6 +33,9 @@ fn state_directory() -> Option<PathBuf> {
 }
 
 pub fn config_dir() -> Result<PathBuf> {
+    if let Some(dir) = test_root() {
+        return Ok(dir);
+    }
     if let Some(dir) = state_directory() {
         return Ok(dir);
     }
@@ -20,6 +45,9 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 pub fn data_dir() -> Result<PathBuf> {
+    if let Some(dir) = test_root() {
+        return Ok(dir);
+    }
     if let Some(dir) = state_directory() {
         return Ok(dir);
     }

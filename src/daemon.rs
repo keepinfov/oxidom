@@ -115,7 +115,7 @@ pub struct DaemonOptions {
 }
 
 #[derive(Clone)]
-struct Shared {
+pub(crate) struct Shared {
     engine: Arc<Mutex<Engine>>,
     readings: Arc<Mutex<HashMap<String, LatencyReading>>>,
     probes: Arc<Mutex<ProbeQueue>>,
@@ -134,7 +134,7 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(
+    pub(crate) fn new(
         engine: Engine,
         socks_port_locked: bool,
         http_port_locked: bool,
@@ -164,12 +164,12 @@ impl Shared {
         // touching `engine` below would take the two locks in the opposite
         // order from `confirm_connection` — engine first, then override — and
         // deadlock the daemon the moment the two raced.
-        let override_status = self.override_status.lock().unwrap().clone();
+        let override_status = crate::sync::lock(&self.override_status).clone();
         if let Some(failure) = override_status {
             return StatusInfo::from_status(&failure.status, None)
                 .with_error_id(Some(failure.server_id));
         }
-        let mut engine = self.engine.lock().unwrap();
+        let mut engine = crate::sync::lock(&self.engine);
         if engine.status() == Status::Connected && !engine.core.is_alive() {
             // Record the death once rather than re-deriving it on every poll,
             // so the log keeps one line and the GUI toasts one transition.
@@ -181,7 +181,7 @@ impl Shared {
     }
 
     fn runtime_info(&self) -> RuntimeInfo {
-        let engine = self.engine.lock().unwrap();
+        let engine = crate::sync::lock(&self.engine);
         let (xray_path, xray_error, xray_source) = match engine.core.resolve_binary() {
             Ok(resolved) => (
                 Some(resolved.path.display().to_string()),
@@ -205,7 +205,7 @@ impl Shared {
     /// only the server the tunnel is actually carrying may be measured through
     /// the proxy, everything else is measured on its own merits.
     fn probe_target(&self, server_id: &str) -> Option<(Server, Config, probe::Route)> {
-        let engine = self.engine.lock().unwrap();
+        let engine = crate::sync::lock(&self.engine);
         let server = engine.find_server(server_id)?;
         let active = engine.state.active_server_id.as_deref() == Some(server_id)
             && engine.status() == Status::Connected;
@@ -218,7 +218,7 @@ impl Shared {
     }
 
     fn enqueue_probe(&self, server_id: String) {
-        if !self.probes.lock().unwrap().enqueue(server_id) {
+        if !crate::sync::lock(&self.probes).enqueue(server_id) {
             return;
         }
         self.pump_probes();
@@ -226,13 +226,13 @@ impl Shared {
 
     fn pump_probes(&self) {
         loop {
-            let Some(next) = self.probes.lock().unwrap().start_next() else {
+            let Some(next) = crate::sync::lock(&self.probes).start_next() else {
                 return;
             };
             let shared = self.clone();
             std::thread::spawn(move || {
                 shared.run_probe(&next);
-                shared.probes.lock().unwrap().finish(&next);
+                crate::sync::lock(&shared.probes).finish(&next);
                 shared.pump_probes();
             });
         }
@@ -270,10 +270,7 @@ impl Shared {
             ),
         };
         let value = reading.value;
-        self.readings
-            .lock()
-            .unwrap()
-            .insert(server_id.to_string(), reading);
+        crate::sync::lock(&self.readings).insert(server_id.to_string(), reading);
         value
     }
 
@@ -290,7 +287,7 @@ impl Shared {
         let shared = self.clone();
         std::thread::spawn(move || {
             let (socks_port, method) = {
-                let engine = shared.engine.lock().unwrap();
+                let engine = crate::sync::lock(&shared.engine);
                 (engine.config.socks_port, engine.config.latency_method)
             };
 
@@ -305,17 +302,17 @@ impl Shared {
                 // Nothing could be measured, but the GUI is waiting on this id
                 // and would otherwise see the spinner retire onto whatever the
                 // map still held. Record the failure it actually is.
-                shared.readings.lock().unwrap().insert(
+                crate::sync::lock(&shared.readings).insert(
                     server_id.clone(),
                     LatencyReading::failed(ProbeFailure::Unreachable, ProbeRoute::Proxied, method),
                 );
                 None
             };
-            shared.probes.lock().unwrap().finish(&server_id);
+            crate::sync::lock(&shared.probes).finish(&server_id);
             if ready && latency.is_some() {
                 return;
             }
-            let mut engine = shared.engine.lock().unwrap();
+            let mut engine = crate::sync::lock(&shared.engine);
             // Bail out if another connect/disconnect superseded this attempt:
             // the tunnel now running is not the one this thread was confirming.
             if shared.connect_generation.load(Ordering::SeqCst) != generation {
@@ -340,7 +337,7 @@ impl Shared {
                 // torn down below, so the core's own status is lost.
                 engine.core.note(&reason);
                 engine.disconnect();
-                *shared.override_status.lock().unwrap() = Some(ErrorOverride {
+                *crate::sync::lock(&shared.override_status) = Some(ErrorOverride {
                     status: Status::Error(reason),
                     server_id: server_id.clone(),
                 });
@@ -363,17 +360,14 @@ impl Shared {
         // engine → readings, the same order `run_probe` takes them in, and the
         // engine lock is dropped before either of the others is touched.
         let alive: HashSet<String> = {
-            let engine = self.engine.lock().unwrap();
+            let engine = crate::sync::lock(&self.engine);
             engine
                 .all_servers()
                 .map(|server| server.id.clone())
                 .collect()
         };
-        self.readings
-            .lock()
-            .unwrap()
-            .retain(|id, _| alive.contains(id));
-        self.probes.lock().unwrap().retain_alive(&alive);
+        crate::sync::lock(&self.readings).retain(|id, _| alive.contains(id));
+        crate::sync::lock(&self.probes).retain_alive(&alive);
     }
 
     /// Periodic re-probe of the active server; keeps the latency reading
@@ -384,7 +378,7 @@ impl Shared {
             loop {
                 std::thread::sleep(ACTIVE_PROBE_INTERVAL);
                 let active = {
-                    let mut engine = shared.engine.lock().unwrap();
+                    let mut engine = crate::sync::lock(&shared.engine);
                     if engine.status() != Status::Connected || !engine.core.is_alive() {
                         continue;
                     }
@@ -400,8 +394,15 @@ impl Shared {
     }
 }
 
-struct Service {
-    shared: Shared,
+pub(crate) struct Service {
+    pub(crate) shared: Shared,
+}
+
+#[cfg(test)]
+pub(crate) fn for_test() -> Service {
+    Service {
+        shared: Shared::new(Engine::load(), false, false, false),
+    }
 }
 
 /// `{:#}` keeps anyhow's cause chain; `to_string()` would send only the
@@ -427,18 +428,13 @@ fn json<T: serde::Serialize>(value: &T) -> fdo::Result<String> {
 #[zbus::interface(name = "dev.keepinfov.oxidom1")]
 impl Service {
     fn list_subscriptions(&self) -> fdo::Result<String> {
-        let engine = self.shared.engine.lock().unwrap();
+        let engine = crate::sync::lock(&self.shared.engine);
         json(&engine.subscriptions)
     }
 
     fn add_subscription(&self, url: String, name: String, send_hwid: bool) -> fdo::Result<()> {
         let name = (!name.is_empty()).then_some(name);
-        let result = self
-            .shared
-            .engine
-            .lock()
-            .unwrap()
-            .add_subscription(url, name, send_hwid);
+        let result = crate::sync::lock(&self.shared.engine).add_subscription(url, name, send_hwid);
         // After the failures too: a refresh that errors part-way through has
         // still replaced some of the list.
         self.shared.prune_readings();
@@ -446,43 +442,38 @@ impl Service {
     }
 
     fn remove_subscription(&self, subscription_id: String) -> fdo::Result<bool> {
-        let result = self
-            .shared
-            .engine
-            .lock()
-            .unwrap()
-            .remove_subscription(&subscription_id);
+        let result = crate::sync::lock(&self.shared.engine).remove_subscription(&subscription_id);
         self.shared.prune_readings();
         result.map_err(failed)
     }
 
     fn refresh(&self, subscription_id: String) -> fdo::Result<()> {
-        let result = self.shared.engine.lock().unwrap().refresh(&subscription_id);
+        let result = crate::sync::lock(&self.shared.engine).refresh(&subscription_id);
         self.shared.prune_readings();
         result.map_err(failed)
     }
 
     fn refresh_all(&self) -> fdo::Result<()> {
-        let result = self.shared.engine.lock().unwrap().refresh_all();
+        let result = crate::sync::lock(&self.shared.engine).refresh_all();
         self.shared.prune_readings();
         result.map_err(failed)
     }
 
     fn import_links(&self, text: String) -> fdo::Result<(u32, u32)> {
-        let result = self.shared.engine.lock().unwrap().import_links(&text);
+        let result = crate::sync::lock(&self.shared.engine).import_links(&text);
         self.shared.prune_readings();
         let (added, unsupported) = result.map_err(failed)?;
         Ok((added as u32, unsupported as u32))
     }
 
     fn remove_server(&self, server_id: String) -> fdo::Result<bool> {
-        let result = self.shared.engine.lock().unwrap().remove_server(&server_id);
+        let result = crate::sync::lock(&self.shared.engine).remove_server(&server_id);
         self.shared.prune_readings();
         result.map_err(failed)
     }
 
     fn set_hwid(&self, subscription_id: String, enabled: bool) -> fdo::Result<()> {
-        let mut engine = self.shared.engine.lock().unwrap();
+        let mut engine = crate::sync::lock(&self.shared.engine);
         if let Some(subscription) = engine
             .subscriptions
             .iter_mut()
@@ -494,7 +485,7 @@ impl Service {
     }
 
     fn connect(&self, server_id: String) -> fdo::Result<()> {
-        *self.shared.override_status.lock().unwrap() = None;
+        *crate::sync::lock(&self.shared.override_status) = None;
         let generation = self.shared.next_connect_generation();
 
         // Both of these happen before the tunnel comes up, and both are about
@@ -504,14 +495,14 @@ impl Service {
         // slot is claimed here, not in the confirmation thread, so there is no
         // window in which the id is in neither set and the card can retire its
         // spinner onto a number nobody measured.
-        self.shared.readings.lock().unwrap().remove(&server_id);
-        self.shared.probes.lock().unwrap().start_now(&server_id);
+        crate::sync::lock(&self.shared.readings).remove(&server_id);
+        crate::sync::lock(&self.shared.probes).start_now(&server_id);
 
-        if let Err(error) = self.shared.engine.lock().unwrap().connect(&server_id) {
+        if let Err(error) = crate::sync::lock(&self.shared.engine).connect(&server_id) {
             // No confirmation will run for an attempt that never started, so
             // the slot has to be given back here or it is lost for good. The
             // id leaves without a reading on purpose: nothing was measured.
-            self.shared.probes.lock().unwrap().finish(&server_id);
+            crate::sync::lock(&self.shared.probes).finish(&server_id);
             return Err(failed(error));
         }
         self.shared.confirm_connection(server_id, generation);
@@ -519,9 +510,9 @@ impl Service {
     }
 
     fn disconnect(&self) -> fdo::Result<()> {
-        *self.shared.override_status.lock().unwrap() = None;
+        *crate::sync::lock(&self.shared.override_status) = None;
         self.shared.next_connect_generation();
-        self.shared.engine.lock().unwrap().disconnect();
+        crate::sync::lock(&self.shared.engine).disconnect();
         Ok(())
     }
 
@@ -542,24 +533,24 @@ impl Service {
     }
 
     fn probe_state(&self) -> fdo::Result<String> {
-        let (running, queued) = self.shared.probes.lock().unwrap().snapshot();
+        let (running, queued) = crate::sync::lock(&self.shared.probes).snapshot();
         let state = ProbeState {
             version: PROBE_STATE_VERSION,
             running,
             queued,
-            readings: self.shared.readings.lock().unwrap().clone(),
+            readings: crate::sync::lock(&self.shared.readings).clone(),
         };
         json(&state)
     }
 
     fn get_settings(&self) -> fdo::Result<String> {
-        json(&self.shared.engine.lock().unwrap().config)
+        json(&crate::sync::lock(&self.shared.engine).config)
     }
 
     fn set_settings(&self, config_json: String) -> fdo::Result<String> {
         let raw: serde_json::Value = serde_json::from_str(&config_json).map_err(failed)?;
         let mut config: Config = serde_json::from_value(raw.clone()).map_err(failed)?;
-        let mut engine = self.shared.engine.lock().unwrap();
+        let mut engine = crate::sync::lock(&self.shared.engine);
 
         // A GUI older than this key sends a payload without it; treat that as
         // "leave it alone" rather than clearing the path the daemon may need
@@ -630,11 +621,11 @@ impl Service {
     }
 
     fn recent_logs(&self) -> fdo::Result<Vec<String>> {
-        Ok(self.shared.engine.lock().unwrap().core.recent_logs())
+        Ok(crate::sync::lock(&self.shared.engine).core.recent_logs())
     }
 
     fn clear_logs(&self) -> fdo::Result<()> {
-        self.shared.engine.lock().unwrap().core.clear_logs();
+        crate::sync::lock(&self.shared.engine).core.clear_logs();
         Ok(())
     }
 }
@@ -709,7 +700,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
     }
     main_loop.run();
 
-    shared.engine.lock().unwrap().disconnect();
+    crate::sync::lock(&shared.engine).disconnect();
     log::info!("oxidom daemon stopped");
     Ok(())
 }
@@ -728,8 +719,88 @@ fn core_rejected_the_protocol(logs: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct TestRoot {
+        path: std::path::PathBuf,
+    }
+
+    impl TestRoot {
+        fn install(label: &str) -> Result<Self> {
+            let suffix = NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "oxidom-test-{label}-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("creating test root {}", path.display()))?;
+            crate::paths::set_test_root(Some(path.clone()));
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            crate::paths::set_test_root(None);
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn poison<T: Send + 'static>(target: Arc<Mutex<T>>) {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::thread::spawn(move || {
+            let _guard = crate::sync::lock(&target);
+            panic!("intentional mutex poison");
+        })
+        .join();
+        std::panic::set_hook(previous_hook);
+        assert!(result.is_err());
+    }
+
     fn drain_slots(queue: &mut ProbeQueue) -> Vec<String> {
         std::iter::from_fn(|| queue.start_next()).collect()
+    }
+
+    #[test]
+    fn a_panicking_worker_leaves_the_daemon_answering() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("poisoned-probes")?;
+        let service = for_test();
+
+        poison(service.shared.probes.clone());
+
+        service.probe_state()?;
+        service.status()?;
+        service.list_subscriptions()?;
+        let queue = crate::sync::lock(&service.shared.probes);
+        let _ = queue.snapshot();
+        Ok(())
+    }
+
+    #[test]
+    fn a_poisoned_engine_lock_still_serves_status() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("poisoned-engine")?;
+        let service = for_test();
+
+        poison(service.shared.engine.clone());
+
+        service.status()?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_root_gives_an_empty_but_valid_surface() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("empty-surface")?;
+        let service = for_test();
+
+        let status: StatusInfo = serde_json::from_str(&service.status()?)?;
+        assert_eq!(status.state, "disconnected");
+        let probes: ProbeState = serde_json::from_str(&service.probe_state()?)?;
+        assert_eq!(probes.version, PROBE_STATE_VERSION);
+        Ok(())
     }
 
     /// The cap is what the GUI's queued spinners exist for: everything past it

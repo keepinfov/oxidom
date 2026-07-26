@@ -17,6 +17,7 @@ mod probe;
 mod state;
 mod subscription;
 mod subscription_format;
+mod sync;
 mod sysproxy;
 mod xray;
 

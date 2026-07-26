@@ -1764,7 +1764,7 @@ impl Controller {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_millis(500), move || {
             controller.drain_tray_commands();
-            if let Some(snapshot) = controller.poll_snapshot.lock().unwrap().take() {
+            if let Some(snapshot) = crate::sync::lock(&controller.poll_snapshot).take() {
                 controller.apply_snapshot(snapshot);
             }
             let tick = controller.sweep_tick.get().wrapping_add(1);
@@ -1791,7 +1791,7 @@ impl Controller {
                         })
                     })();
                     if let Ok(snapshot) = snapshot {
-                        *slot.lock().unwrap() = Some(snapshot);
+                        *crate::sync::lock(&slot) = Some(snapshot);
                     }
                     in_flight.store(false, Ordering::SeqCst);
                 });
@@ -1808,7 +1808,7 @@ impl Controller {
     fn bump_epoch(&self) -> u64 {
         let mut state = self.state.borrow_mut();
         state.ui.state_epoch += 1;
-        *self.poll_snapshot.lock().unwrap() = None;
+        *crate::sync::lock(&self.poll_snapshot) = None;
         state.ui.state_epoch
     }
 

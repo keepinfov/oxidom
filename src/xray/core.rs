@@ -86,11 +86,11 @@ impl XrayCore {
     }
 
     pub fn status(&self) -> Status {
-        self.status.lock().unwrap().clone()
+        crate::sync::lock(&self.status).clone()
     }
 
     fn set_status(&self, s: Status) {
-        *self.status.lock().unwrap() = s;
+        *crate::sync::lock(&self.status) = s;
     }
 
     pub(crate) fn config_path() -> Result<PathBuf> {
@@ -114,7 +114,7 @@ impl XrayCore {
     pub fn connect(&mut self, server: &Server) -> Result<()> {
         self.disconnect();
         self.set_status(Status::Connecting);
-        self.logs.lock().unwrap().clear();
+        crate::sync::lock(&self.logs).clear();
         match self.try_connect(server) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -226,11 +226,11 @@ impl XrayCore {
     }
 
     pub fn recent_logs(&self) -> Vec<String> {
-        self.logs.lock().unwrap().clone()
+        crate::sync::lock(&self.logs).clone()
     }
 
     pub fn clear_logs(&self) {
-        self.logs.lock().unwrap().clear();
+        crate::sync::lock(&self.logs).clear();
     }
 }
 
@@ -275,7 +275,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, logs: Arc<Mutex<Ve
 }
 
 fn push_log(logs: &Arc<Mutex<Vec<String>>>, line: String) {
-    let mut logs = logs.lock().unwrap();
+    let mut logs = crate::sync::lock(logs);
     if logs.len() >= LOG_CAP {
         logs.remove(0);
     }
