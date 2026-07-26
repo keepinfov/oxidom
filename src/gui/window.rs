@@ -2405,7 +2405,7 @@ fn install_css() {
         }
         .server-card:hover { background: alpha(@window_fg_color, 0.09); }
         .server-card.selected-server { box-shadow: inset 0 0 0 1px alpha(@accent_color, 0.65); }
-        .server-card.active-server { background: alpha(@accent_color, 0.12); box-shadow: inset 0 0 0 1px @accent_color; }
+        .server-card.active-server { background: alpha(@success_color, 0.08); box-shadow: inset 0 0 0 1px alpha(@success_color, 0.75); }
         .server-card-header { min-height: 56px; padding: 0; background: transparent; border: none; box-shadow: none; }
         .server-card-header:hover { background: transparent; }
         .server-card-detail { padding: 4px 12px 8px; }
@@ -2438,7 +2438,6 @@ fn install_css() {
         .latency-offline { color: @warning_color; background: alpha(@warning_color, 0.13); }
         .status-badge { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; font-weight: 600; }
         .status-badge.status-working { color: @accent_color; background: alpha(@accent_color, 0.13); }
-        .status-badge.status-connected { color: @success_color; background: alpha(@success_color, 0.13); }
         .status-badge.status-error { color: @error_color; background: alpha(@error_color, 0.13); }
         /* An inset ring rather than a border: `.server-card` is a fixed-height
            frame with overflow hidden, and a real border would eat 2px of the

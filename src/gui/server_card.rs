@@ -186,6 +186,7 @@ pub struct ServerCard {
     pub root: CardFrame,
     detail: gtk::Box,
     detail_region: gtk::Box,
+    header: gtk::Button,
     latency_display: gtk::Stack,
     latency: gtk::Label,
     latency_spinner: gtk::Spinner,
@@ -471,6 +472,7 @@ impl ServerCard {
             root,
             detail,
             detail_region,
+            header,
             latency_display,
             latency,
             latency_spinner,
@@ -616,11 +618,20 @@ impl ServerCard {
     pub fn set_connection_state(&self, state: CardConnectionState) {
         self.connect_button.remove_css_class("suggested-action");
         self.connect_button.remove_css_class("destructive-action");
-        self.status.remove_css_class("status-connected");
         self.status.remove_css_class("status-working");
         self.status.remove_css_class("status-error");
         self.root.remove_css_class("failed-server");
         self.connect_button.set_sensitive(true);
+        let accessible_status = match state {
+            CardConnectionState::Disconnected | CardConnectionState::ConnectedElsewhere => {
+                "Disconnected"
+            }
+            CardConnectionState::ConnectedHere => "Connected",
+            CardConnectionState::Connecting => "Connecting",
+            CardConnectionState::Failed => "Connection failed",
+        };
+        self.header
+            .update_property(&[gtk::accessible::Property::Description(accessible_status)]);
         match state {
             CardConnectionState::Disconnected => {
                 self.status.set_visible(false);
@@ -630,9 +641,10 @@ impl ServerCard {
                 self.root.remove_css_class("active-server");
             }
             CardConnectionState::ConnectedHere => {
-                self.status.set_label("Connected");
-                self.status.add_css_class("status-connected");
-                self.status.set_visible(true);
+                // The success-coloured card and the global status already show
+                // that this is the active tunnel. Keeping a second text pill
+                // here only steals the space the server name needs.
+                self.status.set_visible(false);
                 // Kept visible: this is the one card whose number describes the
                 // connection the user is actually on, and hiding it is why the
                 // active server was the only one you could not see a ping for.
