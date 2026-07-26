@@ -184,10 +184,16 @@ const STARTUP_POLL: Duration = Duration::from_millis(60);
 struct Splash {
     window: adw::ApplicationWindow,
     stage: gtk::Label,
+    /// Kept so [`Splash::dismiss`] can take the handler off before closing.
+    /// Closing a window emits `close-request` exactly as clicking its × does,
+    /// and this handler quits the application — so a splash dismissed by
+    /// success would take the process down with it, a second before the window
+    /// it was waiting for could appear.
+    close_handler: glib::SignalHandlerId,
 }
 
 impl Splash {
-    fn new(app: &adw::Application) -> Self {
+    fn new(app: &adw::Application, cancelled: Rc<Cell<bool>>) -> Self {
         let spinner = gtk::Spinner::builder()
             .width_request(32)
             .height_request(32)
@@ -227,12 +233,34 @@ impl Splash {
             .content(&view)
             .build();
         set_window_icon(&window);
+        // Closing the splash by hand is the only way to abandon a connection
+        // that is taking too long, and there is no window behind it to fall
+        // back to, so it means quit.
+        let close_handler = window.connect_close_request({
+            let app = app.clone();
+            move |_| {
+                cancelled.set(true);
+                app.quit();
+                glib::Propagation::Proceed
+            }
+        });
         window.present();
-        Splash { window, stage }
+        Splash {
+            window,
+            stage,
+            close_handler,
+        }
     }
 
     fn set_stage(&self, stage: ConnectStage) {
         self.stage.set_label(stage_text(stage));
+    }
+
+    /// Take the splash down because the connection finished, not because the
+    /// user gave up on it.
+    fn dismiss(self) {
+        self.window.disconnect(self.close_handler);
+        self.window.close();
     }
 }
 
@@ -267,19 +295,10 @@ pub fn start(
 
     // `--background` shows nothing by definition, so it gets no splash either;
     // its progress goes to the log.
-    let splash = (!background).then(|| Splash::new(app));
     let cancelled = Rc::new(Cell::new(false));
-    if let Some(splash) = &splash {
-        splash.window.connect_close_request({
-            let app = app.clone();
-            let cancelled = cancelled.clone();
-            move |_| {
-                cancelled.set(true);
-                app.quit();
-                glib::Propagation::Proceed
-            }
-        });
-    }
+    // In a cell because dismissing the splash consumes it, and the closure
+    // below outlives the tick that does so.
+    let splash = RefCell::new((!background).then(|| Splash::new(app, cancelled.clone())));
 
     let (stage_sender, stage_receiver) = mpsc::channel();
     let (sender, receiver) = mpsc::channel();
@@ -298,7 +317,7 @@ pub fn start(
             return glib::ControlFlow::Break;
         }
         while let Ok(stage) = stage_receiver.try_recv() {
-            if let Some(splash) = &splash {
+            if let Some(splash) = splash.borrow().as_ref() {
                 splash.set_stage(stage);
             }
         }
@@ -311,8 +330,8 @@ pub fn start(
                 Err("the daemon connection ended without an answer".to_string())
             }
         };
-        if let Some(splash) = &splash {
-            splash.window.close();
+        if let Some(splash) = splash.borrow_mut().take() {
+            splash.dismiss();
         }
         match outcome {
             Ok(client) => on_ready(Some(build(&app, background, client))),
