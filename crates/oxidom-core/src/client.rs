@@ -1,7 +1,7 @@
 //! Blocking D-Bus client for the oxidom daemon. All calls can block for the
 //! duration of a daemon operation — never call these on the GTK main thread.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -91,6 +91,23 @@ fn policy_installed(dirs: &[&str], bus_name: &str) -> bool {
     dirs.iter().any(|dir| Path::new(dir).join(&file).exists())
 }
 
+/// The CLI/daemon binary, which after the binary split is no longer this
+/// process. `$OXIDOM_BIN` (set by the nix wrapper) wins, then a sibling named
+/// `oxidom` next to the current executable, then `$PATH`.
+fn daemon_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("OXIDOM_BIN").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Some(sibling) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join("oxidom")))
+        .filter(|path| path.is_file())
+    {
+        return sibling;
+    }
+    PathBuf::from("oxidom")
+}
+
 /// Does this error mean "nobody is on that name (yet)", as opposed to a final
 /// answer? A daemon that is starting is worth waiting for; a bus that refuses
 /// this user is not — for them a session daemon *is* the right daemon.
@@ -166,11 +183,11 @@ impl DaemonClient {
             return Ok(client);
         }
         progress(ConnectStage::Starting);
-        let exe = std::env::current_exe().context("locating the oxidom binary")?;
-        std::process::Command::new(exe)
+        let executable = daemon_binary();
+        std::process::Command::new(&executable)
             .arg("daemon")
             .spawn()
-            .context("spawning a session daemon")?;
+            .with_context(|| format!("spawning a session daemon with {}", executable.display()))?;
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(150));
             if let Ok(client) = Self::try_bus(false, DaemonSource::Spawned) {
@@ -289,7 +306,29 @@ impl DaemonClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUS_NAME, policy_installed};
+    use super::{BUS_NAME, daemon_binary, policy_installed};
+
+    #[test]
+    fn daemon_binary_prefers_the_environment() {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let previous = std::env::var_os("OXIDOM_BIN");
+        let configured = std::path::PathBuf::from("/configured/oxidom");
+        // SAFETY: all tests that mutate oxidom's process environment use the
+        // same mutex, so no other such test can read or write it concurrently.
+        unsafe {
+            std::env::set_var("OXIDOM_BIN", &configured);
+        }
+        let resolved = daemon_binary();
+        // SAFETY: the same process-wide test mutex remains held.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("OXIDOM_BIN", value),
+                None => std::env::remove_var("OXIDOM_BIN"),
+            }
+        }
+
+        assert_eq!(resolved, configured);
+    }
 
     /// The predicate that decides whether an unanswered system bus is worth
     /// waiting out. Getting it wrong either way is a real cost: a false

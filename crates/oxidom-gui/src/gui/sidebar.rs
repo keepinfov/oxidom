@@ -1,6 +1,6 @@
 use adw::prelude::*;
 
-use crate::APP_ID;
+use oxidom_core::APP_ID;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {

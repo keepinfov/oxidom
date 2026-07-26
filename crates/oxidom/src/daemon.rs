@@ -8,18 +8,18 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use gtk::glib;
+use nix::sys::signal::{SigSet, Signal};
 use zbus::fdo;
 
-use crate::config::{Config, LatencyMethod};
-use crate::engine::Engine;
-use crate::ipc::{
+use oxidom_core::config::{Config, LatencyMethod};
+use oxidom_core::engine::Engine;
+use oxidom_core::ipc::{
     ApplySettingsResult, BUS_NAME, LatencyReading, OBJECT_PATH, PROBE_STATE_VERSION, ProbeFailure,
     ProbeRoute, ProbeState, RuntimeInfo, StatusInfo,
 };
-use crate::model::Server;
-use crate::probe;
-use crate::xray::core::Status;
+use oxidom_core::model::Server;
+use oxidom_core::probe;
+use oxidom_core::xray::core::Status;
 
 /// How many servers may be measured at once. This is now a cap on *processes*:
 /// an HTTP probe starts a core of its own to make its request through, so a
@@ -173,7 +173,7 @@ impl Shared {
 
     /// Returns the id of the server whose core has just been found dead, once.
     fn note_core_death(&self) -> Option<String> {
-        let mut engine = crate::sync::lock(&self.engine);
+        let mut engine = oxidom_core::sync::lock(&self.engine);
         if engine.status() != Status::Connected || engine.core.is_alive() {
             return None;
         }
@@ -187,7 +187,7 @@ impl Shared {
             return;
         }
         let death_is_current = {
-            let engine = crate::sync::lock(&self.engine);
+            let engine = oxidom_core::sync::lock(&self.engine);
             engine.config.reconnect
                 && engine.state.active_server_id.as_deref() == Some(server_id.as_str())
                 && matches!(
@@ -199,7 +199,7 @@ impl Shared {
             return;
         }
         let already_reconnecting = matches!(
-            crate::sync::lock(&self.override_status).as_ref(),
+            oxidom_core::sync::lock(&self.override_status).as_ref(),
             Some(ErrorOverride {
                 status: Status::Error(message),
                 server_id: id,
@@ -209,7 +209,7 @@ impl Shared {
             return;
         }
 
-        *crate::sync::lock(&self.override_status) = Some(ErrorOverride {
+        *oxidom_core::sync::lock(&self.override_status) = Some(ErrorOverride {
             status: Status::Error(RECONNECTING_MESSAGE.to_string()),
             server_id: server_id.clone(),
         });
@@ -252,12 +252,12 @@ impl Shared {
         if self.connect_generation.load(Ordering::SeqCst) != generation {
             return false;
         }
-        if !crate::sync::lock(&self.engine).config.reconnect {
+        if !oxidom_core::sync::lock(&self.engine).config.reconnect {
             self.clear_reconnect_override(server_id);
             return false;
         }
         matches!(
-            crate::sync::lock(&self.override_status).as_ref(),
+            oxidom_core::sync::lock(&self.override_status).as_ref(),
             Some(ErrorOverride {
                 status: Status::Error(message),
                 server_id: id,
@@ -266,7 +266,7 @@ impl Shared {
     }
 
     fn clear_reconnect_override(&self, server_id: &str) {
-        let mut override_status = crate::sync::lock(&self.override_status);
+        let mut override_status = oxidom_core::sync::lock(&self.override_status);
         let is_ours = matches!(
             override_status.as_ref(),
             Some(ErrorOverride {
@@ -289,19 +289,19 @@ impl Shared {
         // touching `engine` below would take the two locks in the opposite
         // order from `confirm_connection` — engine first, then override — and
         // deadlock the daemon the moment the two raced.
-        let override_status = crate::sync::lock(&self.override_status).clone();
+        let override_status = oxidom_core::sync::lock(&self.override_status).clone();
         if let Some(failure) = override_status {
             return StatusInfo::from_status(&failure.status, None)
                 .with_error_id(Some(failure.server_id));
         }
-        let engine = crate::sync::lock(&self.engine);
+        let engine = oxidom_core::sync::lock(&self.engine);
         let status = engine.status();
         let active = engine.state.active_server_id.clone();
         StatusInfo::from_status(&status, active)
     }
 
     fn runtime_info(&self) -> RuntimeInfo {
-        let engine = crate::sync::lock(&self.engine);
+        let engine = oxidom_core::sync::lock(&self.engine);
         let (xray_path, xray_error, xray_source) = match engine.core.resolve_binary() {
             Ok(resolved) => (
                 Some(resolved.path.display().to_string()),
@@ -325,7 +325,7 @@ impl Shared {
     /// only the server the tunnel is actually carrying may be measured through
     /// the proxy, everything else is measured on its own merits.
     fn probe_target(&self, server_id: &str) -> Option<(Server, Config, probe::Route)> {
-        let engine = crate::sync::lock(&self.engine);
+        let engine = oxidom_core::sync::lock(&self.engine);
         let server = engine.find_server(server_id)?;
         let active = engine.state.active_server_id.as_deref() == Some(server_id)
             && engine.status() == Status::Connected;
@@ -338,7 +338,7 @@ impl Shared {
     }
 
     fn enqueue_probe(&self, server_id: String) {
-        if !crate::sync::lock(&self.probes).enqueue(server_id) {
+        if !oxidom_core::sync::lock(&self.probes).enqueue(server_id) {
             return;
         }
         self.pump_probes();
@@ -346,13 +346,13 @@ impl Shared {
 
     fn pump_probes(&self) {
         loop {
-            let Some(next) = crate::sync::lock(&self.probes).start_next() else {
+            let Some(next) = oxidom_core::sync::lock(&self.probes).start_next() else {
                 return;
             };
             let shared = self.clone();
             std::thread::spawn(move || {
                 shared.run_probe(&next);
-                crate::sync::lock(&shared.probes).finish(&next);
+                oxidom_core::sync::lock(&shared.probes).finish(&next);
                 shared.pump_probes();
             });
         }
@@ -389,7 +389,7 @@ impl Shared {
             ),
         };
         let value = reading.value;
-        crate::sync::lock(&self.readings).insert(server_id.to_string(), reading);
+        oxidom_core::sync::lock(&self.readings).insert(server_id.to_string(), reading);
         value
     }
 
@@ -405,11 +405,11 @@ impl Shared {
         if self.connect_generation.load(Ordering::SeqCst) != generation {
             return Ok(None);
         }
-        crate::sync::lock(&self.readings).remove(server_id);
-        crate::sync::lock(&self.probes).start_now(server_id);
+        oxidom_core::sync::lock(&self.readings).remove(server_id);
+        oxidom_core::sync::lock(&self.probes).start_now(server_id);
 
         let connect_result = {
-            let mut engine = crate::sync::lock(&self.engine);
+            let mut engine = oxidom_core::sync::lock(&self.engine);
             if self.connect_generation.load(Ordering::SeqCst) != generation {
                 None
             } else {
@@ -418,11 +418,11 @@ impl Shared {
         };
         match connect_result {
             None => {
-                crate::sync::lock(&self.probes).finish(server_id);
+                oxidom_core::sync::lock(&self.probes).finish(server_id);
                 Ok(None)
             }
             Some(Err(error)) => {
-                crate::sync::lock(&self.probes).finish(server_id);
+                oxidom_core::sync::lock(&self.probes).finish(server_id);
                 Err(error)
             }
             Some(Ok(())) => Ok(Some(self.confirm_connection(
@@ -469,7 +469,7 @@ impl Shared {
         let shared = self.clone();
         std::thread::spawn(move || {
             let (socks_port, method) = {
-                let engine = crate::sync::lock(&shared.engine);
+                let engine = oxidom_core::sync::lock(&shared.engine);
                 (engine.config.socks_port, engine.config.latency_method)
             };
 
@@ -484,19 +484,19 @@ impl Shared {
                 // Nothing could be measured, but the GUI is waiting on this id
                 // and would otherwise see the spinner retire onto whatever the
                 // map still held. Record the failure it actually is.
-                crate::sync::lock(&shared.readings).insert(
+                oxidom_core::sync::lock(&shared.readings).insert(
                     server_id.clone(),
                     LatencyReading::failed(ProbeFailure::Timeout, ProbeRoute::Proxied, method),
                 );
                 None
             };
-            crate::sync::lock(&shared.probes).finish(&server_id);
+            oxidom_core::sync::lock(&shared.probes).finish(&server_id);
             if ready && latency.is_some() {
                 let current = shared.connect_generation.load(Ordering::SeqCst) == generation;
                 let _ = confirmed.send(current);
                 return;
             }
-            let mut engine = crate::sync::lock(&shared.engine);
+            let mut engine = oxidom_core::sync::lock(&shared.engine);
             // Bail out if another connect/disconnect superseded this attempt:
             // the tunnel now running is not the one this thread was confirming.
             if shared.connect_generation.load(Ordering::SeqCst) != generation {
@@ -508,7 +508,7 @@ impl Shared {
             let reason = if core_rejected_the_protocol(&engine.core.recent_logs()) {
                 format!(
                     "the core does not support this server's protocol — {}",
-                    crate::xray::core::HYSTERIA2_CORE_HINT
+                    oxidom_core::xray::core::HYSTERIA2_CORE_HINT
                 )
             } else if ready {
                 "active server did not pass its latency check".to_string()
@@ -523,7 +523,7 @@ impl Shared {
                 engine.core.note(&reason);
                 engine.disconnect();
                 if origin == ConnectionOrigin::Explicit {
-                    *crate::sync::lock(&shared.override_status) = Some(ErrorOverride {
+                    *oxidom_core::sync::lock(&shared.override_status) = Some(ErrorOverride {
                         status: Status::Error(reason),
                         server_id: server_id.clone(),
                     });
@@ -549,14 +549,14 @@ impl Shared {
         // engine → readings, the same order `run_probe` takes them in, and the
         // engine lock is dropped before either of the others is touched.
         let alive: HashSet<String> = {
-            let engine = crate::sync::lock(&self.engine);
+            let engine = oxidom_core::sync::lock(&self.engine);
             engine
                 .all_servers()
                 .map(|server| server.id.clone())
                 .collect()
         };
-        crate::sync::lock(&self.readings).retain(|id, _| alive.contains(id));
-        crate::sync::lock(&self.probes).retain_alive(&alive);
+        oxidom_core::sync::lock(&self.readings).retain(|id, _| alive.contains(id));
+        oxidom_core::sync::lock(&self.probes).retain_alive(&alive);
     }
 
     /// Periodic re-probe of the active server; keeps the latency reading
@@ -567,7 +567,7 @@ impl Shared {
             loop {
                 std::thread::sleep(ACTIVE_PROBE_INTERVAL);
                 let active = {
-                    let mut engine = crate::sync::lock(&shared.engine);
+                    let mut engine = oxidom_core::sync::lock(&shared.engine);
                     if engine.status() != Status::Connected || !engine.core.is_alive() {
                         continue;
                     }
@@ -633,13 +633,14 @@ fn json<T: serde::Serialize>(value: &T) -> fdo::Result<String> {
 #[zbus::interface(name = "dev.keepinfov.oxidom1")]
 impl Service {
     fn list_subscriptions(&self) -> fdo::Result<String> {
-        let engine = crate::sync::lock(&self.shared.engine);
+        let engine = oxidom_core::sync::lock(&self.shared.engine);
         json(&engine.subscriptions)
     }
 
     fn add_subscription(&self, url: String, name: String, send_hwid: bool) -> fdo::Result<()> {
         let name = (!name.is_empty()).then_some(name);
-        let result = crate::sync::lock(&self.shared.engine).add_subscription(url, name, send_hwid);
+        let result =
+            oxidom_core::sync::lock(&self.shared.engine).add_subscription(url, name, send_hwid);
         // After the failures too: a refresh that errors part-way through has
         // still replaced some of the list.
         self.shared.prune_readings();
@@ -647,38 +648,39 @@ impl Service {
     }
 
     fn remove_subscription(&self, subscription_id: String) -> fdo::Result<bool> {
-        let result = crate::sync::lock(&self.shared.engine).remove_subscription(&subscription_id);
+        let result =
+            oxidom_core::sync::lock(&self.shared.engine).remove_subscription(&subscription_id);
         self.shared.prune_readings();
         result.map_err(failed)
     }
 
     fn refresh(&self, subscription_id: String) -> fdo::Result<()> {
-        let result = crate::sync::lock(&self.shared.engine).refresh(&subscription_id);
+        let result = oxidom_core::sync::lock(&self.shared.engine).refresh(&subscription_id);
         self.shared.prune_readings();
         result.map_err(failed)
     }
 
     fn refresh_all(&self) -> fdo::Result<()> {
-        let result = crate::sync::lock(&self.shared.engine).refresh_all();
+        let result = oxidom_core::sync::lock(&self.shared.engine).refresh_all();
         self.shared.prune_readings();
         result.map_err(failed)
     }
 
     fn import_links(&self, text: String) -> fdo::Result<(u32, u32)> {
-        let result = crate::sync::lock(&self.shared.engine).import_links(&text);
+        let result = oxidom_core::sync::lock(&self.shared.engine).import_links(&text);
         self.shared.prune_readings();
         let (added, unsupported) = result.map_err(failed)?;
         Ok((added as u32, unsupported as u32))
     }
 
     fn remove_server(&self, server_id: String) -> fdo::Result<bool> {
-        let result = crate::sync::lock(&self.shared.engine).remove_server(&server_id);
+        let result = oxidom_core::sync::lock(&self.shared.engine).remove_server(&server_id);
         self.shared.prune_readings();
         result.map_err(failed)
     }
 
     fn set_hwid(&self, subscription_id: String, enabled: bool) -> fdo::Result<()> {
-        let mut engine = crate::sync::lock(&self.shared.engine);
+        let mut engine = oxidom_core::sync::lock(&self.shared.engine);
         if let Some(subscription) = engine
             .subscriptions
             .iter_mut()
@@ -690,7 +692,7 @@ impl Service {
     }
 
     fn connect(&self, server_id: String) -> fdo::Result<()> {
-        *crate::sync::lock(&self.shared.override_status) = None;
+        *oxidom_core::sync::lock(&self.shared.override_status) = None;
         let generation = self.shared.next_connect_generation();
 
         let result =
@@ -698,15 +700,15 @@ impl Service {
                 .start_connection(&server_id, generation, ConnectionOrigin::Explicit);
         // A death noticed just before this explicit operation may have queued
         // its reconnect override. The user's action owns the visible state.
-        *crate::sync::lock(&self.shared.override_status) = None;
+        *oxidom_core::sync::lock(&self.shared.override_status) = None;
         result.map(|_| ()).map_err(failed)
     }
 
     fn disconnect(&self) -> fdo::Result<()> {
-        *crate::sync::lock(&self.shared.override_status) = None;
+        *oxidom_core::sync::lock(&self.shared.override_status) = None;
         self.shared.next_connect_generation();
-        crate::sync::lock(&self.shared.engine).disconnect();
-        *crate::sync::lock(&self.shared.override_status) = None;
+        oxidom_core::sync::lock(&self.shared.engine).disconnect();
+        *oxidom_core::sync::lock(&self.shared.override_status) = None;
         Ok(())
     }
 
@@ -727,24 +729,24 @@ impl Service {
     }
 
     fn probe_state(&self) -> fdo::Result<String> {
-        let (running, queued) = crate::sync::lock(&self.shared.probes).snapshot();
+        let (running, queued) = oxidom_core::sync::lock(&self.shared.probes).snapshot();
         let state = ProbeState {
             version: PROBE_STATE_VERSION,
             running,
             queued,
-            readings: crate::sync::lock(&self.shared.readings).clone(),
+            readings: oxidom_core::sync::lock(&self.shared.readings).clone(),
         };
         json(&state)
     }
 
     fn get_settings(&self) -> fdo::Result<String> {
-        json(&crate::sync::lock(&self.shared.engine).config)
+        json(&oxidom_core::sync::lock(&self.shared.engine).config)
     }
 
     fn set_settings(&self, config_json: String) -> fdo::Result<String> {
         let raw: serde_json::Value = serde_json::from_str(&config_json).map_err(failed)?;
         let mut config: Config = serde_json::from_value(raw.clone()).map_err(failed)?;
-        let mut engine = crate::sync::lock(&self.shared.engine);
+        let mut engine = oxidom_core::sync::lock(&self.shared.engine);
 
         // A GUI older than this key sends a payload without it; treat that as
         // "leave it alone" rather than clearing the path the daemon may need
@@ -826,11 +828,15 @@ impl Service {
     }
 
     fn recent_logs(&self) -> fdo::Result<Vec<String>> {
-        Ok(crate::sync::lock(&self.shared.engine).core.recent_logs())
+        Ok(oxidom_core::sync::lock(&self.shared.engine)
+            .core
+            .recent_logs())
     }
 
     fn clear_logs(&self) -> fdo::Result<()> {
-        crate::sync::lock(&self.shared.engine).core.clear_logs();
+        oxidom_core::sync::lock(&self.shared.engine)
+            .core
+            .clear_logs();
         Ok(())
     }
 }
@@ -848,6 +854,14 @@ fn spawn_core_supervisor(shared: Shared) {
 }
 
 pub fn run(options: DaemonOptions) -> Result<()> {
+    // Block SIGINT/SIGTERM before anything spawns a thread: zbus serves on its own
+    // workers, and only threads created after the mask is set inherit it. Waiting
+    // with sigwait then costs no main loop at all.
+    let mut stop = SigSet::empty();
+    stop.add(Signal::SIGINT);
+    stop.add(Signal::SIGTERM);
+    stop.thread_block()?;
+
     let mut engine = Engine::load();
     for warning in engine.load_warnings.drain(..) {
         log::warn!("{warning}");
@@ -905,20 +919,19 @@ pub fn run(options: DaemonOptions) -> Result<()> {
         }
     );
 
-    // Serve until SIGINT/SIGTERM, then shut the tunnel down cleanly.
-    let main_loop = glib::MainLoop::new(None, false);
-    for signal in [libc::SIGINT, libc::SIGTERM] {
-        glib::unix_signal_add(signal, {
-            let main_loop = main_loop.clone();
-            move || {
-                main_loop.quit();
-                glib::ControlFlow::Break
+    loop {
+        match stop.wait() {
+            Ok(Signal::SIGINT | Signal::SIGTERM) => break,
+            Ok(_) => continue,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => {
+                log::error!("sigwait failed: {error}");
+                break;
             }
-        });
+        }
     }
-    main_loop.run();
 
-    crate::sync::lock(&shared.engine).disconnect();
+    oxidom_core::sync::lock(&shared.engine).disconnect();
     log::info!("oxidom daemon stopped");
     Ok(())
 }
@@ -927,7 +940,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
 /// which is what an Xray older than the hysteria2 support does.
 fn core_rejected_the_protocol(logs: &[String]) -> bool {
     logs.iter().any(|line| {
-        crate::xray::core::UNSUPPORTED_PROTOCOL_MARKERS
+        oxidom_core::xray::core::UNSUPPORTED_PROTOCOL_MARKERS
             .iter()
             .any(|marker| line.contains(marker))
     })
@@ -952,14 +965,14 @@ mod tests {
             ));
             std::fs::create_dir_all(&path)
                 .with_context(|| format!("creating test root {}", path.display()))?;
-            crate::paths::set_test_root(Some(path.clone()));
+            oxidom_core::paths::set_test_root(Some(path.clone()));
             Ok(Self { path })
         }
     }
 
     impl Drop for TestRoot {
         fn drop(&mut self) {
-            crate::paths::set_test_root(None);
+            oxidom_core::paths::set_test_root(None);
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
@@ -968,7 +981,7 @@ mod tests {
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::thread::spawn(move || {
-            let _guard = crate::sync::lock(&target);
+            let _guard = oxidom_core::sync::lock(&target);
             panic!("intentional mutex poison");
         })
         .join();
@@ -990,7 +1003,7 @@ mod tests {
 
     #[test]
     fn a_newer_generation_cancels_a_pending_reconnect() -> Result<()> {
-        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("cancel-reconnect")?;
         let service = for_test();
         let stale_generation = service.shared.connect_generation.load(Ordering::SeqCst);
@@ -1004,7 +1017,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            crate::sync::lock(&service.shared.engine).status(),
+            oxidom_core::sync::lock(&service.shared.engine).status(),
             Status::Disconnected
         );
         Ok(())
@@ -1012,10 +1025,12 @@ mod tests {
 
     #[test]
     fn an_absent_reconnect_key_keeps_the_old_value() -> Result<()> {
-        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("old-settings-client")?;
         let service = for_test();
-        crate::sync::lock(&service.shared.engine).config.reconnect = true;
+        oxidom_core::sync::lock(&service.shared.engine)
+            .config
+            .reconnect = true;
         let mut raw = serde_json::to_value(Config::default())?;
         raw.as_object_mut()
             .context("serialized config is not an object")?
@@ -1023,19 +1038,23 @@ mod tests {
 
         service.set_settings(raw.to_string())?;
 
-        assert!(crate::sync::lock(&service.shared.engine).config.reconnect);
+        assert!(
+            oxidom_core::sync::lock(&service.shared.engine)
+                .config
+                .reconnect
+        );
         Ok(())
     }
 
     #[test]
     fn a_dead_core_is_noticed_without_a_status_call() -> Result<()> {
-        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("dead-core")?;
         let service = for_test();
         {
-            let mut engine = crate::sync::lock(&service.shared.engine);
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
             engine.state.active_server_id = Some("dead-server".to_string());
-            *crate::sync::lock(&engine.core.status) = Status::Connected;
+            *oxidom_core::sync::lock(&engine.core.status) = Status::Connected;
             assert!(!engine.core.is_alive());
         }
 
@@ -1044,7 +1063,7 @@ mod tests {
             Some("dead-server")
         );
         assert!(matches!(
-            crate::sync::lock(&service.shared.engine).status(),
+            oxidom_core::sync::lock(&service.shared.engine).status(),
             Status::Error(message) if message == "Xray exited unexpectedly"
         ));
         assert_eq!(service.shared.note_core_death(), None);
@@ -1053,7 +1072,7 @@ mod tests {
 
     #[test]
     fn a_panicking_worker_leaves_the_daemon_answering() -> Result<()> {
-        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("poisoned-probes")?;
         let service = for_test();
 
@@ -1062,14 +1081,14 @@ mod tests {
         service.probe_state()?;
         service.status()?;
         service.list_subscriptions()?;
-        let queue = crate::sync::lock(&service.shared.probes);
+        let queue = oxidom_core::sync::lock(&service.shared.probes);
         let _ = queue.snapshot();
         Ok(())
     }
 
     #[test]
     fn a_poisoned_engine_lock_still_serves_status() -> Result<()> {
-        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("poisoned-engine")?;
         let service = for_test();
 
@@ -1081,7 +1100,7 @@ mod tests {
 
     #[test]
     fn an_empty_root_gives_an_empty_but_valid_surface() -> Result<()> {
-        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("empty-surface")?;
         let service = for_test();
 

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{fsutil, paths};
+use oxidom_core::{fsutil, paths};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

@@ -6,14 +6,15 @@ self: {
 }: let
   cfg = config.programs.oxidom;
   daemonCfg = config.services.oxidom;
-  pkg = self.packages.${pkgs.stdenv.hostPlatform.system}.oxidom;
+  guiPkg = self.packages.${pkgs.stdenv.hostPlatform.system}.oxidom-gui;
+  cliPkg = self.packages.${pkgs.stdenv.hostPlatform.system}.oxidom-cli;
 in {
   options.programs.oxidom = {
     enable = lib.mkEnableOption "oxidom, a GTK4 Xray client";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkg;
+      default = guiPkg;
       description = "The oxidom package to use.";
     };
 
@@ -21,7 +22,7 @@ in {
       type = lib.types.bool;
       default = false;
       description = ''
-        Start `oxidom gui --background` with the graphical session, so the
+        Start `oxidom-gui --background` with the graphical session, so the
         tray icon (and the GNOME system-proxy toggle) are present before the
         window is ever opened.
       '';
@@ -36,7 +37,7 @@ in {
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkg;
+      default = cliPkg;
       description = "The oxidom package the daemon runs from.";
     };
 
@@ -70,7 +71,7 @@ in {
 
   config = lib.mkMerge [
     (lib.mkIf cfg.enable {
-      environment.systemPackages = [cfg.package];
+      environment.systemPackages = [cfg.package cliPkg];
 
       systemd.user.services.oxidom-tray = lib.mkIf cfg.trayAutostart {
         description = "oxidom tray and background GUI";
@@ -78,7 +79,7 @@ in {
         partOf = ["graphical-session.target"];
         after = ["graphical-session.target"];
         serviceConfig = {
-          ExecStart = "${cfg.package}/bin/oxidom gui --background";
+          ExecStart = "${cfg.package}/bin/oxidom-gui --background";
           Restart = "on-failure";
           RestartSec = 3;
         };

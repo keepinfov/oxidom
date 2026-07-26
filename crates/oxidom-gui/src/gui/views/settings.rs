@@ -3,8 +3,8 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::config::{Config, LatencyMethod};
-use crate::ipc::RuntimeInfo;
+use oxidom_core::config::{Config, LatencyMethod};
+use oxidom_core::ipc::RuntimeInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsValues {
@@ -401,10 +401,6 @@ impl SettingsView {
 
     pub fn state(&self) -> SettingsState {
         self.model.borrow().state()
-    }
-
-    pub fn draft(&self) -> SettingsValues {
-        self.model.borrow().draft.clone()
     }
 
     pub fn applied(&self) -> SettingsValues {

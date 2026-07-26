@@ -8,14 +8,13 @@ use adw::prelude::*;
 use anyhow::{Result, anyhow};
 use gtk::glib;
 
-use crate::APP_ID;
-use crate::config::Config;
-use crate::ipc;
-use crate::model::Subscription;
-use crate::xray::core::Status;
-use crate::{paths, sysproxy};
+use oxidom_core::APP_ID;
+use oxidom_core::config::Config;
+use oxidom_core::ipc;
+use oxidom_core::model::Subscription;
+use oxidom_core::xray::core::Status;
+use oxidom_core::{paths, sysproxy};
 
-use super::client::{ConnectStage, DaemonClient, DaemonSource};
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     Effect, PolledSnapshot, ProbeWait, SnapshotState, active_latency_for, latency_states, reduce,
@@ -27,6 +26,7 @@ use super::views::logs::LogsView;
 use super::views::servers::{CardConnection, ServersView};
 use super::views::settings::{SettingsValues, SettingsView};
 use super::views::subscriptions::SubscriptionsView;
+use oxidom_core::client::{ConnectStage, DaemonClient, DaemonSource};
 
 type SettingsCallback = Rc<dyn Fn(SettingsValues)>;
 type ShortcutHandler = Box<dyn Fn(&Rc<Controller>)>;
@@ -39,6 +39,7 @@ const SIDEBAR_BREAKPOINT_WIDTH: u32 = 700;
 /// timer for it would be a second thing to keep in step with the poll.
 const AGE_SWEEP_TICKS: u8 = 30;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResponsiveMode {
     Wide,
@@ -94,6 +95,7 @@ impl SearchState {
     }
 }
 
+#[cfg(test)]
 fn responsive_mode_for_width(width: f64) -> ResponsiveMode {
     if width <= f64::from(SIDEBAR_BREAKPOINT_WIDTH) {
         ResponsiveMode::Compact
@@ -632,7 +634,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
 }
 
 fn set_window_icon(window: &adw::ApplicationWindow) {
-    let icon = include_bytes!("../../data/dev.keepinfov.oxidom.svg");
+    let icon = include_bytes!("../../../../data/dev.keepinfov.oxidom.svg");
     let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(icon.as_slice()))
     else {
         log::warn!("could not decode the window icon");
@@ -1765,7 +1767,7 @@ impl Controller {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_millis(500), move || {
             controller.drain_tray_commands();
-            if let Some(snapshot) = crate::sync::lock(&controller.poll_snapshot).take() {
+            if let Some(snapshot) = oxidom_core::sync::lock(&controller.poll_snapshot).take() {
                 controller.apply_snapshot(snapshot);
             }
             let tick = controller.sweep_tick.get().wrapping_add(1);
@@ -1792,7 +1794,7 @@ impl Controller {
                         })
                     })();
                     if let Ok(snapshot) = snapshot {
-                        *crate::sync::lock(&slot) = Some(snapshot);
+                        *oxidom_core::sync::lock(&slot) = Some(snapshot);
                     }
                     in_flight.store(false, Ordering::SeqCst);
                 });
@@ -1809,7 +1811,7 @@ impl Controller {
     fn bump_epoch(&self) -> u64 {
         let mut state = self.state.borrow_mut();
         state.ui.state_epoch += 1;
-        *crate::sync::lock(&self.poll_snapshot) = None;
+        *oxidom_core::sync::lock(&self.poll_snapshot) = None;
         state.ui.state_epoch
     }
 
@@ -2045,7 +2047,7 @@ impl Controller {
             .find(|server| server.id == active)
             .map(|server| {
                 (
-                    crate::model::name_without_flag(&server.name).to_string(),
+                    oxidom_core::model::name_without_flag(&server.name).to_string(),
                     server.country.clone(),
                 )
             })

@@ -4,10 +4,10 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::engine::LOCAL_ID;
 use crate::gui::operation::{UiOperation, UiOperationKind};
-use crate::link;
-use crate::model::{Subscription, UserInfo};
+use oxidom_core::engine::LOCAL_ID;
+use oxidom_core::link;
+use oxidom_core::model::{Subscription, UserInfo};
 
 use super::super::group::{format_bytes, subscription_description};
 

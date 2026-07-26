@@ -1,4 +1,4 @@
-use crate::model::Subscription;
+use oxidom_core::model::Subscription;
 
 pub fn subscription_description(subscription: &Subscription) -> String {
     let mut parts = Vec::new();

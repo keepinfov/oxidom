@@ -26,7 +26,11 @@ idiomatic, small, and robust. Do not add features beyond this spec without notin
 
 ## Build / dev
 - `nix develop` gives a shell with gtk4/libadwaita/glib + rust toolchain + `xray`.
-- `nix develop -c cargo build` / `cargo run`. `nix build` produces the wrapped binary.
+- `nix develop -c cargo build` builds the workspace; use
+  `nix develop -c cargo run -p oxidom-gui` for the GUI and
+  `nix develop -c cargo run -p oxidom -- <command>` for the CLI/daemon.
+- `nix build` produces both wrapped binaries; `nix build .#oxidom-cli` and
+  `nix build .#oxidom-gui` build the headless and graphical packages separately.
 
 ## Files (config & state)
 Resolve config dir as `$XDG_CONFIG_HOME/oxidom` (`~/.config/oxidom`), data dir as
@@ -253,20 +257,33 @@ to a single column, exposing the small sidebar toggle button (as annotated in th
 
 ## Module layout
 ```
-src/
-  main.rs         # entry + dispatch
-  cli.rs          # clap defs + `run` subcommand
-  config.rs       # config.toml load/save
-  state.rs        # state.toml (active server, per-app memory)
-  model.rs        # Server/Subscription/OutboundSpec types
-  link.rs         # share-link parsers (vless/vmess/trojan/ss/socks/http/hysteria2)
-  subscription.rs # fetch + decode + userinfo headers + hwid
-  xray/
-    config.rs     # OutboundSpec -> Xray JSON
-    core.rs       # process supervisor + status
-  probe.rs        # latency probes
-  netns.rs        # `oxidom run` per-process routing
-  gui/            # Phase 2 (codex): app, window, sidebar, cards, groups, views
+Cargo.toml                       # virtual workspace manifest
+crates/
+  oxidom-core/
+    src/
+      lib.rs
+      client.rs                  # blocking D-Bus client, shared by GUI and CLI
+      config.rs                  # config.toml load/save
+      state.rs                   # state.toml
+      model.rs                   # Server/Subscription/OutboundSpec types
+      link.rs                    # share-link parsers
+      subscription.rs            # fetch + decode + userinfo headers + hwid
+      xray/
+        config.rs                # OutboundSpec -> Xray JSON
+        core.rs                  # process supervisor + status
+        resolve.rs               # Xray binary preflight
+      probe.rs                   # latency probes
+      netns.rs                   # `oxidom run` per-process routing
+  oxidom/
+    src/
+      main.rs                    # CLI entry + dispatch
+      cli.rs                     # clap definitions + GUI binary shim
+      daemon.rs                  # headless D-Bus service
+  oxidom-gui/
+    src/
+      main.rs                    # GTK application entry
+      gui/                       # window, sidebar, cards, groups, views
+    data/flags/
 ```
 
 ## Definition of done

@@ -6,8 +6,8 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
-use crate::config::LatencyMethod;
-use crate::model::Server;
+use oxidom_core::config::LatencyMethod;
+use oxidom_core::model::Server;
 
 pub const COMPACT_CARD_HEIGHT: i32 = 64;
 pub const CARD_MEASURE_WIDTH: i32 = 320;
@@ -216,7 +216,7 @@ impl ServerCard {
         let flag = flag_widget(server.country.as_deref(), 26, 20);
 
         let name = gtk::Label::builder()
-            .label(crate::model::name_without_flag(&server.name))
+            .label(oxidom_core::model::name_without_flag(&server.name))
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(20)
             .xalign(0.0)
@@ -363,7 +363,7 @@ impl ServerCard {
         header.add_controller(keyboard);
 
         let full_name = gtk::Label::builder()
-            .label(crate::model::name_without_flag(&server.name))
+            .label(oxidom_core::model::name_without_flag(&server.name))
             .xalign(0.0)
             .hexpand(true)
             .wrap(true)

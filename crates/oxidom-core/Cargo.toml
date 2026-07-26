@@ -1,0 +1,29 @@
+[package]
+name = "oxidom-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core library for the oxidom Xray client"
+
+[lib]
+name = "oxidom_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+dirs.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+base64.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+shell-words.workspace = true
+libc.workspace = true
+nix.workspace = true
+log.workspace = true
+zbus.workspace = true

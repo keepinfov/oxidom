@@ -11,10 +11,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use crate::ipc::{
+use oxidom_core::ipc::{
     LatencyReading, PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, StatusInfo,
 };
-use crate::xray::core::Status;
+use oxidom_core::xray::core::Status;
 
 use super::operation::UiOperation;
 use super::server_card::{LatencyAge, LatencyState};
@@ -153,6 +153,7 @@ impl SnapshotState {
         self.pending_since = now;
     }
 
+    #[cfg(test)]
     pub fn is_pinned(&self) -> bool {
         self.pending_status.is_some()
     }
@@ -580,8 +581,8 @@ pub(super) fn active_latency_for(state: &SnapshotState) -> (Option<u32>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LatencyMethod;
-    use crate::ipc::{ProbeFailure, ProbeRoute};
+    use oxidom_core::config::LatencyMethod;
+    use oxidom_core::ipc::{ProbeFailure, ProbeRoute};
 
     fn state() -> SnapshotState {
         SnapshotState::new(&StatusInfo::default())

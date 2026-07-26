@@ -5,9 +5,8 @@ use adw::prelude::*;
 use anyhow::Result;
 use gtk::gio;
 
-use crate::APP_ID;
+use oxidom_core::APP_ID;
 
-mod client;
 mod flags;
 mod group;
 mod operation;
@@ -60,7 +59,7 @@ pub fn run(background: bool) -> Result<()> {
 
     // Clap already consumed the process arguments; keep only argv[0]. GLib
     // requires it to activate the application reliably.
-    let args = ["oxidom"];
+    let args = ["oxidom-gui"];
     let _ = app.run_with_args(&args);
     Ok(())
 }
@@ -90,8 +89,8 @@ fn install_development_desktop_integration() {
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
-    let desktop = include_str!("../../data/dev.keepinfov.oxidom.desktop")
-        .replace("Exec=oxidom", &format!("Exec=\"{executable}\""));
+    let desktop = include_str!("../../../../data/dev.keepinfov.oxidom.desktop")
+        .replace("Exec=oxidom-gui", &format!("Exec=\"{executable}\""));
 
     let files = [
         (
@@ -104,13 +103,13 @@ fn install_development_desktop_integration() {
             data_home
                 .join("icons/hicolor/scalable/apps")
                 .join(format!("{APP_ID}.svg")),
-            include_bytes!("../../data/dev.keepinfov.oxidom.svg").as_slice(),
+            include_bytes!("../../../../data/dev.keepinfov.oxidom.svg").as_slice(),
         ),
         (
             data_home
                 .join("icons/hicolor/symbolic/apps")
                 .join(format!("{APP_ID}-symbolic.svg")),
-            include_bytes!("../../data/dev.keepinfov.oxidom-symbolic.svg").as_slice(),
+            include_bytes!("../../../../data/dev.keepinfov.oxidom-symbolic.svg").as_slice(),
         ),
     ];
 

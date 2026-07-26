@@ -5,8 +5,8 @@ use anyhow::{Result, anyhow};
 
 static TEST_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
 
-#[cfg(test)]
-pub(crate) fn set_test_root(dir: Option<PathBuf>) {
+#[doc(hidden)]
+pub fn set_test_root(dir: Option<PathBuf>) {
     *TEST_ROOT
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = dir;
@@ -14,8 +14,8 @@ pub(crate) fn set_test_root(dir: Option<PathBuf>) {
 
 /// Serialises tests that install a root: it is process-global on purpose, so
 /// that worker threads spawned by the daemon see the same one.
-#[cfg(test)]
-pub(crate) static TEST_ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[doc(hidden)]
+pub static TEST_ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn test_root() -> Option<PathBuf> {
     TEST_ROOT

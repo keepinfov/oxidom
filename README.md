@@ -28,11 +28,13 @@ runs fully unprivileged.
 
 ## Architecture
 
-`oxidom daemon` owns the tunnel (subscriptions, Xray core, probes) and serves
-D-Bus (`dev.keepinfov.oxidom.Daemon`); the GUI is a thin client with a tray
-icon. Closing the window keeps the connection; the daemon can run as a
-system service that starts at boot and survives logout. Launching the GUI
-without a daemon auto-spawns a session one.
+The Cargo workspace is split into three crates: `oxidom-core` contains the
+shared tunnel, subscription, probe, and D-Bus client logic; `oxidom` is the
+headless CLI/daemon; and `oxidom-gui` is the GTK application. `oxidom daemon`
+owns the tunnel and serves D-Bus (`dev.keepinfov.oxidom.Daemon`); the GUI is a
+thin client with a tray icon. Closing the window keeps the connection; the
+daemon can run as a system service that starts at boot and survives logout.
+Launching the GUI without a daemon auto-spawns a session one.
 
 ## Install
 
@@ -63,8 +65,12 @@ NixOS, `gpasswd -a alice oxidom` elsewhere).
 With nix (recommended — provides GTK, libadwaita, and the Xray core):
 
 ```sh
-nix develop -c cargo run       # development (auto-spawns a session daemon)
-nix build                      # wrapped release binary in ./result/bin
+nix develop -c cargo build                   # all three workspace crates
+nix develop -c cargo run -p oxidom-gui       # graphical client
+nix develop -c cargo run -p oxidom -- daemon # headless daemon
+nix build                                    # both wrapped binaries
+nix build .#oxidom-cli                       # headless package only
+nix build .#oxidom-gui                       # graphical package only
 ```
 
 Without nix you need GTK4 ≥ 4.14, libadwaita ≥ 1.4, a Rust toolchain, and an
@@ -73,8 +79,9 @@ Without nix you need GTK4 ≥ 4.14, libadwaita ≥ 1.4, a Rust toolchain, and an
 ## CLI
 
 ```sh
-oxidom                     # launch the GUI (default)
-oxidom gui --background    # start hidden (tray only)
+oxidom-gui                 # launch the GUI
+oxidom                     # print CLI help and exit with status 2
+oxidom gui --background    # compatibility shim: exec oxidom-gui hidden
 oxidom daemon [--system]   # headless daemon (session bus by default)
 oxidom run -- CMD          # (planned) run one command through the proxy
 ```

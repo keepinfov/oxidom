@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -10,8 +8,6 @@ use crate::{fsutil, paths};
 pub struct State {
     /// Last active server id.
     pub active_server_id: Option<String>,
-    /// Remembered per-app route choices (desktop-id/binary -> server id).
-    pub app_routes: HashMap<String, String>,
     /// PID of the xray child of the last run, so a crash never leaves an
     /// orphaned tunnel: the next start kills it if it is still an xray process.
     pub xray_pid: Option<u32>,

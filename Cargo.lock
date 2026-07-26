@@ -1159,13 +1159,23 @@ name = "oxidom"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "clap",
- "dirs",
  "env_logger",
- "gtk4",
- "ksni",
- "libadwaita",
+ "log",
+ "nix",
+ "oxidom-core",
+ "serde",
+ "serde_json",
+ "zbus",
+]
+
+[[package]]
+name = "oxidom-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "dirs",
  "libc",
  "log",
  "nix",
@@ -1179,6 +1189,24 @@ dependencies = [
  "ureq",
  "url",
  "zbus",
+]
+
+[[package]]
+name = "oxidom-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "gtk4",
+ "ksni",
+ "libadwaita",
+ "libc",
+ "log",
+ "oxidom-core",
+ "serde",
+ "toml 0.8.23",
+ "url",
 ]
 
 [[package]]

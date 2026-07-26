@@ -6,7 +6,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::model::Subscription;
+use oxidom_core::model::Subscription;
 
 use super::super::group::subscription_description;
 use super::super::prefs::GuiPrefs;

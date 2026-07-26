@@ -20,7 +20,7 @@ pub struct OxidomTray {
 
 impl ksni::Tray for OxidomTray {
     fn id(&self) -> String {
-        crate::APP_ID.to_string()
+        oxidom_core::APP_ID.to_string()
     }
 
     fn title(&self) -> String {
@@ -28,7 +28,7 @@ impl ksni::Tray for OxidomTray {
     }
 
     fn icon_name(&self) -> String {
-        crate::APP_ID.to_string()
+        oxidom_core::APP_ID.to_string()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {

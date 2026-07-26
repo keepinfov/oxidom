@@ -10,7 +10,6 @@ type ClearCallback = Rc<dyn Fn()>;
 pub struct LogsView {
     pub root: gtk::Box,
     scrolled: gtk::ScrolledWindow,
-    view: gtk::TextView,
     buffer: gtk::TextBuffer,
     copy: gtk::Button,
     clear: gtk::Button,
@@ -135,7 +134,6 @@ impl LogsView {
         Self {
             root,
             scrolled,
-            view: text,
             buffer,
             copy,
             clear,
@@ -153,14 +151,6 @@ impl LogsView {
     /// visible log. Local suppression still makes Clear useful without it.
     pub fn connect_clear_requested(&self, callback: impl Fn() + 'static) {
         self.clear_callbacks.borrow_mut().push(Rc::new(callback));
-    }
-
-    pub fn is_following(&self) -> bool {
-        self.following.get()
-    }
-
-    pub fn resume_following(&self) {
-        self.follow.emit_clicked();
     }
 
     pub fn set_logs(&self, logs: &[String]) {
