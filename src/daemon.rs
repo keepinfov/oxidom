@@ -11,15 +11,98 @@ use anyhow::{Context, Result};
 use gtk::glib;
 use zbus::fdo;
 
-use crate::config::Config;
+use crate::config::{Config, LatencyMethod};
 use crate::engine::Engine;
-use crate::ipc::{ApplySettingsResult, BUS_NAME, OBJECT_PATH, ProbeState, RuntimeInfo, StatusInfo};
+use crate::ipc::{
+    ApplySettingsResult, BUS_NAME, LatencyReading, OBJECT_PATH, PROBE_STATE_VERSION, ProbeFailure,
+    ProbeRoute, ProbeState, RuntimeInfo, StatusInfo,
+};
 use crate::model::Server;
 use crate::probe;
 use crate::xray::core::Status;
 
 const MAX_CONCURRENT_PROBES: usize = 8;
 const ACTIVE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The probe pipeline: what is being measured now, and what is waiting for a
+/// slot behind `MAX_CONCURRENT_PROBES`.
+///
+/// One lock rather than the two it replaces. Every interesting question — "is
+/// this id already spoken for?", "may another probe start?" — spans both sets,
+/// so the old pair carried an unwritten `checking` → `probe_queue` ordering
+/// that held only because the two call sites remembered to take them that way.
+#[derive(Default)]
+struct ProbeQueue {
+    running: HashSet<String>,
+    queued: VecDeque<String>,
+}
+
+impl ProbeQueue {
+    /// Take an id unless it is already spoken for. Returns whether it was
+    /// newly queued.
+    fn enqueue(&mut self, server_id: String) -> bool {
+        if self.holds(&server_id) {
+            return false;
+        }
+        self.queued.push_back(server_id);
+        true
+    }
+
+    fn holds(&self, server_id: &str) -> bool {
+        self.running.contains(server_id) || self.queued.iter().any(|id| id == server_id)
+    }
+
+    /// Promote the next waiting id, when a slot is free.
+    fn start_next(&mut self) -> Option<String> {
+        if self.running.len() >= MAX_CONCURRENT_PROBES {
+            return None;
+        }
+        let server_id = self.queued.pop_front()?;
+        self.running.insert(server_id.clone());
+        Some(server_id)
+    }
+
+    /// Run `server_id` now, past the queue and past the cap. The confirmation
+    /// after a connect is not a queued measurement: it decides whether the
+    /// tunnel the user is watching stays up, and cannot wait behind a bulk
+    /// re-check of a whole subscription.
+    fn start_now(&mut self, server_id: &str) {
+        self.queued.retain(|id| id != server_id);
+        self.running.insert(server_id.to_string());
+    }
+
+    fn finish(&mut self, server_id: &str) {
+        self.running.remove(server_id);
+    }
+
+    /// Both sets as the wire wants them.
+    fn snapshot(&self) -> (Vec<String>, Vec<String>) {
+        (
+            self.running.iter().cloned().collect(),
+            self.queued.iter().cloned().collect(),
+        )
+    }
+
+    /// Drop queued ids that are no longer backed by a server. `running` is left
+    /// alone on purpose: each of those has a thread that will `finish` it, and
+    /// removing the entry early would hand out a slot that is still occupied.
+    fn retain_alive(&mut self, alive: &HashSet<String>) {
+        self.queued.retain(|id| alive.contains(id));
+    }
+}
+
+/// A failure the daemon reports in place of the core's own status, together
+/// with the server it belongs to.
+///
+/// The id has to be carried explicitly: every path that sets one of these has
+/// already called `engine.disconnect()`, which clears `active_server_id` — so
+/// by the time the failure is reportable, the only record of *which* server
+/// failed is this struct.
+#[derive(Clone)]
+struct ErrorOverride {
+    status: Status,
+    server_id: String,
+}
 
 pub struct DaemonOptions {
     pub system_bus: bool,
@@ -30,12 +113,11 @@ pub struct DaemonOptions {
 #[derive(Clone)]
 struct Shared {
     engine: Arc<Mutex<Engine>>,
-    latencies: Arc<Mutex<HashMap<String, Option<u32>>>>,
-    checking: Arc<Mutex<HashSet<String>>>,
-    probe_queue: Arc<Mutex<VecDeque<String>>>,
+    readings: Arc<Mutex<HashMap<String, LatencyReading>>>,
+    probes: Arc<Mutex<ProbeQueue>>,
     /// Layered over the core status, e.g. when the confirming probe after a
     /// connect fails and the daemon shuts the tunnel back down.
-    override_status: Arc<Mutex<Option<Status>>>,
+    override_status: Arc<Mutex<Option<ErrorOverride>>>,
     /// Bumped by every connect and disconnect, so an in-flight confirmation
     /// can tell whether the tunnel it was checking is still the current one.
     connect_generation: Arc<AtomicU64>,
@@ -56,9 +138,8 @@ impl Shared {
     ) -> Self {
         Shared {
             engine: Arc::new(Mutex::new(engine)),
-            latencies: Arc::new(Mutex::new(HashMap::new())),
-            checking: Arc::new(Mutex::new(HashSet::new())),
-            probe_queue: Arc::new(Mutex::new(VecDeque::new())),
+            readings: Arc::new(Mutex::new(HashMap::new())),
+            probes: Arc::new(Mutex::new(ProbeQueue::default())),
             override_status: Arc::new(Mutex::new(None)),
             connect_generation: Arc::new(AtomicU64::new(0)),
             socks_port_locked,
@@ -74,8 +155,15 @@ impl Shared {
     }
 
     fn status_info(&self) -> StatusInfo {
-        if let Some(status) = self.override_status.lock().unwrap().clone() {
-            return StatusInfo::from_status(&status, None);
+        // Scoped, not `if let`: in edition 2024 an `if let` scrutinee's
+        // temporary lives for the whole body, so holding this guard while
+        // touching `engine` below would take the two locks in the opposite
+        // order from `confirm_connection` — engine first, then override — and
+        // deadlock the daemon the moment the two raced.
+        let override_status = self.override_status.lock().unwrap().clone();
+        if let Some(failure) = override_status {
+            return StatusInfo::from_status(&failure.status, None)
+                .with_error_id(Some(failure.server_id));
         }
         let mut engine = self.engine.lock().unwrap();
         if engine.status() == Status::Connected && !engine.core.is_alive() {
@@ -126,60 +214,64 @@ impl Shared {
     }
 
     fn enqueue_probe(&self, server_id: String) {
-        {
-            let checking = self.checking.lock().unwrap();
-            let mut queue = self.probe_queue.lock().unwrap();
-            if checking.contains(&server_id) || queue.contains(&server_id) {
-                return;
-            }
-            queue.push_back(server_id);
+        if !self.probes.lock().unwrap().enqueue(server_id) {
+            return;
         }
         self.pump_probes();
     }
 
     fn pump_probes(&self) {
         loop {
-            let next = {
-                let mut checking = self.checking.lock().unwrap();
-                if checking.len() >= MAX_CONCURRENT_PROBES {
-                    return;
-                }
-                let Some(id) = self.probe_queue.lock().unwrap().pop_front() else {
-                    return;
-                };
-                checking.insert(id.clone());
-                id
+            let Some(next) = self.probes.lock().unwrap().start_next() else {
+                return;
             };
             let shared = self.clone();
             std::thread::spawn(move || {
                 shared.run_probe(&next);
-                shared.checking.lock().unwrap().remove(&next);
+                shared.probes.lock().unwrap().finish(&next);
                 shared.pump_probes();
             });
         }
     }
 
-    /// Probe one server and record the outcome. Every id that enters
-    /// `checking` leaves with a `latencies` entry, including ids that no longer
-    /// resolve — the GUI keys its spinner off that entry appearing, so a silent
-    /// early return would leave the card checking forever.
+    /// Probe one server and record the outcome. Every id that enters the queue
+    /// leaves with a `readings` entry, including ids that no longer resolve —
+    /// the GUI keys its spinner off that entry appearing, so a silent early
+    /// return would leave the card checking forever.
     fn run_probe(&self, server_id: &str) -> Option<u32> {
-        let latency = self
-            .probe_target(server_id)
-            .and_then(|(server, config, route)| {
-                probe::measure(
+        let reading = match self.probe_target(server_id) {
+            Some((server, config, route)) => {
+                let method = config.latency_method;
+                let wire = wire_route(route);
+                match probe::measure(
                     &server,
-                    config.latency_method,
+                    method,
                     config.socks_port,
                     &config.latency_test_url,
                     route,
-                )
-            });
-        self.latencies
+                ) {
+                    Some(ms) => LatencyReading::ok(ms, wire, method),
+                    // `probe::measure` collapses every failure into `None`, so
+                    // this is as specific as phase 1 can honestly be.
+                    None => LatencyReading::failed(ProbeFailure::Unreachable, wire, method),
+                }
+            }
+            // The server was removed between the request and its slot. Nothing
+            // was measured and nothing about it is known — including which
+            // method would have been used, since that read the config we never
+            // got to.
+            None => LatencyReading::failed(
+                ProbeFailure::Unknown,
+                ProbeRoute::Direct,
+                LatencyMethod::default(),
+            ),
+        };
+        let value = reading.value;
+        self.readings
             .lock()
             .unwrap()
-            .insert(server_id.to_string(), latency);
-        latency
+            .insert(server_id.to_string(), reading);
+        value
     }
 
     /// After a connect: confirm the tunnel actually works; tear it down and
@@ -189,23 +281,34 @@ impl Shared {
     /// to. Without it a slow probe from a superseded attempt would tear down
     /// the healthy connection that replaced it — the server id alone does not
     /// distinguish two connects to the same server.
+    /// The id is already `running` when this starts — `Service::connect` claims
+    /// the slot — so this thread owns it and must release it on every path.
     fn confirm_connection(&self, server_id: String, generation: u64) {
         let shared = self.clone();
         std::thread::spawn(move || {
-            let socks_port = { shared.engine.lock().unwrap().config.socks_port };
+            let (socks_port, method) = {
+                let engine = shared.engine.lock().unwrap();
+                (engine.config.socks_port, engine.config.latency_method)
+            };
 
             // The core being alive proves nothing: readiness is the inbound
             // accepting connections. Waiting here is also what keeps the probe
             // below from racing a core that simply has not bound yet.
             let ready = probe::wait_for_socks(socks_port);
 
-            shared.checking.lock().unwrap().insert(server_id.clone());
             let latency = if ready {
                 shared.run_probe(&server_id)
             } else {
+                // Nothing could be measured, but the GUI is waiting on this id
+                // and would otherwise see the spinner retire onto whatever the
+                // map still held. Record the failure it actually is.
+                shared.readings.lock().unwrap().insert(
+                    server_id.clone(),
+                    LatencyReading::failed(ProbeFailure::Unreachable, ProbeRoute::Proxied, method),
+                );
                 None
             };
-            shared.checking.lock().unwrap().remove(&server_id);
+            shared.probes.lock().unwrap().finish(&server_id);
             if ready && latency.is_some() {
                 return;
             }
@@ -234,9 +337,40 @@ impl Shared {
                 // torn down below, so the core's own status is lost.
                 engine.core.note(&reason);
                 engine.disconnect();
-                *shared.override_status.lock().unwrap() = Some(Status::Error(reason));
+                *shared.override_status.lock().unwrap() = Some(ErrorOverride {
+                    status: Status::Error(reason),
+                    server_id: server_id.clone(),
+                });
             }
         });
+    }
+
+    /// Forget everything remembered about servers that no longer exist.
+    ///
+    /// A reading outlives its server otherwise: subscriptions issue fresh ids
+    /// on every refresh, so the map would grow for the life of the daemon and —
+    /// worse — an id reused by a later refresh would inherit a number measured
+    /// against a different endpoint.
+    ///
+    /// The queue is pruned in the same pass, and not as a nicety: a removed id
+    /// still waiting for a slot would come round moments later and have
+    /// `run_probe` write a fresh `failed(Unknown, ..)` entry, undoing the clean
+    /// that just ran.
+    fn prune_readings(&self) {
+        // engine → readings, the same order `run_probe` takes them in, and the
+        // engine lock is dropped before either of the others is touched.
+        let alive: HashSet<String> = {
+            let engine = self.engine.lock().unwrap();
+            engine
+                .all_servers()
+                .map(|server| server.id.clone())
+                .collect()
+        };
+        self.readings
+            .lock()
+            .unwrap()
+            .retain(|id, _| alive.contains(id));
+        self.probes.lock().unwrap().retain_alive(&alive);
     }
 
     /// Periodic re-probe of the active server; keeps the latency reading
@@ -254,10 +388,9 @@ impl Shared {
                     engine.state.active_server_id.clone()
                 };
                 if let Some(id) = active {
-                    let already = shared.checking.lock().unwrap().contains(&id);
-                    if !already {
-                        shared.enqueue_probe(id);
-                    }
+                    // `enqueue_probe` already refuses an id that is running or
+                    // waiting, so this cannot pile up behind a slow probe.
+                    shared.enqueue_probe(id);
                 }
             }
         });
@@ -274,6 +407,16 @@ fn failed(error: impl std::fmt::Display) -> fdo::Error {
     fdo::Error::Failed(format!("{error:#}"))
 }
 
+/// The prober's route as the wire spells it. Kept as an explicit mapping so
+/// adding a route to one side is a compile error rather than a silent
+/// mislabelling of where a number came from.
+fn wire_route(route: probe::Route) -> ProbeRoute {
+    match route {
+        probe::Route::Direct => ProbeRoute::Direct,
+        probe::Route::Proxied => ProbeRoute::Proxied,
+    }
+}
+
 fn json<T: serde::Serialize>(value: &T) -> fdo::Result<String> {
     serde_json::to_string(value).map_err(failed)
 }
@@ -287,59 +430,52 @@ impl Service {
 
     fn add_subscription(&self, url: String, name: String, send_hwid: bool) -> fdo::Result<()> {
         let name = (!name.is_empty()).then_some(name);
-        self.shared
-            .engine
-            .lock()
-            .unwrap()
-            .add_subscription(url, name, send_hwid)
-            .map_err(failed)
-    }
-
-    fn remove_subscription(&self, subscription_id: String) -> fdo::Result<bool> {
-        self.shared
-            .engine
-            .lock()
-            .unwrap()
-            .remove_subscription(&subscription_id)
-            .map_err(failed)
-    }
-
-    fn refresh(&self, subscription_id: String) -> fdo::Result<()> {
-        self.shared
-            .engine
-            .lock()
-            .unwrap()
-            .refresh(&subscription_id)
-            .map_err(failed)
-    }
-
-    fn refresh_all(&self) -> fdo::Result<()> {
-        self.shared
-            .engine
-            .lock()
-            .unwrap()
-            .refresh_all()
-            .map_err(failed)
-    }
-
-    fn import_links(&self, text: String) -> fdo::Result<(u32, u32)> {
-        let (added, unsupported) = self
+        let result = self
             .shared
             .engine
             .lock()
             .unwrap()
-            .import_links(&text)
-            .map_err(failed)?;
+            .add_subscription(url, name, send_hwid);
+        // After the failures too: a refresh that errors part-way through has
+        // still replaced some of the list.
+        self.shared.prune_readings();
+        result.map_err(failed)
+    }
+
+    fn remove_subscription(&self, subscription_id: String) -> fdo::Result<bool> {
+        let result = self
+            .shared
+            .engine
+            .lock()
+            .unwrap()
+            .remove_subscription(&subscription_id);
+        self.shared.prune_readings();
+        result.map_err(failed)
+    }
+
+    fn refresh(&self, subscription_id: String) -> fdo::Result<()> {
+        let result = self.shared.engine.lock().unwrap().refresh(&subscription_id);
+        self.shared.prune_readings();
+        result.map_err(failed)
+    }
+
+    fn refresh_all(&self) -> fdo::Result<()> {
+        let result = self.shared.engine.lock().unwrap().refresh_all();
+        self.shared.prune_readings();
+        result.map_err(failed)
+    }
+
+    fn import_links(&self, text: String) -> fdo::Result<(u32, u32)> {
+        let result = self.shared.engine.lock().unwrap().import_links(&text);
+        self.shared.prune_readings();
+        let (added, unsupported) = result.map_err(failed)?;
         Ok((added as u32, unsupported as u32))
     }
 
     fn remove_server(&self, server_id: String) -> fdo::Result<bool> {
-        self.shared
-            .engine
-            .lock()
-            .unwrap()
-            .remove_server(&server_id)
-            .map_err(failed)
+        let result = self.shared.engine.lock().unwrap().remove_server(&server_id);
+        self.shared.prune_readings();
+        result.map_err(failed)
     }
 
     fn set_hwid(&self, subscription_id: String, enabled: bool) -> fdo::Result<()> {
@@ -357,12 +493,24 @@ impl Service {
     fn connect(&self, server_id: String) -> fdo::Result<()> {
         *self.shared.override_status.lock().unwrap() = None;
         let generation = self.shared.next_connect_generation();
-        self.shared
-            .engine
-            .lock()
-            .unwrap()
-            .connect(&server_id)
-            .map_err(failed)?;
+
+        // Both of these happen before the tunnel comes up, and both are about
+        // the same lie. The reading this server already has was taken *directly*
+        // — it says nothing about the tunnel now being built — so it is dropped
+        // rather than left to resurface as the new connection's ping. And the
+        // slot is claimed here, not in the confirmation thread, so there is no
+        // window in which the id is in neither set and the card can retire its
+        // spinner onto a number nobody measured.
+        self.shared.readings.lock().unwrap().remove(&server_id);
+        self.shared.probes.lock().unwrap().start_now(&server_id);
+
+        if let Err(error) = self.shared.engine.lock().unwrap().connect(&server_id) {
+            // No confirmation will run for an attempt that never started, so
+            // the slot has to be given back here or it is lost for good. The
+            // id leaves without a reading on purpose: nothing was measured.
+            self.shared.probes.lock().unwrap().finish(&server_id);
+            return Err(failed(error));
+        }
         self.shared.confirm_connection(server_id, generation);
         Ok(())
     }
@@ -391,16 +539,12 @@ impl Service {
     }
 
     fn probe_state(&self) -> fdo::Result<String> {
+        let (running, queued) = self.shared.probes.lock().unwrap().snapshot();
         let state = ProbeState {
-            checking: self
-                .shared
-                .checking
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect(),
-            latencies: self.shared.latencies.lock().unwrap().clone(),
+            version: PROBE_STATE_VERSION,
+            running,
+            queued,
+            readings: self.shared.readings.lock().unwrap().clone(),
         };
         json(&state)
     }
@@ -575,4 +719,88 @@ fn core_rejected_the_protocol(logs: &[String]) -> bool {
             .iter()
             .any(|marker| line.contains(marker))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drain_slots(queue: &mut ProbeQueue) -> Vec<String> {
+        std::iter::from_fn(|| queue.start_next()).collect()
+    }
+
+    /// The cap is what the GUI's queued spinners exist for: everything past it
+    /// has been accepted but not measured, and must not read as finished.
+    #[test]
+    fn probes_past_the_cap_stay_queued() {
+        let mut queue = ProbeQueue::default();
+        for index in 0..MAX_CONCURRENT_PROBES + 3 {
+            assert!(queue.enqueue(format!("s{index}")));
+        }
+        let started = drain_slots(&mut queue);
+        assert_eq!(started.len(), MAX_CONCURRENT_PROBES);
+
+        let (running, queued) = queue.snapshot();
+        assert_eq!(running.len(), MAX_CONCURRENT_PROBES);
+        assert_eq!(queued.len(), 3);
+
+        // A slot freeing up lets exactly one more through.
+        queue.finish(&started[0]);
+        assert!(queue.start_next().is_some());
+        assert_eq!(queue.snapshot().1.len(), 2);
+    }
+
+    #[test]
+    fn an_id_is_never_queued_twice() {
+        let mut queue = ProbeQueue::default();
+        assert!(queue.enqueue("a".into()));
+        assert!(!queue.enqueue("a".into()), "already waiting");
+        queue.start_next();
+        assert!(!queue.enqueue("a".into()), "already running");
+        queue.finish("a");
+        assert!(queue.enqueue("a".into()), "free to measure again");
+    }
+
+    /// The confirmation after a connect decides whether the tunnel the user is
+    /// watching stays up, so it cannot wait behind a bulk re-check.
+    #[test]
+    fn a_confirmation_probe_jumps_the_queue_and_the_cap() {
+        let mut queue = ProbeQueue::default();
+        for index in 0..MAX_CONCURRENT_PROBES {
+            queue.enqueue(format!("s{index}"));
+        }
+        drain_slots(&mut queue);
+        queue.enqueue("active".into());
+
+        queue.start_now("active");
+        let (running, queued) = queue.snapshot();
+        assert!(running.contains(&"active".to_string()));
+        assert!(!queued.contains(&"active".to_string()), "no double start");
+    }
+
+    /// A server deleted mid-sweep must not come back out of the queue a moment
+    /// later and leave a reading for something that no longer exists.
+    #[test]
+    fn removed_servers_leave_the_queue() {
+        let mut queue = ProbeQueue::default();
+        queue.enqueue("gone".into());
+        queue.enqueue("kept".into());
+        queue.start_next();
+
+        queue.retain_alive(&HashSet::from(["kept".to_string()]));
+        let (_, queued) = queue.snapshot();
+        assert_eq!(queued, vec!["kept".to_string()]);
+    }
+
+    /// A running probe owns a slot until its thread reports back; forgetting it
+    /// early would hand the slot out twice.
+    #[test]
+    fn a_running_probe_keeps_its_slot_through_a_prune() {
+        let mut queue = ProbeQueue::default();
+        queue.enqueue("gone".into());
+        let started = queue.start_next().unwrap();
+
+        queue.retain_alive(&HashSet::new());
+        assert_eq!(queue.snapshot().0, vec![started]);
+    }
 }
