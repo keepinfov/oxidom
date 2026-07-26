@@ -292,14 +292,8 @@ impl Engine {
 
     /// Probe one server with the configured latency method, measured against
     /// that server rather than through the tunnel.
-    pub fn probe(&self, server: &Server) -> Option<u32> {
-        probe::measure(
-            server,
-            self.config.latency_method,
-            self.config.socks_port,
-            &self.config.latency_test_url,
-            probe::Route::Direct,
-        )
+    pub fn probe(&self, server: &Server) -> Option<probe::Measurement> {
+        probe::measure(server, &self.config, probe::Route::Direct)
     }
 }
 

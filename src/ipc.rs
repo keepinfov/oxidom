@@ -120,6 +120,10 @@ pub struct LatencyReading {
     /// monotonic clock reading from another process means nothing.
     pub measured_at_unix_ms: u64,
     pub route: ProbeRoute,
+    /// How the number was *taken*, which is not always the method that was
+    /// configured — a hysteria2 server that refuses TCP is measured by ICMP.
+    /// Recording the intent here instead would make a handshake time
+    /// indistinguishable from the web request the user asked for.
     pub method: LatencyMethod,
     /// Why there is no `value`. `None` exactly when `value` is `Some`.
     pub failure: Option<ProbeFailure>,

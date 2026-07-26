@@ -632,8 +632,11 @@ fn method_subtitle(index: u32) -> &'static str {
     match index {
         0 => "Regular ping straight to the server, outside the tunnel",
         1 => "Time to open a direct connection to the server, outside the tunnel",
-        2 => "Small web request through the tunnel",
-        _ => "Full web request through the tunnel — the most realistic check",
+        // Say that the request goes *through the server*: that is the whole
+        // difference from the two above, and the only thing that catches a
+        // server which completes a handshake and then carries nothing.
+        2 => "Small web request through each server; slower, and starts a core per check",
+        _ => "Full web request through each server — the most realistic check",
     }
 }
 

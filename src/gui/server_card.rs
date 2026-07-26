@@ -6,6 +6,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 
+use crate::config::LatencyMethod;
 use crate::model::Server;
 
 pub const COMPACT_CARD_HEIGHT: i32 = 64;
@@ -128,16 +129,36 @@ pub enum LatencyState {
     Reachable {
         ms: u32,
         age: LatencyAge,
+        /// How the number was really taken — not always what the settings
+        /// asked for, since a hysteria2 server that refuses TCP is measured by
+        /// ICMP. The tooltip says which, instead of letting the badge imply a
+        /// measurement nobody made.
+        method: LatencyMethod,
     },
     /// Measured through the tunnel: a fact about the connection in use.
     Tunnel {
         ms: u32,
         age: LatencyAge,
+        method: LatencyMethod,
     },
     /// A probe ran and the server did not answer.
     Unreachable,
     /// The probe never left this machine, so the server was not tested at all.
     NoNetwork,
+}
+
+/// How a reading was taken, for the badge's tooltip.
+///
+/// Named after what actually happened on the wire rather than after the
+/// setting: a card measured with a TCP handshake says "TCP handshake" even
+/// when the user picked HTTP GET, because that is what the number is.
+fn method_text(method: LatencyMethod) -> &'static str {
+    match method {
+        LatencyMethod::Icmp => "ICMP ping",
+        LatencyMethod::Tcp => "TCP handshake",
+        LatencyMethod::HttpHead => "HTTP HEAD",
+        LatencyMethod::HttpGet => "HTTP GET",
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -530,14 +551,18 @@ impl ServerCard {
             self.latency.remove_css_class(class);
         }
         match state {
-            LatencyState::Reachable { ms, age } => {
-                self.show_reading(&format!("{ms} ms"), &format!("Latency: {ms} ms"), age);
-                self.latency.add_css_class("latency-reachable");
-            }
-            LatencyState::Tunnel { ms, age } => {
+            LatencyState::Reachable { ms, age, method } => {
                 self.show_reading(
                     &format!("{ms} ms"),
-                    &format!("Through the tunnel: {ms} ms"),
+                    &format!("Latency: {ms} ms · {}", method_text(method)),
+                    age,
+                );
+                self.latency.add_css_class("latency-reachable");
+            }
+            LatencyState::Tunnel { ms, age, method } => {
+                self.show_reading(
+                    &format!("{ms} ms"),
+                    &format!("Through the tunnel: {ms} ms · {}", method_text(method)),
                     age,
                 );
                 self.latency.add_css_class("latency-tunnel");
@@ -916,7 +941,10 @@ pub(crate) fn flag_widget(country: Option<&str>, flag_size: i32, globe_size: i32
 
 #[cfg(test)]
 mod tests {
-    use super::{CardConnectionState, ClickPlan, LatencyAge, LatencyState, click_plan_for_press};
+    use super::{
+        CardConnectionState, ClickPlan, LatencyAge, LatencyMethod, LatencyState,
+        click_plan_for_press,
+    };
 
     #[test]
     fn primary_click_toggles_and_double_click_activates() {
@@ -964,19 +992,22 @@ mod tests {
         let fresh = LatencyState::Reachable {
             ms: 41,
             age: LatencyAge::Fresh,
+            method: LatencyMethod::Tcp,
         };
         assert_eq!(
             fresh,
             LatencyState::Reachable {
                 ms: 41,
-                age: LatencyAge::Fresh
+                age: LatencyAge::Fresh,
+                method: LatencyMethod::Tcp
             }
         );
         assert_ne!(
             fresh,
             LatencyState::Reachable {
                 ms: 41,
-                age: LatencyAge::Stale(2)
+                age: LatencyAge::Stale(2),
+                method: LatencyMethod::Tcp
             }
         );
         // Same number, different thing measured.
@@ -984,7 +1015,18 @@ mod tests {
             fresh,
             LatencyState::Tunnel {
                 ms: 41,
-                age: LatencyAge::Fresh
+                age: LatencyAge::Fresh,
+                method: LatencyMethod::Tcp
+            }
+        );
+        // Same number, measured a different way: the badge reads the same but
+        // its tooltip does not, and the sweep must repaint it.
+        assert_ne!(
+            fresh,
+            LatencyState::Reachable {
+                ms: 41,
+                age: LatencyAge::Fresh,
+                method: LatencyMethod::Icmp
             }
         );
     }

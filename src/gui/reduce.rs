@@ -204,10 +204,13 @@ pub(super) enum Effect {
 /// How long a card may wait for a probe result before the spinner is retired
 /// as lost. Generous on purpose: a "check all" over a large subscription runs
 /// eight at a time, each with its own timeout, so a long *legitimate* wait is
-/// normal and cutting it short would misreport a server as unmeasured. This is
-/// the absolute backstop — a daemon that lost track of a probe it still claims
-/// to be running would otherwise keep the card spinning for the session.
-pub(super) const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+/// normal and cutting it short would misreport a server as unmeasured. An HTTP
+/// probe starts a core and makes a request through it — up to ten seconds per
+/// server in the worst case — so a hundred-server subscription can legitimately
+/// keep the last card waiting for over two minutes. This is the absolute
+/// backstop: a daemon that lost track of a probe it still claims to be running
+/// would otherwise keep the card spinning for the session.
+pub(super) const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How long an unacknowledged probe keeps its spinner. Covers the window
 /// between raising the spinner and the daemon reporting the id back; past it
@@ -494,8 +497,16 @@ pub(super) fn latency_state(
     }
     let age = age_of(reading, now_unix_ms);
     match reading.value {
-        Some(ms) if reading.route == ProbeRoute::Proxied => LatencyState::Tunnel { ms, age },
-        Some(ms) => LatencyState::Reachable { ms, age },
+        Some(ms) if reading.route == ProbeRoute::Proxied => LatencyState::Tunnel {
+            ms,
+            age,
+            method: reading.method,
+        },
+        Some(ms) => LatencyState::Reachable {
+            ms,
+            age,
+            method: reading.method,
+        },
         None => match reading.failure {
             Some(ProbeFailure::NoNetwork) => LatencyState::NoNetwork,
             _ => LatencyState::Unreachable,
@@ -590,11 +601,14 @@ mod tests {
     /// than by how long the suite took to get here.
     const NOW_MS: u64 = 1_700_000_000_000;
 
-    /// The badge a just-taken direct reading produces.
+    /// The badge a just-taken direct reading produces. The method is whatever
+    /// [`reading`] stamped on it: the state repeats how the number was taken,
+    /// it does not decide it.
     fn fresh(ms: u32) -> LatencyState {
         LatencyState::Reachable {
             ms,
             age: LatencyAge::Fresh,
+            method: LatencyMethod::HttpGet,
         }
     }
 
@@ -1138,7 +1152,8 @@ mod tests {
             latency(&effects, "a"),
             Some(LatencyState::Tunnel {
                 ms: 41,
-                age: LatencyAge::Fresh
+                age: LatencyAge::Fresh,
+                method: LatencyMethod::HttpGet
             })
         );
     }
@@ -1197,7 +1212,8 @@ mod tests {
             state.card_state("a", NOW_MS + 185_000),
             LatencyState::Reachable {
                 ms: 41,
-                age: LatencyAge::Stale(3)
+                age: LatencyAge::Stale(3),
+                method: LatencyMethod::HttpGet
             }
         );
         // A clock that disagrees between the two processes is not an excuse to
@@ -1206,7 +1222,8 @@ mod tests {
             state.card_state("a", NOW_MS - 1),
             LatencyState::Reachable {
                 ms: 41,
-                age: LatencyAge::Unknown
+                age: LatencyAge::Unknown,
+                method: LatencyMethod::HttpGet
             }
         );
     }

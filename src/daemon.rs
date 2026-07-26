@@ -21,6 +21,10 @@ use crate::model::Server;
 use crate::probe;
 use crate::xray::core::Status;
 
+/// How many servers may be measured at once. This is now a cap on *processes*:
+/// an HTTP probe starts a core of its own to make its request through, so a
+/// "check all" over a large subscription would otherwise fork one Xray per
+/// server and take the machine with it.
 const MAX_CONCURRENT_PROBES: usize = 8;
 const ACTIVE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -243,16 +247,15 @@ impl Shared {
             Some((server, config, route)) => {
                 let method = config.latency_method;
                 let wire = wire_route(route);
-                match probe::measure(
-                    &server,
-                    method,
-                    config.socks_port,
-                    &config.latency_test_url,
-                    route,
-                ) {
-                    Some(ms) => LatencyReading::ok(ms, wire, method),
+                match probe::measure(&server, &config, route) {
+                    // The reading carries the method that produced it, not the
+                    // one the config asked for: a hysteria2 server may answer
+                    // only ICMP. The card says which it was rather than
+                    // passing a handshake off as the user's chosen probe.
+                    Some(measured) => LatencyReading::ok(measured.ms, wire, measured.method),
                     // `probe::measure` collapses every failure into `None`, so
-                    // this is as specific as phase 1 can honestly be.
+                    // this is as specific as phase 1 can honestly be. The
+                    // method here is the one that was attempted.
                     None => LatencyReading::failed(ProbeFailure::Unreachable, wire, method),
                 }
             }
