@@ -193,6 +193,7 @@ pub(super) enum Effect {
     /// position, so this is at most two ids per snapshot, never a sweep.
     Reprobe(String),
     ToastUnreachable,
+    ToastNoNetwork,
     ConnectionError(String),
     /// The daemon is older than the reading contract. Its numbers arrive
     /// undated and unattributed, so the GUI reports nothing rather than
@@ -245,6 +246,7 @@ pub(super) fn reduce(
     }
     let mut effects = Vec::new();
     let mut toast_unreachable = false;
+    let mut toast_no_network = false;
     let mut new_error: Option<String> = None;
     state.daemon_status = snapshot.status.to_status();
     // Only the daemon's override path knows which server a failure belongs to;
@@ -317,7 +319,11 @@ pub(super) fn reduce(
                 state.last_active_latency = Some((id.clone(), ms));
             }
             if state.notify_probe.remove(id) && reading.value.is_none() {
-                toast_unreachable = true;
+                if reading.failure == Some(ProbeFailure::NoNetwork) {
+                    toast_no_network = true;
+                } else {
+                    toast_unreachable = true;
+                }
             }
         }
     }
@@ -437,6 +443,9 @@ pub(super) fn reduce(
 
     if toast_unreachable {
         effects.push(Effect::ToastUnreachable);
+    }
+    if toast_no_network {
+        effects.push(Effect::ToastNoNetwork);
     }
     // Failures the user never triggered — a crashed core, a tunnel torn down by
     // its own latency check — reach the screen only here.
@@ -956,6 +965,44 @@ mod tests {
                 .filter(|effect| matches!(effect, Effect::ToastUnreachable))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn no_network_toasts_once_and_does_not_redden_cards() {
+        let mut state = state();
+        state.notify_probe.insert("a".to_string());
+        let mut no_network = idle();
+        let mut reading = LatencyReading::failed(
+            ProbeFailure::NoNetwork,
+            ProbeRoute::Direct,
+            LatencyMethod::HttpGet,
+        );
+        reading.measured_at_unix_ms = NOW_MS;
+        no_network.readings.insert("a".to_string(), reading);
+
+        let effects = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), no_network),
+            Instant::now(),
+            true,
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::ToastNoNetwork))
+                .count(),
+            1
+        );
+        assert_eq!(
+            latency(&effects, "a"),
+            Some(LatencyState::NoNetwork),
+            "an offline machine is not a dead server"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ToastUnreachable))
         );
     }
 

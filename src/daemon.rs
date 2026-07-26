@@ -252,11 +252,10 @@ impl Shared {
                     // one the config asked for: a hysteria2 server may answer
                     // only ICMP. The card says which it was rather than
                     // passing a handshake off as the user's chosen probe.
-                    Some(measured) => LatencyReading::ok(measured.ms, wire, measured.method),
-                    // `probe::measure` collapses every failure into `None`, so
-                    // this is as specific as phase 1 can honestly be. The
-                    // method here is the one that was attempted.
-                    None => LatencyReading::failed(ProbeFailure::Unreachable, wire, method),
+                    probe::ProbeOutcome::Reachable(measured) => {
+                        LatencyReading::ok(measured.ms, wire, measured.method)
+                    }
+                    outcome => LatencyReading::failed(wire_failure(&outcome), wire, method),
                 }
             }
             // The server was removed between the request and its slot. Nothing
@@ -304,7 +303,7 @@ impl Shared {
                 // map still held. Record the failure it actually is.
                 crate::sync::lock(&shared.readings).insert(
                     server_id.clone(),
-                    LatencyReading::failed(ProbeFailure::Unreachable, ProbeRoute::Proxied, method),
+                    LatencyReading::failed(ProbeFailure::Timeout, ProbeRoute::Proxied, method),
                 );
                 None
             };
@@ -418,6 +417,22 @@ fn wire_route(route: probe::Route) -> ProbeRoute {
     match route {
         probe::Route::Direct => ProbeRoute::Direct,
         probe::Route::Proxied => ProbeRoute::Proxied,
+    }
+}
+
+fn wire_failure(outcome: &probe::ProbeOutcome) -> ProbeFailure {
+    match outcome {
+        probe::ProbeOutcome::Unreachable => ProbeFailure::Unreachable,
+        probe::ProbeOutcome::Timeout => ProbeFailure::Timeout,
+        probe::ProbeOutcome::NoNetwork => ProbeFailure::NoNetwork,
+        probe::ProbeOutcome::Internal(reason) => {
+            log::warn!("probe could not run: {reason}");
+            ProbeFailure::Unknown
+        }
+        // Only failed outcomes are passed here. Keep this total so an
+        // accidental misuse degrades to an honest unknown instead of taking
+        // the daemon down.
+        probe::ProbeOutcome::Reachable(_) => ProbeFailure::Unknown,
     }
 }
 
@@ -801,6 +816,14 @@ mod tests {
         let probes: ProbeState = serde_json::from_str(&service.probe_state()?)?;
         assert_eq!(probes.version, PROBE_STATE_VERSION);
         Ok(())
+    }
+
+    #[test]
+    fn a_local_fault_never_blames_the_server() {
+        assert_eq!(
+            wire_failure(&probe::ProbeOutcome::Internal("test fault")),
+            ProbeFailure::Unknown
+        );
     }
 
     /// The cap is what the GUI's queued spinners exist for: everything past it

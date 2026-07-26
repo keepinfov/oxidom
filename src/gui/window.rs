@@ -1840,6 +1840,7 @@ impl Controller {
                 Effect::ToastUnreachable => {
                     self.show_message("Server is unreachable or did not respond")
                 }
+                Effect::ToastNoNetwork => self.show_message("No network connection"),
                 Effect::ConnectionError(error) => self.show_error("Connection error", &error),
                 Effect::DaemonOutdated => self.show_message(
                     "The oxidom daemon is older than this app — latency readings are unavailable \
