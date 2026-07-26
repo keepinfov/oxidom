@@ -145,7 +145,32 @@ against a real core with `xray run -test -c <file>` rather than against document
 - `http_head` — HEAD `latency_test_url` **through the active SOCKS inbound**.
 - `http_get` — GET `latency_test_url` through SOCKS (Happ-style; expect 204).
 List view may use a cheap method across servers concurrently (bounded thread pool); the active
-connection uses the configured method. Store result in `Server.latency_ms`.
+connection uses the configured method.
+
+### The reading contract (cycle 4, phase 1 — binding)
+A latency number without its context is a lie waiting to be told, so a measurement crosses D-Bus
+as `ipc::LatencyReading { value, measured_at_unix_ms, route, method, failure }` — never as a bare
+`Option<u32>`, and never in `Server`.
+
+- **`route`** is `Direct` or `Proxied`. Only the server the tunnel is *currently* carrying may be
+  measured `Proxied` (`daemon::Shared::probe_target`), and only a `Proxied` reading may be shown
+  as the connection's latency. A reading whose route no longer applies is `Superseded` on the
+  card — shown as `—`, never as a number.
+- **`failure.is_some()` ⟺ `value.is_none()`**, upheld by `LatencyReading::ok`/`failed`. Build them
+  through those constructors.
+- **Every id that enters `ProbeQueue::running` leaves with a `readings` entry**, including ids that
+  no longer resolve. The GUI retires its spinner on the id leaving `running ∪ queued`, so a silent
+  early return leaves a card checking forever.
+- **`queued ≠ finished`.** `ProbeState` reports `running` and `queued` separately; a card waiting
+  for a slot still carries its *previous* number and must not present it as this measurement's.
+- **`ProbeState.version`** is bumped whenever the shape changes. A GUI seeing a lower version
+  reports everything as unmeasured and says why, rather than guessing.
+- Readings are dropped for servers that no longer exist (`Shared::prune_readings`, called by every
+  mutating `Service` method) — ids are reissued on subscription refresh.
+
+Freshness is the GUI's job: `gui::reduce::latency_state` is the **single** mapper from a reading to
+a `LatencyState`, and ages are bucketed to whole minutes so the badge repaints on a bucket change
+rather than once a second.
 
 ## CLI (clap derive)
 Single binary `oxidom`:

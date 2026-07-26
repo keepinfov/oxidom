@@ -21,12 +21,15 @@ pub struct Config {
     pub xray_binary: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LatencyMethod {
     Icmp,
     Tcp,
     HttpHead,
+    /// Matches [`Config::default`]; also what a latency reading falls back to
+    /// when it records a probe that never got as far as reading the config.
+    #[default]
     HttpGet,
 }
 
