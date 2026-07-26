@@ -1,0 +1,12 @@
+[D-BUS Service]
+# Lets a client that reaches for the daemon *start* it instead of finding the
+# name unowned. Without this, a GUI that autostarts at login races the systemd
+# unit: whoever loses falls back to a private session daemon, which owns a
+# different database — the user's servers appear to vanish.
+Name=dev.keepinfov.oxidom.Daemon
+# Ignored when SystemdService is honoured; the spec still requires the key, and
+# a shell-started daemon would be wrong here (it must run as the oxidom user
+# with the unit's hardening).
+Exec=/bin/false
+User=oxidom
+SystemdService=oxidom.service

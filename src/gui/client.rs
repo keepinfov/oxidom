@@ -1,7 +1,8 @@
 //! Blocking D-Bus client for the oxidom daemon. All calls can block for the
 //! duration of a daemon operation — never call these on the GTK main thread.
 
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -19,9 +20,56 @@ use crate::model::Subscription;
 /// subscription in turn, each with its own 30s HTTP cap.
 const METHOD_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long an installed-but-silent system daemon is waited for before the GUI
+/// gives up and runs one of its own. The window it covers is the seconds
+/// between a desktop session autostarting the GUI and the systemd unit claiming
+/// its bus name; a daemon that is genuinely broken is not worth more than this.
+const SYSTEM_DAEMON_GRACE: Duration = Duration::from_secs(10);
+const SYSTEM_DAEMON_RETRY: Duration = Duration::from_millis(250);
+
+/// Where a D-Bus system policy file for the daemon would be installed. Its
+/// presence is what tells "no system daemon on this machine" (nothing to wait
+/// for) apart from "the system daemon has not started yet" (wait for it).
+const SYSTEM_POLICY_DIRS: [&str; 4] = [
+    "/etc/dbus-1/system.d",
+    "/usr/share/dbus-1/system.d",
+    "/usr/local/share/dbus-1/system.d",
+    // NixOS assembles the bus configuration out of the system profile.
+    "/run/current-system/sw/share/dbus-1/system.d",
+];
+
+/// Which daemon the GUI ended up driving. A session daemon keeps its own
+/// database under the user's XDG dirs, so this is not a detail: the two hold
+/// different servers, and picking the wrong one silently is what makes a
+/// subscription look like it lost half its entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonSource {
+    /// The systemd service on the system bus.
+    System,
+    /// A daemon that was already running on the session bus.
+    Session,
+    /// A session daemon this process started.
+    Spawned,
+}
+
+/// What [`DaemonClient::connect_any`] is doing, so the startup window can say
+/// it. Text lives in the window; this only names the step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectStage {
+    /// Asking the system bus.
+    System,
+    /// The system daemon is installed but has not claimed its name yet.
+    WaitingForSystem,
+    /// Asking the session bus.
+    Session,
+    /// Starting a private session daemon.
+    Starting,
+}
+
 #[derive(Clone)]
 pub struct DaemonClient {
     proxy: zbus::blocking::Proxy<'static>,
+    source: DaemonSource,
 }
 
 fn friendly(error: zbus::Error) -> anyhow::Error {
@@ -31,8 +79,37 @@ fn friendly(error: zbus::Error) -> anyhow::Error {
     }
 }
 
+/// Is a system daemon installed at all? Only its D-Bus policy file can say:
+/// without one the bus would refuse every call, so a machine that has it has a
+/// system daemon, and a machine that does not never will.
+fn system_daemon_installed() -> bool {
+    policy_installed(&SYSTEM_POLICY_DIRS, BUS_NAME)
+}
+
+fn policy_installed(dirs: &[&str], bus_name: &str) -> bool {
+    let file = format!("{bus_name}.conf");
+    dirs.iter().any(|dir| Path::new(dir).join(&file).exists())
+}
+
+/// Does this error mean "nobody is on that name (yet)", as opposed to a final
+/// answer? A daemon that is starting is worth waiting for; a bus that refuses
+/// this user is not — for them a session daemon *is* the right daemon.
+fn name_unowned(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(name, ..) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+                | "org.freedesktop.DBus.Error.NameHasNoOwner"
+                | "org.freedesktop.DBus.Error.NoReply"
+                | "org.freedesktop.DBus.Error.Spawn.ChildSignaled"
+                | "org.freedesktop.DBus.Error.Spawn.ChildExited"
+        ),
+        _ => false,
+    }
+}
+
 impl DaemonClient {
-    fn try_bus(system: bool) -> Result<Self> {
+    fn try_bus(system: bool, source: DaemonSource) -> zbus::Result<Self> {
         let builder = if system {
             zbus::blocking::connection::Builder::system()?
         } else {
@@ -42,18 +119,53 @@ impl DaemonClient {
         let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE)?;
         // Reject name owners that don't answer: a real daemon replies fast.
         let _: String = proxy.call("Status", &())?;
-        Ok(DaemonClient { proxy })
+        Ok(DaemonClient { proxy, source })
+    }
+
+    /// Which daemon this client is driving.
+    pub fn source(&self) -> DaemonSource {
+        self.source
     }
 
     /// System bus first (the systemd service), then the session bus; as a
     /// last resort spawn a session daemon so the GUI works standalone.
-    pub fn connect_any() -> Result<Self> {
-        if let Ok(client) = Self::try_bus(true) {
+    ///
+    /// An installed system daemon is *waited for* rather than raced. The GUI is
+    /// autostarted by the desktop session at the same moment systemd starts the
+    /// unit, and losing that race by a second used to bind the whole session to
+    /// a session daemon with a different database — the user's servers appeared
+    /// to vanish, with nothing on screen saying which daemon was answering.
+    /// (The packaged unit is D-Bus activatable, which closes the window on its
+    /// own; this covers installations whose unit is not.)
+    ///
+    /// `progress` is called on the calling thread before each step, so a caller
+    /// that runs this off the main loop can report what it is waiting on.
+    pub fn connect_any(progress: impl Fn(ConnectStage)) -> Result<Self> {
+        progress(ConnectStage::System);
+        match Self::try_bus(true, DaemonSource::System) {
+            Ok(client) => return Ok(client),
+            Err(error) if name_unowned(&error) && system_daemon_installed() => {
+                progress(ConnectStage::WaitingForSystem);
+                let deadline = Instant::now() + SYSTEM_DAEMON_GRACE;
+                while Instant::now() < deadline {
+                    std::thread::sleep(SYSTEM_DAEMON_RETRY);
+                    if let Ok(client) = Self::try_bus(true, DaemonSource::System) {
+                        return Ok(client);
+                    }
+                }
+                log::warn!(
+                    "the system daemon is installed but did not answer within {}s; \
+                     falling back to a session daemon, which keeps its own subscriptions",
+                    SYSTEM_DAEMON_GRACE.as_secs()
+                );
+            }
+            Err(error) => log::info!("no daemon on the system bus ({error})"),
+        }
+        progress(ConnectStage::Session);
+        if let Ok(client) = Self::try_bus(false, DaemonSource::Session) {
             return Ok(client);
         }
-        if let Ok(client) = Self::try_bus(false) {
-            return Ok(client);
-        }
+        progress(ConnectStage::Starting);
         let exe = std::env::current_exe().context("locating the oxidom binary")?;
         std::process::Command::new(exe)
             .arg("daemon")
@@ -61,7 +173,7 @@ impl DaemonClient {
             .context("spawning a session daemon")?;
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(150));
-            if let Ok(client) = Self::try_bus(false) {
+            if let Ok(client) = Self::try_bus(false, DaemonSource::Spawned) {
                 return Ok(client);
             }
         }
@@ -172,5 +284,38 @@ impl DaemonClient {
 
     pub fn clear_logs(&self) -> Result<()> {
         self.proxy.call("ClearLogs", &()).map_err(friendly)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BUS_NAME, policy_installed};
+
+    /// The predicate that decides whether an unanswered system bus is worth
+    /// waiting out. Getting it wrong either way is a real cost: a false
+    /// positive stalls every start on a machine with no system daemon, a false
+    /// negative puts the GUI back on a private database whenever it wins the
+    /// race with the unit.
+    #[test]
+    fn only_an_installed_policy_makes_the_system_daemon_worth_waiting_for() {
+        let dir = std::env::temp_dir().join(format!("oxidom-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dirs = [dir.to_str().unwrap()];
+
+        assert!(!policy_installed(&dirs, BUS_NAME));
+        // A policy for some *other* bus name in the same directory is not ours.
+        std::fs::write(dir.join("org.example.Other.conf"), b"").unwrap();
+        assert!(!policy_installed(&dirs, BUS_NAME));
+
+        std::fs::write(dir.join(format!("{BUS_NAME}.conf")), b"").unwrap();
+        assert!(policy_installed(&dirs, BUS_NAME));
+        // A directory that does not exist at all must not panic or match.
+        assert!(!policy_installed(
+            &["/nonexistent/dbus-1/system.d"],
+            BUS_NAME
+        ));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

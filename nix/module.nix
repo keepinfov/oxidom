@@ -93,7 +93,9 @@ in {
       };
       users.groups.oxidom.members = daemonCfg.users;
 
-      # Lets the daemon own its system-bus name and users talk to it.
+      # Lets the daemon own its system-bus name, users talk to it, and a client
+      # that asks for the name while the unit is still starting *wait* for it
+      # (share/dbus-1/system-services) instead of racing it.
       services.dbus.packages = [daemonCfg.package];
 
       systemd.services.oxidom = {
@@ -102,6 +104,11 @@ in {
         wants = ["network-online.target"];
         after = ["network-online.target" "dbus.service"];
         serviceConfig = {
+          # D-Bus activation: the unit counts as started once it owns the name,
+          # so a client's first call blocks until the daemon can answer it
+          # rather than falling through to a session daemon of its own.
+          Type = "dbus";
+          BusName = "dev.keepinfov.oxidom.Daemon";
           ExecStart = lib.concatStringsSep " " [
             "${daemonCfg.package}/bin/oxidom"
             "daemon"

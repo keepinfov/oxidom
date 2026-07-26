@@ -31,6 +31,10 @@ pub fn run(background: bool) -> Result<()> {
     // an explicit Quit (app.quit()).
     let hold: Rc<RefCell<Option<gio::ApplicationHoldGuard>>> = Rc::new(RefCell::new(None));
     let existing: Rc<RefCell<Option<adw::ApplicationWindow>>> = Rc::new(RefCell::new(None));
+    // Reaching the daemon is asynchronous now, so activation can land while the
+    // first attempt is still in flight. Starting a second one would connect
+    // twice and build two windows.
+    let starting = Rc::new(std::cell::Cell::new(false));
     app.connect_activate(move |app| {
         if hold.borrow().is_none() {
             *hold.borrow_mut() = Some(app.hold());
@@ -41,7 +45,17 @@ pub fn run(background: bool) -> Result<()> {
             window.present();
             return;
         }
-        *existing.borrow_mut() = window::build(app, background);
+        if starting.replace(true) {
+            return;
+        }
+        window::start(app, background, {
+            let existing = existing.clone();
+            let starting = starting.clone();
+            move |window| {
+                starting.set(false);
+                *existing.borrow_mut() = window;
+            }
+        });
     });
 
     // Clap already consumed the process arguments; keep only argv[0]. GLib

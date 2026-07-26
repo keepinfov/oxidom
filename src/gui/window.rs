@@ -15,7 +15,7 @@ use crate::model::Subscription;
 use crate::xray::core::Status;
 use crate::{paths, sysproxy};
 
-use super::client::DaemonClient;
+use super::client::{ConnectStage, DaemonClient, DaemonSource};
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     Effect, PolledSnapshot, ProbeWait, SnapshotState, active_latency_for, latency_states, reduce,
@@ -173,7 +173,90 @@ struct Controller {
     sweep_tick: Cell<u8>,
 }
 
-pub fn build(app: &adw::Application, background: bool) -> Option<adw::ApplicationWindow> {
+/// How often the main loop looks in on the connection thread.
+const STARTUP_POLL: Duration = Duration::from_millis(60);
+
+/// The small window shown while the daemon is being reached. It exists because
+/// the connection is not instant — an installed system daemon is waited for,
+/// and D-Bus activation may have to start it — and a launcher click that
+/// produces nothing at all for several seconds reads as an application that
+/// hung, not as one that is working.
+struct Splash {
+    window: adw::ApplicationWindow,
+    stage: gtk::Label,
+}
+
+impl Splash {
+    fn new(app: &adw::Application) -> Self {
+        let spinner = gtk::Spinner::builder()
+            .width_request(32)
+            .height_request(32)
+            .halign(gtk::Align::Center)
+            .build();
+        spinner.set_spinning(true);
+        let title = gtk::Label::builder()
+            .label("oxidom")
+            .css_classes(["title-2"])
+            .build();
+        let stage = gtk::Label::builder()
+            .label(stage_text(ConnectStage::System))
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["dim-label"])
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_valign(gtk::Align::Center);
+        content.set_vexpand(true);
+        content.set_margin_start(24);
+        content.set_margin_end(24);
+        content.set_margin_bottom(24);
+        content.append(&spinner);
+        content.append(&title);
+        content.append(&stage);
+
+        let view = adw::ToolbarView::new();
+        view.add_top_bar(&adw::HeaderBar::builder().css_classes(["flat"]).build());
+        view.set_content(Some(&content));
+
+        let window = adw::ApplicationWindow::builder()
+            .application(app)
+            .title("oxidom")
+            .default_width(340)
+            .default_height(220)
+            .resizable(false)
+            .content(&view)
+            .build();
+        set_window_icon(&window);
+        window.present();
+        Splash { window, stage }
+    }
+
+    fn set_stage(&self, stage: ConnectStage) {
+        self.stage.set_label(stage_text(stage));
+    }
+}
+
+fn stage_text(stage: ConnectStage) -> &'static str {
+    match stage {
+        ConnectStage::System => "Reaching the oxidom daemon…",
+        ConnectStage::WaitingForSystem => "Waiting for the system daemon to start…",
+        ConnectStage::Session => "Looking for a daemon in this session…",
+        ConnectStage::Starting => "Starting a local daemon…",
+    }
+}
+
+/// Reach the daemon off the main loop, then build the window with it.
+///
+/// `on_ready` receives the window, or `None` when the daemon could not be
+/// reached at all (the error is already on screen by then). Splitting this out
+/// of [`build`] is what lets the connection take its time: it may wait out a
+/// system daemon that is still starting, and the main loop has to keep running
+/// so the splash can be drawn while it does.
+pub fn start(
+    app: &adw::Application,
+    background: bool,
+    on_ready: impl Fn(Option<adw::ApplicationWindow>) + 'static,
+) {
     install_css();
     #[cfg(debug_assertions)]
     if let Some(display) = gtk::gdk::Display::default() {
@@ -182,36 +265,100 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
     }
     gtk::Window::set_default_icon_name(APP_ID);
 
-    let client = match DaemonClient::connect_any() {
-        Ok(client) => client,
-        Err(error) => {
-            let dialog = adw::MessageDialog::new(
-                None::<&gtk::Window>,
-                Some("oxidom daemon unavailable"),
-                Some(&format!("{error:#}")),
-            );
-            dialog.add_responses(&[("quit", "Quit"), ("retry", "Try Again")]);
-            dialog.set_response_appearance("retry", adw::ResponseAppearance::Suggested);
-            dialog.set_default_response(Some("retry"));
-            // Escape must quit, not dismiss: the hold guard is already taken
-            // in `gui::run`, so a dismissed dialog would otherwise leave a
-            // held process with no window and no tray to close it with.
-            dialog.set_close_response("quit");
-            dialog.connect_response(None, {
-                let app = app.clone();
-                move |dialog, response| {
-                    dialog.close();
-                    if response == "retry" {
-                        app.activate();
-                    } else {
-                        app.quit();
-                    }
-                }
-            });
-            dialog.present();
-            return None;
+    // `--background` shows nothing by definition, so it gets no splash either;
+    // its progress goes to the log.
+    let splash = (!background).then(|| Splash::new(app));
+    let cancelled = Rc::new(Cell::new(false));
+    if let Some(splash) = &splash {
+        splash.window.connect_close_request({
+            let app = app.clone();
+            let cancelled = cancelled.clone();
+            move |_| {
+                cancelled.set(true);
+                app.quit();
+                glib::Propagation::Proceed
+            }
+        });
+    }
+
+    let (stage_sender, stage_receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let client = DaemonClient::connect_any(|stage| {
+            log::info!("daemon connection: {}", stage_text(stage));
+            let _ = stage_sender.send(stage);
+        });
+        let _ = sender.send(client.map_err(|error| format!("{error:#}")));
+    });
+
+    let app = app.clone();
+    let on_ready = Rc::new(on_ready);
+    glib::timeout_add_local(STARTUP_POLL, move || {
+        if cancelled.get() {
+            return glib::ControlFlow::Break;
         }
-    };
+        while let Ok(stage) = stage_receiver.try_recv() {
+            if let Some(splash) = &splash {
+                splash.set_stage(stage);
+            }
+        }
+        let outcome = match receiver.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Ok(outcome) => outcome,
+            // The thread died without answering; treat it as a failure rather
+            // than polling a channel nobody will ever write to again.
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("the daemon connection ended without an answer".to_string())
+            }
+        };
+        if let Some(splash) = &splash {
+            splash.window.close();
+        }
+        match outcome {
+            Ok(client) => on_ready(Some(build(&app, background, client))),
+            Err(message) => {
+                show_daemon_error(&app, &message);
+                on_ready(None);
+            }
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn show_daemon_error(app: &adw::Application, message: &str) {
+    let dialog = adw::MessageDialog::new(
+        None::<&gtk::Window>,
+        Some("oxidom daemon unavailable"),
+        Some(message),
+    );
+    dialog.add_responses(&[("quit", "Quit"), ("retry", "Try Again")]);
+    dialog.set_response_appearance("retry", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("retry"));
+    // Escape must quit, not dismiss: the hold guard is already taken in
+    // `gui::run`, so a dismissed dialog would otherwise leave a held process
+    // with no window and no tray to close it with.
+    dialog.set_close_response("quit");
+    dialog.connect_response(None, {
+        let app = app.clone();
+        move |dialog, response| {
+            dialog.close();
+            if response == "retry" {
+                app.activate();
+            } else {
+                app.quit();
+            }
+        }
+    });
+    dialog.present();
+}
+
+fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw::ApplicationWindow {
+    if client.source() != DaemonSource::System {
+        log::info!(
+            "driving a session daemon ({:?}); its subscriptions are stored per-user",
+            client.source()
+        );
+    }
     let subscriptions_snapshot = client.subscriptions().unwrap_or_default();
     let initial_status = client.status().unwrap_or_default();
     let initial_config = client.settings().unwrap_or_default();
@@ -462,7 +609,7 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
     // the daemon's current connection on the cards.
     controller.reconcile_system_proxy();
     controller.sync_connection_cards();
-    Some(window)
+    window
 }
 
 fn set_window_icon(window: &adw::ApplicationWindow) {

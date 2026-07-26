@@ -38,6 +38,21 @@ missing files (treat as defaults/empty).
 - `~/.local/share/oxidom/state.toml` — last active server, per-app route memory.
 - `~/.local/share/oxidom/hwid` — random per-install id (only generated/used if a sub opts in).
 
+### Which daemon owns the store (binding)
+A system daemon run from the NixOS module keeps all of the above in its `StateDirectory`
+(`/var/lib/oxidom`) instead of the user's XDG dirs, so **the choice of daemon is the choice of
+database**. The GUI must not make that choice by accident:
+
+- The system daemon is D-Bus **activatable** (`share/dbus-1/system-services/…`, unit `Type=dbus`),
+  so a client that asks for the name starts it and waits instead of racing it.
+- `DaemonClient::connect_any` falls back to a session daemon only after waiting out an installed
+  system daemon (`SYSTEM_DAEMON_GRACE`), and only when the bus says *nobody owns the name*.
+  `AccessDenied` is a final answer — that user is not allowed to drive the system daemon, and a
+  session daemon of their own is the correct answer for them.
+- Losing this race is invisible in the UI except as servers that "vanished", so the fallback is
+  logged, and the connection runs off the main loop behind a startup window that says which step
+  it is on. Never make the user stare at nothing while a daemon is being reached.
+
 ### `config.toml` schema (serde)
 ```toml
 socks_port = 10808            # local SOCKS inbound
