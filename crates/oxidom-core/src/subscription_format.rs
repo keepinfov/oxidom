@@ -172,17 +172,9 @@ fn xray_profile_server(
 ) -> Option<Server> {
     let first = server_from_xray_outbound(name, proxy_outbounds.first()?)?;
     let burst_observatory = config.get("burstObservatory").cloned();
-    let identity = serde_json::to_string(&json!({
-        "name": name,
-        "proxy_outbounds": proxy_outbounds,
-        "balancers": balancers,
-        "burst_observatory": burst_observatory,
-        "balancer_tag": balancer_tag,
-    }))
-    .ok()?;
     let count = proxy_outbounds.len();
-    Some(Server {
-        id: Server::stable_id(&identity),
+    let mut server = Server {
+        id: String::new(),
         name: name.to_string(),
         protocol: first.protocol,
         address: first.address,
@@ -196,8 +188,11 @@ fn xray_profile_server(
             balancer_tag,
         },
         link: None,
+        alias: None,
         latency_ms: None,
-    })
+    };
+    server.id = Server::stable_id(&server.identity_string());
+    Some(server)
 }
 
 fn server_from_xray_outbound(name: &str, outbound: &Value) -> Option<Server> {
@@ -534,15 +529,11 @@ fn finish_server(
         country: country_from_name(name),
         spec,
         link: None,
+        alias: None,
         latency_ms: None,
     };
     server.link = canonical_share_link(&server);
-    let identity = server
-        .link
-        .clone()
-        .or_else(|| serde_json::to_string(&server.spec).ok())
-        .unwrap_or_else(|| format!("{}:{}:{}", server.address, server.port, server.name));
-    server.id = Server::stable_id(&identity);
+    server.id = Server::stable_id(&server.identity_string());
     server
 }
 

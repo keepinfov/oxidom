@@ -387,6 +387,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
     // leaves the settings rows unlocked and the effective path unknown.
     let initial_runtime = client.runtime_info().ok();
     let selected_id = initial_status.active_id.clone();
+    let servers = ServersView::new(&subscriptions_snapshot);
     let state = Rc::new(RefCell::new(AppState {
         client,
         subscriptions: subscriptions_snapshot,
@@ -394,7 +395,6 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         ui: SnapshotState::new(&initial_status),
     }));
 
-    let servers = ServersView::new();
     let subscriptions = SubscriptionsView::new();
     subscriptions.set_header_actions_embedded(false);
     let subscription_actions = subscriptions.header_actions();

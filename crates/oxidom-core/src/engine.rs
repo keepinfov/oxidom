@@ -1,16 +1,19 @@
 //! App-facing orchestration API. The GUI (Phase 2) drives everything through
 //! this type; it should not call the lower-level modules directly.
 
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow};
 
 use crate::config::Config;
 use crate::model::{Server, Subscription};
 use crate::state::{self, State, store};
 use crate::xray::core::{Status, XrayCore};
-use crate::{link, probe, subscription};
+use crate::{alias, link, probe, subscription};
 
 /// Fixed id of the local group that holds servers imported by share-link,
-/// not tied to any subscription URL.
+/// not tied to any subscription URL. It is a sentinel rather than a hash, so
+/// the identity migration must leave it alone.
 pub const LOCAL_ID: &str = "local";
 
 pub struct Engine {
@@ -40,8 +43,92 @@ impl Engine {
             config,
             load_warnings: store_warning.into_iter().collect(),
         };
+        engine.migrate_identities();
         engine.recover();
         engine
+    }
+
+    fn migrate_identities(&mut self) {
+        let active_before = self.state.active_server_id.clone();
+        let mut server_ids = HashMap::new();
+        let mut seen_ids: HashMap<String, (String, String)> = HashMap::new();
+        let mut identities_changed = false;
+        let mut renamed_servers = 0usize;
+
+        for subscription in &mut self.subscriptions {
+            // The local group is keyed by a sentinel, not by its (empty) URL.
+            // Rehashing it would orphan every share-link the user imported.
+            if subscription.id != LOCAL_ID {
+                let new_subscription_id = Server::stable_id(&subscription.url);
+                if subscription.id != new_subscription_id {
+                    subscription.id = new_subscription_id;
+                    identities_changed = true;
+                }
+            }
+
+            let mut migrated = Vec::with_capacity(subscription.servers.len());
+            for mut server in std::mem::take(&mut subscription.servers) {
+                let old_id = server.id.clone();
+                let new_id = Server::stable_id(&server.identity_string());
+                if old_id != new_id {
+                    server_ids
+                        .entry(old_id.clone())
+                        .or_insert_with(|| new_id.clone());
+                    server.id.clone_from(&new_id);
+                    identities_changed = true;
+                    renamed_servers += 1;
+                }
+
+                if let Some((first_old_id, first_name)) = seen_ids.get(&new_id)
+                    && first_old_id != &old_id
+                {
+                    log::warn!(
+                        "dropping server {:?}: its migrated id collides with earlier server {:?}",
+                        server.name,
+                        first_name
+                    );
+                    identities_changed = true;
+                    continue;
+                }
+                seen_ids
+                    .entry(new_id)
+                    .or_insert_with(|| (old_id, server.name.clone()));
+                migrated.push(server);
+            }
+            subscription.servers = migrated;
+        }
+
+        let aliases_complete = self
+            .all_servers()
+            .all(|server| server.alias.as_ref().is_some());
+        if !identities_changed && aliases_complete {
+            return;
+        }
+
+        if let Some(active_id) = self.state.active_server_id.as_mut()
+            && let Some(new_id) = server_ids.get(active_id)
+        {
+            active_id.clone_from(new_id);
+        }
+        alias::assign(&mut self.subscriptions);
+
+        if let Err(error) = store::save(&self.subscriptions) {
+            log::warn!("could not persist migrated subscription identities: {error:#}");
+        }
+        if let Err(error) = self.state.save() {
+            log::warn!("could not persist migrated active server identity: {error:#}");
+        }
+
+        let active_preserved = active_before.is_none()
+            || self
+                .state
+                .active_server_id
+                .as_deref()
+                .is_some_and(|active_id| self.all_servers().any(|server| server.id == active_id));
+        log::info!(
+            "identity migration renamed {renamed_servers} servers; active server preserved: \
+             {active_preserved}"
+        );
     }
 
     /// Undo each resource a crashed previous instance could have left behind.
@@ -106,6 +193,7 @@ impl Engine {
         } else {
             self.subscriptions.push(sub);
         }
+        alias::assign(&mut self.subscriptions);
         store::save(&self.subscriptions)?;
         Ok(())
     }
@@ -126,6 +214,7 @@ impl Engine {
             None
         };
         subscription::refresh(sub, &ua, hwid.as_deref())?;
+        alias::assign(&mut self.subscriptions);
         self.disconnect_if_active_gone();
         store::save(&self.subscriptions)?;
         Ok(())
@@ -163,6 +252,7 @@ impl Engine {
                 }
             }
         }
+        alias::assign(&mut self.subscriptions);
         self.disconnect_if_active_gone();
         store::save(&self.subscriptions)?;
         if errors.is_empty() {
@@ -219,6 +309,7 @@ impl Engine {
                 added += 1;
             }
         }
+        alias::assign(&mut self.subscriptions);
         store::save(&self.subscriptions)?;
         Ok((added, unsupported))
     }
@@ -398,4 +489,242 @@ fn is_our_xray(pid: u32) -> bool {
     }
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .is_ok_and(|comm| comm.trim().starts_with("xray"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use anyhow::{Context, Result, anyhow};
+
+    use super::{Engine, LOCAL_ID};
+    use crate::link::parse_link;
+    use crate::model::{Server, Subscription};
+    use crate::state::{State, store};
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct TestRoot {
+        path: std::path::PathBuf,
+    }
+
+    impl TestRoot {
+        fn install(label: &str) -> Result<Self> {
+            let suffix = NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "oxidom-core-test-{label}-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("creating test root {}", path.display()))?;
+            crate::paths::set_test_root(Some(path.clone()));
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            crate::paths::set_test_root(None);
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn old_stable_id(seed: &str) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        seed.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    fn old_subscription(url: &str, links: &[&str]) -> Subscription {
+        let mut subscription = Subscription::new(url.to_string(), Some("Test".to_string()));
+        subscription.id = old_stable_id(url);
+        subscription.servers = links
+            .iter()
+            .map(|link| {
+                let mut server = parse_link(link).unwrap();
+                server.id = old_stable_id(&server.identity_string());
+                server.alias = None;
+                server
+            })
+            .collect();
+        subscription
+    }
+
+    #[test]
+    fn migration_leaves_the_local_group_keyed_by_its_sentinel() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("identity-local-group")?;
+        let mut local = old_subscription("", &["trojan://one@one.example:443#Imported"]);
+        local.id = LOCAL_ID.to_string();
+        store::save(&[local])?;
+        State::default().save()?;
+
+        let engine = Engine::load();
+
+        let group = engine
+            .subscriptions
+            .first()
+            .ok_or_else(|| anyhow!("the local group disappeared"))?;
+        assert_eq!(group.id, LOCAL_ID);
+        assert_eq!(group.servers.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_preserves_the_active_server_and_server_count() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("identity-migration")?;
+        let subscription = old_subscription(
+            "https://subscription.example/token",
+            &[
+                "trojan://one@one.example:443#One",
+                "vless://two@two.example:443#Two",
+            ],
+        );
+        let old_active = subscription.servers[1].id.clone();
+        let expected_active = Server::stable_id(&subscription.servers[1].identity_string());
+        let server_count = subscription.servers.len();
+        store::save(&[subscription])?;
+        State {
+            active_server_id: Some(old_active),
+            xray_pid: None,
+        }
+        .save()?;
+
+        let engine = Engine::load();
+
+        assert_eq!(engine.all_servers().count(), server_count);
+        assert_eq!(
+            engine.state.active_server_id.as_deref(),
+            Some(expected_active.as_str())
+        );
+        assert!(
+            engine
+                .all_servers()
+                .all(|server| server.alias.as_ref().is_some_and(|alias| !alias.is_empty()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completed_migration_does_not_rewrite_the_store() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("identity-no-rewrite")?;
+        let mut subscription = old_subscription(
+            "https://subscription.example/stable",
+            &["trojan://one@one.example:443#One"],
+        );
+        subscription.id = Server::stable_id(&subscription.url);
+        subscription.servers[0].id = Server::stable_id(&subscription.servers[0].identity_string());
+        subscription.servers[0].alias = Some("one".to_string());
+        store::save(&[subscription])?;
+        State::default().save()?;
+        let subscriptions_path = crate::paths::subscriptions_file()?;
+        let state_path = crate::paths::state_file()?;
+        let subscriptions_inode = std::fs::metadata(&subscriptions_path)?.ino();
+        let state_inode = std::fs::metadata(&state_path)?.ino();
+
+        let _engine = Engine::load();
+
+        assert_eq!(
+            std::fs::metadata(&subscriptions_path)?.ino(),
+            subscriptions_inode
+        );
+        assert_eq!(std::fs::metadata(&state_path)?.ino(), state_inode);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_keeps_the_first_server_when_old_ids_collapse() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("identity-collision")?;
+        let mut subscription = old_subscription(
+            "https://subscription.example/collision",
+            &["trojan://one@one.example:443#First"],
+        );
+        let mut duplicate = subscription.servers[0].clone();
+        duplicate.id = "different-old-id".to_string();
+        duplicate.name = "Second".to_string();
+        subscription.servers.push(duplicate);
+        store::save(&[subscription])?;
+        State {
+            active_server_id: Some("different-old-id".to_string()),
+            xray_pid: None,
+        }
+        .save()?;
+
+        let engine = Engine::load();
+
+        assert_eq!(engine.all_servers().count(), 1);
+        assert_eq!(
+            engine
+                .all_servers()
+                .next()
+                .map(|server| server.name.as_str()),
+            Some("First")
+        );
+        assert_eq!(
+            engine.state.active_server_id,
+            engine.all_servers().next().map(|server| server.id.clone())
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires OXIDOM_TEST_SUBSCRIPTIONS pointing at a real cache"]
+    fn migrates_a_real_subscription_cache_without_losing_state() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let source = std::env::var_os("OXIDOM_TEST_SUBSCRIPTIONS")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow!("OXIDOM_TEST_SUBSCRIPTIONS is not set"))?;
+        let subscriptions: Vec<Subscription> = serde_json::from_str(
+            &std::fs::read_to_string(&source)
+                .with_context(|| format!("reading {}", source.display()))?,
+        )
+        .with_context(|| format!("parsing {}", source.display()))?;
+        let state_path = source
+            .parent()
+            .ok_or_else(|| anyhow!("subscription path has no parent"))?
+            .join("state.toml");
+        let state: State = toml::from_str(
+            &std::fs::read_to_string(&state_path)
+                .with_context(|| format!("reading {}", state_path.display()))?,
+        )
+        .with_context(|| format!("parsing {}", state_path.display()))?;
+        let active_before = state
+            .active_server_id
+            .clone()
+            .ok_or_else(|| anyhow!("the real state has no active server"))?;
+        if !subscriptions
+            .iter()
+            .flat_map(|subscription| subscription.servers.iter())
+            .any(|server| server.id == active_before)
+        {
+            return Err(anyhow!("the real active server is absent before migration"));
+        }
+        let server_count = subscriptions
+            .iter()
+            .map(|subscription| subscription.servers.len())
+            .sum::<usize>();
+
+        let _root = TestRoot::install("real-identity-migration")?;
+        store::save(&subscriptions)?;
+        state.save()?;
+        let engine = Engine::load();
+
+        assert_eq!(engine.all_servers().count(), server_count);
+        let active_after = engine
+            .state
+            .active_server_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("migration cleared the active server"))?;
+        assert!(
+            engine.all_servers().any(|server| server.id == active_after),
+            "migrated active server is absent"
+        );
+        Ok(())
+    }
 }

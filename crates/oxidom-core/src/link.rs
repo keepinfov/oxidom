@@ -94,8 +94,8 @@ fn finish(
     spec: OutboundSpec,
 ) -> Server {
     let country = country_from_name(&name);
-    Server {
-        id: Server::stable_id(link),
+    let mut server = Server {
+        id: String::new(),
         transport_label: transport_label(protocol, &spec),
         country,
         name,
@@ -104,8 +104,11 @@ fn finish(
         port,
         spec,
         link: Some(link.to_string()),
+        alias: None,
         latency_ms: None,
-    }
+    };
+    server.id = Server::stable_id(&server.identity_string());
+    server
 }
 
 /// Every scheme [`parse_link`] understands, with the human name used in dialogs

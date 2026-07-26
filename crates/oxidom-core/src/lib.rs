@@ -1,7 +1,9 @@
+pub mod alias;
 pub mod client;
 pub mod config;
 pub mod engine;
 pub mod fsutil;
+pub mod handle;
 pub mod ipc;
 pub mod link;
 pub mod model;

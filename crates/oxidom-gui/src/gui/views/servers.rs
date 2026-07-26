@@ -96,7 +96,7 @@ pub struct ServersView {
 }
 
 impl ServersView {
-    pub fn new() -> Self {
+    pub fn new(subscriptions: &[Subscription]) -> Self {
         let content = gtk::Box::new(gtk::Orientation::Vertical, 20);
         content.set_hexpand(true);
         content.set_margin_top(16);
@@ -139,7 +139,7 @@ impl ServersView {
             latencies: Rc::new(RefCell::new(HashMap::new())),
             selected: Rc::new(RefCell::new(None)),
             requested_selected: Rc::new(RefCell::new(None)),
-            prefs: Rc::new(RefCell::new(GuiPrefs::load())),
+            prefs: Rc::new(RefCell::new(GuiPrefs::load(subscriptions))),
         }
     }
 

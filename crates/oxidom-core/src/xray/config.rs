@@ -310,6 +310,7 @@ mod tests {
                 balancer_tag: "balance".to_string(),
             },
             link: None,
+            alias: None,
             latency_ms: None,
         };
 
@@ -344,6 +345,7 @@ mod tests {
                 stream,
             },
             link: None,
+            alias: None,
             latency_ms: None,
         }
     }
@@ -393,6 +395,7 @@ mod tests {
                 settings,
             },
             link: None,
+            alias: None,
             latency_ms: None,
         }
     }

@@ -139,6 +139,7 @@ fn preserve_server_identity(previous: &[Server], refreshed: &mut [Server]) {
         };
         used[index] = true;
         server.id.clone_from(&previous[index].id);
+        server.alias.clone_from(&previous[index].alias);
         server.latency_ms = previous[index].latency_ms;
     }
 }
@@ -277,6 +278,7 @@ mod tests {
         )
         .unwrap();
         previous.latency_ms = Some(42);
+        previous.alias = Some("saved-handle".to_string());
         let old_id = previous.id.clone();
         let mut refreshed = vec![
             parse_link(
@@ -289,6 +291,7 @@ mod tests {
         preserve_server_identity(&[previous], &mut refreshed);
 
         assert_eq!(refreshed[0].id, old_id);
+        assert_eq!(refreshed[0].alias.as_deref(), Some("saved-handle"));
         assert_eq!(refreshed[0].latency_ms, Some(42));
         assert_eq!(refreshed[0].name, "New");
     }

@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use nix::sys::signal::{SigSet, Signal};
 use zbus::fdo;
 
+use oxidom_core::alias;
 use oxidom_core::config::{Config, LatencyMethod};
 use oxidom_core::engine::Engine;
 use oxidom_core::ipc::{
@@ -679,6 +680,47 @@ impl Service {
         result.map_err(failed)
     }
 
+    fn set_server_alias(&self, server_id: String, alias: String) -> fdo::Result<()> {
+        if !alias::is_valid(&alias) {
+            return Err(failed(
+                "alias must be 1-32 lowercase letters, digits, or hyphens, start with a \
+                 letter or digit, and not be exactly 16 hexadecimal characters",
+            ));
+        }
+        let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        let target = engine
+            .subscriptions
+            .iter()
+            .enumerate()
+            .find_map(|(subscription_index, subscription)| {
+                subscription
+                    .servers
+                    .iter()
+                    .position(|server| server.id == server_id)
+                    .map(|server_index| (subscription_index, server_index))
+            })
+            .ok_or_else(|| failed("server not found"))?;
+        let alias_taken = engine
+            .subscriptions
+            .iter()
+            .enumerate()
+            .flat_map(|(subscription_index, subscription)| {
+                subscription
+                    .servers
+                    .iter()
+                    .enumerate()
+                    .map(move |(server_index, server)| ((subscription_index, server_index), server))
+            })
+            .any(|(position, server)| {
+                position != target && server.alias.as_deref() == Some(alias.as_str())
+            });
+        if alias_taken {
+            return Err(failed(format!("alias {alias:?} is already in use")));
+        }
+        engine.subscriptions[target.0].servers[target.1].alias = Some(alias);
+        engine.save().map_err(failed)
+    }
+
     fn set_hwid(&self, subscription_id: String, enabled: bool) -> fdo::Result<()> {
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
         if let Some(subscription) = engine
@@ -1108,6 +1150,41 @@ mod tests {
         assert_eq!(status.state, "disconnected");
         let probes: ProbeState = serde_json::from_str(&service.probe_state()?)?;
         assert_eq!(probes.version, PROBE_STATE_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn server_aliases_are_validated_and_globally_unique() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("server-alias")?;
+        let service = for_test();
+        let first = oxidom_core::link::parse_link("trojan://one@one.example:443#One")
+            .context("parsing first test server")?;
+        let first_id = first.id.clone();
+        let second = oxidom_core::link::parse_link("trojan://two@two.example:443#Two")
+            .context("parsing second test server")?;
+        let second_id = second.id.clone();
+        let mut subscription = oxidom_core::model::Subscription::new(
+            "https://subscription.example".to_string(),
+            Some("Test".to_string()),
+        );
+        subscription.servers = vec![first, second];
+        oxidom_core::alias::assign(std::slice::from_mut(&mut subscription));
+        oxidom_core::sync::lock(&service.shared.engine)
+            .subscriptions
+            .push(subscription);
+
+        service.set_server_alias(first_id, "chosen".to_string())?;
+        assert!(
+            service
+                .set_server_alias(second_id.clone(), "chosen".to_string())
+                .is_err()
+        );
+        assert!(
+            service
+                .set_server_alias(second_id, "NOT-PORTABLE".to_string())
+                .is_err()
+        );
         Ok(())
     }
 

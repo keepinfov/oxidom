@@ -1,6 +1,3 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,16 +236,56 @@ pub struct Server {
     /// as one share link and therefore store `None`.
     #[serde(default)]
     pub link: Option<String>,
+    /// Human handle for the CLI and for `oxidom@<name>` units. Assigned on load and
+    /// carried across subscription refreshes, so a unit name never moves.
+    #[serde(default)]
+    pub alias: Option<String>,
     /// Last latency probe result (runtime only, not persisted).
     #[serde(skip)]
     pub latency_ms: Option<u32>,
 }
 
 impl Server {
-    pub fn stable_id(link: &str) -> String {
-        let mut h = DefaultHasher::new();
-        link.hash(&mut h);
-        format!("{:016x}", h.finish())
+    /// FNV-1a. `DefaultHasher` is explicitly not stable across Rust releases, and a
+    /// server id that changes with the toolchain silently orphans the active server,
+    /// every profile and every unit named after it.
+    pub fn stable_id(seed: &str) -> String {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in seed.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("{hash:016x}")
+    }
+
+    /// The string a server's id is derived from. Kept in one place so that the id
+    /// of an already-stored server can be recomputed exactly during migration,
+    /// instead of being guessed by comparing fields.
+    pub fn identity_string(&self) -> String {
+        if let Some(link) = &self.link {
+            return link.clone();
+        }
+        if let OutboundSpec::XrayProfile {
+            proxy_outbounds,
+            balancers,
+            burst_observatory,
+            balancer_tag,
+        } = &self.spec
+            && let Ok(identity) = serde_json::to_string(&serde_json::json!({
+                "name": self.name,
+                "proxy_outbounds": proxy_outbounds,
+                "balancers": balancers,
+                "burst_observatory": burst_observatory,
+                "balancer_tag": balancer_tag,
+            }))
+        {
+            return identity;
+        }
+        self.identity_from_serialized_spec(serde_json::to_string(&self.spec).ok())
+    }
+
+    fn identity_from_serialized_spec(&self, serialized: Option<String>) -> String {
+        serialized.unwrap_or_else(|| format!("{}:{}:{}", self.address, self.port, self.name))
     }
 
     /// Whether two subscription entries describe the same Xray connection.
@@ -406,6 +443,70 @@ mod tests {
     use super::*;
 
     const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn identity_server(spec: OutboundSpec) -> Server {
+        Server {
+            id: String::new(),
+            name: "Node".to_string(),
+            protocol: Protocol::Socks,
+            address: "example.com".to_string(),
+            port: 1080,
+            transport_label: "socks".to_string(),
+            country: None,
+            spec,
+            link: None,
+            alias: None,
+            latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn stable_id_is_frozen() {
+        // The whole point of the phase: this must fail loudly if the algorithm ever
+        // changes, because on-disk ids and systemd unit names depend on it.
+        assert_eq!(
+            Server::stable_id("vless://uuid@example.com:443#node"),
+            "e113e764d060247a"
+        );
+    }
+
+    #[test]
+    fn identity_string_covers_every_source() {
+        let mut linked = identity_server(OutboundSpec::Socks {
+            username: None,
+            password: None,
+        });
+        linked.link = Some("socks://example.com:1080#Node".to_string());
+        assert_eq!(linked.identity_string(), "socks://example.com:1080#Node");
+
+        let profile = identity_server(OutboundSpec::XrayProfile {
+            proxy_outbounds: vec![serde_json::json!({"tag": "proxy"})],
+            balancers: vec![serde_json::json!({"tag": "balance"})],
+            burst_observatory: None,
+            balancer_tag: "balance".to_string(),
+        });
+        assert_eq!(
+            profile.identity_string(),
+            r#"{"balancer_tag":"balance","balancers":[{"tag":"balance"}],"burst_observatory":null,"name":"Node","proxy_outbounds":[{"tag":"proxy"}]}"#
+        );
+
+        let serialized = identity_server(OutboundSpec::Socks {
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+        });
+        assert_eq!(
+            serialized.identity_string(),
+            r#"{"kind":"socks","username":"user","password":"pass"}"#
+        );
+
+        // Every current OutboundSpec serializes to JSON. Exercise the final
+        // compatibility fallback directly so it cannot silently drift if a future
+        // variant introduces a fallible value.
+        assert_eq!(
+            serialized.identity_from_serialized_spec(None),
+            "example.com:1080:Node"
+        );
+    }
 
     #[test]
     fn pin_accepts_every_spelling_of_the_same_digest() {

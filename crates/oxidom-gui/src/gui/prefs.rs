@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use oxidom_core::model::Subscription;
 use oxidom_core::{fsutil, paths};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -17,11 +18,11 @@ pub struct GuiPrefs {
 }
 
 impl GuiPrefs {
-    pub fn load() -> GuiPrefs {
+    pub fn load(subscriptions: &[Subscription]) -> GuiPrefs {
         let Ok(path) = paths::gui_prefs_file() else {
             return GuiPrefs::default();
         };
-        match std::fs::read_to_string(&path) {
+        let mut prefs = match std::fs::read_to_string(&path) {
             Ok(s) => match toml::from_str(&s) {
                 Ok(prefs) => prefs,
                 Err(error) => {
@@ -31,7 +32,21 @@ impl GuiPrefs {
                 }
             },
             Err(_) => GuiPrefs::default(),
+        };
+        let current: HashSet<&str> = subscriptions
+            .iter()
+            .map(|subscription| subscription.id.as_str())
+            .collect();
+        let before = prefs.collapsed_subscriptions.len();
+        prefs
+            .collapsed_subscriptions
+            .retain(|subscription_id| current.contains(subscription_id.as_str()));
+        if prefs.collapsed_subscriptions.len() != before
+            && let Err(error) = prefs.save()
+        {
+            log::warn!("could not discard stale gui prefs: {error:#}");
         }
+        prefs
     }
 
     pub fn save(&self) -> Result<()> {

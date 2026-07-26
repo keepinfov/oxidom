@@ -237,6 +237,12 @@ impl DaemonClient {
             .map_err(friendly)
     }
 
+    pub fn set_server_alias(&self, server_id: &str, alias: &str) -> Result<()> {
+        self.proxy
+            .call("SetServerAlias", &(server_id, alias))
+            .map_err(friendly)
+    }
+
     pub fn set_hwid(&self, subscription_id: &str, enabled: bool) -> Result<()> {
         self.proxy
             .call("SetHwid", &(subscription_id, enabled))
