@@ -40,18 +40,26 @@ impl Engine {
             config,
             load_warnings: store_warning.into_iter().collect(),
         };
-        engine.recover_from_unclean_shutdown();
+        engine.recover();
         engine
     }
 
-    /// Undo whatever a crashed previous instance left behind: an orphaned
-    /// xray child keeping the tunnel open.
-    fn recover_from_unclean_shutdown(&mut self) {
+    /// Undo each resource a crashed previous instance could have left behind.
+    fn recover(&mut self) {
+        self.recover_stale_core();
+        // Phase 4 adds the TUN device and the routes we added here.
+    }
+
+    fn recover_stale_core(&mut self) {
         if let Some(pid) = self.state.xray_pid.take() {
             if kill_stale_xray(pid) {
                 log::info!("stopped orphaned xray process {pid} from a previous run");
+            } else {
+                log::warn!("could not confirm that orphaned xray process {pid} stopped");
             }
-            self.state.save().ok();
+            if let Err(error) = self.state.save() {
+                log::warn!("could not persist stale-core recovery state: {error:#}");
+            }
         }
     }
 
@@ -275,7 +283,9 @@ impl Engine {
         self.core.connect(&server)?;
         self.state.active_server_id = Some(server_id.to_string());
         self.state.xray_pid = self.core.child_pid();
-        self.state.save().ok();
+        if let Err(error) = self.state.save() {
+            log::warn!("could not persist the active Xray process: {error:#}");
+        }
         Ok(())
     }
 
@@ -283,7 +293,9 @@ impl Engine {
         self.core.disconnect();
         self.state.active_server_id = None;
         self.state.xray_pid = None;
-        self.state.save().ok();
+        if let Err(error) = self.state.save() {
+            log::warn!("could not persist the disconnected state: {error:#}");
+        }
     }
 
     pub fn status(&self) -> Status {
@@ -304,7 +316,9 @@ impl Drop for Engine {
         self.core.disconnect();
         if self.state.xray_pid.is_some() {
             self.state.xray_pid = None;
-            self.state.save().ok();
+            if let Err(error) = self.state.save() {
+                log::warn!("could not clear the Xray recovery PID on shutdown: {error:#}");
+            }
         }
     }
 }
@@ -313,16 +327,54 @@ impl Drop for Engine {
 /// the PID still belongs to our core — PIDs get recycled.
 fn kill_stale_xray(pid: u32) -> bool {
     if !is_our_xray(pid) {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            return true;
+        }
+        log::warn!("refusing to signal stale PID {pid}: it is not an oxidom Xray core");
         return false;
     }
-    let Ok(pid) = i32::try_from(pid) else {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        log::warn!("stale Xray PID {pid} is outside the platform PID range");
         return false;
     };
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGTERM,
-    )
-    .is_ok()
+    let process = nix::unistd::Pid::from_raw(raw_pid);
+    match nix::sys::signal::kill(process, nix::sys::signal::Signal::SIGTERM) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => return true,
+        Err(error) => {
+            log::warn!("could not send SIGTERM to stale Xray PID {pid}: {error}");
+            return false;
+        }
+    }
+    if wait_until_gone(process, std::time::Duration::from_secs(2)) {
+        return true;
+    }
+
+    log::warn!("stale Xray PID {pid} ignored SIGTERM; sending SIGKILL");
+    match nix::sys::signal::kill(process, nix::sys::signal::Signal::SIGKILL) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => return true,
+        Err(error) => {
+            log::warn!("could not send SIGKILL to stale Xray PID {pid}: {error}");
+            return false;
+        }
+    }
+    wait_until_gone(process, std::time::Duration::from_secs(2))
+}
+
+fn wait_until_gone(pid: nix::unistd::Pid, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match nix::sys::signal::kill(pid, None) {
+            Err(nix::errno::Errno::ESRCH) => return true,
+            Err(error) => {
+                log::warn!("could not inspect stale Xray PID {pid}: {error}");
+                return false;
+            }
+            Ok(()) if std::time::Instant::now() >= deadline => return false,
+            Ok(()) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
 }
 
 /// Does this PID belong to a core oxidom started?
