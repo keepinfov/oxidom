@@ -1561,6 +1561,7 @@ impl Controller {
             socks_port: values.socks_port,
             http_port: values.http_port,
             system_proxy: values.system_proxy,
+            reconnect: values.reconnect,
             latency_method: values.latency_method,
             latency_test_url: values.latency_test_url.clone(),
             subscription_user_agent: values.subscription_user_agent.clone(),

@@ -9,6 +9,10 @@ pub struct Config {
     pub socks_port: u16,
     pub http_port: u16,
     pub system_proxy: bool,
+    /// Bring the tunnel back up by ourselves when the core dies unexpectedly.
+    /// Off by default: a client that silently redials is a client that hides a
+    /// server going bad, and the user asked for explicit modes throughout.
+    pub reconnect: bool,
     pub latency_method: LatencyMethod,
     pub latency_test_url: String,
     /// User-Agent sent when fetching subscriptions. Many panels (Remnawave,
@@ -39,6 +43,7 @@ impl Default for Config {
             socks_port: 10808,
             http_port: 10809,
             system_proxy: false,
+            reconnect: false,
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".to_string(),
             subscription_user_agent: "v2rayNG/1.9.5".to_string(),
@@ -70,5 +75,15 @@ impl Config {
         let s = toml::to_string_pretty(self).context("serializing config")?;
         fsutil::write_private_atomic(&path, s.as_bytes()).context("writing config")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_off_by_default() {
+        assert!(!Config::default().reconnect);
     }
 }

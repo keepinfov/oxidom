@@ -11,6 +11,7 @@ pub struct SettingsValues {
     pub socks_port: u16,
     pub http_port: u16,
     pub system_proxy: bool,
+    pub reconnect: bool,
     pub latency_method: LatencyMethod,
     pub latency_test_url: String,
     pub subscription_user_agent: String,
@@ -24,6 +25,7 @@ impl From<&Config> for SettingsValues {
             socks_port: config.socks_port,
             http_port: config.http_port,
             system_proxy: config.system_proxy,
+            reconnect: config.reconnect,
             latency_method: config.latency_method,
             latency_test_url: config.latency_test_url.clone(),
             subscription_user_agent: config.subscription_user_agent.clone(),
@@ -91,6 +93,7 @@ struct SettingsWidgets {
     socks: adw::SpinRow,
     http: adw::SpinRow,
     system_proxy: adw::SwitchRow,
+    reconnect: adw::SwitchRow,
     method: adw::ComboRow,
     test_url: adw::EntryRow,
     user_agent: adw::EntryRow,
@@ -110,6 +113,7 @@ impl SettingsWidgets {
             socks_port: self.socks.value() as u16,
             http_port: self.http.value() as u16,
             system_proxy: self.system_proxy.is_active(),
+            reconnect: self.reconnect.is_active(),
             latency_method: match self.method.selected() {
                 0 => LatencyMethod::Icmp,
                 1 => LatencyMethod::Tcp,
@@ -128,6 +132,7 @@ impl SettingsWidgets {
         self.socks.set_value(f64::from(values.socks_port));
         self.http.set_value(f64::from(values.http_port));
         self.system_proxy.set_active(values.system_proxy);
+        self.reconnect.set_active(values.reconnect);
         self.method.set_selected(match values.latency_method {
             LatencyMethod::Icmp => 0,
             LatencyMethod::Tcp => 1,
@@ -180,6 +185,11 @@ impl SettingsView {
             .title("System proxy")
             .subtitle("Send the whole desktop's traffic through oxidom while connected (GNOME)")
             .active(applied.system_proxy)
+            .build();
+        let reconnect = adw::SwitchRow::builder()
+            .title("Reconnect automatically")
+            .subtitle("Reconnect only when Xray exits unexpectedly, never after Disconnect")
+            .active(applied.reconnect)
             .build();
 
         let methods = gtk::StringList::new(&["ICMP", "TCP", "HTTP HEAD", "HTTP GET"]);
@@ -249,6 +259,7 @@ impl SettingsView {
         proxy_group.add(&http);
         proxy_group.add(&ports_error);
         proxy_group.add(&system_proxy);
+        proxy_group.add(&reconnect);
         let xray_group = adw::PreferencesGroup::builder()
             .title("Xray core")
             .description(
@@ -299,6 +310,7 @@ impl SettingsView {
             socks,
             http,
             system_proxy,
+            reconnect,
             method,
             test_url,
             user_agent,
@@ -577,6 +589,10 @@ fn connect_draft_signals(
         let update = update.clone();
         move |_| update()
     });
+    widgets.reconnect.connect_active_notify({
+        let update = update.clone();
+        move |_| update()
+    });
     widgets.method.connect_selected_notify({
         let update = update.clone();
         move |_| update()
@@ -694,6 +710,7 @@ mod tests {
             socks_port: 10808,
             http_port: 10809,
             system_proxy: false,
+            reconnect: false,
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".into(),
             subscription_user_agent: "oxidom/test".into(),

@@ -58,6 +58,7 @@ database**. The GUI must not make that choice by accident:
 socks_port = 10808            # local SOCKS inbound
 http_port  = 10809            # local HTTP inbound
 system_proxy = false          # toggle GNOME/env system proxy on connect
+reconnect = false             # reconnect after an unexpected core exit; explicit opt-in
 latency_method = "http_get"   # one of: icmp | tcp | http_head | http_get
 latency_test_url = "https://www.gstatic.com/generate_204"
 subscription_user_agent = "v2rayNG/1.9.5"  # panels gate the body on this
@@ -151,8 +152,15 @@ against a real core with `xray run -test -c <file>` rather than against document
   when xray never started.
 - Track state: `Disconnected | Connecting | Connected | Error(msg)`. Consider "Connected" once
   the process is up and a latency probe through the SOCKS inbound succeeds.
-- Stop cleanly on disconnect/app-exit (SIGTERM, then SIGKILL after timeout).
+- Stop cleanly on disconnect/app-exit (SIGTERM, then SIGKILL after timeout). The same escalation
+  applies to an orphan inherited from a crashed run (`engine::kill_stale_xray`), which verifies
+  the process is gone rather than assuming SIGTERM worked.
 - Only one core process at a time (single active server).
+- **An unexpected exit is noticed by the daemon itself** (`daemon::spawn_core_supervisor`, 1 s
+  tick), not only while a GUI polls `Status()` — a headless daemon used to stay "connected" over a
+  dead core indefinitely. With `reconnect = true` the supervisor redials the same server with a
+  1 s→30 s backoff, cancelled by any explicit `Connect`/`Disconnect` through `connect_generation`.
+  Default is off: silently redialling hides a server going bad.
 
 ## Latency probes (`latency_method`)
 - `icmp` — spawn `ping -c1 -W1 <host>` and parse (avoids raw-socket privileges).
@@ -161,6 +169,24 @@ against a real core with `xray run -test -c <file>` rather than against document
 - `http_get` — GET `latency_test_url` through SOCKS (Happ-style; expect 204).
 List view may use a cheap method across servers concurrently (bounded thread pool); the active
 connection uses the configured method.
+
+### Probe outcomes (cycle 4, phase 2 — binding)
+`probe::measure` returns `ProbeOutcome`, never `Option`: `Reachable(Measurement) | Unreachable |
+Timeout | NoNetwork | Internal(&'static str)`. The distinction is the point — a failure that is
+*not the server's fault* must never be drawn as a dead server.
+
+- **`NoNetwork`** is claimed only on evidence: a kernel error that says so
+  (`NetworkUnreachable`/`NetworkDown`/`HostUnreachable`, or `ENETUNREACH`/`ENETDOWN`/`EHOSTUNREACH`
+  by errno), or an ambiguous DNS failure *plus* no default route in `/proc/net/route` or
+  `/proc/net/ipv6_route`. getaddrinfo reports NXDOMAIN and "no resolver" identically, so DNS alone
+  never proves it. An unreadable `/proc` means "no evidence", not "offline".
+- **`Internal`** is this machine's fault — no core binary, no free port, unwritable data dir. It
+  crosses the wire as `ProbeFailure::Unknown` plus a `warn` line; blaming the server would be a
+  lie, and inventing a fifth wire variant would break older GUIs (`ProbeFailure` has no
+  `#[serde(other)]`).
+- The hysteria2 ICMP fallback retries only `Unreachable`/`Timeout`. Retrying `NoNetwork` would
+  launder it into "server is dead".
+- An HTTP response with an error status still proves the server carried the request: `Reachable`.
 
 ### The reading contract (cycle 4, phase 1 — binding)
 A latency number without its context is a lie waiting to be told, so a measurement crosses D-Bus

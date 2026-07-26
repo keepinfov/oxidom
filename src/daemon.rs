@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,6 +27,13 @@ use crate::xray::core::Status;
 /// server and take the machine with it.
 const MAX_CONCURRENT_PROBES: usize = 8;
 const ACTIVE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+const CORE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+const CORE_EXITED_MESSAGE: &str = "Xray exited unexpectedly";
+const RECONNECTING_MESSAGE: &str = "Xray exited unexpectedly — reconnecting";
+
+fn reconnect_delay(attempt: u32) -> Duration {
+    Duration::from_secs((1_u64 << attempt.min(5)).min(30))
+}
 
 /// The probe pipeline: what is being measured now, and what is waiting for a
 /// slot behind `MAX_CONCURRENT_PROBES`.
@@ -108,6 +115,12 @@ struct ErrorOverride {
     server_id: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnectionOrigin {
+    Explicit,
+    Reconnect,
+}
+
 pub struct DaemonOptions {
     pub system_bus: bool,
     pub socks_port: Option<u16>,
@@ -158,7 +171,119 @@ impl Shared {
         self.connect_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// Returns the id of the server whose core has just been found dead, once.
+    fn note_core_death(&self) -> Option<String> {
+        let mut engine = crate::sync::lock(&self.engine);
+        if engine.status() != Status::Connected || engine.core.is_alive() {
+            return None;
+        }
+        let server_id = engine.state.active_server_id.clone();
+        engine.core.fail(CORE_EXITED_MESSAGE);
+        server_id
+    }
+
+    fn begin_reconnect(&self, server_id: String, generation: u64) {
+        if self.connect_generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let death_is_current = {
+            let engine = crate::sync::lock(&self.engine);
+            engine.config.reconnect
+                && engine.state.active_server_id.as_deref() == Some(server_id.as_str())
+                && matches!(
+                    engine.status(),
+                    Status::Error(message) if message == CORE_EXITED_MESSAGE
+                )
+        };
+        if !death_is_current || self.connect_generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let already_reconnecting = matches!(
+            crate::sync::lock(&self.override_status).as_ref(),
+            Some(ErrorOverride {
+                status: Status::Error(message),
+                server_id: id,
+            }) if message == RECONNECTING_MESSAGE && id == &server_id
+        );
+        if already_reconnecting {
+            return;
+        }
+
+        *crate::sync::lock(&self.override_status) = Some(ErrorOverride {
+            status: Status::Error(RECONNECTING_MESSAGE.to_string()),
+            server_id: server_id.clone(),
+        });
+        let shared = self.clone();
+        std::thread::spawn(move || shared.reconnect(server_id, generation));
+    }
+
+    fn reconnect(&self, server_id: String, generation: u64) {
+        let mut attempt = 0;
+        loop {
+            if !self.reconnect_is_pending(&server_id, generation) {
+                return;
+            }
+            std::thread::sleep(reconnect_delay(attempt));
+            if !self.reconnect_is_pending(&server_id, generation) {
+                return;
+            }
+
+            let Some(result) = self.start_reconnect_attempt(&server_id, generation) else {
+                return;
+            };
+            match result {
+                Ok(confirmed) => {
+                    if confirmed.recv().unwrap_or(false)
+                        && self.reconnect_is_pending(&server_id, generation)
+                    {
+                        self.clear_reconnect_override(&server_id);
+                        return;
+                    }
+                }
+                Err(error) => {
+                    log::warn!("automatic reconnect to {server_id} failed: {error:#}");
+                }
+            }
+            attempt = attempt.saturating_add(1);
+        }
+    }
+
+    fn reconnect_is_pending(&self, server_id: &str, generation: u64) -> bool {
+        if self.connect_generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        if !crate::sync::lock(&self.engine).config.reconnect {
+            self.clear_reconnect_override(server_id);
+            return false;
+        }
+        matches!(
+            crate::sync::lock(&self.override_status).as_ref(),
+            Some(ErrorOverride {
+                status: Status::Error(message),
+                server_id: id,
+            }) if message == RECONNECTING_MESSAGE && id == server_id
+        )
+    }
+
+    fn clear_reconnect_override(&self, server_id: &str) {
+        let mut override_status = crate::sync::lock(&self.override_status);
+        let is_ours = matches!(
+            override_status.as_ref(),
+            Some(ErrorOverride {
+                status: Status::Error(message),
+                server_id: id,
+            }) if message == RECONNECTING_MESSAGE && id == server_id
+        );
+        if is_ours {
+            *override_status = None;
+        }
+    }
+
     fn status_info(&self) -> StatusInfo {
+        let generation = self.connect_generation.load(Ordering::SeqCst);
+        if let Some(server_id) = self.note_core_death() {
+            self.begin_reconnect(server_id, generation);
+        }
         // Scoped, not `if let`: in edition 2024 an `if let` scrutinee's
         // temporary lives for the whole body, so holding this guard while
         // touching `engine` below would take the two locks in the opposite
@@ -169,12 +294,7 @@ impl Shared {
             return StatusInfo::from_status(&failure.status, None)
                 .with_error_id(Some(failure.server_id));
         }
-        let mut engine = crate::sync::lock(&self.engine);
-        if engine.status() == Status::Connected && !engine.core.is_alive() {
-            // Record the death once rather than re-deriving it on every poll,
-            // so the log keeps one line and the GUI toasts one transition.
-            engine.core.fail("Xray exited unexpectedly");
-        }
+        let engine = crate::sync::lock(&self.engine);
         let status = engine.status();
         let active = engine.state.active_server_id.clone();
         StatusInfo::from_status(&status, active)
@@ -273,6 +393,63 @@ impl Shared {
         value
     }
 
+    /// Start every connection through one path, whether the caller is a D-Bus
+    /// request or the supervisor. Claiming the probe slot here preserves the
+    /// same honest card state while `confirm_connection` proves the tunnel.
+    fn start_connection(
+        &self,
+        server_id: &str,
+        generation: u64,
+        origin: ConnectionOrigin,
+    ) -> Result<Option<mpsc::Receiver<bool>>> {
+        if self.connect_generation.load(Ordering::SeqCst) != generation {
+            return Ok(None);
+        }
+        crate::sync::lock(&self.readings).remove(server_id);
+        crate::sync::lock(&self.probes).start_now(server_id);
+
+        let connect_result = {
+            let mut engine = crate::sync::lock(&self.engine);
+            if self.connect_generation.load(Ordering::SeqCst) != generation {
+                None
+            } else {
+                Some(engine.connect(server_id))
+            }
+        };
+        match connect_result {
+            None => {
+                crate::sync::lock(&self.probes).finish(server_id);
+                Ok(None)
+            }
+            Some(Err(error)) => {
+                crate::sync::lock(&self.probes).finish(server_id);
+                Err(error)
+            }
+            Some(Ok(())) => Ok(Some(self.confirm_connection(
+                server_id.to_string(),
+                generation,
+                origin,
+            ))),
+        }
+    }
+
+    /// `None` means an explicit operation has already superseded this retry,
+    /// so no Xray start was attempted.
+    fn start_reconnect_attempt(
+        &self,
+        server_id: &str,
+        generation: u64,
+    ) -> Option<Result<mpsc::Receiver<bool>>> {
+        if self.connect_generation.load(Ordering::SeqCst) != generation {
+            return None;
+        }
+        match self.start_connection(server_id, generation, ConnectionOrigin::Reconnect) {
+            Ok(Some(confirmed)) => Some(Ok(confirmed)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+
     /// After a connect: confirm the tunnel actually works; tear it down and
     /// surface an error when it does not.
     ///
@@ -280,9 +457,15 @@ impl Shared {
     /// to. Without it a slow probe from a superseded attempt would tear down
     /// the healthy connection that replaced it — the server id alone does not
     /// distinguish two connects to the same server.
-    /// The id is already `running` when this starts — `Service::connect` claims
+    /// The id is already `running` when this starts — `start_connection` claims
     /// the slot — so this thread owns it and must release it on every path.
-    fn confirm_connection(&self, server_id: String, generation: u64) {
+    fn confirm_connection(
+        &self,
+        server_id: String,
+        generation: u64,
+        origin: ConnectionOrigin,
+    ) -> mpsc::Receiver<bool> {
+        let (confirmed, confirmation) = mpsc::channel();
         let shared = self.clone();
         std::thread::spawn(move || {
             let (socks_port, method) = {
@@ -309,12 +492,15 @@ impl Shared {
             };
             crate::sync::lock(&shared.probes).finish(&server_id);
             if ready && latency.is_some() {
+                let current = shared.connect_generation.load(Ordering::SeqCst) == generation;
+                let _ = confirmed.send(current);
                 return;
             }
             let mut engine = crate::sync::lock(&shared.engine);
             // Bail out if another connect/disconnect superseded this attempt:
             // the tunnel now running is not the one this thread was confirming.
             if shared.connect_generation.load(Ordering::SeqCst) != generation {
+                let _ = confirmed.send(false);
                 return;
             }
             // A core that rejected the config exited at once, so both the dead
@@ -336,12 +522,16 @@ impl Shared {
                 // torn down below, so the core's own status is lost.
                 engine.core.note(&reason);
                 engine.disconnect();
-                *crate::sync::lock(&shared.override_status) = Some(ErrorOverride {
-                    status: Status::Error(reason),
-                    server_id: server_id.clone(),
-                });
+                if origin == ConnectionOrigin::Explicit {
+                    *crate::sync::lock(&shared.override_status) = Some(ErrorOverride {
+                        status: Status::Error(reason),
+                        server_id: server_id.clone(),
+                    });
+                }
             }
+            let _ = confirmed.send(false);
         });
+        confirmation
     }
 
     /// Forget everything remembered about servers that no longer exist.
@@ -503,31 +693,20 @@ impl Service {
         *crate::sync::lock(&self.shared.override_status) = None;
         let generation = self.shared.next_connect_generation();
 
-        // Both of these happen before the tunnel comes up, and both are about
-        // the same lie. The reading this server already has was taken *directly*
-        // — it says nothing about the tunnel now being built — so it is dropped
-        // rather than left to resurface as the new connection's ping. And the
-        // slot is claimed here, not in the confirmation thread, so there is no
-        // window in which the id is in neither set and the card can retire its
-        // spinner onto a number nobody measured.
-        crate::sync::lock(&self.shared.readings).remove(&server_id);
-        crate::sync::lock(&self.shared.probes).start_now(&server_id);
-
-        if let Err(error) = crate::sync::lock(&self.shared.engine).connect(&server_id) {
-            // No confirmation will run for an attempt that never started, so
-            // the slot has to be given back here or it is lost for good. The
-            // id leaves without a reading on purpose: nothing was measured.
-            crate::sync::lock(&self.shared.probes).finish(&server_id);
-            return Err(failed(error));
-        }
-        self.shared.confirm_connection(server_id, generation);
-        Ok(())
+        let result =
+            self.shared
+                .start_connection(&server_id, generation, ConnectionOrigin::Explicit);
+        // A death noticed just before this explicit operation may have queued
+        // its reconnect override. The user's action owns the visible state.
+        *crate::sync::lock(&self.shared.override_status) = None;
+        result.map(|_| ()).map_err(failed)
     }
 
     fn disconnect(&self) -> fdo::Result<()> {
         *crate::sync::lock(&self.shared.override_status) = None;
         self.shared.next_connect_generation();
         crate::sync::lock(&self.shared.engine).disconnect();
+        *crate::sync::lock(&self.shared.override_status) = None;
         Ok(())
     }
 
@@ -582,6 +761,11 @@ impl Service {
             }
             config.xray_binary = engine.config.xray_binary.clone();
         }
+        // Preserve an opt-in made directly in config.toml when an older GUI,
+        // which has no checkbox for this key, applies its settings payload.
+        if raw.get("reconnect").is_none() {
+            config.reconnect = engine.config.reconnect;
+        }
 
         // Rejected here as well as in the GUI: any D-Bus client can send a
         // config, and a zero or colliding port produces a core that fails to
@@ -620,7 +804,13 @@ impl Service {
             if let Some(active) = engine.state.active_server_id.clone() {
                 let generation = self.shared.next_connect_generation();
                 match engine.connect(&active) {
-                    Ok(()) => self.shared.confirm_connection(active, generation),
+                    Ok(()) => {
+                        self.shared.confirm_connection(
+                            active,
+                            generation,
+                            ConnectionOrigin::Explicit,
+                        );
+                    }
                     Err(error) => reconnect_error = Some(format!("{error:#}")),
                 }
             }
@@ -643,6 +833,18 @@ impl Service {
         crate::sync::lock(&self.shared.engine).core.clear_logs();
         Ok(())
     }
+}
+
+fn spawn_core_supervisor(shared: Shared) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(CORE_WATCH_INTERVAL);
+            let generation = shared.connect_generation.load(Ordering::SeqCst);
+            if let Some(server_id) = shared.note_core_death() {
+                shared.begin_reconnect(server_id, generation);
+            }
+        }
+    });
 }
 
 pub fn run(options: DaemonOptions) -> Result<()> {
@@ -677,6 +879,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
         options.system_bus,
     );
     shared.spawn_active_probe_loop();
+    spawn_core_supervisor(shared.clone());
 
     let service = Service {
         shared: shared.clone(),
@@ -775,6 +978,77 @@ mod tests {
 
     fn drain_slots(queue: &mut ProbeQueue) -> Vec<String> {
         std::iter::from_fn(|| queue.start_next()).collect()
+    }
+
+    #[test]
+    fn backoff_climbs_and_caps_at_thirty_seconds() {
+        let delays: Vec<u64> = (0..=6)
+            .map(|attempt| reconnect_delay(attempt).as_secs())
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+    }
+
+    #[test]
+    fn a_newer_generation_cancels_a_pending_reconnect() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("cancel-reconnect")?;
+        let service = for_test();
+        let stale_generation = service.shared.connect_generation.load(Ordering::SeqCst);
+
+        service.shared.next_connect_generation();
+
+        assert!(
+            service
+                .shared
+                .start_reconnect_attempt("never-started", stale_generation)
+                .is_none()
+        );
+        assert_eq!(
+            crate::sync::lock(&service.shared.engine).status(),
+            Status::Disconnected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_absent_reconnect_key_keeps_the_old_value() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("old-settings-client")?;
+        let service = for_test();
+        crate::sync::lock(&service.shared.engine).config.reconnect = true;
+        let mut raw = serde_json::to_value(Config::default())?;
+        raw.as_object_mut()
+            .context("serialized config is not an object")?
+            .remove("reconnect");
+
+        service.set_settings(raw.to_string())?;
+
+        assert!(crate::sync::lock(&service.shared.engine).config.reconnect);
+        Ok(())
+    }
+
+    #[test]
+    fn a_dead_core_is_noticed_without_a_status_call() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("dead-core")?;
+        let service = for_test();
+        {
+            let mut engine = crate::sync::lock(&service.shared.engine);
+            engine.state.active_server_id = Some("dead-server".to_string());
+            *crate::sync::lock(&engine.core.status) = Status::Connected;
+            assert!(!engine.core.is_alive());
+        }
+
+        assert_eq!(
+            service.shared.note_core_death().as_deref(),
+            Some("dead-server")
+        );
+        assert!(matches!(
+            crate::sync::lock(&service.shared.engine).status(),
+            Status::Error(message) if message == "Xray exited unexpectedly"
+        ));
+        assert_eq!(service.shared.note_core_death(), None);
+        Ok(())
     }
 
     #[test]
