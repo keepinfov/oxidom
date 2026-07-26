@@ -1,5 +1,4 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -11,18 +10,21 @@ use gtk::glib;
 
 use crate::APP_ID;
 use crate::config::Config;
-use crate::ipc::{self, ProbeState, StatusInfo};
+use crate::ipc;
 use crate::model::Subscription;
 use crate::xray::core::Status;
 use crate::{paths, sysproxy};
 
 use super::client::DaemonClient;
 use super::operation::{UiOperation, UiOperationKind};
+use super::reduce::{
+    Effect, PolledSnapshot, ProbeWait, SnapshotState, active_latency_for, latency_states, reduce,
+};
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
 use super::tray::{OxidomTray, TrayCommand};
 use super::views::logs::LogsView;
-use super::views::servers::ServersView;
+use super::views::servers::{CardConnection, ServersView};
 use super::views::settings::{SettingsValues, SettingsView};
 use super::views::subscriptions::SubscriptionsView;
 
@@ -30,11 +32,12 @@ type SettingsCallback = Rc<dyn Fn(SettingsValues)>;
 type ShortcutHandler = Box<dyn Fn(&Rc<Controller>)>;
 
 const SIDEBAR_BREAKPOINT_WIDTH: u32 = 700;
-/// How long a card may wait for a probe result before the spinner is retired
-/// as lost. Generous on purpose: a "check all" over a large subscription runs
-/// eight at a time, each with its own timeout, so a long *legitimate* wait is
-/// normal and cutting it short would misreport a server as unmeasured.
-const PROBE_DEADLINE: Duration = Duration::from_secs(180);
+
+/// Poll ticks between age sweeps — 30 × 500 ms, i.e. every 15 s. A reading's
+/// age is bucketed to whole minutes, so this is four chances to notice each
+/// bucket change; sweeping on every tick would be pure waste, and a second
+/// timer for it would be a second thing to keep in step with the poll.
+const AGE_SWEEP_TICKS: u8 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResponsiveMode {
@@ -110,47 +113,15 @@ fn servers_available_width(window_width: i32, compact: bool) -> i32 {
     window_width.saturating_sub(sidebar)
 }
 
-/// One round of daemon polling, produced off the main thread.
-struct PolledSnapshot {
-    status: StatusInfo,
-    probe: ProbeState,
-    logs: Vec<String>,
-}
-
 struct AppState {
     client: DaemonClient,
     subscriptions: Vec<Subscription>,
     /// Card the user is inspecting/expanded. Also the target of the header
     /// Connect button. Distinct from the server that is actually connected.
     selected_id: Option<String>,
-    /// Server the tunnel is (optimistically) running for; drives the highlight.
-    connected_id: Option<String>,
-    latencies: HashMap<String, Option<u32>>,
-    /// Last successful measurement of the connected server, tagged with the
-    /// server id it belongs to. Shown (dimmed) in the status chips whenever
-    /// no probe has confirmed a fresh reading for the *current* connection
-    /// yet, so the chip never goes blank right after a (re)connect; the id
-    /// tag is what keeps a previous server's number from leaking onto a
-    /// different one — it is intentionally never reset on disconnect, since
-    /// a stale-but-correct reading for the same server is exactly what
-    /// should resurface on reconnect.
-    last_active_latency: Option<(String, u32)>,
-    checking: HashSet<String>,
-    /// When each id entered `checking`. A probe is normally retired by its
-    /// result appearing in the daemon's `latencies`; if the daemon restarts
-    /// mid-probe that result never arrives, and without a deadline the card
-    /// would spin for the rest of the session.
-    checking_since: HashMap<String, Instant>,
-    /// Ids whose failed probe should raise a toast (explicit per-card ping).
-    notify_probe: HashSet<String>,
-    operation: Option<UiOperation>,
-    /// Optimistic status shown while a job is in flight.
-    pending_status: Option<Status>,
-    /// Latest status reported by the daemon.
-    daemon_status: Status,
-    /// Last daemon error already shown to the user, so the 500 ms poll does
-    /// not re-toast the same failure on every tick.
-    notified_error: Option<String>,
+    /// Everything the poll snapshot owns, kept apart so the transition over it
+    /// can be reviewed and tested without a display. See [`super::reduce`].
+    ui: SnapshotState,
 }
 
 struct Controller {
@@ -195,9 +166,11 @@ struct Controller {
     proxy_applied: Cell<bool>,
     /// Last (active, connecting) pair pushed to the cards, to avoid an
     /// O(cards) pass on every poll tick.
-    applied_connection: RefCell<(Option<String>, Option<String>)>,
+    applied_connection: RefCell<CardConnection>,
     poll_in_flight: Arc<AtomicBool>,
     poll_snapshot: Arc<Mutex<Option<PolledSnapshot>>>,
+    /// Poll ticks since the last age sweep. See [`AGE_SWEEP_TICKS`].
+    sweep_tick: Cell<u8>,
 }
 
 pub fn build(app: &adw::Application, background: bool) -> Option<adw::ApplicationWindow> {
@@ -250,18 +223,7 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
         client,
         subscriptions: subscriptions_snapshot,
         selected_id,
-        connected_id: initial_status.active_id.clone(),
-        latencies: HashMap::new(),
-        last_active_latency: None,
-        checking: HashSet::new(),
-        checking_since: HashMap::new(),
-        notify_probe: HashSet::new(),
-        operation: None,
-        pending_status: None,
-        daemon_status: initial_status.to_status(),
-        // Left unset on purpose: a GUI opening onto an already-broken daemon
-        // should toast once, on its first poll.
-        notified_error: None,
+        ui: SnapshotState::new(&initial_status),
     }));
 
     let servers = ServersView::new();
@@ -449,8 +411,9 @@ pub fn build(app: &adw::Application, background: bool) -> Option<adw::Applicatio
         tray_commands,
         tray_pushed: RefCell::new((false, String::new())),
         proxy_applied: Cell::new(gui_proxy_marker_exists()),
-        applied_connection: RefCell::new((None, None)),
+        applied_connection: RefCell::new(CardConnection::default()),
         poll_in_flight: Arc::new(AtomicBool::new(false)),
+        sweep_tick: Cell::new(0),
         poll_snapshot: Arc::new(Mutex::new(None)),
     });
     *controller_holder.borrow_mut() = Rc::downgrade(&controller);
@@ -950,15 +913,14 @@ impl Controller {
     }
 
     fn rebuild_views(self: &Rc<Self>) {
-        let (subscriptions, selected_id, connected_id, latencies, checking, operation) = {
+        let (subscriptions, selected_id, connected_id, latency_states, operation) = {
             let state = self.state.borrow();
             (
                 state.subscriptions.clone(),
                 state.selected_id.clone(),
-                state.connected_id.clone(),
-                state.latencies.clone(),
-                state.checking.clone(),
-                state.operation.clone(),
+                state.ui.connected_id.clone(),
+                latency_states(&state.ui, ipc::now_unix_ms()),
+                state.ui.operation.clone(),
             )
         };
         let callbacks = super::views::servers::CardCallbacks {
@@ -1007,8 +969,7 @@ impl Controller {
             &subscriptions,
             connected_id.as_deref(),
             selected_id.as_deref(),
-            &latencies,
-            &checking,
+            &latency_states,
             callbacks,
         );
 
@@ -1079,14 +1040,17 @@ impl Controller {
         // would leave a card claiming "Connected" that `sync_connection_cards`
         // then refuses to repair because its cache still matches. Record what
         // the rebuild actually painted, then let the sync reconcile it.
-        *self.applied_connection.borrow_mut() = (connected_id, None);
+        *self.applied_connection.borrow_mut() = CardConnection {
+            active: connected_id,
+            ..CardConnection::default()
+        };
         self.sync_connection_cards();
     }
 
     fn activate_server(self: &Rc<Self>, server_id: String) {
         let (status, connected) = {
             let state = self.state.borrow();
-            (self.current_status(&state), state.connected_id.clone())
+            (state.ui.current_status(), state.ui.connected_id.clone())
         };
         if matches!(status, Status::Connected | Status::Connecting)
             && connected.as_deref() == Some(&server_id)
@@ -1100,7 +1064,7 @@ impl Controller {
     fn disconnect_if_active(self: &Rc<Self>) {
         let status = {
             let state = self.state.borrow();
-            self.current_status(&state)
+            state.ui.current_status()
         };
         if matches!(status, Status::Connecting | Status::Connected) {
             self.disconnect();
@@ -1126,15 +1090,15 @@ impl Controller {
     fn probe_one(self: &Rc<Self>, server_id: String, notify_failure: bool) {
         {
             let mut state = self.state.borrow_mut();
-            if state.checking.contains(&server_id) {
+            if state.ui.checking.contains_key(&server_id) {
                 return;
             }
-            state.checking.insert(server_id.clone());
             state
-                .checking_since
-                .insert(server_id.clone(), Instant::now());
+                .ui
+                .checking
+                .insert(server_id.clone(), ProbeWait::new(Instant::now()));
             if notify_failure {
-                state.notify_probe.insert(server_id.clone());
+                state.ui.notify_probe.insert(server_id.clone());
             }
         }
         self.servers
@@ -1149,8 +1113,8 @@ impl Controller {
             let now = Instant::now();
             let mut new_ids = Vec::new();
             for id in ids {
-                if state.checking.insert(id.clone()) {
-                    state.checking_since.insert(id.clone(), now);
+                if !state.ui.checking.contains_key(&id) {
+                    state.ui.checking.insert(id.clone(), ProbeWait::new(now));
                     new_ids.push(id);
                 }
             }
@@ -1205,12 +1169,14 @@ impl Controller {
     fn abandon_probes(self: &Rc<Self>, ids: &[String], error: &str) {
         let restored: Vec<(String, LatencyState)> = {
             let mut state = self.state.borrow_mut();
+            let now_unix_ms = ipc::now_unix_ms();
             let mut restored = Vec::new();
             for id in ids {
-                if state.checking.remove(id) {
-                    state.checking_since.remove(id);
-                    state.notify_probe.remove(id);
-                    let latency = known_latency_state(&state.latencies, id);
+                if state.ui.checking.remove(id).is_some() {
+                    state.ui.notify_probe.remove(id);
+                    // Read after the removal above, so the card falls back to
+                    // what it knew rather than to the spinner it is leaving.
+                    let latency = state.ui.card_state(id, now_unix_ms);
                     restored.push((id.clone(), latency));
                 }
             }
@@ -1230,13 +1196,22 @@ impl Controller {
         {
             let mut state = self.state.borrow_mut();
             state.selected_id = Some(server_id.clone());
-            state.connected_id = Some(server_id.clone());
-            state.pending_status = Some(Status::Connecting);
+            state.ui.connected_id = Some(server_id.clone());
+            // Whatever failed before, this click supersedes it — including a
+            // retry of the very server that failed.
+            state.ui.failed_id = None;
+            state.ui.pin_status(Status::Connecting, Instant::now());
         }
-        self.set_cards_connection(Some(&server_id), Some(&server_id));
+        self.bump_epoch();
+        self.set_cards_connection(CardConnection {
+            active: Some(server_id.clone()),
+            connecting: Some(server_id.clone()),
+            failed: None,
+        });
         self.servers.set_selected(Some(&server_id));
         self.refresh_status();
         let work_id = server_id.clone();
+        let failed_id = server_id.clone();
         self.client_job(
             UiOperation::for_server(UiOperationKind::Connect, server_id),
             move |client| client.connect_server(&work_id),
@@ -1245,10 +1220,20 @@ impl Controller {
                     let message = format!("{error:#}");
                     {
                         let mut state = controller.state.borrow_mut();
-                        state.pending_status = Some(Status::Error(message.clone()));
-                        state.connected_id = None;
+                        state
+                            .ui
+                            .pin_status(Status::Error(message.clone()), Instant::now());
+                        state.ui.connected_id = None;
+                        // Named here rather than left to the daemon: a refused
+                        // bus call, or a job rejected while another is running,
+                        // never reached it, so it has no failure to report.
+                        state.ui.failed_id = Some(failed_id.clone());
                     }
-                    controller.set_cards_connection(None, None);
+                    controller.set_cards_connection(CardConnection {
+                        active: None,
+                        connecting: None,
+                        failed: Some(failed_id.clone()),
+                    });
                     // The daemon reports the same failure on its next poll;
                     // claim it now so it is not toasted twice.
                     controller.mark_error_notified(&message);
@@ -1263,10 +1248,12 @@ impl Controller {
     fn disconnect(self: &Rc<Self>) {
         {
             let mut state = self.state.borrow_mut();
-            state.pending_status = Some(Status::Disconnected);
-            state.connected_id = None;
+            state.ui.pin_status(Status::Disconnected, Instant::now());
+            state.ui.connected_id = None;
+            state.ui.failed_id = None;
         }
-        self.set_cards_connection(None, None);
+        self.bump_epoch();
+        self.set_cards_connection(CardConnection::default());
         self.refresh_status();
         self.client_job(
             UiOperation::new(UiOperationKind::Disconnect),
@@ -1367,9 +1354,13 @@ impl Controller {
                 if disconnected {
                     {
                         let mut state = self.state.borrow_mut();
-                        state.connected_id = None;
+                        state.ui.connected_id = None;
+                        state.ui.failed_id = None;
                     }
-                    self.set_cards_connection(None, None);
+                    // No failure to report: the server is simply gone, and
+                    // naming it as failed would point at a card that no longer
+                    // exists.
+                    self.set_cards_connection(CardConnection::default());
                     self.show_message("Disconnected — the active server was removed");
                     self.reconcile_system_proxy();
                     self.refresh_status();
@@ -1429,12 +1420,23 @@ impl Controller {
                             ));
                         }
                         if let Some(error) = outcome.reconnect_error {
-                            {
+                            // The port change took the tunnel down and it did
+                            // not come back: that is a failure of the server it
+                            // was running for, and the card should say so.
+                            let failed = {
                                 let mut state = controller.state.borrow_mut();
-                                state.pending_status = Some(Status::Error(error.clone()));
-                                state.connected_id = None;
-                            }
-                            controller.set_cards_connection(None, None);
+                                state
+                                    .ui
+                                    .pin_status(Status::Error(error.clone()), Instant::now());
+                                let failed = state.ui.connected_id.take();
+                                state.ui.failed_id = failed.clone();
+                                failed
+                            };
+                            controller.set_cards_connection(CardConnection {
+                                active: None,
+                                connecting: None,
+                                failed,
+                            });
                             controller.mark_error_notified(&error);
                             controller.show_error(
                                 "Settings saved, but the connection could not restart",
@@ -1472,7 +1474,7 @@ impl Controller {
     {
         {
             let mut state = self.state.borrow_mut();
-            if state.operation.is_some() {
+            if state.ui.operation.is_some() {
                 drop(state);
                 // Hand the refusal to the completion handler instead of
                 // returning silently. It owns the per-call cleanup — clearing
@@ -1482,11 +1484,15 @@ impl Controller {
                 complete(self, Err(anyhow!("another operation is still running")));
                 return;
             }
-            state.operation = Some(operation.clone());
+            state.ui.operation = Some(operation.clone());
         }
         self.subscriptions.set_operation(Some(operation));
         self.refresh_activity_status();
 
+        // Stamped on the main thread, before the worker exists: `AppState` is
+        // not `Send`, and an epoch read after the D-Bus calls would certify
+        // exactly the staleness it is supposed to catch.
+        let epoch = self.bump_epoch();
         let client = self.state.borrow().client.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -1502,6 +1508,7 @@ impl Controller {
                     status: client.status()?,
                     probe: client.probe_state()?,
                     logs: client.recent_logs()?,
+                    epoch,
                 })
             })();
             let _ = sender.send((result, subscriptions, snapshot));
@@ -1520,16 +1527,32 @@ impl Controller {
                         if let Ok(subscriptions) = subscriptions {
                             state.subscriptions = subscriptions;
                         }
-                        state.pending_status = None;
-                        state.operation = None;
+                        // The pin is deliberately left standing: retiring it
+                        // here is what let a snapshot older than the click
+                        // repaint the pre-click frame. `reduce` drops it once
+                        // the daemon stops reporting the old world, or after
+                        // its deadline.
+                        state.ui.operation = None;
                     }
                     controller.subscriptions.set_operation(None);
-                    match snapshot {
-                        Ok(snapshot) => controller.apply_snapshot(snapshot),
-                        Err(_) => controller.refresh_status(),
-                    }
+                    // The handler runs *before* the snapshot is applied: it is
+                    // where a failed connect pins its outcome, and applying
+                    // first would paint one frame of the pre-failure state and
+                    // then leave the pin to be picked up half a second later.
                     if let Some(complete) = complete.take() {
                         complete(&controller, result);
+                    }
+                    // Whatever the handler just decided outranks the reads this
+                    // worker made — but its own reads happened after the daemon
+                    // returned from the operation, so they are authoritative by
+                    // construction and get re-stamped rather than dropped.
+                    let epoch = controller.bump_epoch();
+                    match snapshot {
+                        Ok(mut snapshot) => {
+                            snapshot.epoch = epoch;
+                            controller.apply_snapshot(snapshot);
+                        }
+                        Err(_) => controller.refresh_status(),
                     }
                     glib::ControlFlow::Break
                 }
@@ -1537,9 +1560,10 @@ impl Controller {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if let Some(controller) = weak.upgrade() {
                         let mut state = controller.state.borrow_mut();
-                        state.pending_status = None;
-                        state.operation = None;
+                        state.ui.clear_pin();
+                        state.ui.operation = None;
                         drop(state);
+                        controller.bump_epoch();
                         controller.subscriptions.set_operation(None);
                         controller.show_message("Background operation stopped unexpectedly");
                         controller.refresh_status();
@@ -1577,8 +1601,18 @@ impl Controller {
             if let Some(snapshot) = controller.poll_snapshot.lock().unwrap().take() {
                 controller.apply_snapshot(snapshot);
             }
+            let tick = controller.sweep_tick.get().wrapping_add(1);
+            controller.sweep_tick.set(tick % AGE_SWEEP_TICKS);
+            if controller.sweep_tick.get() == 0 {
+                controller.sweep_latency_ages();
+            }
             if !controller.poll_in_flight.swap(true, Ordering::SeqCst) {
-                let client = controller.state.borrow().client.clone();
+                let state = controller.state.borrow();
+                let client = state.client.clone();
+                // Read before the reads, on the main thread: this round can
+                // only speak for the world as it stood when it started.
+                let epoch = state.ui.state_epoch;
+                drop(state);
                 let slot = controller.poll_snapshot.clone();
                 let in_flight = controller.poll_in_flight.clone();
                 std::thread::spawn(move || {
@@ -1587,6 +1621,7 @@ impl Controller {
                             status: client.status()?,
                             probe: client.probe_state()?,
                             logs: client.recent_logs()?,
+                            epoch,
                         })
                     })();
                     if let Ok(snapshot) = snapshot {
@@ -1599,136 +1634,58 @@ impl Controller {
         });
     }
 
+    /// Everything polled before this call describes a world the user has
+    /// already changed. Bumping invalidates the rounds still in flight, and
+    /// dropping the slot discards the one that already landed but has not been
+    /// applied yet. Returns the new epoch for callers that own an authoritative
+    /// snapshot of their own.
+    fn bump_epoch(&self) -> u64 {
+        let mut state = self.state.borrow_mut();
+        state.ui.state_epoch += 1;
+        *self.poll_snapshot.lock().unwrap() = None;
+        state.ui.state_epoch
+    }
+
     fn apply_snapshot(self: &Rc<Self>, snapshot: PolledSnapshot) {
-        let mut latency_updates: Vec<(String, LatencyState)> = Vec::new();
-        let mut toast_unreachable = false;
-        let mut new_error: Option<String> = None;
-        {
+        let effects = {
             let mut state = self.state.borrow_mut();
-            for (id, value) in &snapshot.probe.latencies {
-                if state.latencies.get(id) != Some(value) {
-                    state.latencies.insert(id.clone(), *value);
-                    latency_updates.push((
-                        id.clone(),
-                        match value {
-                            Some(ms) => LatencyState::Reachable(*ms),
-                            None => LatencyState::Unreachable,
-                        },
-                    ));
-                    if state.connected_id.as_deref() == Some(id)
-                        && let Some(ms) = value
-                    {
-                        state.last_active_latency = Some((id.clone(), *ms));
-                    }
-                    if state.notify_probe.remove(id) && value.is_none() {
-                        toast_unreachable = true;
-                    }
+            reduce(
+                &mut state.ui,
+                &snapshot,
+                Instant::now(),
+                ipc::now_unix_ms(),
+                self.window.is_visible(),
+            )
+        };
+        // A round that predates the user's last action is dropped whole — logs,
+        // cards and the system-proxy reconciliation included.
+        let Some(effects) = effects else {
+            return;
+        };
+        // Collected rather than issued inline: `probe_one` borrows the state the
+        // effects were just produced from.
+        let mut reprobe = Vec::new();
+        for effect in effects {
+            match effect {
+                Effect::Latency(id, latency_state) => {
+                    self.servers.set_latency_state(&id, latency_state)
                 }
-            }
-            // Mirror the daemon's checking set: new entries show spinners,
-            // ids that finished (have a result and are no longer checking)
-            // leave the local set.
-            let daemon_checking: HashSet<String> =
-                snapshot.probe.checking.iter().cloned().collect();
-            let now = Instant::now();
-            for id in &daemon_checking {
-                if state.checking.insert(id.clone()) {
-                    state.checking_since.insert(id.clone(), now);
-                    latency_updates.push((id.clone(), LatencyState::Checking));
+                Effect::Reprobe(id) => reprobe.push(id),
+                Effect::ToastUnreachable => {
+                    self.show_message("Server is unreachable or did not respond")
                 }
-            }
-            // An id is done when the daemon stopped running it *and* left a
-            // result. The result is what distinguishes "finished" from "still
-            // queued": the daemon reports only the probes it is running, not
-            // the ones waiting behind `MAX_CONCURRENT_PROBES`. The deadline is
-            // the backstop for a result that will never arrive — a daemon that
-            // restarted mid-probe loses both its queue and its readings.
-            let finished: Vec<String> = state
-                .checking
-                .iter()
-                .filter(|id| {
-                    if daemon_checking.contains(*id) {
-                        return false;
-                    }
-                    snapshot.probe.latencies.contains_key(*id)
-                        || state
-                            .checking_since
-                            .get(*id)
-                            .is_none_or(|since| now.duration_since(*since) > PROBE_DEADLINE)
-                })
-                .cloned()
-                .collect();
-            for id in finished {
-                state.checking.remove(&id);
-                state.checking_since.remove(&id);
-                if !latency_updates.iter().any(|(updated, _)| updated == &id) {
-                    let value = snapshot.probe.latencies.get(&id).copied();
-                    latency_updates.push((
-                        id,
-                        match value {
-                            Some(Some(ms)) => LatencyState::Reachable(ms),
-                            Some(None) => LatencyState::Unreachable,
-                            // Timed out waiting for the daemon: no reading was
-                            // ever taken, so claiming "unreachable" would be a
-                            // lie about the server.
-                            None => LatencyState::Unmeasured,
-                        },
-                    ));
-                }
-            }
-            state.daemon_status = snapshot.status.to_status();
-            // A completion handler can pin a terminal `pending_status` — a
-            // failed connect, a settings apply whose reconnect failed — to
-            // show the outcome before the daemon's own poll catches up. Retire
-            // it once the daemon has stopped disagreeing: left in place it
-            // outranks every later daemon status forever, and freezes the
-            // `connected_id` resync below with it.
-            if state.operation.is_none()
-                && matches!(
-                    state.pending_status,
-                    Some(Status::Error(_) | Status::Disconnected)
-                )
-                && !matches!(state.daemon_status, Status::Connected | Status::Connecting)
-            {
-                state.pending_status = None;
-            }
-            // Key off the daemon's own view, not `current_status`: the latter
-            // prefers `pending_status`, which may still hold an optimistic
-            // transition the daemon has not confirmed yet.
-            let error = match &state.daemon_status {
-                Status::Error(message) => Some(message.clone()),
-                _ => None,
-            };
-            if error != state.notified_error {
-                state.notified_error = error.clone();
-                // Record the transition either way, but stay quiet while
-                // hidden: ToastOverlay queues, and `gui --background` would
-                // otherwise dump an hour of stale toasts when first opened.
-                new_error = error.filter(|_| self.window.is_visible());
-            }
-            // While no optimistic transition is in flight, the daemon's view
-            // of the active server wins.
-            if state.operation.is_none()
-                && state.pending_status.is_none()
-                && snapshot.status.active_id != state.connected_id
-            {
-                // `last_active_latency` is tagged with the id it belongs to
-                // and only ever read when that tag matches `connected_id`
-                // (see its doc comment), so it self-invalidates here without
-                // needing an explicit reset.
-                state.connected_id = snapshot.status.active_id.clone();
+                Effect::ConnectionError(error) => self.show_error("Connection error", &error),
+                Effect::DaemonOutdated => self.show_message(
+                    "The oxidom daemon is older than this app — latency readings are unavailable \
+                     until it is restarted",
+                ),
             }
         }
-        for (id, latency_state) in latency_updates {
-            self.servers.set_latency_state(&id, latency_state);
-        }
-        if toast_unreachable {
-            self.show_message("Server is unreachable or did not respond");
-        }
-        // Failures the user never triggered — a crashed core, a tunnel torn
-        // down by its own latency check — reach the screen only here.
-        if let Some(error) = new_error {
-            self.show_error("Connection error", &error);
+        for id in reprobe {
+            // `probe_one` is a no-op for an id already being checked, which is
+            // what keeps a reading the daemon keeps re-taking over the same
+            // wrong route from turning into a request loop.
+            self.probe_one(id, false);
         }
         self.logs.set_logs(&snapshot.logs);
         self.sync_connection_cards();
@@ -1736,30 +1693,59 @@ impl Controller {
         self.refresh_status();
     }
 
+    /// Re-date every badge. Readings do not change when they get older, so
+    /// nothing in the poll would ever notice a number crossing from "just
+    /// measured" into "measured 3 minutes ago"; the card compares against what
+    /// it is showing and ignores the rest, so this costs a lookup per card.
+    fn sweep_latency_ages(self: &Rc<Self>) {
+        let states = {
+            let state = self.state.borrow();
+            latency_states(&state.ui, ipc::now_unix_ms())
+        };
+        for (id, latency) in states {
+            self.servers.set_latency_state(&id, latency);
+        }
+    }
+
     /// Push the current connection onto the cards, skipping the O(cards)
     /// pass when nothing changed.
     fn sync_connection_cards(&self) {
-        let (active, status) = {
+        let (active, failed, status) = {
             let state = self.state.borrow();
-            (state.connected_id.clone(), self.current_status(&state))
+            (
+                state.ui.connected_id.clone(),
+                state.ui.failed_id.clone(),
+                state.ui.current_status(),
+            )
         };
         let desired = match status {
-            Status::Connecting => (active.clone(), active),
-            Status::Connected => (active, None),
-            _ => (None, None),
+            Status::Connecting => CardConnection {
+                active: active.clone(),
+                connecting: active,
+                failed: None,
+            },
+            Status::Connected => CardConnection {
+                active,
+                connecting: None,
+                failed: None,
+            },
+            // A failure keeps naming its server; a plain disconnect names none.
+            Status::Error(_) => CardConnection {
+                active: None,
+                connecting: None,
+                failed,
+            },
+            Status::Disconnected => CardConnection::default(),
         };
         if *self.applied_connection.borrow() == desired {
             return;
         }
-        *self.applied_connection.borrow_mut() = desired.clone();
-        self.servers
-            .set_connection(desired.0.as_deref(), desired.1.as_deref());
+        self.set_cards_connection(desired);
     }
 
-    fn set_cards_connection(&self, active: Option<&str>, connecting: Option<&str>) {
-        *self.applied_connection.borrow_mut() =
-            (active.map(str::to_string), connecting.map(str::to_string));
-        self.servers.set_connection(active, connecting);
+    fn set_cards_connection(&self, connection: CardConnection) {
+        self.servers.set_connection(&connection);
+        *self.applied_connection.borrow_mut() = connection;
     }
 
     /// The GNOME system proxy is a session concern, so the GUI (not the
@@ -1769,7 +1755,7 @@ impl Controller {
         let applied_settings = self.settings.applied();
         let status = {
             let state = self.state.borrow();
-            self.current_status(&state)
+            state.ui.current_status()
         };
         let want = applied_settings.system_proxy && status == Status::Connected;
         if want && !self.proxy_applied.get() {
@@ -1868,8 +1854,8 @@ impl Controller {
 
     fn refresh_status(&self) {
         let state = self.state.borrow();
-        let status = self.current_status(&state);
-        let (active_latency, latency_stale) = active_latency_for(&state);
+        let status = state.ui.current_status();
+        let (active_latency, latency_stale) = active_latency_for(&state.ui);
         drop(state);
 
         self.update_tray(&status);
@@ -1883,7 +1869,7 @@ impl Controller {
 
     /// Display name and country of the connected server.
     fn active_server_display(&self, state: &AppState) -> Option<(String, Option<String>)> {
-        let active = state.connected_id.as_deref()?;
+        let active = state.ui.connected_id.as_deref()?;
         state
             .subscriptions
             .iter()
@@ -1971,8 +1957,8 @@ impl Controller {
     }
 
     fn update_sidebar_connection_status(&self, state: &AppState) {
-        let status = self.current_status(state);
-        let (active_latency, latency_stale) = active_latency_for(state);
+        let status = state.ui.current_status();
+        let (active_latency, latency_stale) = active_latency_for(&state.ui);
         self.sidebar_status.set_sensitive(false);
         self.sidebar_status_label.remove_css_class("latency-stale");
         match status {
@@ -2021,7 +2007,7 @@ impl Controller {
 
     fn refresh_activity_status(&self) {
         let state = self.state.borrow();
-        match (state.operation.as_ref(), state.checking.len()) {
+        match (state.ui.operation.as_ref(), state.ui.checking.len()) {
             (Some(operation), _) => {
                 set_status_tone(&self.sidebar_status, StatusTone::Working);
                 self.sidebar_status_icon
@@ -2045,20 +2031,13 @@ impl Controller {
         }
     }
 
-    fn current_status(&self, state: &AppState) -> Status {
-        state
-            .pending_status
-            .clone()
-            .unwrap_or_else(|| state.daemon_status.clone())
-    }
-
     /// The status buttons double as the only always-visible carrier of a
     /// failure: the detail otherwise lives in a tooltip, which is unreachable
     /// by keyboard and hidden entirely in wide mode.
     fn handle_status_clicked(self: &Rc<Self>) {
         let status = {
             let state = self.state.borrow();
-            self.current_status(&state)
+            state.ui.current_status()
         };
         match status {
             Status::Error(error) => self.show_error_details("Connection error", &error),
@@ -2128,7 +2107,7 @@ impl Controller {
     /// not toast the identical message a second time. Both paths format the
     /// same anyhow error with `{:#}`, so the strings match exactly.
     fn mark_error_notified(&self, message: &str) {
-        self.state.borrow_mut().notified_error = Some(message.to_string());
+        self.state.borrow_mut().ui.notified_error = Some(message.to_string());
     }
 
     fn navigate_to(&self, page: Page) {
@@ -2170,32 +2149,6 @@ fn summarize_error(title: &str, detail: &str) -> String {
     let cut: String = detail.chars().take(MAX_DETAIL).collect();
     let cut = cut.trim_end();
     format!("{title}: {cut}…")
-}
-
-/// What a card should show when it is not being checked: the last reading if
-/// we have one, otherwise "unmeasured" — never a spinner.
-fn known_latency_state(latencies: &HashMap<String, Option<u32>>, id: &str) -> LatencyState {
-    match latencies.get(id) {
-        Some(Some(ms)) => LatencyState::Reachable(*ms),
-        Some(None) => LatencyState::Unreachable,
-        None => LatencyState::Unmeasured,
-    }
-}
-
-/// Latency to show for the connected server, and whether it's a carried-over
-/// fallback (no probe has confirmed a fresh reading for this connection yet)
-/// rather than a live `state.latencies` entry.
-fn active_latency_for(state: &AppState) -> (Option<u32>, bool) {
-    let Some(id) = state.connected_id.as_deref() else {
-        return (None, false);
-    };
-    if let Some(ms) = state.latencies.get(id).copied().flatten() {
-        return (Some(ms), false);
-    }
-    match &state.last_active_latency {
-        Some((last_id, ms)) if last_id == id => (Some(*ms), true),
-        _ => (None, false),
-    }
 }
 
 fn set_status_tone<W: IsA<gtk::Widget>>(widget: &W, tone: StatusTone) {
@@ -2300,14 +2253,29 @@ fn install_css() {
         .server-globe { min-width: 28px; min-height: 28px; }
         .server-name { font-weight: 600; font-size: 0.98em; }
         .server-subtitle { font-size: 0.82em; }
-        .latency-badge { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; font-weight: 500; }
-        .latency-badge.latency-error { font-size: 1.05em; padding: 1px 8px; font-weight: 700; }
-        .latency-spinner { color: @accent_color; }
+        /* The pill is always there, including while a check runs: the spinner
+           carries the same class so it appears inside the badge instead of the
+           badge vanishing and the row twitching on every re-check. */
+        .latency-badge { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; font-weight: 500; background: alpha(@window_fg_color, 0.07); }
+        .latency-badge.latency-error, .latency-badge.latency-offline { font-size: 1.05em; padding: 1px 8px; font-weight: 700; }
+        .latency-spinner { color: @accent_color; min-height: 22px; padding: 3px 8px; }
         .latency-reachable { color: @accent_color; background: alpha(@accent_color, 0.12); }
+        /* Measured through the tunnel: a fact about the connection in use, not
+           about the server on its own. Worth its own colour. */
+        .latency-tunnel { color: @success_color; background: alpha(@success_color, 0.14); }
+        /* Scoped to the card badge on purpose — the .latency-stale rule above
+           is scoped to the headerbar and the sidebar and does not reach here. */
+        .latency-badge.latency-stale { opacity: 0.55; }
         .latency-error { color: @error_color; background: alpha(@error_color, 0.13); }
+        .latency-offline { color: @warning_color; background: alpha(@warning_color, 0.13); }
         .status-badge { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; font-weight: 600; }
         .status-badge.status-working { color: @accent_color; background: alpha(@accent_color, 0.13); }
         .status-badge.status-connected { color: @success_color; background: alpha(@success_color, 0.13); }
+        .status-badge.status-error { color: @error_color; background: alpha(@error_color, 0.13); }
+        /* An inset ring rather than a border: `.server-card` is a fixed-height
+           frame with overflow hidden, and a real border would eat 2px of the
+           content it clips. */
+        .server-card.failed-server { box-shadow: inset 0 0 0 1px alpha(@error_color, 0.55); }
         "#,
     );
     if let Some(display) = gtk::gdk::Display::default() {
