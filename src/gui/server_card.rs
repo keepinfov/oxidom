@@ -168,6 +168,9 @@ pub struct ServerCard {
     latency_display: gtk::Stack,
     latency: gtk::Label,
     latency_spinner: gtk::Spinner,
+    /// The badge-shaped box the spinner sits in; carries the pill's background
+    /// and its tooltip, neither of which may live on a rotating widget.
+    latency_spinner_pill: gtk::Box,
     status: gtk::Label,
     connect_button: gtk::Button,
     expanded: Rc<Cell<bool>>,
@@ -209,26 +212,40 @@ impl ServerCard {
         labels.append(&name);
         labels.append(&subtitle);
 
+        // `Fill` on both axes, here and on the spinner's pill below: the stack
+        // is homogeneous, so two children that fill it are drawn at exactly the
+        // same size. Anything else lets the badge change shape when a check
+        // starts, since a spinner and a line of 0.75em text have nothing like
+        // the same natural height.
         let latency = gtk::Label::builder()
             .css_classes(["latency-badge"])
             .halign(gtk::Align::Fill)
-            .valign(gtk::Align::Center)
+            .valign(gtk::Align::Fill)
             .hexpand(true)
             .xalign(0.5)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(8)
             .build();
-        // `latency-badge` on the spinner too, and `Fill` rather than `Center`,
-        // so the pill keeps its size and background while a check runs: the
-        // spinner appears *inside* it instead of replacing it, and the row
-        // stops twitching every time a card is re-checked.
+        // The pill keeps its size and background while a check runs — the
+        // spinner appears *inside* it instead of replacing it, so the row stops
+        // twitching every time a card is re-checked. The background belongs to
+        // the box, never to the spinner: GTK animates a spinner by rotating its
+        // whole node, so a badge drawn on the spinner itself spins along with
+        // it, and the pill tumbles across the card.
         let latency_spinner = gtk::Spinner::builder()
             .width_request(16)
             .height_request(16)
-            .halign(gtk::Align::Fill)
+            .halign(gtk::Align::Center)
             .valign(gtk::Align::Center)
-            .css_classes(["latency-spinner", "latency-badge"])
+            .hexpand(true)
+            .css_classes(["latency-spinner"])
             .build();
+        let latency_spinner_pill = gtk::Box::builder()
+            .halign(gtk::Align::Fill)
+            .valign(gtk::Align::Fill)
+            .css_classes(["latency-badge"])
+            .build();
+        latency_spinner_pill.append(&latency_spinner);
         let latency_display = gtk::Stack::builder()
             .width_request(68)
             .halign(gtk::Align::End)
@@ -238,7 +255,7 @@ impl ServerCard {
             .css_classes(["latency-display"])
             .build();
         latency_display.add_named(&latency, Some("label"));
-        latency_display.add_named(&latency_spinner, Some("spinner"));
+        latency_display.add_named(&latency_spinner_pill, Some("spinner"));
         let status = gtk::Label::builder()
             .css_classes(["status-badge"])
             .valign(gtk::Align::Center)
@@ -436,6 +453,7 @@ impl ServerCard {
             latency_display,
             latency,
             latency_spinner,
+            latency_spinner_pill,
             status,
             connect_button,
             expanded,
@@ -533,11 +551,14 @@ impl ServerCard {
             LatencyState::Checking => {
                 self.latency_display.set_visible_child_name("spinner");
                 self.latency_spinner.set_spinning(true);
-                self.latency_spinner
+                self.latency_spinner_pill
                     .set_tooltip_text(Some("Checking server reachability"));
             }
+            // Same dash as an unmeasured server, in the error colour: a failed
+            // check still leaves no number, and a cross reads as a verdict on
+            // the server rather than as the absence of a reading.
             LatencyState::Unreachable => {
-                self.show_label("×", "Server is unreachable or did not respond");
+                self.show_label("—", "Server is unreachable or did not respond");
                 self.latency.add_css_class("latency-error");
             }
             LatencyState::NoNetwork => {

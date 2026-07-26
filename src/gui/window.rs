@@ -2254,11 +2254,13 @@ fn install_css() {
         .server-name { font-weight: 600; font-size: 0.98em; }
         .server-subtitle { font-size: 0.82em; }
         /* The pill is always there, including while a check runs: the spinner
-           carries the same class so it appears inside the badge instead of the
-           badge vanishing and the row twitching on every re-check. */
+           sits in a box carrying the same class, so it appears inside the badge
+           instead of the badge vanishing and the row twitching on every
+           re-check. The class must stay on the box — a spinner is animated by
+           rotating its whole node, background included. */
         .latency-badge { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; font-weight: 500; background: alpha(@window_fg_color, 0.07); }
-        .latency-badge.latency-error, .latency-badge.latency-offline { font-size: 1.05em; padding: 1px 8px; font-weight: 700; }
-        .latency-spinner { color: @accent_color; min-height: 22px; padding: 3px 8px; }
+        .latency-badge.latency-offline { font-size: 1.05em; padding: 1px 8px; font-weight: 700; }
+        .latency-spinner { color: @accent_color; }
         .latency-reachable { color: @accent_color; background: alpha(@accent_color, 0.12); }
         /* Measured through the tunnel: a fact about the connection in use, not
            about the server on its own. Worth its own colour. */
