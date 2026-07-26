@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -20,6 +20,19 @@ const MIN_CARD_WIDTH: i32 = 250;
 const MIN_CARD_WIDTH_FOR_THREE_COLUMNS: i32 = 300;
 const COLUMN_HYSTERESIS: i32 = 16;
 const RESIZE_SETTLE_MS: u64 = 120;
+
+/// What the cards should say about the connection. One value rather than three
+/// arguments so the window's "already applied" cache cannot fall out of step
+/// with what the cards were last told.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CardConnection {
+    /// The server the tunnel is running for.
+    pub active: Option<String>,
+    /// The server an attempt is being built for.
+    pub connecting: Option<String>,
+    /// The server whose attempt failed, until something replaces it.
+    pub failed: Option<String>,
+}
 
 /// `select` only inspects/expands a card. `activate` independently connects,
 /// switches, or disconnects its server.
@@ -175,13 +188,16 @@ impl ServersView {
         self.schedule_expanded_remeasure();
     }
 
+    /// `latency_states` carries everything a badge needs, already decided by
+    /// `reduce`: ids it does not mention have nothing measured. The view used to
+    /// re-derive that from a latency map plus a set of in-flight ids, which is
+    /// how a rebuilt card and a live one could end up disagreeing.
     pub fn rebuild(
         &self,
         subscriptions: &[Subscription],
         connected_id: Option<&str>,
         selected_id: Option<&str>,
-        latencies: &HashMap<String, Option<u32>>,
-        checking: &HashSet<String>,
+        latency_states: &HashMap<String, LatencyState>,
         callbacks: CardCallbacks,
     ) {
         while let Some(child) = self.content.first_child() {
@@ -190,7 +206,10 @@ impl ServersView {
         self.cards.borrow_mut().clear();
         self.groups.borrow_mut().clear();
         self.search_texts.borrow_mut().clear();
-        *self.latencies.borrow_mut() = latencies.clone();
+        *self.latencies.borrow_mut() = latency_states
+            .iter()
+            .filter_map(|(id, state)| sort_value(*state).map(|value| (id.clone(), value)))
+            .collect();
         *self.selected.borrow_mut() = selected_id.map(str::to_string);
         *self.requested_selected.borrow_mut() = selected_id.map(str::to_string);
 
@@ -354,7 +373,10 @@ impl ServersView {
             let mut group_cards: Vec<(String, gtk::Widget)> = Vec::new();
             for server in &subscription.servers {
                 let id = server.id.clone();
-                let latency_state = latency_state(&id, latencies, checking);
+                let latency_state = latency_states
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(LatencyState::Unmeasured);
                 let on_select = {
                     let cb = callbacks.select.clone();
                     let id = id.clone();
@@ -507,40 +529,36 @@ impl ServersView {
         if let Some(card) = self.cards.borrow().get(server_id) {
             card.set_latency_state(state);
         }
-        match state {
-            LatencyState::Reachable(ms) => {
+        // `Checking` says nothing about where the card belongs in a latency
+        // sort, so it leaves the previous key alone rather than clearing it.
+        match sort_value(state) {
+            Some(value) => {
                 self.latencies
                     .borrow_mut()
-                    .insert(server_id.to_string(), Some(ms));
+                    .insert(server_id.to_string(), value);
             }
-            LatencyState::Unreachable => {
-                self.latencies
-                    .borrow_mut()
-                    .insert(server_id.to_string(), None);
-            }
-            LatencyState::Unmeasured => {
+            None if state != LatencyState::Checking => {
                 self.latencies.borrow_mut().remove(server_id);
             }
-            LatencyState::Checking => {}
+            None => {}
         }
     }
 
     /// Reflect the connection on every card in one pass: a `connecting` server
     /// wins, otherwise `active` decides Connected/Elsewhere/Disconnected.
-    pub fn set_connection(&self, active: Option<&str>, connecting: Option<&str>) {
+    pub fn set_connection(&self, connection: &CardConnection) {
         for (id, card) in self.cards.borrow().iter() {
-            let state = if let Some(connecting_id) = connecting {
-                if connecting_id == id {
-                    CardConnectionState::Connecting
-                } else {
-                    CardConnectionState::Disconnected
-                }
-            } else {
-                match active {
-                    Some(active_id) if active_id == id => CardConnectionState::ConnectedHere,
+            let state = match (&connection.connecting, &connection.failed) {
+                // An attempt in flight outranks everything: no other card may
+                // claim a connection while one is being built.
+                (Some(connecting), _) if connecting == id => CardConnectionState::Connecting,
+                (Some(_), _) => CardConnectionState::Disconnected,
+                (None, Some(failed)) if failed == id => CardConnectionState::Failed,
+                _ => match connection.active.as_deref() {
+                    Some(active) if active == id => CardConnectionState::ConnectedHere,
                     Some(_) => CardConnectionState::ConnectedElsewhere,
                     None => CardConnectionState::Disconnected,
-                }
+                },
             };
             card.set_connection_state(state);
         }
@@ -894,18 +912,14 @@ fn collapse_tooltip(collapsed: bool) -> &'static str {
     if collapsed { "Expand" } else { "Collapse" }
 }
 
-fn latency_state(
-    id: &str,
-    latencies: &HashMap<String, Option<u32>>,
-    checking: &HashSet<String>,
-) -> LatencyState {
-    if checking.contains(id) {
-        return LatencyState::Checking;
-    }
-    match latencies.get(id) {
-        Some(Some(ms)) => LatencyState::Reachable(*ms),
-        Some(None) => LatencyState::Unreachable,
-        None => LatencyState::Unmeasured,
+/// The sort key a badge contributes, if any: a number, a definite failure, or
+/// nothing to say. Only [`sorted_by_latency`] consumes this — the badge itself
+/// renders from the [`LatencyState`] directly.
+fn sort_value(state: LatencyState) -> Option<Option<u32>> {
+    match state {
+        LatencyState::Reachable { ms, .. } | LatencyState::Tunnel { ms, .. } => Some(Some(ms)),
+        LatencyState::Unreachable | LatencyState::NoNetwork => Some(None),
+        LatencyState::Unmeasured | LatencyState::Superseded | LatencyState::Checking => None,
     }
 }
 

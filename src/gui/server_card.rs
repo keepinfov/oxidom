@@ -99,12 +99,45 @@ impl CardFrame {
     }
 }
 
+/// How old a reading is, in whole minutes.
+///
+/// Bucketed rather than exact because the age is refreshed by a background
+/// sweep: a value that changed every second would repaint — and re-fade — every
+/// badge on every pass, for a number nobody reads to the second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatencyAge {
+    /// No usable timestamp, so nothing can be said about the age.
+    Unknown,
+    /// Taken within the last minute.
+    Fresh,
+    /// Whole minutes since the measurement, saturating.
+    Stale(u16),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatencyState {
+    /// No probe has ever produced a reading for this server.
     Unmeasured,
+    /// A reading exists, but it was taken in a context that is gone — a number
+    /// measured through the tunnel, for a server that no longer carries it, or
+    /// the other way round. Showing it is the same lie as passing a
+    /// pre-connect direct ping off as the tunnel's latency.
+    Superseded,
     Checking,
-    Reachable(u32),
+    /// Measured straight at the server: a fact about that server.
+    Reachable {
+        ms: u32,
+        age: LatencyAge,
+    },
+    /// Measured through the tunnel: a fact about the connection in use.
+    Tunnel {
+        ms: u32,
+        age: LatencyAge,
+    },
+    /// A probe ran and the server did not answer.
     Unreachable,
+    /// The probe never left this machine, so the server was not tested at all.
+    NoNetwork,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +146,11 @@ pub enum CardConnectionState {
     ConnectedHere,
     ConnectedElsewhere,
     Connecting,
+    /// This server's connection attempt failed. Distinct from `Disconnected`
+    /// because the two look identical otherwise, and a user who clicked
+    /// Connect and got the card they started from has no way to tell that
+    /// anything happened at all.
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +171,10 @@ pub struct ServerCard {
     status: gtk::Label,
     connect_button: gtk::Button,
     expanded: Rc<Cell<bool>>,
+    /// What the badge is currently showing. The age sweep re-pushes a state for
+    /// every card every 15 s, so without this the whole grid would re-fade on
+    /// each pass for the handful of badges that actually changed.
+    last_latency: Rc<Cell<LatencyState>>,
     latency_generation: Rc<Cell<u64>>,
     height_generation: Rc<Cell<u64>>,
 }
@@ -176,12 +218,16 @@ impl ServerCard {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(8)
             .build();
+        // `latency-badge` on the spinner too, and `Fill` rather than `Center`,
+        // so the pill keeps its size and background while a check runs: the
+        // spinner appears *inside* it instead of replacing it, and the row
+        // stops twitching every time a card is re-checked.
         let latency_spinner = gtk::Spinner::builder()
             .width_request(16)
             .height_request(16)
-            .halign(gtk::Align::Center)
+            .halign(gtk::Align::Fill)
             .valign(gtk::Align::Center)
-            .css_classes(["latency-spinner"])
+            .css_classes(["latency-spinner", "latency-badge"])
             .build();
         let latency_display = gtk::Stack::builder()
             .width_request(68)
@@ -393,6 +439,7 @@ impl ServerCard {
             status,
             connect_button,
             expanded,
+            last_latency: Rc::new(Cell::new(latency_state)),
             latency_generation: Rc::new(Cell::new(0)),
             height_generation: Rc::new(Cell::new(0)),
         };
@@ -402,10 +449,18 @@ impl ServerCard {
     }
 
     pub fn set_latency_state(&self, state: LatencyState) {
+        let previous = self.last_latency.replace(state);
+        if previous == state {
+            return;
+        }
         let generation = self.latency_generation.get().wrapping_add(1);
         self.latency_generation.set(generation);
 
+        // The spinner and the number share one slot, so fading across that
+        // boundary reads as the pill blinking out and back rather than as a
+        // check starting. Only number-to-number is worth a crossfade.
         if state == LatencyState::Checking
+            || previous == LatencyState::Checking
             || self.latency.text().is_empty()
             || !adw::is_animations_enabled(&self.latency_display)
         {
@@ -447,22 +502,33 @@ impl ServerCard {
 
     fn apply_latency(&self, state: LatencyState) {
         self.latency_spinner.set_spinning(false);
-        self.latency.remove_css_class("latency-reachable");
-        self.latency.remove_css_class("latency-error");
-        self.latency.remove_css_class("latency-checking");
+        for class in [
+            "latency-reachable",
+            "latency-tunnel",
+            "latency-stale",
+            "latency-error",
+            "latency-offline",
+        ] {
+            self.latency.remove_css_class(class);
+        }
         match state {
-            LatencyState::Reachable(ms) => {
-                self.latency_display.set_visible_child_name("label");
-                self.latency.set_label(&format!("{ms} ms"));
-                self.latency
-                    .set_tooltip_text(Some(&format!("Latency: {ms} ms")));
+            LatencyState::Reachable { ms, age } => {
+                self.show_reading(&format!("{ms} ms"), &format!("Latency: {ms} ms"), age);
                 self.latency.add_css_class("latency-reachable");
             }
+            LatencyState::Tunnel { ms, age } => {
+                self.show_reading(
+                    &format!("{ms} ms"),
+                    &format!("Through the tunnel: {ms} ms"),
+                    age,
+                );
+                self.latency.add_css_class("latency-tunnel");
+            }
             LatencyState::Unmeasured => {
-                self.latency_display.set_visible_child_name("label");
-                self.latency.set_label("—");
-                self.latency
-                    .set_tooltip_text(Some("Latency has not been measured"));
+                self.show_label("—", "Latency has not been measured");
+            }
+            LatencyState::Superseded => {
+                self.show_label("—", "Measured in a different context — needs a fresh check");
             }
             LatencyState::Checking => {
                 self.latency_display.set_visible_child_name("spinner");
@@ -471,12 +537,33 @@ impl ServerCard {
                     .set_tooltip_text(Some("Checking server reachability"));
             }
             LatencyState::Unreachable => {
-                self.latency_display.set_visible_child_name("label");
-                self.latency.set_label("×");
-                self.latency
-                    .set_tooltip_text(Some("Server is unreachable or did not respond"));
+                self.show_label("×", "Server is unreachable or did not respond");
                 self.latency.add_css_class("latency-error");
             }
+            LatencyState::NoNetwork => {
+                self.show_label("⊘", "No network — the server was not checked");
+                self.latency.add_css_class("latency-offline");
+            }
+        }
+    }
+
+    fn show_label(&self, text: &str, tooltip: &str) {
+        self.latency_display.set_visible_child_name("label");
+        self.latency.set_label(text);
+        self.latency.set_tooltip_text(Some(tooltip));
+    }
+
+    /// A number, dimmed and dated once it is a minute old. The number itself
+    /// stays readable: it is still the last thing we know, and hiding it would
+    /// trade one dishonesty for another.
+    fn show_reading(&self, text: &str, tooltip: &str, age: LatencyAge) {
+        match age {
+            LatencyAge::Stale(minutes) => {
+                let unit = if minutes == 1 { "minute" } else { "minutes" };
+                self.show_label(text, &format!("{tooltip} · measured {minutes} {unit} ago"));
+                self.latency.add_css_class("latency-stale");
+            }
+            LatencyAge::Fresh | LatencyAge::Unknown => self.show_label(text, tooltip),
         }
     }
 
@@ -485,6 +572,8 @@ impl ServerCard {
         self.connect_button.remove_css_class("destructive-action");
         self.status.remove_css_class("status-connected");
         self.status.remove_css_class("status-working");
+        self.status.remove_css_class("status-error");
+        self.root.remove_css_class("failed-server");
         self.connect_button.set_sensitive(true);
         match state {
             CardConnectionState::Disconnected => {
@@ -498,7 +587,10 @@ impl ServerCard {
                 self.status.set_label("Connected");
                 self.status.add_css_class("status-connected");
                 self.status.set_visible(true);
-                self.latency_display.set_visible(false);
+                // Kept visible: this is the one card whose number describes the
+                // connection the user is actually on, and hiding it is why the
+                // active server was the only one you could not see a ping for.
+                self.latency_display.set_visible(true);
                 self.connect_button.set_label("Disconnect");
                 self.connect_button.add_css_class("destructive-action");
                 self.root.add_css_class("active-server");
@@ -518,6 +610,20 @@ impl ServerCard {
                 self.connect_button.set_label("Connecting…");
                 self.connect_button.set_sensitive(false);
                 self.root.remove_css_class("active-server");
+            }
+            CardConnectionState::Failed => {
+                self.status.set_label("Failed");
+                self.status.add_css_class("status-error");
+                self.status.set_visible(true);
+                // The badge stays hidden here even though it does for no other
+                // state: the only number this card can have is a direct one
+                // taken before the attempt, and offering it beside "Failed"
+                // reads as "the tunnel is fine, 84 ms" — the exact lie.
+                self.latency_display.set_visible(false);
+                self.connect_button.set_label("Reconnect");
+                self.connect_button.add_css_class("suggested-action");
+                self.root.remove_css_class("active-server");
+                self.root.add_css_class("failed-server");
             }
         }
     }
@@ -789,7 +895,7 @@ pub(crate) fn flag_widget(country: Option<&str>, flag_size: i32, globe_size: i32
 
 #[cfg(test)]
 mod tests {
-    use super::{CardConnectionState, ClickPlan, click_plan_for_press};
+    use super::{CardConnectionState, ClickPlan, LatencyAge, LatencyState, click_plan_for_press};
 
     #[test]
     fn primary_click_toggles_and_double_click_activates() {
@@ -820,6 +926,45 @@ mod tests {
         assert_ne!(
             CardConnectionState::ConnectedElsewhere,
             CardConnectionState::Connecting
+        );
+        // The whole point of the state: a server that failed does not look
+        // like one the user never touched.
+        assert_ne!(
+            CardConnectionState::Failed,
+            CardConnectionState::Disconnected
+        );
+    }
+
+    /// The badge has to compare equal for the age sweep's early return to
+    /// work, and a reading that got older has to compare *un*equal for the
+    /// sweep to be worth running at all.
+    #[test]
+    fn a_badge_changes_exactly_when_its_reading_or_its_age_does() {
+        let fresh = LatencyState::Reachable {
+            ms: 41,
+            age: LatencyAge::Fresh,
+        };
+        assert_eq!(
+            fresh,
+            LatencyState::Reachable {
+                ms: 41,
+                age: LatencyAge::Fresh
+            }
+        );
+        assert_ne!(
+            fresh,
+            LatencyState::Reachable {
+                ms: 41,
+                age: LatencyAge::Stale(2)
+            }
+        );
+        // Same number, different thing measured.
+        assert_ne!(
+            fresh,
+            LatencyState::Tunnel {
+                ms: 41,
+                age: LatencyAge::Fresh
+            }
         );
     }
 }
