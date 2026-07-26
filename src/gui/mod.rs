@@ -12,6 +12,7 @@ mod flags;
 mod group;
 mod operation;
 mod prefs;
+mod reduce;
 mod server_card;
 mod sidebar;
 mod tray;
