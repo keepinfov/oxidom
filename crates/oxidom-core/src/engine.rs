@@ -1,55 +1,47 @@
-//! App-facing orchestration API. The GUI (Phase 2) drives everything through
-//! this type; it should not call the lower-level modules directly.
+//! Daemon-owned registry and per-profile runtime sessions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use anyhow::{Result, anyhow};
 
 use crate::config::Config;
 use crate::model::{Server, Subscription};
-use crate::state::{self, State, store};
+use crate::state::{self, SessionState, State, store};
 use crate::xray::core::{Status, XrayCore};
-use crate::{alias, link, probe, subscription};
+use crate::{alias, bind, link, probe, subscription};
 
 /// Fixed id of the local group that holds servers imported by share-link,
 /// not tied to any subscription URL. It is a sentinel rather than a hash, so
 /// the identity migration must leave it alone.
 pub const LOCAL_ID: &str = "local";
 
-pub struct Engine {
+/// Persistent configuration and server catalog shared by every session.
+pub struct Registry {
     pub config: Config,
-    pub state: State,
     pub subscriptions: Vec<Subscription>,
-    pub core: XrayCore,
     /// Non-fatal problems found while loading (e.g. a quarantined corrupt
     /// subscriptions file). The GUI surfaces these once at startup.
     pub load_warnings: Vec<String>,
 }
 
-impl Engine {
+impl Registry {
     pub fn load() -> Self {
         let config = Config::load();
-        let core = XrayCore::new(
-            config.socks_port,
-            config.http_port,
-            config.xray_binary.clone(),
-        );
-        let state = State::load();
         let (subscriptions, store_warning) = store::load();
-        let mut engine = Engine {
-            state,
+        Registry {
             subscriptions,
-            core,
             config,
             load_warnings: store_warning.into_iter().collect(),
-        };
-        engine.migrate_identities();
-        engine.recover();
-        engine
+        }
     }
 
-    fn migrate_identities(&mut self) {
-        let active_before = self.state.active_server_id.clone();
+    pub fn migrate_identities(&mut self, state: &mut State) {
+        let active_before: Vec<String> = state
+            .sessions
+            .iter()
+            .filter_map(|session| session.server_id.clone())
+            .collect();
         let mut server_ids = HashMap::new();
         let mut seen_ids: HashMap<String, (String, String)> = HashMap::new();
         let mut identities_changed = false;
@@ -105,54 +97,39 @@ impl Engine {
             return;
         }
 
-        if let Some(active_id) = self.state.active_server_id.as_mut()
-            && let Some(new_id) = server_ids.get(active_id)
-        {
-            active_id.clone_from(new_id);
+        for session in &mut state.sessions {
+            if let Some(active_id) = session.server_id.as_mut()
+                && let Some(new_id) = server_ids.get(active_id)
+            {
+                active_id.clone_from(new_id);
+            }
         }
         alias::assign(&mut self.subscriptions);
 
         if let Err(error) = store::save(&self.subscriptions) {
             log::warn!("could not persist migrated subscription identities: {error:#}");
         }
-        if let Err(error) = self.state.save() {
+        if let Err(error) = state.save() {
             log::warn!("could not persist migrated active server identity: {error:#}");
         }
 
-        let active_preserved = active_before.is_none()
-            || self
-                .state
-                .active_server_id
-                .as_deref()
-                .is_some_and(|active_id| self.all_servers().any(|server| server.id == active_id));
+        let active_after: Vec<&str> = state
+            .sessions
+            .iter()
+            .filter_map(|session| session.server_id.as_deref())
+            .collect();
+        let active_preserved = active_after.len() == active_before.len()
+            && active_after
+                .iter()
+                .all(|active_id| self.all_servers().any(|server| server.id == *active_id));
         log::info!(
             "identity migration renamed {renamed_servers} servers; active server preserved: \
              {active_preserved}"
         );
     }
 
-    /// Undo each resource a crashed previous instance could have left behind.
-    fn recover(&mut self) {
-        self.recover_stale_core();
-        // Phase 4 adds the TUN device and the routes we added here.
-    }
-
-    fn recover_stale_core(&mut self) {
-        if let Some(pid) = self.state.xray_pid.take() {
-            if kill_stale_xray(pid) {
-                log::info!("stopped orphaned xray process {pid} from a previous run");
-            } else {
-                log::warn!("could not confirm that orphaned xray process {pid} stopped");
-            }
-            if let Err(error) = self.state.save() {
-                log::warn!("could not persist stale-core recovery state: {error:#}");
-            }
-        }
-    }
-
     pub fn save(&self) -> Result<()> {
         self.config.save()?;
-        self.state.save()?;
         store::save(&self.subscriptions)?;
         Ok(())
     }
@@ -215,7 +192,6 @@ impl Engine {
         };
         subscription::refresh(sub, &ua, hwid.as_deref())?;
         alias::assign(&mut self.subscriptions);
-        self.disconnect_if_active_gone();
         store::save(&self.subscriptions)?;
         Ok(())
     }
@@ -253,7 +229,6 @@ impl Engine {
             }
         }
         alias::assign(&mut self.subscriptions);
-        self.disconnect_if_active_gone();
         store::save(&self.subscriptions)?;
         if errors.is_empty() {
             Ok(())
@@ -262,17 +237,10 @@ impl Engine {
         }
     }
 
-    /// Remove a subscription. Returns true when the removal took the active
-    /// server with it and the tunnel was therefore shut down.
-    pub fn remove_subscription(&mut self, sub_id: &str) -> Result<bool> {
-        let disconnected = self.disconnect_if_active_within(|server_id, subs| {
-            subs.iter()
-                .find(|s| s.id == sub_id)
-                .is_some_and(|s| s.servers.iter().any(|server| server.id == server_id))
-        });
+    pub fn remove_subscription(&mut self, sub_id: &str) -> Result<()> {
         self.subscriptions.retain(|s| s.id != sub_id);
         store::save(&self.subscriptions)?;
-        Ok(disconnected)
+        Ok(())
     }
 
     /// Import one or more share-links into the local "My servers" group.
@@ -315,18 +283,369 @@ impl Engine {
     }
 
     /// Remove a single server from the local group, dropping the group when it
-    /// becomes empty. Only local servers are removable; subscription servers
-    /// would just reappear on refresh. Returns true when the removed server
-    /// was the active one and the tunnel was shut down.
-    pub fn remove_server(&mut self, server_id: &str) -> Result<bool> {
-        let disconnected = self.disconnect_if_active_within(|active_id, _| active_id == server_id);
+    /// becomes empty. Subscription servers would just reappear on refresh.
+    pub fn remove_server(&mut self, server_id: &str) -> Result<()> {
         if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == LOCAL_ID) {
             sub.servers.retain(|s| s.id != server_id);
         }
         self.subscriptions
             .retain(|s| !(s.id == LOCAL_ID && s.servers.is_empty()));
         store::save(&self.subscriptions)?;
+        Ok(())
+    }
+}
+
+/// One running profile and the Xray process that carries it.
+pub struct Session {
+    /// Name of the profile that started this session. This is the runtime key.
+    pub profile: String,
+    pub core: XrayCore,
+    pub address: Ipv4Addr,
+    pub socks_port: u16,
+    pub http_port: u16,
+    pub server_id: Option<String>,
+}
+
+impl Session {
+    pub fn new(
+        profile: String,
+        address: Ipv4Addr,
+        socks_port: u16,
+        http_port: u16,
+        xray_binary: String,
+    ) -> Self {
+        Self {
+            profile,
+            core: XrayCore::new(socks_port, http_port, xray_binary),
+            address,
+            socks_port,
+            http_port,
+            server_id: None,
+        }
+    }
+
+    pub fn connect(&mut self, server: &Server) -> Result<()> {
+        self.core.connect(server, self.address, &self.profile)?;
+        self.server_id = Some(server.id.clone());
+        Ok(())
+    }
+
+    pub fn disconnect(&mut self) {
+        self.core.disconnect();
+        self.server_id = None;
+    }
+
+    pub fn status(&self) -> Status {
+        self.core.status()
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        self.core.is_alive()
+    }
+
+    pub fn recent_logs(&self) -> Vec<String> {
+        self.core.recent_logs()
+    }
+
+    pub fn clear_logs(&self) {
+        self.core.clear_logs();
+    }
+
+    pub fn child_pid(&self) -> Option<u32> {
+        self.core.child_pid()
+    }
+
+    pub fn socks_endpoint(&self) -> SocketAddrV4 {
+        SocketAddrV4::new(self.address, self.socks_port)
+    }
+
+    pub fn http_endpoint(&self) -> SocketAddrV4 {
+        SocketAddrV4::new(self.address, self.http_port)
+    }
+
+    fn set_ports(&mut self, socks_port: u16, http_port: u16) {
+        self.socks_port = socks_port;
+        self.http_port = http_port;
+        self.core.socks_port = socks_port;
+        self.core.http_port = http_port;
+    }
+
+    fn state(&self) -> SessionState {
+        SessionState {
+            profile: self.profile.clone(),
+            server_id: self.server_id.clone(),
+            address: self.address,
+            socks_port: self.socks_port,
+            http_port: self.http_port,
+            xray_pid: self.child_pid(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Sessions {
+    inner: BTreeMap<String, Session>,
+}
+
+impl Sessions {
+    pub fn get(&self, profile: &str) -> Option<&Session> {
+        self.inner.get(profile)
+    }
+
+    pub fn get_mut(&mut self, profile: &str) -> Option<&mut Session> {
+        self.inner.get_mut(profile)
+    }
+
+    pub fn insert(&mut self, session: Session) -> Option<Session> {
+        self.inner.insert(session.profile.clone(), session)
+    }
+
+    pub fn remove(&mut self, profile: &str) -> Option<Session> {
+        self.inner.remove(profile)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Session)> {
+        self.inner
+            .iter()
+            .map(|(profile, session)| (profile.as_str(), session))
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn taken_addresses(&self) -> Vec<Ipv4Addr> {
+        self.inner.values().map(|session| session.address).collect()
+    }
+
+    pub fn owner_of_system_proxy(&self) -> Option<&str> {
+        None
+    }
+
+    fn from_state(state: &State, config: &Config) -> Self {
+        let mut sessions = Sessions::default();
+        for saved in &state.sessions {
+            let mut session = Session::new(
+                saved.profile.clone(),
+                saved.address,
+                saved.socks_port,
+                saved.http_port,
+                config.xray_binary.clone(),
+            );
+            session.server_id.clone_from(&saved.server_id);
+            sessions.insert(session);
+        }
+        if sessions.is_empty() {
+            let address = bind::address_for("default", &[])
+                .expect("the reserved default address is always available");
+            sessions.insert(Session::new(
+                "default".to_string(),
+                address,
+                config.socks_port,
+                config.http_port,
+                config.xray_binary.clone(),
+            ));
+        }
+        sessions
+    }
+}
+
+/// Compatibility facade for the still-single-session daemon surface.
+pub struct Engine {
+    pub registry: Registry,
+    pub sessions: Sessions,
+    pub state: State,
+}
+
+impl Engine {
+    pub fn load() -> Self {
+        let mut registry = Registry::load();
+        let mut state = State::load(&registry.config);
+        registry.migrate_identities(&mut state);
+        let sessions = Sessions::from_state(&state, &registry.config);
+        let mut engine = Engine {
+            registry,
+            sessions,
+            state,
+        };
+        engine.recover();
+        engine
+    }
+
+    /// Undo each resource a crashed previous instance could have left behind.
+    fn recover(&mut self) {
+        self.recover_stale_cores();
+        // Phase 4b adds the TUN device and the routes we added here.
+    }
+
+    fn recover_stale_cores(&mut self) {
+        let mut changed = false;
+        for session in &mut self.state.sessions {
+            let Some(pid) = session.xray_pid.take() else {
+                continue;
+            };
+            changed = true;
+            if kill_stale_xray(pid, &session.profile) {
+                log::info!(
+                    "stopped orphaned xray process {pid} for profile {:?} from a previous run",
+                    session.profile
+                );
+            } else {
+                log::warn!(
+                    "could not confirm that orphaned xray process {pid} for profile {:?} stopped",
+                    session.profile
+                );
+            }
+        }
+        if changed && let Err(error) = self.state.save() {
+            log::warn!("could not persist stale-core recovery state: {error:#}");
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.registry.save()?;
+        self.state.save()?;
+        Ok(())
+    }
+
+    pub fn all_servers(&self) -> impl Iterator<Item = &Server> {
+        self.registry.all_servers()
+    }
+
+    pub fn find_server(&self, id: &str) -> Option<Server> {
+        self.registry.find_server(id)
+    }
+
+    pub fn add_subscription(
+        &mut self,
+        url: String,
+        name: Option<String>,
+        send_hwid: bool,
+    ) -> Result<()> {
+        self.registry.add_subscription(url, name, send_hwid)
+    }
+
+    pub fn refresh(&mut self, sub_id: &str) -> Result<()> {
+        self.registry.refresh(sub_id)?;
+        self.disconnect_if_active_gone();
+        Ok(())
+    }
+
+    pub fn refresh_all(&mut self) -> Result<()> {
+        let result = self.registry.refresh_all();
+        self.disconnect_if_active_gone();
+        result
+    }
+
+    /// Remove a subscription, stopping every session whose server it held.
+    pub fn remove_subscription(&mut self, sub_id: &str) -> Result<bool> {
+        let disconnected = !self
+            .disconnect_if_active_within(|server_id, subscriptions| {
+                subscriptions
+                    .iter()
+                    .find(|subscription| subscription.id == sub_id)
+                    .is_some_and(|subscription| {
+                        subscription
+                            .servers
+                            .iter()
+                            .any(|server| server.id == server_id)
+                    })
+            })
+            .is_empty();
+        self.registry.remove_subscription(sub_id)?;
         Ok(disconnected)
+    }
+
+    pub fn import_links(&mut self, text: &str) -> Result<(usize, usize)> {
+        self.registry.import_links(text)
+    }
+
+    pub fn remove_server(&mut self, server_id: &str) -> Result<bool> {
+        let disconnected = !self
+            .disconnect_if_active_within(|active_id, _| active_id == server_id)
+            .is_empty();
+        self.registry.remove_server(server_id)?;
+        Ok(disconnected)
+    }
+
+    pub fn default_session(&self) -> Option<&Session> {
+        if let Some(session) = self.sessions.get("default") {
+            return Some(session);
+        }
+        (self.sessions.len() == 1)
+            .then(|| self.sessions.iter().next().map(|(_, session)| session))
+            .flatten()
+    }
+
+    pub fn default_session_mut(&mut self) -> Option<&mut Session> {
+        let profile = self.default_profile()?.to_string();
+        self.sessions.get_mut(&profile)
+    }
+
+    fn default_profile(&self) -> Option<&str> {
+        if self.sessions.get("default").is_some() {
+            Some("default")
+        } else if self.sessions.len() == 1 {
+            self.sessions.iter().next().map(|(profile, _)| profile)
+        } else {
+            None
+        }
+    }
+
+    /// Select the single session the compatibility daemon is about to use.
+    /// A2 replaces this transition with insertion alongside existing sessions.
+    pub fn prepare_session(
+        &mut self,
+        profile: &str,
+        address: Ipv4Addr,
+        socks_port: u16,
+        http_port: u16,
+    ) -> Result<()> {
+        if !crate::profile::valid_name(profile) {
+            return Err(anyhow!("invalid profile name {profile:?}"));
+        }
+        if let Some(session) = self.sessions.get_mut(profile) {
+            session.address = address;
+            session.set_ports(socks_port, http_port);
+            return Ok(());
+        }
+
+        for session in self.sessions.inner.values_mut() {
+            session.disconnect();
+        }
+        self.sessions.inner.clear();
+        self.state.sessions.clear();
+        self.sessions.insert(Session::new(
+            profile.to_string(),
+            address,
+            socks_port,
+            http_port,
+            self.registry.config.xray_binary.clone(),
+        ));
+        Ok(())
+    }
+
+    pub fn set_default_ports(&mut self, socks_port: u16, http_port: u16) {
+        let Some(profile) = self.default_profile().map(str::to_string) else {
+            return;
+        };
+        if let Some(session) = self.sessions.get_mut(&profile) {
+            session.set_ports(socks_port, http_port);
+        }
+        self.sync_session(&profile);
+    }
+
+    pub fn active_server_id(&self) -> Option<String> {
+        self.default_session()?.server_id.clone()
+    }
+
+    pub fn active_profile(&self) -> Option<String> {
+        let session = self.default_session()?;
+        session.server_id.as_ref().map(|_| session.profile.clone())
     }
 
     /// Disconnect when a refresh took the active server away with it — the
@@ -339,11 +658,17 @@ impl Engine {
                 .iter()
                 .any(|s| s.servers.iter().any(|server| server.id == active_id))
         });
-        if gone {
-            self.core
-                .note("the active server is no longer in its subscription — disconnected");
+        if !gone.is_empty() {
+            for profile in &gone {
+                let Some(session) = self.sessions.get(profile) else {
+                    continue;
+                };
+                session
+                    .core
+                    .note("the active server is no longer in its subscription — disconnected");
+            }
         }
-        gone
+        !gone.is_empty()
     }
 
     /// Disconnect when the tunnel is running and the active server matches
@@ -352,28 +677,50 @@ impl Engine {
     fn disconnect_if_active_within(
         &mut self,
         covers: impl Fn(&str, &[Subscription]) -> bool,
-    ) -> bool {
+    ) -> Vec<String> {
         // `Error` counts as active: a crashed core still leaves the server
         // recorded as the active one, and deleting it must clear that.
-        let active = match (&self.state.active_server_id, self.core.status()) {
-            (Some(id), Status::Connected | Status::Connecting | Status::Error(_)) => id.clone(),
-            _ => return false,
-        };
-        if covers(&active, &self.subscriptions) {
-            self.disconnect();
-            true
-        } else {
-            false
+        let affected: Vec<String> = self
+            .sessions
+            .iter()
+            .filter_map(
+                |(profile, session)| match (&session.server_id, session.status()) {
+                    (Some(id), Status::Connected | Status::Connecting | Status::Error(_))
+                        if covers(id, &self.registry.subscriptions) =>
+                    {
+                        Some(profile.to_string())
+                    }
+                    _ => None,
+                },
+            )
+            .collect();
+        for profile in &affected {
+            if let Some(session) = self.sessions.get_mut(profile) {
+                session.disconnect();
+            }
+            self.sync_session(profile);
         }
+        if !affected.is_empty()
+            && let Err(error) = self.state.save()
+        {
+            log::warn!("could not persist the disconnected state: {error:#}");
+        }
+        affected
     }
 
     pub fn connect(&mut self, server_id: &str) -> Result<()> {
         let server = self
             .find_server(server_id)
             .ok_or_else(|| anyhow!("server not found"))?;
-        self.core.connect(&server)?;
-        self.state.active_server_id = Some(server_id.to_string());
-        self.state.xray_pid = self.core.child_pid();
+        let profile = self
+            .default_profile()
+            .ok_or_else(|| anyhow!("no default session is available"))?
+            .to_string();
+        self.sessions
+            .get_mut(&profile)
+            .expect("the selected session exists")
+            .connect(&server)?;
+        self.sync_session(&profile);
         if let Err(error) = self.state.save() {
             log::warn!("could not persist the active Xray process: {error:#}");
         }
@@ -381,22 +728,49 @@ impl Engine {
     }
 
     pub fn disconnect(&mut self) {
-        self.core.disconnect();
-        self.state.active_server_id = None;
-        self.state.xray_pid = None;
+        let Some(profile) = self.default_profile().map(str::to_string) else {
+            return;
+        };
+        if let Some(session) = self.sessions.get_mut(&profile) {
+            session.disconnect();
+        }
+        self.sync_session(&profile);
         if let Err(error) = self.state.save() {
             log::warn!("could not persist the disconnected state: {error:#}");
         }
     }
 
     pub fn status(&self) -> Status {
-        self.core.status()
+        self.default_session()
+            .map(Session::status)
+            .unwrap_or(Status::Disconnected)
     }
 
     /// Probe one server with the configured latency method, measured against
     /// that server rather than through the tunnel.
     pub fn probe(&self, server: &Server) -> probe::ProbeOutcome {
-        probe::measure(server, &self.config, probe::Route::Direct)
+        probe::measure(
+            server,
+            &self.registry.config,
+            probe::Route::Direct,
+            Ipv4Addr::LOCALHOST,
+        )
+    }
+
+    fn sync_session(&mut self, profile: &str) {
+        let Some(saved) = self.sessions.get(profile).map(Session::state) else {
+            return;
+        };
+        if let Some(existing) = self
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.profile == profile)
+        {
+            *existing = saved;
+        } else {
+            self.state.sessions.push(saved);
+        }
     }
 }
 
@@ -404,9 +778,18 @@ impl Drop for Engine {
     fn drop(&mut self) {
         // Stop the child before the struct fields drop so the recovery flag
         // can be persisted as clean in the same pass.
-        self.core.disconnect();
-        if self.state.xray_pid.is_some() {
-            self.state.xray_pid = None;
+        for session in self.sessions.inner.values_mut() {
+            session.core.disconnect();
+        }
+        if self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.xray_pid.is_some())
+        {
+            for session in &mut self.state.sessions {
+                session.xray_pid = None;
+            }
             if let Err(error) = self.state.save() {
                 log::warn!("could not clear the Xray recovery PID on shutdown: {error:#}");
             }
@@ -416,8 +799,8 @@ impl Drop for Engine {
 
 /// Kill a leftover xray process from a previous run, but only after verifying
 /// the PID still belongs to our core — PIDs get recycled.
-fn kill_stale_xray(pid: u32) -> bool {
-    if !is_our_xray(pid) {
+fn kill_stale_xray(pid: u32, profile: &str) -> bool {
+    if !is_our_xray(pid, profile) {
         if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
             return true;
         }
@@ -475,12 +858,12 @@ fn wait_until_gone(pid: nix::unistd::Pid, timeout: std::time::Duration) -> bool 
 /// `xray-linux-amd64` and leave its tunnel up with no way to stop it. The
 /// generated config path is the reliable marker: nothing else is run against
 /// it. The name check stays as a fallback for when the data dir has moved.
-fn is_our_xray(pid: u32) -> bool {
+fn is_our_xray(pid: u32, profile: &str) -> bool {
     let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
     let cmdline = String::from_utf8_lossy(&raw);
-    if let Ok(config) = XrayCore::config_path()
+    if let Ok(config) = XrayCore::config_path(profile)
         && cmdline
             .split('\0')
             .any(|arg| !arg.is_empty() && std::path::Path::new(arg) == config)
@@ -494,14 +877,16 @@ fn is_our_xray(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use std::hash::{Hash, Hasher};
+    use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use anyhow::{Context, Result, anyhow};
 
-    use super::{Engine, LOCAL_ID};
+    use super::{Engine, LOCAL_ID, Session, Sessions};
+    use crate::bind;
     use crate::link::parse_link;
     use crate::model::{Server, Subscription};
-    use crate::state::{State, store};
+    use crate::state::{SessionState, State, store};
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -551,6 +936,92 @@ mod tests {
         subscription
     }
 
+    fn saved_session(server_id: Option<String>) -> SessionState {
+        SessionState {
+            profile: "default".to_string(),
+            server_id,
+            address: Ipv4Addr::LOCALHOST,
+            socks_port: 10808,
+            http_port: 10809,
+            xray_pid: None,
+        }
+    }
+
+    fn saved_profile_session(profile: &str, xray_pid: Option<u32>) -> SessionState {
+        SessionState {
+            profile: profile.to_string(),
+            address: bind::address_for(profile, &[]).unwrap(),
+            xray_pid,
+            ..saved_session(None)
+        }
+    }
+
+    #[test]
+    fn sessions_iterate_in_profile_order_and_report_endpoints() {
+        let mut sessions = Sessions::default();
+        sessions.insert(Session::new(
+            "work".to_string(),
+            Ipv4Addr::new(127, 72, 14, 1),
+            10808,
+            10809,
+            String::new(),
+        ));
+        sessions.insert(Session::new(
+            "home".to_string(),
+            Ipv4Addr::new(127, 31, 8, 1),
+            10808,
+            10809,
+            String::new(),
+        ));
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|(profile, _)| profile)
+                .collect::<Vec<_>>(),
+            ["home", "work"]
+        );
+        assert_eq!(sessions.len(), 2);
+        assert!(!sessions.is_empty());
+        assert_eq!(sessions.taken_addresses().len(), 2);
+        assert_eq!(
+            sessions.get("work").unwrap().socks_endpoint().to_string(),
+            "127.72.14.1:10808"
+        );
+        assert_eq!(
+            sessions.get("work").unwrap().http_endpoint().to_string(),
+            "127.72.14.1:10809"
+        );
+        assert!(sessions.owner_of_system_proxy().is_none());
+        assert!(sessions.remove("home").is_some());
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn recovery_clears_every_recorded_session_pid() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("recover-all-sessions")?;
+        State {
+            sessions: vec![
+                saved_profile_session("home", Some(4_000_000)),
+                saved_profile_session("work", Some(4_000_001)),
+            ],
+        }
+        .save()?;
+
+        let engine = Engine::load();
+
+        assert_eq!(engine.state.sessions.len(), 2);
+        assert!(
+            engine
+                .state
+                .sessions
+                .iter()
+                .all(|session| session.xray_pid.is_none())
+        );
+        Ok(())
+    }
+
     #[test]
     fn migration_leaves_the_local_group_keyed_by_its_sentinel() -> Result<()> {
         let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
@@ -563,6 +1034,7 @@ mod tests {
         let engine = Engine::load();
 
         let group = engine
+            .registry
             .subscriptions
             .first()
             .ok_or_else(|| anyhow!("the local group disappeared"))?;
@@ -587,9 +1059,7 @@ mod tests {
         let server_count = subscription.servers.len();
         store::save(&[subscription])?;
         State {
-            active_server_id: Some(old_active),
-            active_profile: None,
-            xray_pid: None,
+            sessions: vec![saved_session(Some(old_active))],
         }
         .save()?;
 
@@ -597,7 +1067,7 @@ mod tests {
 
         assert_eq!(engine.all_servers().count(), server_count);
         assert_eq!(
-            engine.state.active_server_id.as_deref(),
+            engine.active_server_id().as_deref(),
             Some(expected_active.as_str())
         );
         assert!(
@@ -652,9 +1122,7 @@ mod tests {
         subscription.servers.push(duplicate);
         store::save(&[subscription])?;
         State {
-            active_server_id: Some("different-old-id".to_string()),
-            active_profile: None,
-            xray_pid: None,
+            sessions: vec![saved_session(Some("different-old-id".to_string()))],
         }
         .save()?;
 
@@ -669,7 +1137,7 @@ mod tests {
             Some("First")
         );
         assert_eq!(
-            engine.state.active_server_id,
+            engine.active_server_id(),
             engine.all_servers().next().map(|server| server.id.clone())
         );
         Ok(())
@@ -691,14 +1159,14 @@ mod tests {
             .parent()
             .ok_or_else(|| anyhow!("subscription path has no parent"))?
             .join("state.toml");
-        let state: State = toml::from_str(
-            &std::fs::read_to_string(&state_path)
-                .with_context(|| format!("reading {}", state_path.display()))?,
-        )
-        .with_context(|| format!("parsing {}", state_path.display()))?;
-        let active_before = state
-            .active_server_id
-            .clone()
+        let state_body = std::fs::read_to_string(&state_path)
+            .with_context(|| format!("reading {}", state_path.display()))?;
+        let state_value: toml::Value = toml::from_str(&state_body)
+            .with_context(|| format!("parsing {}", state_path.display()))?;
+        let active_before = state_value
+            .get("active_server_id")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
             .ok_or_else(|| anyhow!("the real state has no active server"))?;
         if !subscriptions
             .iter()
@@ -714,14 +1182,12 @@ mod tests {
 
         let _root = TestRoot::install("real-identity-migration")?;
         store::save(&subscriptions)?;
-        state.save()?;
+        crate::fsutil::write_private_atomic(&crate::paths::state_file()?, state_body.as_bytes())?;
         let engine = Engine::load();
 
         assert_eq!(engine.all_servers().count(), server_count);
         let active_after = engine
-            .state
-            .active_server_id
-            .as_deref()
+            .active_server_id()
             .ok_or_else(|| anyhow!("migration cleared the active server"))?;
         assert!(
             engine.all_servers().any(|server| server.id == active_after),

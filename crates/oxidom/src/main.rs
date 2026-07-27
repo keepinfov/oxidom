@@ -214,8 +214,13 @@ fn ip(egress: bool, fresh: bool) -> CliResult {
     let (_, server) = connected_server(&client)?;
     let address = if egress {
         let config = client.settings().map_err(Failure::error)?;
-        oxidom_core::egress::address(&server.id, config.socks_port, fresh)
-            .map_err(Failure::error)?
+        oxidom_core::egress::address(
+            &server.id,
+            std::net::Ipv4Addr::LOCALHOST,
+            config.socks_port,
+            fresh,
+        )
+        .map_err(Failure::error)?
     } else {
         endpoint_ip(&server)?
     };

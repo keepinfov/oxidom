@@ -1,4 +1,5 @@
 pub mod alias;
+pub mod bind;
 pub mod cli_json;
 pub mod client;
 pub mod config;

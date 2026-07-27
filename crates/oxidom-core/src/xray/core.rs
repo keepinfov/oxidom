@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -93,17 +94,21 @@ impl XrayCore {
         *crate::sync::lock(&self.status) = s;
     }
 
-    pub(crate) fn config_path() -> Result<PathBuf> {
-        Ok(paths::data_dir()?.join("current-config.json"))
+    pub(crate) fn config_path(profile: &str) -> Result<PathBuf> {
+        if !crate::profile::valid_name(profile) {
+            bail!("refusing to build an Xray config path from invalid profile {profile:?}");
+        }
+        Ok(paths::data_dir()?.join(format!("current-config-{profile}.json")))
     }
 
     /// Refuse to start when a local inbound port is already taken; otherwise
     /// Xray exits instantly and the only symptom would be a failed probe.
-    fn ensure_ports_free(&self) -> Result<()> {
+    fn ensure_ports_free(&self, bind: Ipv4Addr) -> Result<()> {
         for (port, label) in [(self.socks_port, "SOCKS"), (self.http_port, "HTTP")] {
-            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            if std::net::TcpListener::bind((bind, port)).is_err() {
                 bail!(
-                    "local {label} port {port} is already in use — pick a different port in Settings"
+                    "local {label} endpoint {bind}:{port} is already in use — pick a different \
+                     port in Settings"
                 );
             }
         }
@@ -111,11 +116,11 @@ impl XrayCore {
     }
 
     /// Start (or restart) the core for `server`.
-    pub fn connect(&mut self, server: &Server) -> Result<()> {
+    pub fn connect(&mut self, server: &Server, bind: Ipv4Addr, profile: &str) -> Result<()> {
         self.disconnect();
         self.set_status(Status::Connecting);
         crate::sync::lock(&self.logs).clear();
-        match self.try_connect(server) {
+        match self.try_connect(server, bind, profile) {
             Ok(()) => Ok(()),
             Err(error) => {
                 // `{:#}` keeps the anyhow cause chain: the outermost context
@@ -167,13 +172,13 @@ impl XrayCore {
         }
     }
 
-    fn try_connect(&mut self, server: &Server) -> Result<()> {
+    fn try_connect(&mut self, server: &Server, bind: Ipv4Addr, profile: &str) -> Result<()> {
         // Resolve before checking ports: a busy port must not mask a missing core.
         let xray = self.resolve_binary()?;
         self.preflight_notes(server);
-        self.ensure_ports_free()?;
-        let cfg = config::generate(server, self.socks_port, self.http_port);
-        let path = Self::config_path()?;
+        self.ensure_ports_free(bind)?;
+        let cfg = config::generate(server, bind, self.socks_port, self.http_port);
+        let path = Self::config_path(profile)?;
         // The generated config embeds the server credentials — keep it private.
         fsutil::write_private_atomic(&path, serde_json::to_string_pretty(&cfg)?.as_bytes())
             .context("writing xray config")?;
@@ -280,4 +285,24 @@ fn push_log(logs: &Arc<Mutex<Vec<String>>>, line: String) {
         logs.remove(0);
     }
     logs.push(line);
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::XrayCore;
+
+    #[test]
+    fn config_paths_are_profile_scoped_and_validate_the_name() -> Result<()> {
+        let work = XrayCore::config_path("work")?;
+        let home = XrayCore::config_path("home")?;
+        assert_ne!(work, home);
+        assert_eq!(
+            work.file_name().and_then(|name| name.to_str()),
+            Some("current-config-work.json")
+        );
+        assert!(XrayCore::config_path("../outside").is_err());
+        Ok(())
+    }
 }

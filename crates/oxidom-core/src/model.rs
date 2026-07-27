@@ -250,12 +250,7 @@ impl Server {
     /// server id that changes with the toolchain silently orphans the active server,
     /// every profile and every unit named after it.
     pub fn stable_id(seed: &str) -> String {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in seed.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        format!("{hash:016x}")
+        format!("{:016x}", stable_hash(seed))
     }
 
     /// The string a server's id is derived from. Kept in one place so that the id
@@ -296,6 +291,18 @@ impl Server {
             && self.port == other.port
             && self.spec == other.spec
     }
+}
+
+/// The stable 64-bit value behind persisted ids and profile bind addresses.
+/// Keeping both consumers on one implementation prevents a toolchain update
+/// from moving either identity unexpectedly.
+pub(crate) fn stable_hash(seed: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

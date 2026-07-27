@@ -1,6 +1,6 @@
 use std::error::Error as _;
 use std::io;
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -76,7 +76,7 @@ pub enum ProbeOutcome {
 /// `Route::Proxied` goes through the tunnel already in use, and never falls
 /// back to a direct probe: that would report a healthy number for a tunnel
 /// carrying nothing.
-pub fn measure(server: &Server, config: &Config, route: Route) -> ProbeOutcome {
+pub fn measure(server: &Server, config: &Config, route: Route, bind: Ipv4Addr) -> ProbeOutcome {
     let method = config.latency_method;
     match method {
         LatencyMethod::Icmp => icmp_ping(&server.address),
@@ -88,9 +88,13 @@ pub fn measure(server: &Server, config: &Config, route: Route) -> ProbeOutcome {
                 "GET"
             };
             match route {
-                Route::Proxied => {
-                    http_ping(config.socks_port, &config.latency_test_url, verb, TIMEOUT)
-                }
+                Route::Proxied => http_ping(
+                    bind,
+                    config.socks_port,
+                    &config.latency_test_url,
+                    verb,
+                    TIMEOUT,
+                ),
                 Route::Direct => real_delay(server, config, verb),
             }
         }
@@ -109,7 +113,11 @@ fn real_delay(server: &Server, config: &Config, verb: &str) -> ProbeOutcome {
         Ok(core) => core,
         Err(outcome) => return outcome,
     };
-    if !socks_ready(core.socks_port, PROBE_CORE_READY_TIMEOUT) {
+    if !socks_ready(
+        Ipv4Addr::LOCALHOST,
+        core.socks_port,
+        PROBE_CORE_READY_TIMEOUT,
+    ) {
         log::debug!(
             "probe core for {} never bound its inbound within {}s",
             server.address,
@@ -118,6 +126,7 @@ fn real_delay(server: &Server, config: &Config, verb: &str) -> ProbeOutcome {
         return ProbeOutcome::Timeout;
     }
     http_ping(
+        Ipv4Addr::LOCALHOST,
         core.socks_port,
         &config.latency_test_url,
         verb,
@@ -154,7 +163,7 @@ impl ProbeCore {
         // server, which is why the gap is kept as short as possible.
         let socks_port = free_port().map_err(|_| ProbeOutcome::Internal("no free port"))?;
         let http_port = free_port().map_err(|_| ProbeOutcome::Internal("no free port"))?;
-        let generated = xray_config::generate(server, socks_port, http_port);
+        let generated = xray_config::generate(server, Ipv4Addr::LOCALHOST, socks_port, http_port);
         let config_path = paths::data_dir()
             .map_err(|_| ProbeOutcome::Internal("cannot stage a probe config"))?
             .join(format!("probe-{socks_port}.json"));
@@ -235,9 +244,9 @@ fn direct_ping(server: &Server) -> ProbeOutcome {
 }
 
 /// Is the local SOCKS inbound accepting connections?
-pub fn socks_up(port: u16) -> bool {
+pub fn socks_up(address: Ipv4Addr, port: u16) -> bool {
     std::net::TcpStream::connect_timeout(
-        &(std::net::Ipv4Addr::LOCALHOST, port).into(),
+        &SocketAddrV4::new(address, port).into(),
         std::time::Duration::from_millis(300),
     )
     .is_ok()
@@ -246,14 +255,14 @@ pub fn socks_up(port: u16) -> bool {
 /// Wait for the core to bind its SOCKS inbound after a spawn. The process
 /// being alive says nothing about whether it is carrying traffic yet, so this
 /// is what "connected" actually rests on.
-pub fn wait_for_socks(port: u16) -> bool {
-    socks_ready(port, SOCKS_READY_TIMEOUT)
+pub fn wait_for_socks(address: Ipv4Addr, port: u16) -> bool {
+    socks_ready(address, port, SOCKS_READY_TIMEOUT)
 }
 
-fn socks_ready(port: u16, timeout: Duration) -> bool {
+fn socks_ready(address: Ipv4Addr, port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if socks_up(port) {
+        if socks_up(address, port) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -315,8 +324,14 @@ pub fn icmp_ping(host: &str) -> ProbeOutcome {
 }
 
 /// Time an HTTP request to `url` routed through the local SOCKS inbound.
-pub fn http_ping(socks_port: u16, url: &str, method: &str, timeout: Duration) -> ProbeOutcome {
-    let proxy_url = format!("socks5://127.0.0.1:{socks_port}");
+pub fn http_ping(
+    address: Ipv4Addr,
+    socks_port: u16,
+    url: &str,
+    method: &str,
+    timeout: Duration,
+) -> ProbeOutcome {
+    let proxy_url = format!("socks5://{address}:{socks_port}");
     let proxy = match ureq::Proxy::new(&proxy_url) {
         Ok(proxy) => proxy,
         Err(_) => return ProbeOutcome::Internal("bad proxy url"),
@@ -517,8 +532,12 @@ eth0 00000000 0100A8C0 0003 0 0 100 00000000 0 0 0
                 crate::link::parse_link(&link).expect("the link parses")
             }
         };
-        let ProbeOutcome::Reachable(measured) = measure(&server, &Config::default(), Route::Direct)
-        else {
+        let ProbeOutcome::Reachable(measured) = measure(
+            &server,
+            &Config::default(),
+            Route::Direct,
+            Ipv4Addr::LOCALHOST,
+        ) else {
             panic!("the server did not carry the request");
         };
         assert_eq!(

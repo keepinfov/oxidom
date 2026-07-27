@@ -1,15 +1,17 @@
+use std::net::Ipv4Addr;
+
 use serde_json::{Value, json};
 
 use crate::model::{Hysteria2Settings, OutboundSpec, Server, StreamSettings};
 
 /// Generate a full Xray config JSON for `server`, with local SOCKS + HTTP inbounds.
-pub fn generate(server: &Server, socks_port: u16, http_port: u16) -> Value {
+pub fn generate(server: &Server, bind: Ipv4Addr, socks_port: u16, http_port: u16) -> Value {
     let mut config = json!({
         "log": { "loglevel": "warning" },
         "inbounds": [
             {
                 "tag": "socks-in",
-                "listen": "127.0.0.1",
+                "listen": bind.to_string(),
                 "port": socks_port,
                 "protocol": "socks",
                 "settings": { "auth": "noauth", "udp": true },
@@ -17,7 +19,7 @@ pub fn generate(server: &Server, socks_port: u16, http_port: u16) -> Value {
             },
             {
                 "tag": "http-in",
-                "listen": "127.0.0.1",
+                "listen": bind.to_string(),
                 "port": http_port,
                 "protocol": "http",
                 "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
@@ -283,6 +285,8 @@ fn trim_obj(v: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use serde_json::json;
 
     use super::generate;
@@ -314,7 +318,7 @@ mod tests {
             latency_ms: None,
         };
 
-        let config = generate(&server, 10808, 10809);
+        let config = generate(&server, Ipv4Addr::LOCALHOST, 10808, 10809);
         assert_eq!(config["inbounds"][0]["port"], 10808);
         assert_eq!(config["outbounds"].as_array().map(Vec::len), Some(4));
         assert_eq!(config["routing"]["rules"][0]["ip"][0], "geoip:private");
@@ -350,12 +354,89 @@ mod tests {
         }
     }
 
+    fn socks_server() -> Server {
+        Server {
+            id: "socks".to_string(),
+            name: "SOCKS".to_string(),
+            protocol: Protocol::Socks,
+            address: "proxy.example".to_string(),
+            port: 1080,
+            transport_label: "socks".to_string(),
+            country: None,
+            spec: OutboundSpec::Socks {
+                username: None,
+                password: None,
+            },
+            link: None,
+            alias: None,
+            latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn default_bind_keeps_the_legacy_config_bytes() {
+        let generated = generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809);
+        let legacy = json!({
+            "log": { "loglevel": "warning" },
+            "inbounds": [
+                {
+                    "tag": "socks-in",
+                    "listen": "127.0.0.1",
+                    "port": 10808,
+                    "protocol": "socks",
+                    "settings": { "auth": "noauth", "udp": true },
+                    "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+                },
+                {
+                    "tag": "http-in",
+                    "listen": "127.0.0.1",
+                    "port": 10809,
+                    "protocol": "http",
+                    "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+                }
+            ],
+            "outbounds": [
+                {
+                    "tag": "proxy",
+                    "protocol": "socks",
+                    "settings": { "servers": [{ "address": "proxy.example", "port": 1080 }] }
+                },
+                { "protocol": "freedom", "tag": "direct" },
+                { "protocol": "blackhole", "tag": "block" }
+            ],
+            "routing": {
+                "domainStrategy": "IPIfNonMatch",
+                "rules": [
+                    { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" }
+                ]
+            }
+        });
+
+        assert_eq!(
+            serde_json::to_vec(&generated).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+    }
+
+    #[test]
+    fn both_inbounds_use_the_session_address() {
+        let bind = Ipv4Addr::new(127, 72, 14, 1);
+        let config = generate(&socks_server(), bind, 10808, 10809);
+        assert_eq!(config["inbounds"][0]["listen"], "127.72.14.1");
+        assert_eq!(config["inbounds"][1]["listen"], "127.72.14.1");
+    }
+
     /// Xray 26.x rejects the whole config when `allowInsecure` is true, so a
     /// server that asks for it must still produce a config the core will start.
     #[test]
     fn allow_insecure_is_never_emitted() {
         for insecure in [true, false] {
-            let config = generate(&tls_vless(insecure, None), 10808, 10809);
+            let config = generate(
+                &tls_vless(insecure, None),
+                Ipv4Addr::LOCALHOST,
+                10808,
+                10809,
+            );
             let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
             assert!(
                 tls.get("allowInsecure").is_none(),
@@ -368,7 +449,12 @@ mod tests {
     #[test]
     fn certificate_pin_is_emitted_as_a_bare_hex_string() {
         let pin = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let config = generate(&tls_vless(true, Some(pin)), 10808, 10809);
+        let config = generate(
+            &tls_vless(true, Some(pin)),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+        );
         let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
         // A bare string, not an array: Xray 26.x fails to decode the array form.
         assert_eq!(tls["pinnedPeerCertSha256"], json!(pin));
@@ -376,7 +462,7 @@ mod tests {
 
     #[test]
     fn absent_pin_leaves_the_key_out() {
-        let config = generate(&tls_vless(false, None), 10808, 10809);
+        let config = generate(&tls_vless(false, None), Ipv4Addr::LOCALHOST, 10808, 10809);
         let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
         assert!(tls.get("pinnedPeerCertSha256").is_none(), "{tls}");
     }
@@ -409,6 +495,7 @@ mod tests {
                 down_mbps: Some(300),
                 ..Default::default()
             }),
+            Ipv4Addr::LOCALHOST,
             10808,
             10809,
         );
@@ -446,6 +533,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            Ipv4Addr::LOCALHOST,
             10808,
             10809,
         );
@@ -468,6 +556,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            Ipv4Addr::LOCALHOST,
             10808,
             10809,
         );
@@ -495,6 +584,7 @@ mod tests {
                 hop_interval_secs: Some(30),
                 ..Default::default()
             }),
+            Ipv4Addr::LOCALHOST,
             10808,
             10809,
         );
@@ -505,7 +595,12 @@ mod tests {
 
     #[test]
     fn unset_hysteria2_options_are_omitted_entirely() {
-        let config = generate(&hysteria2(Hysteria2Settings::default()), 10808, 10809);
+        let config = generate(
+            &hysteria2(Hysteria2Settings::default()),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+        );
         let stream = &config["outbounds"][0]["streamSettings"];
         let hy = &stream["hysteriaSettings"];
         for key in ["up", "down", "congestion", "udpIdleTimeout", "udpHop"] {
@@ -516,7 +611,7 @@ mod tests {
 
     #[test]
     fn vless_outbound_shape() {
-        let config = generate(&tls_vless(false, None), 10808, 10809);
+        let config = generate(&tls_vless(false, None), Ipv4Addr::LOCALHOST, 10808, 10809);
         let out = &config["outbounds"][0];
         assert_eq!(out["protocol"], "vless");
         assert_eq!(out["settings"]["vnext"][0]["address"], "example.com");
@@ -576,8 +671,13 @@ mod tests {
             ])
             .collect();
 
-        for server in &servers {
-            let config = generate(server, 10808, 10809);
+        for (index, server) in servers.iter().enumerate() {
+            let bind = if index == 0 {
+                Ipv4Addr::new(127, 72, 14, 1)
+            } else {
+                Ipv4Addr::LOCALHOST
+            };
+            let config = generate(server, bind, 10808, 10809);
             let path = std::env::temp_dir().join(format!(
                 "oxidom-cfg-{}-{}.json",
                 std::process::id(),

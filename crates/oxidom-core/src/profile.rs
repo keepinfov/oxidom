@@ -153,8 +153,7 @@ pub fn ensure_default(engine: &Engine) -> Result<()> {
         return Ok(());
     }
     let server = engine
-        .state
-        .active_server_id
+        .active_server_id()
         .as_deref()
         .and_then(|active_id| engine.all_servers().find(|server| server.id == active_id))
         .and_then(|server| server.alias.clone())
@@ -162,8 +161,8 @@ pub fn ensure_default(engine: &Engine) -> Result<()> {
     let profile = Profile {
         select: ProfileSelect { server },
         proxy: ProfileProxy {
-            socks_port: engine.config.socks_port,
-            http_port: engine.config.http_port,
+            socks_port: engine.registry.config.socks_port,
+            http_port: engine.registry.config.http_port,
         },
         ..Profile::default()
     };

@@ -2205,7 +2205,13 @@ impl Controller {
         };
         let want = applied_settings.system_proxy && status == Status::Connected;
         if want && !self.proxy_applied.get() {
-            if sysproxy::apply(applied_settings.socks_port, applied_settings.http_port).is_ok() {
+            if sysproxy::apply(
+                std::net::Ipv4Addr::LOCALHOST,
+                applied_settings.socks_port,
+                applied_settings.http_port,
+            )
+            .is_ok()
+            {
                 self.proxy_applied.set(true);
                 if let Some(marker) = gui_proxy_marker() {
                     let _ = std::fs::write(marker, b"1");

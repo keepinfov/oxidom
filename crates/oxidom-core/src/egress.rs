@@ -1,6 +1,6 @@
 //! Observe and cache the tunnel's public egress address for the CLI.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -12,7 +12,7 @@ pub const DEFAULT_EGRESS_URL: &str = "https://api.ipify.org";
 const CACHE_TTL_MS: u64 = 60_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub fn address(server_id: &str, socks_port: u16, fresh: bool) -> Result<IpAddr> {
+pub fn address(server_id: &str, bind: Ipv4Addr, socks_port: u16, fresh: bool) -> Result<IpAddr> {
     let path = paths::cache_dir()?.join("egress.json");
     let now = crate::ipc::now_unix_ms();
     if !fresh
@@ -33,7 +33,7 @@ pub fn address(server_id: &str, socks_port: u16, fresh: bool) -> Result<IpAddr> 
     // transport passes a domain `TargetAddr` to the proxy instead of resolving
     // it locally. In other words, `socks5` here has the `socks5h` behavior the
     // CLI contract requires.
-    let proxy_url = format!("socks5://127.0.0.1:{socks_port}");
+    let proxy_url = format!("socks5://{bind}:{socks_port}");
     let proxy = ureq::Proxy::new(&proxy_url).context("building the local SOCKS proxy URL")?;
     let response = ureq::AgentBuilder::new()
         .proxy(proxy)
