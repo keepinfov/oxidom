@@ -1,8 +1,12 @@
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
-use std::os::unix::process::CommandExt;
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+
+pub const PROFILE_SUBCOMMANDS: &[&str] = &["up", "down", "status", "ip", "run", "env", "tun"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -39,18 +43,27 @@ pub enum Command {
     },
     /// Show the active connection.
     Status {
+        /// Profile to inspect. Omitted, all sessions are listed.
+        profile: Option<String>,
         /// Print the stable machine-readable schema.
         #[arg(long)]
         json: bool,
     },
     /// Print the active server endpoint or observed public egress address.
     Ip {
+        /// Session whose server to inspect (defaults to `default`).
+        profile: Option<String>,
         /// Observe the public address through the active SOCKS tunnel.
         #[arg(long)]
         egress: bool,
         /// Ignore the 60-second egress cache.
         #[arg(long, requires = "egress")]
         fresh: bool,
+    },
+    /// Print shell exports for one session's local proxies.
+    Env {
+        /// Session whose proxy variables to print (defaults to `default`).
+        profile: Option<String>,
     },
     /// List daemon objects.
     List {
@@ -113,6 +126,7 @@ pub enum ListTarget {
     Servers,
     Profiles,
     Subscriptions,
+    Sessions,
 }
 
 #[derive(Subcommand, Debug)]
@@ -131,6 +145,36 @@ pub enum ProfileCommand {
     Edit { name: String },
     /// Remove one profile.
     Rm { name: String },
+}
+
+/// Accept both `oxidom up work` and `oxidom work up`.
+///
+/// Verb-first is canonical: it is the form documented in AGENTS.md and used
+/// by `oxidom@.service`. Profile-first is a shell-history-friendly synonym.
+pub fn normalize(mut args: Vec<OsString>) -> Vec<OsString> {
+    if args.len() < 3 {
+        return args;
+    }
+    if args[1].as_os_str().as_bytes().starts_with(b"-") {
+        return args;
+    }
+
+    let command = Cli::command();
+    let known = command.get_subcommands().any(|subcommand| {
+        args[1] == subcommand.get_name()
+            || subcommand.get_all_aliases().any(|alias| args[1] == alias)
+    });
+    if known {
+        return args;
+    }
+
+    if args[2]
+        .to_str()
+        .is_some_and(|verb| PROFILE_SUBCOMMANDS.contains(&verb))
+    {
+        args.swap(1, 2);
+    }
+    args
 }
 
 fn gui_binary() -> PathBuf {
@@ -163,4 +207,96 @@ pub fn run_gui(background: bool, debug: bool) -> Result<()> {
             executable.display()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(normalize(args.iter().map(OsString::from).collect()))
+    }
+
+    #[test]
+    fn verb_first_and_profile_first_parse_identically() {
+        for (verb_first, profile_first) in [
+            (&["oxidom", "up", "work"][..], &["oxidom", "work", "up"][..]),
+            (
+                &["oxidom", "down", "work"][..],
+                &["oxidom", "work", "down"][..],
+            ),
+            (
+                &["oxidom", "status", "work", "--json"][..],
+                &["oxidom", "work", "status", "--json"][..],
+            ),
+            (
+                &["oxidom", "env", "work"][..],
+                &["oxidom", "work", "env"][..],
+            ),
+        ] {
+            assert_eq!(
+                format!("{:?}", parse(verb_first).unwrap().command),
+                format!("{:?}", parse(profile_first).unwrap().command)
+            );
+        }
+    }
+
+    #[test]
+    fn an_existing_verb_or_flag_is_never_swapped() {
+        let list = normalize(
+            ["oxidom", "list", "servers"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        );
+        assert_eq!(list, ["oxidom", "list", "servers"]);
+
+        let version = normalize(
+            ["oxidom", "--version", "work"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        );
+        assert_eq!(version, ["oxidom", "--version", "work"]);
+    }
+
+    #[test]
+    fn profile_first_run_preserves_the_separator_and_tail() {
+        let cli = parse(&["oxidom", "work", "run", "--", "curl", "x"]).unwrap();
+        let Command::Run { args } = cli.command else {
+            panic!("run did not parse");
+        };
+        assert_eq!(args, ["work", "--", "curl", "x"]);
+    }
+
+    #[test]
+    fn an_unknown_pair_passes_through_to_clap() {
+        let input: Vec<OsString> = ["oxidom", "foo", "bar"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(normalize(input.clone()), input);
+        assert!(Cli::try_parse_from(input).is_err());
+    }
+
+    #[test]
+    fn reserved_profile_names_track_clap_commands_and_aliases() {
+        let mut clap_names = BTreeSet::new();
+        let command = Cli::command();
+        for subcommand in command.get_subcommands() {
+            clap_names.insert(subcommand.get_name());
+            clap_names.extend(subcommand.get_all_aliases());
+        }
+        // `tun` is reserved ahead of phase 4b so adding the command cannot
+        // make an existing profile ambiguous overnight.
+        clap_names.insert("tun");
+
+        let reserved: BTreeSet<&str> = oxidom_core::profile::RESERVED_NAMES
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(reserved, clap_names);
+    }
 }

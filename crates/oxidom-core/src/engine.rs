@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::model::{Server, Subscription};
 use crate::state::{self, SessionState, State, store};
 use crate::xray::core::{Status, XrayCore};
-use crate::{alias, bind, link, probe, subscription};
+use crate::{alias, link, probe, subscription};
 
 /// Fixed id of the local group that holds servers imported by share-link,
 /// not tied to any subscription URL. It is a sentinel rather than a hash, so
@@ -385,6 +385,7 @@ impl Session {
 #[derive(Default)]
 pub struct Sessions {
     inner: BTreeMap<String, Session>,
+    system_proxy_owner: Option<String>,
 }
 
 impl Sessions {
@@ -401,7 +402,11 @@ impl Sessions {
     }
 
     pub fn remove(&mut self, profile: &str) -> Option<Session> {
-        self.inner.remove(profile)
+        let removed = self.inner.remove(profile);
+        if removed.is_some() && self.system_proxy_owner.as_deref() == Some(profile) {
+            self.system_proxy_owner = None;
+        }
+        removed
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Session)> {
@@ -423,7 +428,28 @@ impl Sessions {
     }
 
     pub fn owner_of_system_proxy(&self) -> Option<&str> {
-        None
+        self.system_proxy_owner.as_deref()
+    }
+
+    pub fn claim_system_proxy(&mut self, profile: &str) -> Result<()> {
+        if let Some(owner) = self.owner_of_system_proxy()
+            && owner != profile
+        {
+            return Err(anyhow!(
+                "the system proxy is already held by profile {owner:?}"
+            ));
+        }
+        if !self.inner.contains_key(profile) {
+            return Err(anyhow!("profile {profile:?} has no session"));
+        }
+        self.system_proxy_owner = Some(profile.to_string());
+        Ok(())
+    }
+
+    pub fn release_system_proxy(&mut self, profile: &str) {
+        if self.owner_of_system_proxy() == Some(profile) {
+            self.system_proxy_owner = None;
+        }
     }
 
     fn from_state(state: &State, config: &Config) -> Self {
@@ -438,17 +464,6 @@ impl Sessions {
             );
             session.server_id.clone_from(&saved.server_id);
             sessions.insert(session);
-        }
-        if sessions.is_empty() {
-            let address = bind::address_for("default", &[])
-                .expect("the reserved default address is always available");
-            sessions.insert(Session::new(
-                "default".to_string(),
-                address,
-                config.socks_port,
-                config.http_port,
-                config.xray_binary.clone(),
-            ));
         }
         sessions
     }
@@ -576,9 +591,7 @@ impl Engine {
         if let Some(session) = self.sessions.get("default") {
             return Some(session);
         }
-        (self.sessions.len() == 1)
-            .then(|| self.sessions.iter().next().map(|(_, session)| session))
-            .flatten()
+        self.sessions.iter().next().map(|(_, session)| session)
     }
 
     pub fn default_session_mut(&mut self) -> Option<&mut Session> {
@@ -589,15 +602,16 @@ impl Engine {
     fn default_profile(&self) -> Option<&str> {
         if self.sessions.get("default").is_some() {
             Some("default")
-        } else if self.sessions.len() == 1 {
-            self.sessions.iter().next().map(|(profile, _)| profile)
         } else {
-            None
+            self.sessions.iter().next().map(|(profile, _)| profile)
         }
     }
 
-    /// Select the single session the compatibility daemon is about to use.
-    /// A2 replaces this transition with insertion alongside existing sessions.
+    /// Create a session alongside the profiles that are already running.
+    ///
+    /// Reusing an existing entry is reserved for `Connect`, whose historical
+    /// contract is to replace whatever the `default` session is carrying.
+    /// `UpProfile` rejects an existing entry before it reaches this method.
     pub fn prepare_session(
         &mut self,
         profile: &str,
@@ -614,11 +628,6 @@ impl Engine {
             return Ok(());
         }
 
-        for session in self.sessions.inner.values_mut() {
-            session.disconnect();
-        }
-        self.sessions.inner.clear();
-        self.state.sessions.clear();
         self.sessions.insert(Session::new(
             profile.to_string(),
             address,
@@ -630,13 +639,11 @@ impl Engine {
     }
 
     pub fn set_default_ports(&mut self, socks_port: u16, http_port: u16) {
-        let Some(profile) = self.default_profile().map(str::to_string) else {
+        let Some(session) = self.sessions.get_mut("default") else {
             return;
         };
-        if let Some(session) = self.sessions.get_mut(&profile) {
-            session.set_ports(socks_port, http_port);
-        }
-        self.sync_session(&profile);
+        session.set_ports(socks_port, http_port);
+        self.sync_session("default");
     }
 
     pub fn active_server_id(&self) -> Option<String> {
@@ -709,18 +716,18 @@ impl Engine {
     }
 
     pub fn connect(&mut self, server_id: &str) -> Result<()> {
+        self.connect_session("default", server_id)
+    }
+
+    pub fn connect_session(&mut self, profile: &str, server_id: &str) -> Result<()> {
         let server = self
             .find_server(server_id)
             .ok_or_else(|| anyhow!("server not found"))?;
-        let profile = self
-            .default_profile()
-            .ok_or_else(|| anyhow!("no default session is available"))?
-            .to_string();
         self.sessions
-            .get_mut(&profile)
-            .expect("the selected session exists")
+            .get_mut(profile)
+            .ok_or_else(|| anyhow!("profile {profile:?} has no session"))?
             .connect(&server)?;
-        self.sync_session(&profile);
+        self.sync_session(profile);
         if let Err(error) = self.state.save() {
             log::warn!("could not persist the active Xray process: {error:#}");
         }
@@ -728,16 +735,46 @@ impl Engine {
     }
 
     pub fn disconnect(&mut self) {
-        let Some(profile) = self.default_profile().map(str::to_string) else {
-            return;
-        };
-        if let Some(session) = self.sessions.get_mut(&profile) {
+        if let Err(error) = self.remove_session("default") {
+            log::warn!("could not persist the disconnected state: {error:#}");
+        }
+    }
+
+    /// Stop a core but keep its session entry so a failed connection remains
+    /// inspectable until the user explicitly brings the profile down.
+    pub fn stop_session(&mut self, profile: &str) {
+        if let Some(session) = self.sessions.get_mut(profile) {
             session.disconnect();
         }
-        self.sync_session(&profile);
+        self.sync_session(profile);
         if let Err(error) = self.state.save() {
             log::warn!("could not persist the disconnected state: {error:#}");
         }
+    }
+
+    /// Bring one profile down and forget its ephemeral runtime allocation.
+    pub fn remove_session(&mut self, profile: &str) -> Result<bool> {
+        let Some(mut session) = self.sessions.remove(profile) else {
+            return Ok(false);
+        };
+        session.disconnect();
+        self.state.sessions.retain(|saved| saved.profile != profile);
+        self.state.save()?;
+        Ok(true)
+    }
+
+    /// An unnamed `Down` means all sessions, not whichever one happens to be
+    /// visible through the compatibility status fields.
+    pub fn disconnect_all(&mut self) -> Result<bool> {
+        let had_sessions = !self.sessions.is_empty();
+        for session in self.sessions.inner.values_mut() {
+            session.disconnect();
+        }
+        self.sessions.inner.clear();
+        self.sessions.system_proxy_owner = None;
+        self.state.sessions.clear();
+        self.state.save()?;
+        Ok(had_sessions)
     }
 
     pub fn status(&self) -> Status {
@@ -993,7 +1030,11 @@ mod tests {
             "127.72.14.1:10809"
         );
         assert!(sessions.owner_of_system_proxy().is_none());
+        sessions.claim_system_proxy("home").unwrap();
+        assert_eq!(sessions.owner_of_system_proxy(), Some("home"));
+        assert!(sessions.claim_system_proxy("work").is_err());
         assert!(sessions.remove("home").is_some());
+        assert!(sessions.owner_of_system_proxy().is_none());
         assert_eq!(sessions.len(), 1);
     }
 

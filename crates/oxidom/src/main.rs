@@ -10,10 +10,14 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use oxidom_core::cli_json::{ProfileOutput, ServerOutput, StatusOutput, SubscriptionOutput};
+use oxidom_core::cli_json::{
+    ProfileOutput, ServerOutput, SessionOutput, StatusOutput, SubscriptionOutput,
+};
 use oxidom_core::client::DaemonClient;
 use oxidom_core::handle::{self, HandleMatch};
-use oxidom_core::ipc::{PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry};
+use oxidom_core::ipc::{
+    PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry, SessionInfo,
+};
 use oxidom_core::model::{Server, Subscription};
 use oxidom_core::profile::{Profile, ProfileProxy};
 use serde::Serialize;
@@ -97,7 +101,7 @@ fn exit_code_for(kind: FailureKind) -> u8 {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(cli::normalize(std::env::args_os().collect()));
     // The daemon's log is its journal, and `journalctl -u oxidom` is the only
     // window into it. For every other subcommand the same lines are noise in
     // front of whatever the user actually asked for — "no daemon on the system
@@ -117,8 +121,13 @@ fn dispatch(cli: Cli) -> CliResult {
         Command::Up { profile } => up(&profile),
         Command::Down { profile } => down(profile.as_deref()),
         Command::Connect { handle } => connect(&handle),
-        Command::Status { json } => status(json),
-        Command::Ip { egress, fresh } => ip(egress, fresh),
+        Command::Status { profile, json } => status(profile.as_deref(), json),
+        Command::Ip {
+            profile,
+            egress,
+            fresh,
+        } => ip(profile.as_deref(), egress, fresh),
+        Command::Env { profile } => env(profile.as_deref()),
         Command::List { target, json } => list(target, json),
         Command::Ping { handle } => ping(&handle),
         Command::Alias { handle, new } => set_alias(&handle, &new),
@@ -165,7 +174,11 @@ fn up(profile: &str) -> CliResult {
 
 fn down(profile: Option<&str>) -> CliResult {
     let client = existing_client()?;
-    let stopped = client.down(profile.unwrap_or("")).map_err(Failure::error)?;
+    let stopped = match profile {
+        Some(profile) => client.down_profile(profile),
+        None => client.down(""),
+    }
+    .map_err(Failure::error)?;
     if !stopped {
         // Stopping is idempotent on purpose. `oxidom@work`'s ExecStop runs
         // whenever that unit stops, including long after `home` took the
@@ -173,7 +186,7 @@ fn down(profile: Option<&str>) -> CliResult {
         // having correctly done nothing. The post-condition asked for — this
         // profile is not running — already holds.
         eprintln!(
-            "profile {:?} does not own the active tunnel; nothing to stop",
+            "profile {:?} is not up; nothing to stop",
             profile.unwrap_or_default()
         );
     }
@@ -187,13 +200,15 @@ fn connect(handle: &str) -> CliResult {
     client.connect_server(&server.id).map_err(Failure::error)
 }
 
-fn status(json: bool) -> CliResult {
+fn status(profile: Option<&str>, json: bool) -> CliResult {
     let client = existing_client()?;
-    let (status, server) = connected_server(&client)?;
-    let config = client.settings().map_err(Failure::error)?;
+    let Some(profile) = profile else {
+        return print_sessions(&client, json);
+    };
+    let (session, server) = connected_session(&client, profile)?;
     let probes = client.probe_state().map_err(Failure::error)?;
     let latency_ms = current_latency(&probes, &server.id);
-    let output = StatusOutput::new(&status, Some(&server), &config, latency_ms);
+    let output = StatusOutput::new(&session, Some(&server), latency_ms);
 
     if json {
         print_json(&output)
@@ -203,28 +218,57 @@ fn status(json: bool) -> CliResult {
             .map(|value| format!("{value} ms"))
             .unwrap_or_else(|| "—".to_string());
         print_line(format!(
-            "{}  {}  {}  socks {}  {}",
-            output.state, handle, server.name, output.socks_port, latency
+            "{}  {}  {}  socks {}:{}  {}",
+            output.state, handle, server.name, output.address, output.socks_port, latency
         ))
     }
 }
 
-fn ip(egress: bool, fresh: bool) -> CliResult {
+fn ip(profile: Option<&str>, egress: bool, fresh: bool) -> CliResult {
     let client = existing_client()?;
-    let (_, server) = connected_server(&client)?;
+    let (session, server) = connected_listed_session(&client, profile.unwrap_or("default"))?;
     let address = if egress {
-        let config = client.settings().map_err(Failure::error)?;
-        oxidom_core::egress::address(
-            &server.id,
-            std::net::Ipv4Addr::LOCALHOST,
-            config.socks_port,
-            fresh,
-        )
-        .map_err(Failure::error)?
+        let bind = session
+            .address
+            .parse()
+            .map_err(|error| Failure::message(format!("invalid session address: {error}")))?;
+        oxidom_core::egress::address(&server.id, bind, session.socks_port, fresh)
+            .map_err(Failure::error)?
     } else {
         endpoint_ip(&server)?
     };
     print_line(address)
+}
+
+fn env(profile: Option<&str>) -> CliResult {
+    let client = existing_client()?;
+    let (session, _) = connected_listed_session(&client, profile.unwrap_or("default"))?;
+    print_text(session_environment(&session))
+}
+
+fn session_environment(session: &SessionInfo) -> String {
+    format!(
+        "export ALL_PROXY=socks5h://{}:{}\n\
+         export all_proxy=socks5h://{}:{}\n\
+         export HTTP_PROXY=http://{}:{}\n\
+         export http_proxy=http://{}:{}\n\
+         export HTTPS_PROXY=http://{}:{}\n\
+         export https_proxy=http://{}:{}\n\
+         export NO_PROXY=localhost,127.0.0.0/8,::1\n\
+         export no_proxy=localhost,127.0.0.0/8,::1\n",
+        session.address,
+        session.socks_port,
+        session.address,
+        session.socks_port,
+        session.address,
+        session.http_port,
+        session.address,
+        session.http_port,
+        session.address,
+        session.http_port,
+        session.address,
+        session.http_port,
+    )
 }
 
 fn list(target: ListTarget, json: bool) -> CliResult {
@@ -233,7 +277,77 @@ fn list(target: ListTarget, json: bool) -> CliResult {
         ListTarget::Servers => list_servers(&client, json),
         ListTarget::Profiles => list_profiles(&client, json),
         ListTarget::Subscriptions => list_subscriptions(&client, json),
+        ListTarget::Sessions => print_sessions(&client, json),
     }
+}
+
+fn print_sessions(client: &DaemonClient, json: bool) -> CliResult {
+    let sessions = client.list_sessions().map_err(Failure::error)?;
+    let probes = client.probe_state().map_err(Failure::error)?;
+    let outputs = sessions
+        .iter()
+        .map(|session| {
+            let latency = (session.state == "connected")
+                .then(|| {
+                    session
+                        .server_id
+                        .as_deref()
+                        .and_then(|server_id| current_latency(&probes, server_id))
+                })
+                .flatten();
+            SessionOutput::new(session, latency)
+        })
+        .collect::<Vec<_>>();
+    if json {
+        print_json(&outputs)
+    } else {
+        print_text(session_table(&outputs))
+    }
+}
+
+fn session_table(sessions: &[SessionOutput]) -> String {
+    let mut rows = Vec::with_capacity(sessions.len() + 1);
+    rows.push([
+        "PROFILE".to_string(),
+        "STATE".to_string(),
+        "SERVER".to_string(),
+        "ADDRESS".to_string(),
+        "LATENCY".to_string(),
+    ]);
+    rows.extend(sessions.iter().map(|session| {
+        [
+            session.profile.clone(),
+            session.state.clone(),
+            session
+                .server_alias
+                .clone()
+                .or_else(|| session.server_id.clone())
+                .unwrap_or_else(|| "—".to_string()),
+            format!("{}:{}", session.address, session.socks_port),
+            session
+                .latency_ms
+                .map(|latency| format!("{latency}ms"))
+                .unwrap_or_else(|| "—".to_string()),
+        ]
+    }));
+    let mut widths = [0usize; 5];
+    for row in &rows {
+        for (column, value) in row.iter().enumerate() {
+            widths[column] = widths[column].max(value.chars().count());
+        }
+    }
+    let mut table = String::new();
+    for row in rows {
+        for (column, value) in row.into_iter().enumerate() {
+            table.push_str(&value);
+            if column < widths.len() - 1 {
+                let padding = widths[column].saturating_sub(value.chars().count()) + 2;
+                table.extend(std::iter::repeat_n(' ', padding));
+            }
+        }
+        table.push('\n');
+    }
+    table
 }
 
 fn list_servers(client: &DaemonClient, json: bool) -> CliResult {
@@ -482,13 +596,33 @@ impl Drop for TemporaryProfile {
     }
 }
 
-fn connected_server(client: &DaemonClient) -> CliResult<(oxidom_core::ipc::StatusInfo, Server)> {
-    let status = client.status().map_err(Failure::error)?;
-    if status.state != "connected" {
+fn connected_session(client: &DaemonClient, profile: &str) -> CliResult<(SessionInfo, Server)> {
+    let session = client.session_status(profile).map_err(Failure::error)?;
+    connected_server_for_session(client, session)
+}
+
+fn connected_listed_session(
+    client: &DaemonClient,
+    profile: &str,
+) -> CliResult<(SessionInfo, Server)> {
+    let session = client
+        .list_sessions()
+        .map_err(Failure::error)?
+        .into_iter()
+        .find(|session| session.profile == profile)
+        .ok_or_else(Failure::not_connected)?;
+    connected_server_for_session(client, session)
+}
+
+fn connected_server_for_session(
+    client: &DaemonClient,
+    session: SessionInfo,
+) -> CliResult<(SessionInfo, Server)> {
+    if session.state != "connected" {
         return Err(Failure::not_connected());
     }
-    let active_id = status
-        .active_id
+    let active_id = session
+        .server_id
         .as_deref()
         .ok_or_else(|| Failure::message("daemon reports connected without an active server"))?;
     let subscriptions = client.subscriptions().map_err(Failure::error)?;
@@ -498,7 +632,7 @@ fn connected_server(client: &DaemonClient) -> CliResult<(oxidom_core::ipc::Statu
         .find(|server| server.id == active_id)
         .cloned()
         .ok_or_else(|| Failure::message("the active server is no longer in the daemon store"))?;
-    Ok((status, server))
+    Ok((session, server))
 }
 
 fn resolve_server<'a>(subscriptions: &'a [Subscription], needle: &str) -> CliResult<&'a Server> {
@@ -586,5 +720,66 @@ mod tests {
         assert_eq!(exit_code_for(FailureKind::Error), 1);
         assert_eq!(exit_code_for(FailureKind::NotConnected), 3);
         assert_eq!(exit_code_for(FailureKind::DaemonUnavailable), 4);
+    }
+
+    #[test]
+    fn session_table_is_aligned_without_borders() {
+        let sessions = [
+            SessionOutput {
+                profile: "default".to_string(),
+                state: "connected".to_string(),
+                server_id: Some("id-one".to_string()),
+                server_alias: Some("ch-trojan".to_string()),
+                server_name: Some("Swiss".to_string()),
+                address: "127.0.0.1".to_string(),
+                socks_port: 10808,
+                http_port: 10809,
+                latency_ms: Some(84),
+                error: None,
+                owns_system_proxy: false,
+            },
+            SessionOutput {
+                profile: "work".to_string(),
+                state: "connected".to_string(),
+                server_id: Some("id-two".to_string()),
+                server_alias: Some("nl-vless".to_string()),
+                server_name: Some("Dutch".to_string()),
+                address: "127.72.14.1".to_string(),
+                socks_port: 10808,
+                http_port: 10809,
+                latency_ms: Some(112),
+                error: None,
+                owns_system_proxy: false,
+            },
+        ];
+
+        assert_eq!(
+            session_table(&sessions),
+            "PROFILE  STATE      SERVER     ADDRESS            LATENCY\n\
+             default  connected  ch-trojan  127.0.0.1:10808    84ms\n\
+             work     connected  nl-vless   127.72.14.1:10808  112ms\n"
+        );
+    }
+
+    #[test]
+    fn env_uses_both_session_endpoints_and_remote_dns_socks() {
+        let session = SessionInfo {
+            address: "127.72.14.1".to_string(),
+            socks_port: 10808,
+            http_port: 10809,
+            ..SessionInfo::default()
+        };
+
+        assert_eq!(
+            session_environment(&session),
+            "export ALL_PROXY=socks5h://127.72.14.1:10808\n\
+             export all_proxy=socks5h://127.72.14.1:10808\n\
+             export HTTP_PROXY=http://127.72.14.1:10809\n\
+             export http_proxy=http://127.72.14.1:10809\n\
+             export HTTPS_PROXY=http://127.72.14.1:10809\n\
+             export https_proxy=http://127.72.14.1:10809\n\
+             export NO_PROXY=localhost,127.0.0.0/8,::1\n\
+             export no_proxy=localhost,127.0.0.0/8,::1\n"
+        );
     }
 }

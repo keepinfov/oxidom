@@ -39,6 +39,12 @@ pub struct StatusInfo {
     /// live. The failed server is still worth naming — otherwise the card the
     /// user clicked falls back to looking merely disconnected.
     pub error_id: Option<String>,
+    /// Every profile session known to the daemon, in stable profile order.
+    ///
+    /// The fields above remain a compatibility view of `default`, or of the
+    /// first session when `default` is absent, because existing GUIs still
+    /// consume only that single-session shape.
+    pub sessions: Vec<SessionInfo>,
 }
 
 impl StatusInfo {
@@ -55,6 +61,7 @@ impl StatusInfo {
             active_id,
             active_profile: None,
             error_id: None,
+            sessions: Vec::new(),
         }
     }
 
@@ -83,6 +90,25 @@ impl StatusInfo {
             _ => Status::Disconnected,
         }
     }
+}
+
+/// One running profile as exposed by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SessionInfo {
+    pub profile: String,
+    /// "disconnected" | "connecting" | "connected" | "error"
+    pub state: String,
+    pub error: Option<String>,
+    pub server_id: Option<String>,
+    pub server_alias: Option<String>,
+    pub server_name: Option<String>,
+    /// Loopback address shared by this session's inbounds.
+    pub address: String,
+    pub socks_port: u16,
+    pub http_port: u16,
+    /// Whether this session is the logical owner of the desktop system proxy.
+    pub owns_system_proxy: bool,
 }
 
 /// How a probe reached the server. Mirrors `probe::Route` rather than reusing

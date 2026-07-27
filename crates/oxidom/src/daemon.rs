@@ -18,7 +18,7 @@ use oxidom_core::engine::Engine;
 use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
     ApplySettingsResult, BUS_NAME, LatencyReading, OBJECT_PATH, PROBE_STATE_VERSION, ProbeFailure,
-    ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo, StatusInfo, UpResult, UpServer,
+    ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo, SessionInfo, StatusInfo, UpResult, UpServer,
 };
 use oxidom_core::model::Server;
 use oxidom_core::probe;
@@ -110,8 +110,8 @@ impl ProbeQueue {
 /// with the server it belongs to.
 ///
 /// The id has to be carried explicitly: every path that sets one of these has
-/// already called `engine.disconnect()`, which clears the session's server id — so
-/// by the time the failure is reportable, the only record of *which* server
+/// already stopped its session, which clears the session's server id — so by
+/// the time the failure is reportable, the only record of *which* server
 /// failed is this struct.
 #[derive(Clone)]
 struct ErrorOverride {
@@ -138,10 +138,12 @@ pub(crate) struct Shared {
     probes: Arc<Mutex<ProbeQueue>>,
     /// Layered over the core status, e.g. when the confirming probe after a
     /// connect fails and the daemon shuts the tunnel back down.
-    override_status: Arc<Mutex<Option<ErrorOverride>>>,
-    /// Bumped by every connect and disconnect, so an in-flight confirmation
-    /// can tell whether the tunnel it was checking is still the current one.
+    override_status: Arc<Mutex<HashMap<String, ErrorOverride>>>,
+    /// Generates attempt ids; `current_generations` keeps one cancellation
+    /// domain per profile so bringing `work` up cannot invalidate `default`'s
+    /// in-flight confirmation.
     connect_generation: Arc<AtomicU64>,
+    current_generations: Arc<Mutex<HashMap<String, u64>>>,
     /// Ports pinned by `--socks-port`/`--http-port`, i.e. by the service unit.
     socks_port_locked: bool,
     http_port_locked: bool,
@@ -161,8 +163,9 @@ impl Shared {
             engine: Arc::new(Mutex::new(engine)),
             readings: Arc::new(Mutex::new(HashMap::new())),
             probes: Arc::new(Mutex::new(ProbeQueue::default())),
-            override_status: Arc::new(Mutex::new(None)),
+            override_status: Arc::new(Mutex::new(HashMap::new())),
             connect_generation: Arc::new(AtomicU64::new(0)),
+            current_generations: Arc::new(Mutex::new(HashMap::new())),
             socks_port_locked,
             http_port_locked,
             system_bus,
@@ -170,22 +173,23 @@ impl Shared {
     }
 
     /// The ports a profile actually gets, and the names of the ones it asked
-    /// for and did not. Ports pinned on the unit's command line outrank the
-    /// profile for the same reason `set_settings` refuses them: the inbound
-    /// would move only until the next restart put it back.
+    /// for and did not. Unit-pinned ports describe the primary tunnel and
+    /// therefore constrain only `default`; every other profile keeps its own
+    /// ports on its own loopback address.
     fn reconcile_profile_ports(
         &self,
         config: &Config,
+        profile_name: &str,
         profile: &Profile,
     ) -> (u16, u16, Vec<String>) {
         let mut ignored = Vec::new();
         let mut socks_port = profile.proxy.socks_port;
         let mut http_port = profile.proxy.http_port;
-        if self.socks_port_locked && socks_port != config.socks_port {
+        if profile_name == "default" && self.socks_port_locked && socks_port != config.socks_port {
             socks_port = config.socks_port;
             ignored.push("SOCKS port".to_string());
         }
-        if self.http_port_locked && http_port != config.http_port {
+        if profile_name == "default" && self.http_port_locked && http_port != config.http_port {
             http_port = config.http_port;
             ignored.push("HTTP port".to_string());
         }
@@ -194,44 +198,67 @@ impl Shared {
 
     /// Invalidate any in-flight connect confirmation and return the id of the
     /// attempt starting now.
-    fn next_connect_generation(&self) -> u64 {
-        self.connect_generation.fetch_add(1, Ordering::SeqCst) + 1
+    fn next_connect_generation(&self, profile: &str) -> u64 {
+        let generation = self.connect_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        oxidom_core::sync::lock(&self.current_generations).insert(profile.to_string(), generation);
+        generation
     }
 
-    /// Returns the id of the server whose core has just been found dead, once.
-    fn note_core_death(&self) -> Option<String> {
+    fn generation_is_current(&self, profile: &str, generation: u64) -> bool {
+        oxidom_core::sync::lock(&self.current_generations).get(profile) == Some(&generation)
+    }
+
+    fn current_generation(&self, profile: &str) -> Option<u64> {
+        oxidom_core::sync::lock(&self.current_generations)
+            .get(profile)
+            .copied()
+    }
+
+    fn invalidate_generation(&self, profile: &str) {
+        oxidom_core::sync::lock(&self.current_generations).remove(profile);
+    }
+
+    fn invalidate_all_generations(&self) {
+        oxidom_core::sync::lock(&self.current_generations).clear();
+    }
+
+    /// Returns the compatibility session and server whose core has just been
+    /// found dead, once. A3 extends the background sweep to every profile.
+    fn note_core_death(&self) -> Option<(String, String)> {
         let mut engine = oxidom_core::sync::lock(&self.engine);
-        let alive = engine
-            .default_session_mut()
-            .is_some_and(|session| session.is_alive());
-        if engine.status() != Status::Connected || alive {
+        let profile = engine.default_session()?.profile.clone();
+        let session = engine.sessions.get_mut(&profile)?;
+        let alive = session.is_alive();
+        if session.status() != Status::Connected || alive {
             return None;
         }
-        let server_id = engine.active_server_id();
-        if let Some(session) = engine.default_session_mut() {
-            session.core.fail(CORE_EXITED_MESSAGE);
-        }
-        server_id
+        let server_id = session.server_id.clone()?;
+        session.core.fail(CORE_EXITED_MESSAGE);
+        Some((profile, server_id))
     }
 
-    fn begin_reconnect(&self, server_id: String, generation: u64) {
-        if self.connect_generation.load(Ordering::SeqCst) != generation {
+    fn begin_reconnect(&self, profile: String, server_id: String, generation: u64) {
+        if !self.generation_is_current(&profile, generation) {
             return;
         }
         let death_is_current = {
             let engine = oxidom_core::sync::lock(&self.engine);
             engine.registry.config.reconnect
-                && engine.active_server_id().as_deref() == Some(server_id.as_str())
+                && engine
+                    .sessions
+                    .get(&profile)
+                    .and_then(|session| session.server_id.as_deref())
+                    == Some(server_id.as_str())
                 && matches!(
-                    engine.status(),
-                    Status::Error(message) if message == CORE_EXITED_MESSAGE
+                    engine.sessions.get(&profile).map(|session| session.status()),
+                    Some(Status::Error(message)) if message == CORE_EXITED_MESSAGE
                 )
         };
-        if !death_is_current || self.connect_generation.load(Ordering::SeqCst) != generation {
+        if !death_is_current || !self.generation_is_current(&profile, generation) {
             return;
         }
         let already_reconnecting = matches!(
-            oxidom_core::sync::lock(&self.override_status).as_ref(),
+            oxidom_core::sync::lock(&self.override_status).get(&profile),
             Some(ErrorOverride {
                 status: Status::Error(message),
                 server_id: id,
@@ -241,47 +268,54 @@ impl Shared {
             return;
         }
 
-        *oxidom_core::sync::lock(&self.override_status) = Some(ErrorOverride {
-            status: Status::Error(RECONNECTING_MESSAGE.to_string()),
-            server_id: server_id.clone(),
-        });
+        oxidom_core::sync::lock(&self.override_status).insert(
+            profile.clone(),
+            ErrorOverride {
+                status: Status::Error(RECONNECTING_MESSAGE.to_string()),
+                server_id: server_id.clone(),
+            },
+        );
         let shared = self.clone();
-        std::thread::spawn(move || shared.reconnect(server_id, generation));
+        std::thread::spawn(move || shared.reconnect(profile, server_id, generation));
     }
 
-    fn reconnect(&self, server_id: String, generation: u64) {
+    fn reconnect(&self, profile: String, server_id: String, generation: u64) {
         let mut attempt = 0;
         loop {
-            if !self.reconnect_is_pending(&server_id, generation) {
+            if !self.reconnect_is_pending(&profile, &server_id, generation) {
                 return;
             }
             std::thread::sleep(reconnect_delay(attempt));
-            if !self.reconnect_is_pending(&server_id, generation) {
+            if !self.reconnect_is_pending(&profile, &server_id, generation) {
                 return;
             }
 
-            let Some(result) = self.start_reconnect_attempt(&server_id, generation) else {
+            let Some(result) = self.start_reconnect_attempt(&profile, &server_id, generation)
+            else {
                 return;
             };
             match result {
                 Ok(confirmed) => {
                     if confirmed.recv().unwrap_or(false)
-                        && self.reconnect_is_pending(&server_id, generation)
+                        && self.reconnect_is_pending(&profile, &server_id, generation)
                     {
-                        self.clear_reconnect_override(&server_id);
+                        self.clear_reconnect_override(&profile, &server_id);
                         return;
                     }
                 }
                 Err(error) => {
-                    log::warn!("automatic reconnect to {server_id} failed: {error:#}");
+                    log::warn!(
+                        "automatic reconnect of profile {profile:?} to {server_id} failed: \
+                         {error:#}"
+                    );
                 }
             }
             attempt = attempt.saturating_add(1);
         }
     }
 
-    fn reconnect_is_pending(&self, server_id: &str, generation: u64) -> bool {
-        if self.connect_generation.load(Ordering::SeqCst) != generation {
+    fn reconnect_is_pending(&self, profile: &str, server_id: &str, generation: u64) -> bool {
+        if !self.generation_is_current(profile, generation) {
             return false;
         }
         if !oxidom_core::sync::lock(&self.engine)
@@ -289,11 +323,11 @@ impl Shared {
             .config
             .reconnect
         {
-            self.clear_reconnect_override(server_id);
+            self.clear_reconnect_override(profile, server_id);
             return false;
         }
         matches!(
-            oxidom_core::sync::lock(&self.override_status).as_ref(),
+            oxidom_core::sync::lock(&self.override_status).get(profile),
             Some(ErrorOverride {
                 status: Status::Error(message),
                 server_id: id,
@@ -301,48 +335,94 @@ impl Shared {
         )
     }
 
-    fn clear_reconnect_override(&self, server_id: &str) {
+    fn clear_reconnect_override(&self, profile: &str, server_id: &str) {
         let mut override_status = oxidom_core::sync::lock(&self.override_status);
         let is_ours = matches!(
-            override_status.as_ref(),
+            override_status.get(profile),
             Some(ErrorOverride {
                 status: Status::Error(message),
                 server_id: id,
             }) if message == RECONNECTING_MESSAGE && id == server_id
         );
         if is_ours {
-            *override_status = None;
+            override_status.remove(profile);
         }
     }
 
+    fn clear_override(&self, profile: &str) {
+        oxidom_core::sync::lock(&self.override_status).remove(profile);
+    }
+
+    fn clear_all_overrides(&self) {
+        oxidom_core::sync::lock(&self.override_status).clear();
+    }
+
     fn status_info(&self) -> StatusInfo {
-        let generation = self.connect_generation.load(Ordering::SeqCst);
-        if let Some(server_id) = self.note_core_death() {
-            self.begin_reconnect(server_id, generation);
+        if let Some((profile, server_id)) = self.note_core_death()
+            && let Some(generation) = self.current_generation(&profile)
+        {
+            self.begin_reconnect(profile, server_id, generation);
         }
         // Scoped, not `if let`: in edition 2024 an `if let` scrutinee's
         // temporary lives for the whole body, so holding this guard while
         // touching `engine` below would take the two locks in the opposite
         // order from `confirm_connection` — engine first, then override — and
         // deadlock the daemon the moment the two raced.
-        let override_status = oxidom_core::sync::lock(&self.override_status).clone();
-        if let Some(failure) = override_status {
-            return StatusInfo::from_status(&failure.status, None)
-                .with_error_id(Some(failure.server_id));
-        }
+        let overrides = oxidom_core::sync::lock(&self.override_status).clone();
         let engine = oxidom_core::sync::lock(&self.engine);
-        let status = engine.status();
-        let active = engine.active_server_id();
-        let active_profile = engine.active_profile();
-        StatusInfo::from_status(&status, active).with_active_profile(active_profile)
+        let sessions = engine
+            .sessions
+            .iter()
+            .map(|(profile, session)| {
+                session_info(&engine, profile, session, overrides.get(profile))
+            })
+            .collect::<Vec<_>>();
+        let Some(session) = engine.default_session() else {
+            let mut status = StatusInfo::from_status(&Status::Disconnected, None);
+            status.sessions = sessions;
+            return status;
+        };
+        let profile = session.profile.as_str();
+        let mut status = if let Some(failure) = overrides.get(profile) {
+            StatusInfo::from_status(&failure.status, None)
+                .with_error_id(Some(failure.server_id.clone()))
+        } else {
+            StatusInfo::from_status(&session.status(), session.server_id.clone())
+                .with_active_profile(session.server_id.as_ref().map(|_| profile.to_string()))
+        };
+        status.sessions = sessions;
+        status
+    }
+
+    fn list_session_infos(&self) -> Vec<SessionInfo> {
+        let overrides = oxidom_core::sync::lock(&self.override_status).clone();
+        let engine = oxidom_core::sync::lock(&self.engine);
+        engine
+            .sessions
+            .iter()
+            .map(|(profile, session)| {
+                session_info(&engine, profile, session, overrides.get(profile))
+            })
+            .collect()
+    }
+
+    fn session_info(&self, profile: &str) -> Option<SessionInfo> {
+        let override_status = oxidom_core::sync::lock(&self.override_status)
+            .get(profile)
+            .cloned();
+        let engine = oxidom_core::sync::lock(&self.engine);
+        let session = engine.sessions.get(profile)?;
+        Some(session_info(
+            &engine,
+            profile,
+            session,
+            override_status.as_ref(),
+        ))
     }
 
     fn runtime_info(&self) -> RuntimeInfo {
         let engine = oxidom_core::sync::lock(&self.engine);
-        let resolved = engine
-            .default_session()
-            .context("no default session")
-            .and_then(|session| session.core.resolve_binary());
+        let resolved = oxidom_core::xray::resolve::resolve(&engine.registry.config.xray_binary);
         let (xray_path, xray_error, xray_source) = match resolved {
             Ok(resolved) => (
                 Some(resolved.path.display().to_string()),
@@ -443,16 +523,55 @@ impl Shared {
         value
     }
 
+    /// Measure the tunnel owned by one profile. The result still uses the
+    /// legacy server-id map until A3 splits proxied readings by session.
+    fn run_session_probe(&self, profile: &str, server_id: &str) -> Option<u32> {
+        let target = {
+            let engine = oxidom_core::sync::lock(&self.engine);
+            match (engine.find_server(server_id), engine.sessions.get(profile)) {
+                (Some(server), Some(session)) => {
+                    let mut config = engine.registry.config.clone();
+                    config.socks_port = session.socks_port;
+                    config.http_port = session.http_port;
+                    Some((server, config, session.address))
+                }
+                _ => None,
+            }
+        };
+        let reading = match target {
+            Some((server, config, address)) => {
+                let method = config.latency_method;
+                match probe::measure(&server, &config, probe::Route::Proxied, address) {
+                    probe::ProbeOutcome::Reachable(measured) => {
+                        LatencyReading::ok(measured.ms, ProbeRoute::Proxied, measured.method)
+                    }
+                    outcome => {
+                        LatencyReading::failed(wire_failure(&outcome), ProbeRoute::Proxied, method)
+                    }
+                }
+            }
+            None => LatencyReading::failed(
+                ProbeFailure::Unknown,
+                ProbeRoute::Proxied,
+                LatencyMethod::default(),
+            ),
+        };
+        let value = reading.value;
+        oxidom_core::sync::lock(&self.readings).insert(server_id.to_string(), reading);
+        value
+    }
+
     /// Start every connection through one path, whether the caller is a D-Bus
     /// request or the supervisor. Claiming the probe slot here preserves the
     /// same honest card state while `confirm_connection` proves the tunnel.
     fn start_connection(
         &self,
+        profile: &str,
         server_id: &str,
         generation: u64,
         origin: ConnectionOrigin,
     ) -> Result<Option<mpsc::Receiver<bool>>> {
-        if self.connect_generation.load(Ordering::SeqCst) != generation {
+        if !self.generation_is_current(profile, generation) {
             return Ok(None);
         }
         oxidom_core::sync::lock(&self.readings).remove(server_id);
@@ -460,10 +579,10 @@ impl Shared {
 
         let connect_result = {
             let mut engine = oxidom_core::sync::lock(&self.engine);
-            if self.connect_generation.load(Ordering::SeqCst) != generation {
+            if !self.generation_is_current(profile, generation) {
                 None
             } else {
-                Some(engine.connect(server_id))
+                Some(engine.connect_session(profile, server_id))
             }
         };
         match connect_result {
@@ -476,6 +595,7 @@ impl Shared {
                 Err(error)
             }
             Some(Ok(())) => Ok(Some(self.confirm_connection(
+                profile.to_string(),
                 server_id.to_string(),
                 generation,
                 origin,
@@ -487,13 +607,14 @@ impl Shared {
     /// so no Xray start was attempted.
     fn start_reconnect_attempt(
         &self,
+        profile: &str,
         server_id: &str,
         generation: u64,
     ) -> Option<Result<mpsc::Receiver<bool>>> {
-        if self.connect_generation.load(Ordering::SeqCst) != generation {
+        if !self.generation_is_current(profile, generation) {
             return None;
         }
-        match self.start_connection(server_id, generation, ConnectionOrigin::Reconnect) {
+        match self.start_connection(profile, server_id, generation, ConnectionOrigin::Reconnect) {
             Ok(Some(confirmed)) => Some(Ok(confirmed)),
             Ok(None) => None,
             Err(error) => Some(Err(error)),
@@ -511,6 +632,7 @@ impl Shared {
     /// the slot — so this thread owns it and must release it on every path.
     fn confirm_connection(
         &self,
+        profile: String,
         server_id: String,
         generation: u64,
         origin: ConnectionOrigin,
@@ -520,7 +642,7 @@ impl Shared {
         std::thread::spawn(move || {
             let (address, socks_port, method) = {
                 let engine = oxidom_core::sync::lock(&shared.engine);
-                let Some(session) = engine.default_session() else {
+                let Some(session) = engine.sessions.get(&profile) else {
                     oxidom_core::sync::lock(&shared.readings).insert(
                         server_id.clone(),
                         LatencyReading::failed(
@@ -546,7 +668,7 @@ impl Shared {
             let ready = probe::wait_for_socks(address, socks_port);
 
             let latency = if ready {
-                shared.run_probe(&server_id)
+                shared.run_session_probe(&profile, &server_id)
             } else {
                 // Nothing could be measured, but the GUI is waiting on this id
                 // and would otherwise see the spinner retire onto whatever the
@@ -559,21 +681,22 @@ impl Shared {
             };
             oxidom_core::sync::lock(&shared.probes).finish(&server_id);
             if ready && latency.is_some() {
-                let current = shared.connect_generation.load(Ordering::SeqCst) == generation;
+                let current = shared.generation_is_current(&profile, generation);
                 let _ = confirmed.send(current);
                 return;
             }
             let mut engine = oxidom_core::sync::lock(&shared.engine);
             // Bail out if another connect/disconnect superseded this attempt:
             // the tunnel now running is not the one this thread was confirming.
-            if shared.connect_generation.load(Ordering::SeqCst) != generation {
+            if !shared.generation_is_current(&profile, generation) {
                 let _ = confirmed.send(false);
                 return;
             }
             // A core that rejected the config exited at once, so both the dead
             // inbound and the failed probe are symptoms. Say the actual cause.
             let logs = engine
-                .default_session()
+                .sessions
+                .get(&profile)
                 .map(|session| session.recent_logs())
                 .unwrap_or_default();
             let reason = if core_rejected_the_protocol(&logs) {
@@ -587,19 +710,25 @@ impl Shared {
                 "the local SOCKS inbound never came up — the core is not carrying traffic"
                     .to_string()
             };
-            let still_active = engine.active_server_id().as_deref() == Some(&server_id);
-            if still_active && engine.status() == Status::Connected {
+            let still_active = engine.sessions.get(&profile).is_some_and(|session| {
+                session.server_id.as_deref() == Some(&server_id)
+                    && session.status() == Status::Connected
+            });
+            if still_active {
                 // Leave the reason in the log buffer too: the tunnel is
                 // torn down below, so the core's own status is lost.
-                if let Some(session) = engine.default_session() {
+                if let Some(session) = engine.sessions.get(&profile) {
                     session.core.note(&reason);
                 }
-                engine.disconnect();
+                engine.stop_session(&profile);
                 if origin == ConnectionOrigin::Explicit {
-                    *oxidom_core::sync::lock(&shared.override_status) = Some(ErrorOverride {
-                        status: Status::Error(reason),
-                        server_id: server_id.clone(),
-                    });
+                    oxidom_core::sync::lock(&shared.override_status).insert(
+                        profile.clone(),
+                        ErrorOverride {
+                            status: Status::Error(reason),
+                            server_id: server_id.clone(),
+                        },
+                    );
                 }
             }
             let _ = confirmed.send(false);
@@ -663,6 +792,25 @@ pub(crate) struct Service {
     pub(crate) shared: Shared,
 }
 
+impl Service {
+    fn stop_profile(&self, profile: &str) -> fdo::Result<bool> {
+        self.shared.clear_override(profile);
+        self.shared.invalidate_generation(profile);
+        oxidom_core::sync::lock(&self.shared.engine)
+            .remove_session(profile)
+            .map_err(failed)
+    }
+
+    fn stop_all_profiles(&self) -> fdo::Result<()> {
+        self.shared.clear_all_overrides();
+        self.shared.invalidate_all_generations();
+        oxidom_core::sync::lock(&self.shared.engine)
+            .disconnect_all()
+            .map(|_| ())
+            .map_err(failed)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn for_test() -> Service {
     Service {
@@ -713,6 +861,53 @@ fn wire_failure(outcome: &probe::ProbeOutcome) -> ProbeFailure {
 
 fn json<T: serde::Serialize>(value: &T) -> fdo::Result<String> {
     serde_json::to_string(value).map_err(failed)
+}
+
+fn session_info(
+    engine: &Engine,
+    profile: &str,
+    session: &oxidom_core::engine::Session,
+    override_status: Option<&ErrorOverride>,
+) -> SessionInfo {
+    let (status, server_id) = match override_status {
+        Some(failure) => (&failure.status, Some(failure.server_id.clone())),
+        None => {
+            let status = session.status();
+            return session_info_with_status(engine, profile, session, &status, None);
+        }
+    };
+    session_info_with_status(engine, profile, session, status, server_id)
+}
+
+fn session_info_with_status(
+    engine: &Engine,
+    profile: &str,
+    session: &oxidom_core::engine::Session,
+    status: &Status,
+    override_server_id: Option<String>,
+) -> SessionInfo {
+    let (state, error) = match status {
+        Status::Disconnected => ("disconnected", None),
+        Status::Connecting => ("connecting", None),
+        Status::Connected => ("connected", None),
+        Status::Error(message) => ("error", Some(message.clone())),
+    };
+    let server_id = override_server_id.or_else(|| session.server_id.clone());
+    let server = server_id
+        .as_deref()
+        .and_then(|server_id| engine.all_servers().find(|server| server.id == server_id));
+    SessionInfo {
+        profile: profile.to_string(),
+        state: state.to_string(),
+        error,
+        server_id,
+        server_alias: server.and_then(|server| server.alias.clone()),
+        server_name: server.map(|server| server.name.clone()),
+        address: session.address.to_string(),
+        socks_port: session.socks_port,
+        http_port: session.http_port,
+        owns_system_proxy: engine.sessions.owner_of_system_proxy() == Some(profile),
+    }
 }
 
 /// How each candidate for an ambiguous handle should be spelled back at the
@@ -831,34 +1026,45 @@ impl Service {
     }
 
     fn connect(&self, server_id: String) -> fdo::Result<()> {
-        *oxidom_core::sync::lock(&self.shared.override_status) = None;
-        let generation = self.shared.next_connect_generation();
+        self.shared.clear_override("default");
+        let generation = self.shared.next_connect_generation("default");
         {
             let mut engine = oxidom_core::sync::lock(&self.shared.engine);
             let socks_port = engine.registry.config.socks_port;
             let http_port = engine.registry.config.http_port;
+            if engine.registry.config.system_proxy
+                && let Some(owner) = engine.sessions.owner_of_system_proxy()
+                && owner != "default"
+            {
+                return Err(failed(format!(
+                    "the system proxy is already held by profile {owner:?}"
+                )));
+            }
             engine
                 .prepare_session("default", Ipv4Addr::LOCALHOST, socks_port, http_port)
                 .map_err(failed)?;
+            if engine.registry.config.system_proxy {
+                engine
+                    .sessions
+                    .claim_system_proxy("default")
+                    .map_err(failed)?;
+            }
         }
 
-        let result =
-            self.shared
-                .start_connection(&server_id, generation, ConnectionOrigin::Explicit);
+        let result = self.shared.start_connection(
+            "default",
+            &server_id,
+            generation,
+            ConnectionOrigin::Explicit,
+        );
         // A death noticed just before this explicit operation may have queued
         // its reconnect override. The user's action owns the visible state.
-        *oxidom_core::sync::lock(&self.shared.override_status) = None;
+        self.shared.clear_override("default");
         result.map(|_| ()).map_err(failed)
     }
 
     fn disconnect(&self) -> fdo::Result<()> {
-        *oxidom_core::sync::lock(&self.shared.override_status) = None;
-        self.shared.next_connect_generation();
-        {
-            let mut engine = oxidom_core::sync::lock(&self.shared.engine);
-            engine.disconnect();
-        }
-        *oxidom_core::sync::lock(&self.shared.override_status) = None;
+        self.stop_profile("default")?;
         Ok(())
     }
 
@@ -916,9 +1122,14 @@ impl Service {
         // guard: `start_connection` takes the same lock itself.
         let (server, ignored_ports) = {
             let mut engine = oxidom_core::sync::lock(&self.shared.engine);
-            let (socks_port, http_port, ignored_ports) = self
-                .shared
-                .reconcile_profile_ports(&engine.registry.config, &profile);
+            if engine.sessions.get(&name).is_some() {
+                return Err(failed(format!(
+                    "profile {name:?} is already up; run `oxidom down {name}` first"
+                )));
+            }
+            let (socks_port, http_port, ignored_ports) =
+                self.shared
+                    .reconcile_profile_ports(&engine.registry.config, &name, &profile);
             if socks_port == http_port {
                 return Err(failed(
                     "the profile's SOCKS and HTTP inbounds would share a port",
@@ -943,26 +1154,41 @@ impl Service {
                 }
             };
 
-            if engine.registry.config.socks_port != socks_port
-                || engine.registry.config.http_port != http_port
+            let wants_system_proxy = engine.registry.config.system_proxy;
+            if wants_system_proxy
+                && let Some(owner) = engine.sessions.owner_of_system_proxy()
+                && owner != name
+            {
+                return Err(failed(format!(
+                    "the system proxy is already held by profile {owner:?}"
+                )));
+            }
+            let address = oxidom_core::bind::address_for(&name, &engine.sessions.taken_addresses())
+                .ok_or_else(|| failed("no free profile loopback addresses remain"))?;
+
+            if name == "default"
+                && (engine.registry.config.socks_port != socks_port
+                    || engine.registry.config.http_port != http_port)
             {
                 engine.registry.config.socks_port = socks_port;
                 engine.registry.config.http_port = http_port;
-                engine.set_default_ports(socks_port, http_port);
                 engine.save().map_err(failed)?;
             }
             engine
-                .prepare_session(&name, Ipv4Addr::LOCALHOST, socks_port, http_port)
+                .prepare_session(&name, address, socks_port, http_port)
                 .map_err(failed)?;
+            if wants_system_proxy {
+                engine.sessions.claim_system_proxy(&name).map_err(failed)?;
+            }
             (server, ignored_ports)
         };
 
-        *oxidom_core::sync::lock(&self.shared.override_status) = None;
-        let generation = self.shared.next_connect_generation();
+        self.shared.clear_override(&name);
+        let generation = self.shared.next_connect_generation(&name);
         let result =
             self.shared
-                .start_connection(&server.id, generation, ConnectionOrigin::Explicit);
-        *oxidom_core::sync::lock(&self.shared.override_status) = None;
+                .start_connection(&name, &server.id, generation, ConnectionOrigin::Explicit);
+        self.shared.clear_override(&name);
         result.map_err(failed)?;
 
         json(&UpResult {
@@ -976,19 +1202,29 @@ impl Service {
     }
 
     fn down(&self, profile: String) -> fdo::Result<bool> {
-        // A named stop only matches the profile that brought the tunnel up.
-        // Otherwise `systemctl stop oxidom@work` would tear down whatever
-        // `home` had running, which is not what stopping a unit means.
-        if !profile.is_empty()
-            && oxidom_core::sync::lock(&self.shared.engine)
-                .active_profile()
-                .as_deref()
-                != Some(profile.as_str())
-        {
-            return Ok(false);
+        if profile.is_empty() {
+            // The old single-session method remains unconditional. With
+            // sessions that means bringing every profile down.
+            self.stop_all_profiles()?;
+            return Ok(true);
         }
-        self.disconnect()?;
-        Ok(true)
+        self.stop_profile(&profile)
+    }
+
+    fn list_sessions(&self) -> fdo::Result<String> {
+        json(&self.shared.list_session_infos())
+    }
+
+    fn session_status(&self, profile: String) -> fdo::Result<String> {
+        let session = self
+            .shared
+            .session_info(&profile)
+            .ok_or_else(|| failed(format!("profile {profile:?} is not up")))?;
+        json(&session)
+    }
+
+    fn down_profile(&self, profile: String) -> fdo::Result<bool> {
+        self.stop_profile(&profile)
     }
 
     fn status(&self) -> fdo::Result<String> {
@@ -1073,6 +1309,19 @@ impl Service {
 
         let ports_changed = engine.registry.config.socks_port != config.socks_port
             || engine.registry.config.http_port != config.http_port;
+        let compatibility_profile = engine
+            .default_session()
+            .map(|session| session.profile.clone());
+        if config.system_proxy {
+            if let Some(profile) = compatibility_profile.as_deref() {
+                engine
+                    .sessions
+                    .claim_system_proxy(profile)
+                    .map_err(failed)?;
+            }
+        } else if let Some(owner) = engine.sessions.owner_of_system_proxy().map(str::to_string) {
+            engine.sessions.release_system_proxy(&owner);
+        }
         engine.registry.config = config;
         let socks_port = engine.registry.config.socks_port;
         let http_port = engine.registry.config.http_port;
@@ -1086,11 +1335,16 @@ impl Service {
         if ports_changed && engine.status() == Status::Connected {
             // Same treatment as a user-driven connect: the restarted core has
             // to prove the new inbound is up before this counts as connected.
-            if let Some(active) = engine.active_server_id() {
-                let generation = self.shared.next_connect_generation();
-                match engine.connect(&active) {
+            if let Some(active) = engine
+                .sessions
+                .get("default")
+                .and_then(|session| session.server_id.clone())
+            {
+                let generation = self.shared.next_connect_generation("default");
+                match engine.connect_session("default", &active) {
                     Ok(()) => {
                         self.shared.confirm_connection(
+                            "default".to_string(),
                             active,
                             generation,
                             ConnectionOrigin::Explicit,
@@ -1129,9 +1383,10 @@ fn spawn_core_supervisor(shared: Shared) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(CORE_WATCH_INTERVAL);
-            let generation = shared.connect_generation.load(Ordering::SeqCst);
-            if let Some(server_id) = shared.note_core_death() {
-                shared.begin_reconnect(server_id, generation);
+            if let Some((profile, server_id)) = shared.note_core_death()
+                && let Some(generation) = shared.current_generation(&profile)
+            {
+                shared.begin_reconnect(profile, server_id, generation);
             }
         }
     });
@@ -1163,10 +1418,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
 
     // Report the core up front: `journalctl -u oxidom` should show a missing
     // binary before anyone clicks Connect and wonders why it failed.
-    let resolved = engine
-        .default_session()
-        .context("no default session")
-        .and_then(|session| session.core.resolve_binary());
+    let resolved = oxidom_core::xray::resolve::resolve(&engine.registry.config.xray_binary);
     match resolved {
         Ok(resolved) => log::info!(
             "using the Xray core at {} (from {})",
@@ -1229,7 +1481,9 @@ pub fn run(options: DaemonOptions) -> Result<()> {
         }
     }
 
-    oxidom_core::sync::lock(&shared.engine).disconnect();
+    if let Err(error) = oxidom_core::sync::lock(&shared.engine).disconnect_all() {
+        log::warn!("could not persist the clean daemon shutdown: {error:#}");
+    }
     log::info!("oxidom daemon stopped");
     Ok(())
 }
@@ -1293,12 +1547,14 @@ mod tests {
     }
 
     fn mark_active(engine: &mut Engine, profile: &str, server_id: &str) -> Result<()> {
-        let address = bind::address_for(profile, &[]).context("allocating test address")?;
+        let address = bind::address_for(profile, &engine.sessions.taken_addresses())
+            .context("allocating test address")?;
         let socks_port = engine.registry.config.socks_port;
         let http_port = engine.registry.config.http_port;
         engine.prepare_session(profile, address, socks_port, http_port)?;
         engine
-            .default_session_mut()
+            .sessions
+            .get_mut(profile)
             .context("test session is absent")?
             .server_id = Some(server_id.to_string());
         Ok(())
@@ -1317,14 +1573,13 @@ mod tests {
         let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("cancel-reconnect")?;
         let service = for_test();
-        let stale_generation = service.shared.connect_generation.load(Ordering::SeqCst);
-
-        service.shared.next_connect_generation();
+        let stale_generation = service.shared.next_connect_generation("default");
+        service.shared.next_connect_generation("default");
 
         assert!(
             service
                 .shared
-                .start_reconnect_attempt("never-started", stale_generation)
+                .start_reconnect_attempt("default", "never-started", stale_generation)
                 .is_none()
         );
         assert_eq!(
@@ -1373,8 +1628,8 @@ mod tests {
         }
 
         assert_eq!(
-            service.shared.note_core_death().as_deref(),
-            Some("dead-server")
+            service.shared.note_core_death(),
+            Some(("default".to_string(), "dead-server".to_string()))
         );
         assert!(matches!(
             oxidom_core::sync::lock(&service.shared.engine).status(),
@@ -1478,8 +1733,9 @@ mod tests {
             ..Profile::default()
         };
 
-        let (socks_port, http_port, ignored) =
-            service.shared.reconcile_profile_ports(&config, &profile);
+        let (socks_port, http_port, ignored) = service
+            .shared
+            .reconcile_profile_ports(&config, "default", &profile);
 
         assert_eq!(socks_port, config.socks_port);
         assert_eq!(http_port, config.http_port);
@@ -1512,11 +1768,179 @@ mod tests {
             ..Profile::default()
         };
 
-        let (socks_port, http_port, ignored) =
-            service.shared.reconcile_profile_ports(&config, &profile);
+        let (socks_port, http_port, ignored) = service
+            .shared
+            .reconcile_profile_ports(&config, "work", &profile);
 
         assert_eq!((socks_port, http_port), (21080, 21081));
         assert!(ignored.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn unit_pins_do_not_override_a_non_default_profile() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("profile-non-default-pins")?;
+        let service = for_test_with_pinned_ports();
+        let config = oxidom_core::sync::lock(&service.shared.engine)
+            .registry
+            .config
+            .clone();
+        let profile = Profile {
+            proxy: oxidom_core::profile::ProfileProxy {
+                socks_port: 21080,
+                http_port: 21081,
+            },
+            ..Profile::default()
+        };
+
+        let (socks_port, http_port, ignored) = service
+            .shared
+            .reconcile_profile_ports(&config, "work", &profile);
+
+        assert_eq!((socks_port, http_port), (21080, 21081));
+        assert!(ignored.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sessions_are_listed_in_order_and_stopped_independently() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("sessions-list-down")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            mark_active(&mut engine, "work", "work-server")?;
+            mark_active(&mut engine, "home", "home-server")?;
+            *oxidom_core::sync::lock(
+                &engine
+                    .sessions
+                    .get("work")
+                    .context("work session")?
+                    .core
+                    .status,
+            ) = Status::Connected;
+            *oxidom_core::sync::lock(
+                &engine
+                    .sessions
+                    .get("home")
+                    .context("home session")?
+                    .core
+                    .status,
+            ) = Status::Connected;
+            engine.sessions.claim_system_proxy("home")?;
+        }
+
+        let sessions: Vec<SessionInfo> = serde_json::from_str(&service.list_sessions()?)?;
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.profile.as_str())
+                .collect::<Vec<_>>(),
+            ["home", "work"]
+        );
+        assert!(sessions[0].owns_system_proxy);
+        assert!(!sessions[1].owns_system_proxy);
+        assert!(service.down_profile("work".to_string())?);
+        assert!(
+            oxidom_core::sync::lock(&service.shared.engine)
+                .sessions
+                .get("home")
+                .is_some()
+        );
+        assert!(
+            oxidom_core::sync::lock(&service.shared.engine)
+                .sessions
+                .get("work")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_keeps_the_legacy_view_and_adds_all_sessions() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("sessions-status-compat")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            mark_active(&mut engine, "work", "work-server")?;
+            mark_active(&mut engine, "home", "home-server")?;
+            *oxidom_core::sync::lock(
+                &engine
+                    .sessions
+                    .get("home")
+                    .context("home session")?
+                    .core
+                    .status,
+            ) = Status::Connecting;
+        }
+
+        let status: StatusInfo = serde_json::from_str(&service.status()?)?;
+        assert_eq!(status.state, "connecting");
+        assert_eq!(status.active_profile.as_deref(), Some("home"));
+        assert_eq!(status.active_id.as_deref(), Some("home-server"));
+        assert_eq!(status.sessions.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_existing_profile_session_is_refused_before_starting_another_core() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("profile-already-up")?;
+        let service = for_test();
+        let profile = Profile {
+            select: oxidom_core::profile::ProfileSelect {
+                server: "anything".to_string(),
+            },
+            ..Profile::default()
+        };
+        profile::save("work", &profile)?;
+        mark_active(
+            &mut oxidom_core::sync::lock(&service.shared.engine),
+            "work",
+            "server",
+        )?;
+
+        let error = service.up_profile("work".to_string()).unwrap_err();
+        assert!(error.to_string().contains("profile \"work\" is already up"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_system_proxy_owner_is_refused() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("profile-system-proxy-owner")?;
+        let service = for_test();
+        let server = oxidom_core::link::parse_link("trojan://secret@example.com:443#Example")
+            .context("parsing server")?;
+        let server_id = server.id.clone();
+        let mut subscription = oxidom_core::model::Subscription::new(
+            "https://subscription.example".to_string(),
+            Some("Test".to_string()),
+        );
+        subscription.servers.push(server);
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.subscriptions.push(subscription);
+            engine.registry.config.system_proxy = true;
+            mark_active(&mut engine, "home", "home-server")?;
+            engine.sessions.claim_system_proxy("home")?;
+        }
+        profile::save(
+            "work",
+            &Profile {
+                select: oxidom_core::profile::ProfileSelect { server: server_id },
+                ..Profile::default()
+            },
+        )?;
+
+        let error = service.up_profile("work".to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the system proxy is already held by profile \"home\"")
+        );
         Ok(())
     }
 

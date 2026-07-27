@@ -1,8 +1,10 @@
 //! Named connection profiles stored below the daemon's config directory.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -12,6 +14,29 @@ use crate::engine::Engine;
 use crate::{fsutil, paths};
 
 const MAX_NAME_LEN: usize = 32;
+
+/// Top-level CLI words cannot also be profile-first profile names: the
+/// normalizer deliberately gives a verb in the first position precedence.
+pub const RESERVED_NAMES: &[&str] = &[
+    "up",
+    "connect-profile",
+    "down",
+    "disconnect",
+    "status",
+    "ip",
+    "list",
+    "ping",
+    "alias",
+    "profile",
+    "connect",
+    "daemon",
+    "gui",
+    "run",
+    "env",
+    "tun",
+];
+
+static WARNED_RESERVED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -86,6 +111,20 @@ pub fn valid_name(name: &str) -> bool {
         })
 }
 
+pub fn is_reserved(name: &str) -> bool {
+    RESERVED_NAMES.contains(&name)
+}
+
+fn warn_reserved(name: &str) {
+    let warned = WARNED_RESERVED.get_or_init(|| Mutex::new(HashSet::new()));
+    if crate::sync::lock(warned).insert(name.to_string()) {
+        log::warn!(
+            "profile {name:?} uses a reserved CLI command name; it remains readable but cannot \
+             be saved under that name"
+        );
+    }
+}
+
 pub fn list() -> Result<Vec<String>> {
     let directory = paths::profiles_dir()?;
     let entries = match fs::read_dir(&directory) {
@@ -113,6 +152,9 @@ pub fn list() -> Result<Vec<String>> {
             continue;
         };
         if valid_name(name) {
+            if is_reserved(name) {
+                warn_reserved(name);
+            }
             names.push(name.to_string());
         }
     }
@@ -122,12 +164,18 @@ pub fn list() -> Result<Vec<String>> {
 
 pub fn load(name: &str) -> Result<Profile> {
     let path = profile_path(name)?;
+    if is_reserved(name) {
+        warn_reserved(name);
+    }
     let body = fs::read_to_string(&path)
         .with_context(|| format!("reading profile {name:?} from {}", path.display()))?;
     Profile::from_toml(&body).with_context(|| format!("in profile {name:?}"))
 }
 
 pub fn save(name: &str, profile: &Profile) -> Result<()> {
+    if is_reserved(name) {
+        bail!("profile name {name:?} is reserved by the oxidom CLI");
+    }
     let path = profile_path(name)?;
     profile.validate()?;
     let body = profile.to_toml()?;
@@ -185,7 +233,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{Profile, list, valid_name};
+    use super::{Profile, is_reserved, list, valid_name};
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -251,6 +299,30 @@ http_port = 12081
         ] {
             assert!(!valid_name(rejected), "{rejected:?}");
         }
+    }
+
+    #[test]
+    fn command_names_are_reserved_for_argv_normalization() {
+        for reserved in super::RESERVED_NAMES {
+            assert!(is_reserved(reserved), "{reserved:?}");
+        }
+        for allowed in ["default", "work", "home-2"] {
+            assert!(!is_reserved(allowed), "{allowed:?}");
+        }
+    }
+
+    #[test]
+    fn reserved_legacy_profiles_stay_visible_and_readable() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("reserved-readable");
+        let path = crate::paths::profiles_dir()?.join("status.toml");
+        let profile = Profile::default();
+        crate::fsutil::write_private_atomic(&path, profile.to_toml()?.as_bytes())?;
+
+        assert_eq!(list()?, vec!["status".to_string()]);
+        assert_eq!(super::load("status")?, profile);
+        assert!(super::save("status", &profile).is_err());
+        Ok(())
     }
 
     #[test]

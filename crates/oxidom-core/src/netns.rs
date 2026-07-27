@@ -14,18 +14,14 @@
 
 use anyhow::{Result, bail};
 
-use crate::config::Config;
-
 pub fn run(args: &[String]) -> Result<()> {
     if args.is_empty() {
         bail!("no command given to `oxidom run`");
     }
-    let cfg = Config::load();
     bail!(
-        "`oxidom run` is not yet available: per-process routing needs the privileged \
-         netns helper, which is not installed. The active proxy would be \
-         socks5://127.0.0.1:{}. Command requested: {}",
-        cfg.socks_port,
+        "`oxidom run` is not yet available: per-process routing will arrive with profile \
+         interfaces. `oxidom env <profile>` works now for programs that honor proxy \
+         environment variables. Command requested: {}",
         shell_words::join(args)
     );
 }

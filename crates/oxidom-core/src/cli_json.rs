@@ -6,8 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
-use crate::ipc::{ProfileEntry, StatusInfo};
+use crate::ipc::{ProfileEntry, SessionInfo};
 use crate::model::{Server, Subscription, UserInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,22 +17,53 @@ pub struct StatusOutput {
     pub http_port: u16,
     pub latency_ms: Option<u32>,
     pub error: Option<String>,
+    /// Local SOCKS bind address for the selected session.
+    pub address: String,
 }
 
 impl StatusOutput {
-    pub fn new(
-        status: &StatusInfo,
-        server: Option<&Server>,
-        config: &Config,
-        latency_ms: Option<u32>,
-    ) -> Self {
+    pub fn new(session: &SessionInfo, server: Option<&Server>, latency_ms: Option<u32>) -> Self {
         StatusOutput {
-            state: status.state.clone(),
+            state: session.state.clone(),
             server: server.map(ActiveServerOutput::from),
-            socks_port: config.socks_port,
-            http_port: config.http_port,
+            socks_port: session.socks_port,
+            http_port: session.http_port,
             latency_ms,
-            error: status.error.clone(),
+            error: session.error.clone(),
+            address: session.address.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOutput {
+    pub profile: String,
+    pub state: String,
+    pub server_id: Option<String>,
+    pub server_alias: Option<String>,
+    pub server_name: Option<String>,
+    pub address: String,
+    pub socks_port: u16,
+    pub http_port: u16,
+    pub latency_ms: Option<u32>,
+    pub error: Option<String>,
+    pub owns_system_proxy: bool,
+}
+
+impl SessionOutput {
+    pub fn new(session: &SessionInfo, latency_ms: Option<u32>) -> Self {
+        Self {
+            profile: session.profile.clone(),
+            state: session.state.clone(),
+            server_id: session.server_id.clone(),
+            server_alias: session.server_alias.clone(),
+            server_name: session.server_name.clone(),
+            address: session.address.clone(),
+            socks_port: session.socks_port,
+            http_port: session.http_port,
+            latency_ms,
+            error: session.error.clone(),
+            owns_system_proxy: session.owns_system_proxy,
         }
     }
 }
@@ -179,8 +209,7 @@ pub struct EgressCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::ipc::StatusInfo;
+    use crate::ipc::SessionInfo;
     use crate::link::parse_link;
     use crate::model::{Subscription, UserInfo};
 
@@ -191,16 +220,43 @@ mod tests {
                 .unwrap();
         server.id = "0123456789abcdef".to_string();
         server.alias = Some("ch-trojan".to_string());
-        let status = StatusInfo {
+        let session = SessionInfo {
+            profile: "default".to_string(),
             state: "connected".to_string(),
-            active_id: Some(server.id.clone()),
-            ..StatusInfo::default()
+            server_id: Some(server.id.clone()),
+            server_alias: server.alias.clone(),
+            server_name: Some(server.name.clone()),
+            address: "127.0.0.1".to_string(),
+            socks_port: 10808,
+            http_port: 10809,
+            ..SessionInfo::default()
         };
-        let output = StatusOutput::new(&status, Some(&server), &Config::default(), Some(84));
+        let output = StatusOutput::new(&session, Some(&server), Some(84));
 
         assert_eq!(
             serde_json::to_string(&output).unwrap(),
-            r#"{"state":"connected","server":{"id":"0123456789abcdef","alias":"ch-trojan","name":"🇨🇭 Trojan","address":"203.0.113.7","port":443,"protocol":"trojan"},"socks_port":10808,"http_port":10809,"latency_ms":84,"error":null}"#
+            r#"{"state":"connected","server":{"id":"0123456789abcdef","alias":"ch-trojan","name":"🇨🇭 Trojan","address":"203.0.113.7","port":443,"protocol":"trojan"},"socks_port":10808,"http_port":10809,"latency_ms":84,"error":null,"address":"127.0.0.1"}"#
+        );
+    }
+
+    #[test]
+    fn session_list_json_shape_is_frozen() {
+        let session = SessionInfo {
+            profile: "work".to_string(),
+            state: "connected".to_string(),
+            server_id: Some("0123456789abcdef".to_string()),
+            server_alias: Some("ch-trojan".to_string()),
+            server_name: Some("Swiss".to_string()),
+            address: "127.72.14.1".to_string(),
+            socks_port: 10808,
+            http_port: 10809,
+            owns_system_proxy: true,
+            ..SessionInfo::default()
+        };
+
+        assert_eq!(
+            serde_json::to_string(&SessionOutput::new(&session, Some(84))).unwrap(),
+            r#"{"profile":"work","state":"connected","server_id":"0123456789abcdef","server_alias":"ch-trojan","server_name":"Swiss","address":"127.72.14.1","socks_port":10808,"http_port":10809,"latency_ms":84,"error":null,"owns_system_proxy":true}"#
         );
     }
 

@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::Config;
 use crate::ipc::{
     ApplySettingsResult, BUS_NAME, INTERFACE, OBJECT_PATH, ProbeState, ProfileEntry, RuntimeInfo,
-    StatusInfo, UpResult,
+    SessionInfo, StatusInfo, UpResult,
 };
 use crate::model::Subscription;
 use crate::profile::Profile;
@@ -88,7 +88,9 @@ fn profiles_unsupported(error: zbus::Error) -> anyhow::Error {
     if let zbus::Error::MethodError(name, _, _) = &error
         && name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
     {
-        return anyhow::anyhow!("this oxidom daemon is older than profiles; restart it to upgrade");
+        return anyhow::anyhow!(
+            "this oxidom daemon is older than profiles and sessions; restart it to upgrade"
+        );
     }
     friendly(error)
 }
@@ -323,6 +325,28 @@ impl DaemonClient {
     pub fn down(&self, profile: &str) -> Result<bool> {
         self.proxy
             .call("Down", &(profile,))
+            .map_err(profiles_unsupported)
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        let json: String = self
+            .proxy
+            .call("ListSessions", &())
+            .map_err(profiles_unsupported)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn session_status(&self, name: &str) -> Result<SessionInfo> {
+        let json: String = self
+            .proxy
+            .call("SessionStatus", &(name,))
+            .map_err(profiles_unsupported)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn down_profile(&self, name: &str) -> Result<bool> {
+        self.proxy
+            .call("DownProfile", &(name,))
             .map_err(profiles_unsupported)
     }
 
