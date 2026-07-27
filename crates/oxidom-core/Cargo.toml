@@ -30,3 +30,7 @@ tokio.workspace = true
 futures-util.workspace = true
 log.workspace = true
 zbus.workspace = true
+
+[dev-dependencies]
+# The netlink threading test stands in for zbus's runtime, which is threaded.
+tokio = { workspace = true, features = ["rt-multi-thread"] }

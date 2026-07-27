@@ -18,7 +18,8 @@ pub struct DefaultNetwork {
 }
 
 pub struct Net {
-    runtime: tokio::runtime::Runtime,
+    /// Always `Some` until `Drop` takes it; see the `Drop` impl below.
+    runtime: Option<tokio::runtime::Runtime>,
     handle: Handle,
 }
 
@@ -32,10 +33,21 @@ impl Net {
             .enable_io()
             .build()
             .context("creating the netlink runtime")?;
-        let (connection, handle, _) =
-            rtnetlink::new_connection().context("opening the rtnetlink connection")?;
+        // `new_connection` registers the netlink socket with whatever reactor is
+        // current on this thread, so it has to run inside ours. Without the
+        // guard a plain thread panics with "there is no reactor running", and a
+        // thread that happens to be a zbus worker is worse: the socket lands on
+        // the D-Bus reactor while the connection task waits on ours, and no
+        // exchange ever completes.
+        let (connection, handle, _) = {
+            let _guard = runtime.enter();
+            rtnetlink::new_connection().context("opening the rtnetlink connection")?
+        };
         runtime.spawn(connection);
-        Ok(Self { runtime, handle })
+        Ok(Self {
+            runtime: Some(runtime),
+            handle,
+        })
     }
 
     /// Drive one netlink exchange to completion.
@@ -46,9 +58,13 @@ impl Net {
     /// from within a runtime" — the method then never replies and the client
     /// hangs forever. A scoped plain thread is never a worker.
     fn block<T: Send>(&self, future: impl Future<Output = T> + Send) -> T {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("the netlink runtime outlives every exchange");
         std::thread::scope(|scope| {
             scope
-                .spawn(|| self.runtime.block_on(future))
+                .spawn(|| runtime.block_on(future))
                 .join()
                 .expect("the netlink worker thread panicked")
         })
@@ -242,6 +258,21 @@ impl Net {
                 .collect();
             Ok(Some(DefaultNetwork { gateway, connected }))
         })
+    }
+}
+
+/// Retire the runtime without blocking.
+///
+/// Dropping a `Runtime` normally waits for its threads, which tokio forbids
+/// inside an async context — and the daemon builds a `Net` on a zbus worker,
+/// where the plain drop panics with "Cannot drop a runtime in a context where
+/// blocking is not allowed". Nothing here outlives the connection task, so
+/// letting it go unawaited is exactly right.
+impl Drop for Net {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
