@@ -130,6 +130,23 @@ in {
           PrivateTmp = true;
         };
       };
+
+      # Template unit: instantiated as `oxidom@<profile>`. It deliberately has
+      # no `wantedBy` — NixOS would link the template itself into
+      # multi-user.target.wants, and systemd cannot start a template with no
+      # instance. Enable the instances you want instead, e.g.
+      # `systemd.services."oxidom@work".wantedBy = ["multi-user.target"];`
+      systemd.services."oxidom@" = {
+        description = "oxidom profile %i";
+        requires = ["oxidom.service"];
+        after = ["oxidom.service"];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${daemonCfg.package}/bin/oxidom up %i";
+          ExecStop = "${daemonCfg.package}/bin/oxidom down --profile %i";
+        };
+      };
     })
   ];
 }

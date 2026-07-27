@@ -1,0 +1,13 @@
+[Unit]
+Description=oxidom profile %i
+Requires=oxidom.service
+After=oxidom.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/oxidom up %i
+ExecStop=/usr/bin/oxidom down --profile %i
+
+[Install]
+WantedBy=multi-user.target

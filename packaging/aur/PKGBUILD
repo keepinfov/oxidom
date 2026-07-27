@@ -17,9 +17,11 @@ conflicts=(oxidom)
 options=(!lto)
 source=("$pkgname::git+$url.git"
         oxidom.service
+        oxidom@.service
         oxidom-git.sysusers)
 sha256sums=('SKIP'
             'e50c4cde3e6f7c3dad7644001e089147610fc8689419e775871baa913ab02c28'
+            '7d2813231f2153b60166d07a44bff40f1d59541f928e4c626a65db28d2104bd4'
             'cfd693db52fc6f98e0c16a3ac2071b6551e0e2d7e500721b6976ab49bfb4ec5a')
 
 pkgver() {
@@ -65,6 +67,8 @@ package() {
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 "$srcdir/oxidom.service" \
     "$pkgdir/usr/lib/systemd/system/oxidom.service"
+  install -Dm644 "$srcdir/oxidom@.service" \
+    "$pkgdir/usr/lib/systemd/system/oxidom@.service"
   install -Dm644 "$srcdir/oxidom-git.sysusers" \
     "$pkgdir/usr/lib/sysusers.d/oxidom.conf"
 }

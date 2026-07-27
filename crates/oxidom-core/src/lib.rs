@@ -1,6 +1,8 @@
 pub mod alias;
+pub mod cli_json;
 pub mod client;
 pub mod config;
+pub mod egress;
 pub mod engine;
 pub mod fsutil;
 pub mod handle;

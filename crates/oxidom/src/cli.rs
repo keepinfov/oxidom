@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::os::unix::process::CommandExt;
 
 #[derive(Parser, Debug)]
@@ -19,6 +19,66 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Connect using a named profile.
+    #[command(visible_alias = "connect-profile")]
+    Up {
+        /// Profile name.
+        #[arg(default_value = "default")]
+        profile: String,
+    },
+    /// Disconnect the active tunnel.
+    #[command(visible_alias = "disconnect")]
+    Down {
+        /// Disconnect only when this profile owns the active tunnel.
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Connect directly to one server, without a profile.
+    Connect {
+        /// Exact alias/id or a unique alias/name substring.
+        handle: String,
+    },
+    /// Show the active connection.
+    Status {
+        /// Print the stable machine-readable schema.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the active server endpoint or observed public egress address.
+    Ip {
+        /// Observe the public address through the active SOCKS tunnel.
+        #[arg(long)]
+        egress: bool,
+        /// Ignore the 60-second egress cache.
+        #[arg(long, requires = "egress")]
+        fresh: bool,
+    },
+    /// List daemon objects.
+    List {
+        /// Object type to list.
+        #[arg(value_enum, default_value_t = ListTarget::Servers)]
+        target: ListTarget,
+        /// Print the stable machine-readable schema.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Measure one server and print milliseconds.
+    Ping {
+        /// Exact alias/id or a unique alias/name substring.
+        handle: String,
+    },
+    /// Assign a stable human handle to a server.
+    Alias {
+        /// Existing exact alias/id or a unique alias/name substring.
+        handle: String,
+        /// New globally unique alias.
+        new: String,
+    },
+    /// Manage named connection profiles.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
     /// Launch the graphical interface.
     Gui {
         /// Start without showing the window (for autostart; the tray/daemon
@@ -44,6 +104,31 @@ pub enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         args: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ListTarget {
+    Servers,
+    Profiles,
+    Subscriptions,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProfileCommand {
+    /// List profiles.
+    List {
+        /// Print the stable machine-readable schema.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one profile as TOML.
+    Show { name: String },
+    /// Create an empty profile using the current proxy ports.
+    New { name: String },
+    /// Edit one profile with $EDITOR, $VISUAL, or vi.
+    Edit { name: String },
+    /// Remove one profile.
+    Rm { name: String },
 }
 
 fn gui_binary() -> PathBuf {

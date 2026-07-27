@@ -54,6 +54,25 @@ impl Profile {
         }
         Ok(())
     }
+
+    pub fn from_toml(body: &str) -> Result<Self> {
+        toml::from_str(body).context("parsing profile")
+    }
+
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string_pretty(self).context("serializing profile")
+    }
+}
+
+/// Parse an editor setting without involving a shell. Editor variables often
+/// include flags (`code --wait`), while executing the string through a shell
+/// would turn a local preference into an avoidable command-injection surface.
+pub fn editor_command(raw: &str) -> Result<Vec<String>> {
+    let arguments = shell_words::split(raw).context("parsing the editor command")?;
+    if arguments.is_empty() {
+        bail!("the editor command is empty");
+    }
+    Ok(arguments)
 }
 
 /// Profile names are also systemd instance names, so accepting path syntax or
@@ -105,13 +124,13 @@ pub fn load(name: &str) -> Result<Profile> {
     let path = profile_path(name)?;
     let body = fs::read_to_string(&path)
         .with_context(|| format!("reading profile {name:?} from {}", path.display()))?;
-    toml::from_str(&body).with_context(|| format!("parsing profile {name:?}"))
+    Profile::from_toml(&body).with_context(|| format!("in profile {name:?}"))
 }
 
 pub fn save(name: &str, profile: &Profile) -> Result<()> {
     let path = profile_path(name)?;
     profile.validate()?;
-    let body = toml::to_string_pretty(profile).context("serializing profile")?;
+    let body = profile.to_toml()?;
     fsutil::write_private_atomic(&path, body.as_bytes())
         .with_context(|| format!("writing profile {name:?}"))
 }
@@ -233,6 +252,15 @@ http_port = 12081
         ] {
             assert!(!valid_name(rejected), "{rejected:?}");
         }
+    }
+
+    #[test]
+    fn editor_settings_accept_flags_and_quoted_arguments() -> Result<()> {
+        assert_eq!(
+            super::editor_command(r#"code --wait "--profile=Work Tree""#)?,
+            ["code", "--wait", "--profile=Work Tree"]
+        );
+        Ok(())
     }
 
     #[test]

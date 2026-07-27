@@ -56,6 +56,18 @@ pub fn data_dir() -> Result<PathBuf> {
         .join("oxidom"))
 }
 
+/// User-owned ephemeral data. A system daemon's `STATE_DIRECTORY` must never
+/// redirect this: `oxidom ip --egress` runs as the caller and could not write
+/// a root-owned daemon directory.
+pub fn cache_dir() -> Result<PathBuf> {
+    if let Some(dir) = test_root() {
+        return Ok(dir);
+    }
+    Ok(dirs::cache_dir()
+        .ok_or_else(|| anyhow!("no XDG cache dir"))?
+        .join("oxidom"))
+}
+
 pub fn config_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
 }

@@ -172,30 +172,10 @@ impl DaemonClient {
     /// `progress` is called on the calling thread before each step, so a caller
     /// that runs this off the main loop can report what it is waiting on.
     pub fn connect_any(progress: impl Fn(ConnectStage)) -> Result<Self> {
-        progress(ConnectStage::System);
-        match Self::try_bus(true, DaemonSource::System) {
-            Ok(client) => return Ok(client),
-            Err(error) if name_unowned(&error) && system_daemon_installed() => {
-                progress(ConnectStage::WaitingForSystem);
-                let deadline = Instant::now() + SYSTEM_DAEMON_GRACE;
-                while Instant::now() < deadline {
-                    std::thread::sleep(SYSTEM_DAEMON_RETRY);
-                    if let Ok(client) = Self::try_bus(true, DaemonSource::System) {
-                        return Ok(client);
-                    }
-                }
-                log::warn!(
-                    "the system daemon is installed but did not answer within {}s; \
-                     falling back to a session daemon, which keeps its own subscriptions",
-                    SYSTEM_DAEMON_GRACE.as_secs()
-                );
-            }
-            Err(error) => log::info!("no daemon on the system bus ({error})"),
-        }
-        progress(ConnectStage::Session);
-        if let Ok(client) = Self::try_bus(false, DaemonSource::Session) {
+        if let Some(client) = Self::find_existing(&progress, true) {
             return Ok(client);
         }
+
         progress(ConnectStage::Starting);
         let executable = daemon_binary();
         std::process::Command::new(&executable)
@@ -209,6 +189,46 @@ impl DaemonClient {
             }
         }
         bail!("could not reach or start the oxidom daemon")
+    }
+
+    /// Reach an already running daemon without starting a private session
+    /// daemon. Read-only CLI commands use this so a status check never changes
+    /// machine state merely by asking.
+    pub fn connect_existing() -> Result<Self> {
+        Self::find_existing(&|_| {}, false)
+            .ok_or_else(|| anyhow::anyhow!("the oxidom daemon is not available"))
+    }
+
+    /// `patient` decides whether an installed-but-silent system daemon is worth
+    /// waiting [`SYSTEM_DAEMON_GRACE`] for. Only a caller that would otherwise
+    /// start a daemon of its own has that race to lose; a read-only CLI command
+    /// must answer "nothing is running" now, not in ten seconds.
+    fn find_existing(progress: &impl Fn(ConnectStage), patient: bool) -> Option<DaemonClient> {
+        progress(ConnectStage::System);
+        match Self::try_bus(true, DaemonSource::System) {
+            Ok(client) => return Some(client),
+            Err(error) if patient && name_unowned(&error) && system_daemon_installed() => {
+                progress(ConnectStage::WaitingForSystem);
+                let deadline = Instant::now() + SYSTEM_DAEMON_GRACE;
+                while Instant::now() < deadline {
+                    std::thread::sleep(SYSTEM_DAEMON_RETRY);
+                    if let Ok(client) = Self::try_bus(true, DaemonSource::System) {
+                        return Some(client);
+                    }
+                }
+                log::warn!(
+                    "the system daemon is installed but did not answer within {}s; \
+                     falling back to a session daemon, which keeps its own subscriptions",
+                    SYSTEM_DAEMON_GRACE.as_secs()
+                );
+            }
+            Err(error) if patient => {
+                log::info!("no daemon on the system bus ({error})");
+            }
+            Err(_) => {}
+        }
+        progress(ConnectStage::Session);
+        Self::try_bus(false, DaemonSource::Session).ok()
     }
 
     pub fn subscriptions(&self) -> Result<Vec<Subscription>> {

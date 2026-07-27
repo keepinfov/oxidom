@@ -38,9 +38,11 @@ Resolve config dir as `$XDG_CONFIG_HOME/oxidom` (`~/.config/oxidom`), data dir a
 missing files (treat as defaults/empty).
 
 - `~/.config/oxidom/config.toml` — user settings (see schema).
+- `~/.config/oxidom/profiles/<name>.toml` — named CLI/systemd connection profiles.
 - `~/.local/share/oxidom/subscriptions.json` — cached subscriptions + parsed servers.
 - `~/.local/share/oxidom/state.toml` — last active server, per-app route memory.
 - `~/.local/share/oxidom/hwid` — random per-install id (only generated/used if a sub opts in).
+- `~/.cache/oxidom/egress.json` — user-owned 60-second cache for `oxidom ip --egress`.
 
 ### Which daemon owns the store (binding)
 A system daemon run from the NixOS module keeps all of the above in its `StateDirectory`
@@ -218,14 +220,64 @@ a `LatencyState`, and ages are bucketed to whole minutes so the badge repaints o
 rather than once a second.
 
 ## CLI (clap derive)
-Single binary `oxidom`:
-- `oxidom` / `oxidom gui` → launch GUI (default).
-- `oxidom run -- <cmd>...` → run one process routed through the active proxy via a **network
-  namespace**. Mechanism (Phase 1): create/enter a netns with a veth or `slirp`-style userspace
-  path to the local SOCKS inbound, or (simpler first cut) a netns + `redsocks`/`tun2socks`
-  bridged to SOCKS; then `exec` the target. Needs a small privileged helper — design the helper
-  boundary so the GUI never needs root. Document the chosen privilege model in `.notes/`.
-- (Phase 3) `oxidom connect <id> | status | disconnect` → control a background core for scripting.
+`oxidom` is the headless CLI/daemon and `oxidom-gui` is the graphical client.
+`oxidom gui` remains a compatibility shim that execs the latter.
+
+- `oxidom up [PROFILE]` (`connect-profile`) connects the `default` profile or the named one.
+- `oxidom down [--profile NAME]` (`disconnect`) stops the tunnel unconditionally unless a profile
+  is named.
+- `oxidom connect <HANDLE>` connects one server without a profile.
+- `oxidom status [--json]`, `oxidom ip [--egress] [--fresh]`,
+  `oxidom list [servers|profiles|subscriptions] [--json]`, and
+  `oxidom ping <HANDLE>` are read commands and never spawn a session daemon.
+- `oxidom alias <HANDLE> <NEW>` changes a server alias.
+- `oxidom profile {list,show,new,edit,rm}` manages daemon-owned profiles.
+- `oxidom daemon [--system --socks-port --http-port]` runs the D-Bus service.
+- `oxidom run -- <cmd>...` is the reserved per-process network-namespace launcher.
+
+Only `up` and `connect` may spawn a private session daemon; every other control command requires
+an existing daemon.
+
+Data goes only to stdout; warnings, errors, and ambiguous-handle candidates go to stderr. JSON
+uses the fixed DTOs in `oxidom-core/src/cli_json.rs`. Exit codes are binding:
+
+| Code | Meaning |
+|---:|---|
+| 0 | Success |
+| 1 | Command error |
+| 3 | No active connection |
+| 4 | Daemon unavailable |
+
+### Handles and aliases (binding)
+
+Server ids use hand-written FNV-1a 64 and aliases are globally unique, stable human handles.
+`handle::resolve` prefers an exact alias, then an exact id, then a unique case-insensitive
+substring of alias or name. No match is an error; multiple substring matches are an error with
+the candidates listed in stderr. Aliases are lowercase ASCII letters/digits/hyphens, at most 32
+characters, and cannot be exactly 16 hexadecimal characters.
+
+### Profiles (binding)
+
+Profiles live in `profiles/<name>.toml` below the daemon's config directory:
+
+```toml
+description = "work"
+
+[select]
+server = "ch-trojan"
+
+[proxy]
+socks_port = 10808
+http_port = 10809
+```
+
+Names match `^[a-z0-9][a-z0-9_-]{0,31}$`. `UpProfile` resolves `select.server` as a handle and
+applies ports unless the daemon unit pins them. `Down("")` disconnects unconditionally;
+`Down(name)` disconnects only when `state.active_profile == name`, otherwise it returns `false`
+without touching the active tunnel. `oxidom down --profile` still exits `0` in that case: it is
+the unit's `ExecStop`, and the post-condition it was asked for — that profile is not running —
+already holds. Removing a profile deliberately leaves `active_profile` set, so the unit can still
+stop the tunnel it started.
 
 ## GUI (Phase 2 — codex brief)
 Build with `adw::Application` (app id `dev.keepinfov.oxidom`). Wire to the core modules; do not

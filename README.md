@@ -50,7 +50,12 @@ services.oxidom.enable = true;          # system daemon at boot
 services.oxidom.socksPort = 20172;      # optional
 ```
 
-**Arch (AUR):** `packaging/aur/PKGBUILD` (`oxidom-git`), then
+The flake exposes separate `oxidom-cli` (headless) and `oxidom-gui` packages;
+the default package contains both. The NixOS module installs the GUI and CLI
+when `programs.oxidom.enable` is set and uses only the headless package for the
+system daemon.
+
+**Arch (AUR):** `packaging/aur/PKGBUILD` (`oxidom-git`) installs both binaries, then
 `systemctl enable --now oxidom.service`.
 
 The system daemon rewrites the machine's proxy configuration and runs the
@@ -79,11 +84,32 @@ Without nix you need GTK4 ≥ 4.14, libadwaita ≥ 1.4, a Rust toolchain, and an
 ## CLI
 
 ```sh
-oxidom-gui                 # launch the GUI
-oxidom                     # print CLI help and exit with status 2
-oxidom gui --background    # compatibility shim: exec oxidom-gui hidden
-oxidom daemon [--system]   # headless daemon (session bus by default)
-oxidom run -- CMD          # (planned) run one command through the proxy
+oxidom up [PROFILE]                  # connect a profile (default: default)
+oxidom down [--profile NAME]         # stop unconditionally or only its owner
+oxidom connect HANDLE                # connect one server without a profile
+oxidom status [--json]               # active server, ports, and tunnel latency
+oxidom ip [--egress] [--fresh]       # endpoint IP or cached public egress IP
+oxidom list [servers|profiles|subscriptions] [--json]
+oxidom ping HANDLE                   # print only milliseconds on success
+oxidom alias HANDLE NEW
+oxidom profile {list,show,new,edit,rm}
+oxidom daemon [--system]             # headless daemon (session bus by default)
+oxidom gui --background              # compatibility shim to oxidom-gui
+oxidom run -- CMD                    # reserved per-process proxy launcher
+```
+
+Structured data is printed only to stdout; diagnostics and ambiguous-handle
+candidates go to stderr. Stable exit codes are `0` (success), `1` (command
+error), `3` (not connected), and `4` (daemon unavailable). Read commands do
+not start a private daemon; only `up` and `connect` may do so.
+
+Profiles are TOML files owned by the daemon. For example, after
+`oxidom profile new work`, set `select.server` with `oxidom profile edit work`
+and run it directly or as a boot-managed oneshot:
+
+```sh
+sudo systemctl start oxidom@work
+sudo systemctl enable oxidom@work
 ```
 
 ## Status
