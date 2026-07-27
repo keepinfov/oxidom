@@ -9,6 +9,10 @@ pub enum UiOperationKind {
     ImportServers,
     DeleteServer,
     ApplySettings,
+    SaveProfile,
+    RemoveProfile,
+    UpProfile,
+    DownProfile,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +20,7 @@ pub struct UiOperation {
     pub kind: UiOperationKind,
     pub subscription_id: Option<String>,
     pub server_id: Option<String>,
+    pub profile: Option<String>,
 }
 
 impl UiOperation {
@@ -24,6 +29,7 @@ impl UiOperation {
             kind,
             subscription_id: None,
             server_id: None,
+            profile: None,
         }
     }
 
@@ -32,6 +38,7 @@ impl UiOperation {
             kind,
             subscription_id: Some(subscription_id.into()),
             server_id: None,
+            profile: None,
         }
     }
 
@@ -40,6 +47,16 @@ impl UiOperation {
             kind,
             subscription_id: None,
             server_id: Some(server_id.into()),
+            profile: None,
+        }
+    }
+
+    pub fn for_profile(kind: UiOperationKind, profile: impl Into<String>) -> Self {
+        Self {
+            kind,
+            subscription_id: None,
+            server_id: None,
+            profile: Some(profile.into()),
         }
     }
 
@@ -54,6 +71,10 @@ impl UiOperation {
             UiOperationKind::ImportServers => "Importing servers…",
             UiOperationKind::DeleteServer => "Removing server…",
             UiOperationKind::ApplySettings => "Applying settings…",
+            UiOperationKind::SaveProfile => "Saving profile…",
+            UiOperationKind::RemoveProfile => "Removing profile…",
+            UiOperationKind::UpProfile => "Connecting…",
+            UiOperationKind::DownProfile => "Disconnecting…",
         }
     }
 }

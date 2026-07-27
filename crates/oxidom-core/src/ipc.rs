@@ -27,6 +27,10 @@ pub struct StatusInfo {
     pub error: Option<String>,
     /// Id of the server the tunnel runs for, when any.
     pub active_id: Option<String>,
+    /// Name of the profile that brought the tunnel up, when it was brought up by
+    /// one. `Connect` on a bare server leaves it unset, and so does a daemon
+    /// older than profiles — the GUI must read "no profile", not "unknown".
+    pub active_profile: Option<String>,
     /// Id of the server a failure belongs to, when the daemon knows it.
     ///
     /// Deliberately not folded into `active_id`: that one means "the tunnel is
@@ -49,8 +53,18 @@ impl StatusInfo {
             state: state.to_string(),
             error,
             active_id,
+            active_profile: None,
             error_id: None,
         }
+    }
+
+    /// Name the profile the tunnel was brought up by. Separate from
+    /// [`Self::from_status`] for the same reason as [`Self::with_error_id`]:
+    /// the status alone does not know it, and the override path — which
+    /// reports a tunnel that is already down — must not claim one.
+    pub fn with_active_profile(mut self, active_profile: Option<String>) -> Self {
+        self.active_profile = active_profile;
+        self
     }
 
     /// Name the server a failure belongs to. Separate from [`Self::from_status`]

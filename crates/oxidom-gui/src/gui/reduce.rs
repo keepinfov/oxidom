@@ -37,6 +37,8 @@ pub(super) struct PolledSnapshot {
 pub(super) struct SnapshotState {
     /// Server the tunnel is (optimistically) running for; drives the highlight.
     pub connected_id: Option<String>,
+    /// Profile that brought the tunnel up, as reported by the daemon.
+    pub active_profile: Option<String>,
     /// The daemon's measurements as last seen. Whole readings rather than bare
     /// numbers: when a number was taken, through what and by which method is
     /// what separates a fact about the current tunnel from a leftover.
@@ -119,6 +121,7 @@ impl SnapshotState {
     pub fn new(status: &StatusInfo) -> Self {
         Self {
             connected_id: status.active_id.clone(),
+            active_profile: status.active_profile.clone(),
             readings: HashMap::new(),
             last_active_latency: None,
             checking: HashMap::new(),
@@ -250,6 +253,7 @@ pub(super) fn reduce(
     let mut toast_no_network = false;
     let mut new_error: Option<String> = None;
     state.daemon_status = snapshot.status.to_status();
+    state.active_profile = snapshot.status.active_profile.clone();
     // Only the daemon's override path knows which server a failure belongs to;
     // failures that never reached the daemon are named by the connect handler
     // instead, which is why this only ever adds.
@@ -789,6 +793,17 @@ mod tests {
         assert!(state.is_pinned());
     }
 
+    #[test]
+    fn active_profile_is_initialized_and_updated_from_current_snapshots() {
+        let initial = StatusInfo::default().with_active_profile(Some("home".to_string()));
+        let mut state = SnapshotState::new(&initial);
+        assert_eq!(state.active_profile.as_deref(), Some("home"));
+
+        let current = StatusInfo::default().with_active_profile(Some("work".to_string()));
+        fold(&mut state, &snapshot(current, idle()), Instant::now(), true);
+        assert_eq!(state.active_profile.as_deref(), Some("work"));
+    }
+
     /// The flicker in one test: a round that started before the click reports
     /// the pre-click world, and must not be allowed to describe it.
     #[test]
@@ -796,14 +811,17 @@ mod tests {
         let mut state = state();
         state.state_epoch = 1;
         state.connected_id = Some("a".to_string());
+        state.active_profile = Some("home".to_string());
         state.pin_status(Status::Connecting, Instant::now());
 
         let stale = snapshot(
-            StatusInfo::from_status(&Status::Disconnected, None),
+            StatusInfo::from_status(&Status::Disconnected, None)
+                .with_active_profile(Some("work".to_string())),
             probe(&[], &[("a", Some(41))]),
         );
         assert!(reduce(&mut state, &stale, Instant::now(), NOW_MS, true).is_none());
         assert_eq!(state.connected_id.as_deref(), Some("a"));
+        assert_eq!(state.active_profile.as_deref(), Some("home"));
         assert!(state.readings.is_empty());
         assert!(matches!(state.current_status(), Status::Connecting));
     }

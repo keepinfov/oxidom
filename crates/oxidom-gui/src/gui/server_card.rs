@@ -9,12 +9,18 @@ use gtk::subclass::prelude::*;
 use oxidom_core::config::LatencyMethod;
 use oxidom_core::model::Server;
 
+use super::views::{
+    dialog_content, icon_button, set_transient_parent, set_validation, validation_label,
+};
+
 pub const COMPACT_CARD_HEIGHT: i32 = 64;
 pub const CARD_MEASURE_WIDTH: i32 = 320;
 
 const COLLAPSE_DURATION_MS: u32 = 120;
 const EXPAND_DURATION_MS: u32 = 160;
 const DETAIL_FADE_IN_DURATION_MS: u32 = 120;
+const ALIAS_ERROR: &str = "Use lowercase letters, digits and '-'; up to 32 characters, and not \
+    16 hex digits (that is what a server id looks like).";
 
 type Completion = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
@@ -212,6 +218,7 @@ impl ServerCard {
         on_select: impl Fn() + 'static,
         on_activate: impl Fn() + 'static,
         on_ping: impl Fn() + 'static,
+        on_set_alias: impl Fn(String) + 'static,
     ) -> Self {
         let flag = flag_widget(server.country.as_deref(), 26, 20);
 
@@ -387,6 +394,21 @@ impl ServerCard {
             .selectable(true)
             .css_classes(["dim-label", "server-meta"])
             .build();
+        let alias = gtk::Label::builder()
+            // Labelled, unlike the two lines above it: an address is
+            // self-evident, a bare lowercase word under one is not.
+            .label(server.alias.as_deref().map_or_else(
+                || "no alias".to_string(),
+                |alias| format!("alias  ·  {alias}"),
+            ))
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(1)
+            .selectable(true)
+            .css_classes(["dim-label", "server-meta"])
+            .build();
         let connect_button = gtk::Button::builder()
             .label("Connect")
             .halign(gtk::Align::End)
@@ -396,6 +418,13 @@ impl ServerCard {
         connect_button.connect_clicked({
             let on_activate = on_activate.clone();
             move |_| on_activate()
+        });
+        let edit_alias = icon_button("document-edit-symbolic", "Set alias");
+        edit_alias.add_css_class("server-action");
+        let current_alias = server.alias.clone();
+        let on_set_alias: Rc<dyn Fn(String)> = Rc::new(on_set_alias);
+        edit_alias.connect_clicked(move |button| {
+            show_alias_dialog(button, current_alias.as_deref(), on_set_alias.clone());
         });
         let copy_button = gtk::Button::builder()
             .icon_name("edit-copy-symbolic")
@@ -423,6 +452,7 @@ impl ServerCard {
 
         let action_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         action_row.set_hexpand(true);
+        action_row.append(&edit_alias);
         action_row.append(&copy_button);
         action_row.append(&ping_button);
         let action_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -433,6 +463,7 @@ impl ServerCard {
         let metadata = gtk::Box::new(gtk::Orientation::Vertical, 6);
         metadata.append(&full_name);
         metadata.append(&meta);
+        metadata.append(&alias);
         let metadata_scroller = gtk::ScrolledWindow::builder()
             .child(&metadata)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -898,6 +929,75 @@ impl ServerCard {
     }
 }
 
+fn show_alias_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    current: Option<&str>,
+    on_save: Rc<dyn Fn(String)>,
+) {
+    let window = adw::Window::builder()
+        .title("Set Alias")
+        .modal(true)
+        .default_width(420)
+        .build();
+    set_transient_parent(&window, parent);
+
+    let header = adw::HeaderBar::new();
+    let cancel = gtk::Button::with_label("Cancel");
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    save.set_sensitive(false);
+    header.pack_start(&cancel);
+    header.pack_end(&save);
+
+    let group = adw::PreferencesGroup::new();
+    let entry = adw::EntryRow::builder()
+        .title("Alias")
+        .text(current.unwrap_or_default())
+        .activates_default(true)
+        .build();
+    group.add(&entry);
+    let validation = validation_label();
+    let content = dialog_content(&group, &validation);
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.append(&header);
+    page.append(&content);
+    window.set_content(Some(&page));
+    window.set_default_widget(Some(&save));
+
+    let update_validation: Rc<dyn Fn()> = Rc::new({
+        let entry = entry.clone();
+        let save = save.clone();
+        let validation = validation.clone();
+        move || {
+            let issue = alias_validation(entry.text().as_str());
+            save.set_sensitive(issue.is_none());
+            set_validation(&validation, issue);
+        }
+    });
+    entry.connect_changed({
+        let update_validation = update_validation.clone();
+        move |_| update_validation()
+    });
+    update_validation();
+
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+    let window_for_save = window.clone();
+    save.connect_clicked(move |button| {
+        let alias = entry.text().to_string();
+        if !button.is_sensitive() || alias_validation(&alias).is_some() {
+            return;
+        }
+        on_save(alias);
+        window_for_save.close();
+    });
+    window.present();
+}
+
+pub fn alias_validation(alias: &str) -> Option<&'static str> {
+    (!oxidom_core::alias::is_valid(alias)).then_some(ALIAS_ERROR)
+}
+
 fn click_plan_for_press(button: u32, n_press: i32) -> ClickPlan {
     match (button, n_press) {
         (gtk::gdk::BUTTON_PRIMARY, 1) => ClickPlan::ToggleDetails,
@@ -954,8 +1054,8 @@ pub(crate) fn flag_widget(country: Option<&str>, flag_size: i32, globe_size: i32
 #[cfg(test)]
 mod tests {
     use super::{
-        CardConnectionState, ClickPlan, LatencyAge, LatencyMethod, LatencyState,
-        click_plan_for_press,
+        ALIAS_ERROR, CardConnectionState, ClickPlan, LatencyAge, LatencyMethod, LatencyState,
+        alias_validation, click_plan_for_press,
     };
 
     #[test]
@@ -994,6 +1094,22 @@ mod tests {
             CardConnectionState::Failed,
             CardConnectionState::Disconnected
         );
+    }
+
+    #[test]
+    fn alias_validation_uses_the_core_rules() {
+        for valid in ["home", "ch-trojan", "a"] {
+            assert_eq!(alias_validation(valid), None, "{valid:?}");
+        }
+        for invalid in [
+            "",
+            "Home",
+            "home.office",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "deadbeefcafe1234",
+        ] {
+            assert_eq!(alias_validation(invalid), Some(ALIAS_ERROR), "{invalid:?}");
+        }
     }
 
     /// The badge has to compare equal for the age sweep's early return to

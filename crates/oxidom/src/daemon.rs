@@ -323,7 +323,8 @@ impl Shared {
         let engine = oxidom_core::sync::lock(&self.engine);
         let status = engine.status();
         let active = engine.state.active_server_id.clone();
-        StatusInfo::from_status(&status, active)
+        let active_profile = engine.state.active_profile.clone();
+        StatusInfo::from_status(&status, active).with_active_profile(active_profile)
     }
 
     fn runtime_info(&self) -> RuntimeInfo {

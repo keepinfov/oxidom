@@ -43,6 +43,7 @@ pub struct CardCallbacks {
     pub ping: Rc<dyn Fn(String)>,
     pub recheck: Rc<dyn Fn(Vec<String>)>,
     pub refresh: Rc<dyn Fn(String)>,
+    pub set_alias: Rc<dyn Fn(String, String)>,
 }
 
 /// One subscription block. Cards live in independent vertical column boxes
@@ -392,6 +393,11 @@ impl ServersView {
                     let id = id.clone();
                     move || cb(id.clone())
                 };
+                let on_set_alias = {
+                    let cb = callbacks.set_alias.clone();
+                    let id = id.clone();
+                    move |alias| cb(id.clone(), alias)
+                };
                 let connection_state = match connected_id {
                     Some(connected_id) if connected_id == id => CardConnectionState::ConnectedHere,
                     Some(_) => CardConnectionState::ConnectedElsewhere,
@@ -404,6 +410,7 @@ impl ServersView {
                     on_select,
                     on_activate,
                     on_ping,
+                    on_set_alias,
                 );
                 let mut tooltip = format!(
                     "{} · {}:{} · {}",

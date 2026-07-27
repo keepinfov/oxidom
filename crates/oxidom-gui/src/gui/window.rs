@@ -11,7 +11,9 @@ use gtk::glib;
 use oxidom_core::APP_ID;
 use oxidom_core::config::Config;
 use oxidom_core::ipc;
+use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
+use oxidom_core::profile::Profile;
 use oxidom_core::xray::core::Status;
 use oxidom_core::{paths, sysproxy};
 
@@ -23,6 +25,7 @@ use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
 use super::tray::{OxidomTray, TrayCommand};
 use super::views::logs::LogsView;
+use super::views::profiles::{ProfileCallbacks, ProfilesView, server_choices};
 use super::views::servers::{CardConnection, ServersView};
 use super::views::settings::{SettingsValues, SettingsView};
 use super::views::subscriptions::SubscriptionsView;
@@ -118,6 +121,7 @@ fn servers_available_width(window_width: i32, compact: bool) -> i32 {
 struct AppState {
     client: DaemonClient,
     subscriptions: Vec<Subscription>,
+    profiles: Vec<ProfileEntry>,
     /// Card the user is inspecting/expanded. Also the target of the header
     /// Connect button. Distinct from the server that is actually connected.
     selected_id: Option<String>,
@@ -142,6 +146,7 @@ struct Controller {
     header_status_flag: gtk::Box,
     header_status_label: gtk::Label,
     header_status_spinner: gtk::Spinner,
+    profile_actions: gtk::Box,
     subscription_actions: gtk::Box,
     settings_actions: gtk::Box,
     compact: Rc<Cell<bool>>,
@@ -152,6 +157,7 @@ struct Controller {
     sidebar_status_label: gtk::Label,
     sidebar_list: gtk::ListBox,
     servers: ServersView,
+    profiles: ProfilesView,
     subscriptions: SubscriptionsView,
     settings: SettingsView,
     logs: LogsView,
@@ -373,6 +379,12 @@ fn show_daemon_error(app: &adw::Application, message: &str) {
     dialog.present();
 }
 
+fn refresh_profiles_after<R>(client: &DaemonClient, result: R) -> (R, Vec<ProfileEntry>) {
+    // A failed refresh must not mask the outcome the user asked about: the
+    // list is a redraw, the operation is the answer.
+    (result, client.list_profiles().unwrap_or_default())
+}
+
 fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw::ApplicationWindow {
     if client.source() != DaemonSource::System {
         log::info!(
@@ -381,6 +393,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         );
     }
     let subscriptions_snapshot = client.subscriptions().unwrap_or_default();
+    let profiles_snapshot = client.list_profiles().unwrap_or_default();
     let initial_status = client.status().unwrap_or_default();
     let initial_config = client.settings().unwrap_or_default();
     // A daemon older than RuntimeInfo answers UnknownMethod; `None` just
@@ -391,10 +404,15 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
     let state = Rc::new(RefCell::new(AppState {
         client,
         subscriptions: subscriptions_snapshot,
+        profiles: profiles_snapshot,
         selected_id,
         ui: SnapshotState::new(&initial_status),
     }));
 
+    let profiles = ProfilesView::new();
+    profiles.set_header_actions_embedded(false);
+    let profile_actions = profiles.header_actions();
+    profile_actions.set_visible(false);
     let subscriptions = SubscriptionsView::new();
     subscriptions.set_header_actions_embedded(false);
     let subscription_actions = subscriptions.header_actions();
@@ -407,6 +425,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         .hexpand(true)
         .build();
     stack.add_named(&servers.root, Some(Page::General.stack_name()));
+    stack.add_named(&profiles.root, Some(Page::Profiles.stack_name()));
     stack.add_named(&subscriptions.root, Some(Page::Subscriptions.stack_name()));
 
     let settings_callback: Rc<RefCell<Option<SettingsCallback>>> = Rc::new(RefCell::new(None));
@@ -488,6 +507,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
     header.pack_start(&search_toggle);
     header.pack_start(&header_status);
     header.pack_start(&search);
+    header.pack_end(&profile_actions);
     header.pack_end(&subscription_actions);
     header.pack_end(&settings_actions);
 
@@ -559,6 +579,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         header_status_flag,
         header_status_label,
         header_status_spinner,
+        profile_actions,
         subscription_actions,
         settings_actions,
         compact: Rc::new(Cell::new(false)),
@@ -569,6 +590,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         sidebar_status_label: sidebar.status_label,
         sidebar_list: sidebar.list,
         servers,
+        profiles,
         subscriptions,
         settings,
         logs,
@@ -713,6 +735,7 @@ impl Controller {
         );
         for (index, page) in [
             Page::General,
+            Page::Profiles,
             Page::Subscriptions,
             Page::Settings,
             Page::Logs,
@@ -971,10 +994,13 @@ impl Controller {
 
     fn sync_search_chrome(&self) {
         let general = self.is_general_page();
+        let profiles =
+            self.stack.visible_child_name().as_deref() == Some(Page::Profiles.stack_name());
         let subscriptions =
             self.stack.visible_child_name().as_deref() == Some(Page::Subscriptions.stack_name());
         let settings =
             self.stack.visible_child_name().as_deref() == Some(Page::Settings.stack_name());
+        self.profile_actions.set_visible(profiles);
         self.subscription_actions.set_visible(subscriptions);
         self.settings_actions.set_visible(settings);
         if self.compact.get() {
@@ -1019,6 +1045,7 @@ impl Controller {
             self.sidebar_toggle.set_visible(false);
         }
 
+        self.profiles.set_ultra_compact(enabled);
         self.subscriptions.set_ultra_compact(enabled);
         self.settings.set_ultra_compact(enabled);
         self.header.set_show_title(!enabled);
@@ -1080,6 +1107,56 @@ impl Controller {
         self.window.add_breakpoint(breakpoint);
     }
 
+    fn rebuild_profiles(self: &Rc<Self>) {
+        let (profiles, choices, active, connected, operation) = {
+            let state = self.state.borrow();
+            (
+                state.profiles.clone(),
+                server_choices(&state.subscriptions),
+                state.ui.active_profile.clone(),
+                matches!(state.ui.current_status(), Status::Connected),
+                state.ui.operation.clone(),
+            )
+        };
+        let callbacks = ProfileCallbacks {
+            up: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |name| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.up_profile(name);
+                    }
+                })
+            },
+            down: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |name| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.down_profile(name);
+                    }
+                })
+            },
+            save: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |name, profile| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.save_profile(name, profile);
+                    }
+                })
+            },
+            remove: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |name| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.remove_profile(name);
+                    }
+                })
+            },
+        };
+        self.profiles
+            .rebuild(&profiles, &choices, active.as_deref(), connected, callbacks);
+        self.profiles.set_operation(operation);
+    }
+
     fn rebuild_views(self: &Rc<Self>) {
         let (subscriptions, selected_id, connected_id, latency_states, operation) = {
             let state = self.state.borrow();
@@ -1132,6 +1209,14 @@ impl Controller {
                     }
                 })
             },
+            set_alias: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |server_id, alias| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.set_alias(server_id, alias);
+                    }
+                })
+            },
         };
         self.servers.rebuild(
             &subscriptions,
@@ -1140,6 +1225,7 @@ impl Controller {
             &latency_states,
             callbacks,
         );
+        self.rebuild_profiles();
 
         let sub_callbacks = super::views::subscriptions::SubscriptionCallbacks {
             add: {
@@ -1377,6 +1463,7 @@ impl Controller {
             failed: None,
         });
         self.servers.set_selected(Some(&server_id));
+        self.rebuild_profiles();
         self.refresh_status();
         let work_id = server_id.clone();
         let failed_id = server_id.clone();
@@ -1402,6 +1489,7 @@ impl Controller {
                         connecting: None,
                         failed: Some(failed_id.clone()),
                     });
+                    controller.rebuild_profiles();
                     // The daemon reports the same failure on its next poll;
                     // claim it now so it is not toasted twice.
                     controller.mark_error_notified(&message);
@@ -1422,6 +1510,7 @@ impl Controller {
         }
         self.bump_epoch();
         self.set_cards_connection(CardConnection::default());
+        self.rebuild_profiles();
         self.refresh_status();
         self.client_job(
             UiOperation::new(UiOperationKind::Disconnect),
@@ -1431,6 +1520,165 @@ impl Controller {
                     controller.show_message(&format!("Could not disconnect: {error}"));
                 }
                 controller.reconcile_system_proxy();
+            },
+        );
+    }
+
+    fn save_profile(self: &Rc<Self>, name: String, profile: Profile) {
+        let work_name = name.clone();
+        self.client_job(
+            UiOperation::for_profile(UiOperationKind::SaveProfile, name),
+            move |client| {
+                Ok(refresh_profiles_after(
+                    client,
+                    client.save_profile(&work_name, &profile),
+                ))
+            },
+            |controller, result| match result {
+                Ok((operation, profiles)) => {
+                    controller.state.borrow_mut().profiles = profiles;
+                    controller.rebuild_views();
+                    if let Err(error) = operation {
+                        controller.show_message(&format!("Could not save profile: {error}"));
+                    }
+                }
+                Err(error) => {
+                    controller.show_message(&format!("Could not save profile: {error}"));
+                }
+            },
+        );
+    }
+
+    fn remove_profile(self: &Rc<Self>, name: String) {
+        let work_name = name.clone();
+        self.client_job(
+            UiOperation::for_profile(UiOperationKind::RemoveProfile, name),
+            move |client| {
+                Ok(refresh_profiles_after(
+                    client,
+                    client.remove_profile(&work_name),
+                ))
+            },
+            |controller, result| match result {
+                Ok((operation, profiles)) => {
+                    controller.state.borrow_mut().profiles = profiles;
+                    controller.rebuild_views();
+                    if let Err(error) = operation {
+                        controller.show_message(&format!("Could not remove profile: {error}"));
+                    }
+                }
+                Err(error) => {
+                    controller.show_message(&format!("Could not remove profile: {error}"));
+                }
+            },
+        );
+    }
+
+    fn up_profile(self: &Rc<Self>, name: String) {
+        let work_name = name.clone();
+        let message_name = name.clone();
+        self.client_job(
+            UiOperation::for_profile(UiOperationKind::UpProfile, name),
+            move |client| {
+                Ok(refresh_profiles_after(
+                    client,
+                    client.up_profile(&work_name),
+                ))
+            },
+            move |controller, result| {
+                let operation = match result {
+                    Ok((operation, profiles)) => {
+                        controller.state.borrow_mut().profiles = profiles;
+                        operation
+                    }
+                    Err(error) => Err(error),
+                };
+                match operation {
+                    Ok(result) => {
+                        let server_id = result.server.id;
+                        {
+                            let mut state = controller.state.borrow_mut();
+                            state.selected_id = Some(server_id.clone());
+                            state.ui.connected_id = Some(server_id.clone());
+                            state.ui.failed_id = None;
+                            state.ui.pin_status(Status::Connecting, Instant::now());
+                        }
+                        controller.bump_epoch();
+                        controller.set_cards_connection(CardConnection {
+                            active: Some(server_id.clone()),
+                            connecting: Some(server_id.clone()),
+                            failed: None,
+                        });
+                        controller.servers.set_selected(Some(&server_id));
+                        controller.rebuild_profiles();
+                        if !result.ignored_ports.is_empty() {
+                            controller.show_message(&format!(
+                                "{} left unchanged — fixed by the system service unit",
+                                result.ignored_ports.join(" and ")
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        // Deliberately neither pinned nor cleared. `UpProfile`
+                        // refuses before it touches the tunnel whenever the
+                        // profile is unreadable or its handle resolves to
+                        // nothing or to several servers, and calling that
+                        // "disconnected" would blank a connection that is still
+                        // carrying traffic. The status this worker read after
+                        // the call lands immediately after this handler and
+                        // paints whichever of the two it actually is.
+                        controller.mark_error_notified(&format!("{error:#}"));
+                        controller
+                            .show_message(&format!("Could not bring up «{message_name}»: {error}"));
+                    }
+                }
+                controller.reconcile_system_proxy();
+                controller.refresh_status();
+            },
+        );
+    }
+
+    fn down_profile(self: &Rc<Self>, name: String) {
+        let work_name = name.clone();
+        let message_name = name.clone();
+        self.client_job(
+            UiOperation::for_profile(UiOperationKind::DownProfile, name),
+            move |client| Ok(refresh_profiles_after(client, client.down(&work_name))),
+            move |controller, result| {
+                let operation = match result {
+                    Ok((operation, profiles)) => {
+                        controller.state.borrow_mut().profiles = profiles;
+                        operation
+                    }
+                    Err(error) => Err(error),
+                };
+                match operation {
+                    Ok(false) => {
+                        controller.rebuild_profiles();
+                        controller.show_message(&format!(
+                            "«{message_name}» is not the profile running the tunnel"
+                        ));
+                    }
+                    Ok(true) => {
+                        {
+                            let mut state = controller.state.borrow_mut();
+                            state.ui.pin_status(Status::Disconnected, Instant::now());
+                            state.ui.connected_id = None;
+                            state.ui.failed_id = None;
+                        }
+                        controller.bump_epoch();
+                        controller.set_cards_connection(CardConnection::default());
+                        controller.rebuild_profiles();
+                        controller.refresh_status();
+                        controller.reconcile_system_proxy();
+                    }
+                    Err(error) => {
+                        controller.rebuild_profiles();
+                        controller.show_message(&format!(
+                            "Could not disconnect «{message_name}»: {error}"
+                        ));
+                    }
+                }
             },
         );
     }
@@ -1553,6 +1801,19 @@ impl Controller {
         );
     }
 
+    fn set_alias(self: &Rc<Self>, server_id: String, alias: String) {
+        self.client_job(
+            UiOperation::new(UiOperationKind::ApplySettings),
+            move |client| client.set_server_alias(&server_id, &alias),
+            |controller, result| match result {
+                Ok(()) => controller.rebuild_views(),
+                Err(error) => {
+                    controller.show_message(&format!("Could not set alias: {error}"));
+                }
+            },
+        );
+    }
+
     fn save_settings(self: &Rc<Self>, values: SettingsValues) {
         let validation = self.settings.validation();
         if !validation.is_valid() {
@@ -1655,6 +1916,7 @@ impl Controller {
             }
             state.ui.operation = Some(operation.clone());
         }
+        self.profiles.set_operation(Some(operation.clone()));
         self.subscriptions.set_operation(Some(operation));
         self.refresh_activity_status();
 
@@ -1703,6 +1965,7 @@ impl Controller {
                         // its deadline.
                         state.ui.operation = None;
                     }
+                    controller.profiles.set_operation(None);
                     controller.subscriptions.set_operation(None);
                     // The handler runs *before* the snapshot is applied: it is
                     // where a failed connect pins its outcome, and applying
@@ -1733,6 +1996,7 @@ impl Controller {
                         state.ui.operation = None;
                         drop(state);
                         controller.bump_epoch();
+                        controller.profiles.set_operation(None);
                         controller.subscriptions.set_operation(None);
                         controller.show_message("Background operation stopped unexpectedly");
                         controller.refresh_status();
@@ -1816,15 +2080,24 @@ impl Controller {
     }
 
     fn apply_snapshot(self: &Rc<Self>, snapshot: PolledSnapshot) {
-        let effects = {
+        let (effects, profile_state_changed) = {
             let mut state = self.state.borrow_mut();
-            reduce(
+            let before = (
+                state.ui.active_profile.clone(),
+                matches!(state.ui.current_status(), Status::Connected),
+            );
+            let effects = reduce(
                 &mut state.ui,
                 &snapshot,
                 Instant::now(),
                 ipc::now_unix_ms(),
                 self.window.is_visible(),
-            )
+            );
+            let after = (
+                state.ui.active_profile.clone(),
+                matches!(state.ui.current_status(), Status::Connected),
+            );
+            (effects, before != after)
         };
         // A round that predates the user's last action is dropped whole — logs,
         // cards and the system-proxy reconciliation included.
@@ -1858,6 +2131,9 @@ impl Controller {
             self.probe_one(id, false);
         }
         self.logs.set_logs(&snapshot.logs);
+        if profile_state_changed {
+            self.rebuild_profiles();
+        }
         self.sync_connection_cards();
         self.reconcile_system_proxy();
         self.refresh_status();
