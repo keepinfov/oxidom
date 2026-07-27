@@ -223,6 +223,35 @@ pub struct RuntimeInfo {
     pub http_port: u16,
 }
 
+/// One profile in a listing, flattened for CLI and other D-Bus clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProfileEntry {
+    pub name: String,
+    pub description: String,
+    pub server: String,
+    pub socks_port: u16,
+    pub http_port: u16,
+}
+
+/// The selected server returned after bringing a profile up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct UpServer {
+    pub id: String,
+    pub alias: Option<String>,
+    pub name: String,
+}
+
+/// Result of applying and connecting a profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct UpResult {
+    pub server: UpServer,
+    /// Profile port names ignored because the daemon unit pins them.
+    pub ignored_ports: Vec<String>,
+}
+
 /// A follow-up the GUI can offer for a failure. Errors cross D-Bus as free
 /// text, so the mapping lives here beside the contract rather than being
 /// guessed independently on each side.

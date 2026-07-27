@@ -14,12 +14,14 @@ use zbus::fdo;
 use oxidom_core::alias;
 use oxidom_core::config::{Config, LatencyMethod};
 use oxidom_core::engine::Engine;
+use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
     ApplySettingsResult, BUS_NAME, LatencyReading, OBJECT_PATH, PROBE_STATE_VERSION, ProbeFailure,
-    ProbeRoute, ProbeState, RuntimeInfo, StatusInfo,
+    ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo, StatusInfo, UpResult, UpServer,
 };
 use oxidom_core::model::Server;
 use oxidom_core::probe;
+use oxidom_core::profile::{self, Profile};
 use oxidom_core::xray::core::Status;
 
 /// How many servers may be measured at once. This is now a cap on *processes*:
@@ -164,6 +166,29 @@ impl Shared {
             http_port_locked,
             system_bus,
         }
+    }
+
+    /// The ports a profile actually gets, and the names of the ones it asked
+    /// for and did not. Ports pinned on the unit's command line outrank the
+    /// profile for the same reason `set_settings` refuses them: the inbound
+    /// would move only until the next restart put it back.
+    fn reconcile_profile_ports(
+        &self,
+        config: &Config,
+        profile: &Profile,
+    ) -> (u16, u16, Vec<String>) {
+        let mut ignored = Vec::new();
+        let mut socks_port = profile.proxy.socks_port;
+        let mut http_port = profile.proxy.http_port;
+        if self.socks_port_locked && socks_port != config.socks_port {
+            socks_port = config.socks_port;
+            ignored.push("SOCKS port".to_string());
+        }
+        if self.http_port_locked && http_port != config.http_port {
+            http_port = config.http_port;
+            ignored.push("HTTP port".to_string());
+        }
+        (socks_port, http_port, ignored)
     }
 
     /// Invalidate any in-flight connect confirmation and return the id of the
@@ -595,6 +620,15 @@ pub(crate) fn for_test() -> Service {
     }
 }
 
+/// A daemon started the way the service unit starts it: with both inbound
+/// ports fixed on the command line.
+#[cfg(test)]
+pub(crate) fn for_test_with_pinned_ports() -> Service {
+    Service {
+        shared: Shared::new(Engine::load(), true, true, false),
+    }
+}
+
 /// `{:#}` keeps anyhow's cause chain; `to_string()` would send only the
 /// outermost context ("spawning xray") and drop the reason it failed.
 fn failed(error: impl std::fmt::Display) -> fdo::Error {
@@ -629,6 +663,16 @@ fn wire_failure(outcome: &probe::ProbeOutcome) -> ProbeFailure {
 
 fn json<T: serde::Serialize>(value: &T) -> fdo::Result<String> {
     serde_json::to_string(value).map_err(failed)
+}
+
+/// How each candidate for an ambiguous handle should be spelled back at the
+/// user: the alias they can retype, or the id when the server has none yet.
+fn candidate_list(candidates: &[&Server]) -> String {
+    candidates
+        .iter()
+        .map(|server| server.alias.as_deref().unwrap_or(server.id.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[zbus::interface(name = "dev.keepinfov.oxidom1")]
@@ -749,9 +793,150 @@ impl Service {
     fn disconnect(&self) -> fdo::Result<()> {
         *oxidom_core::sync::lock(&self.shared.override_status) = None;
         self.shared.next_connect_generation();
-        oxidom_core::sync::lock(&self.shared.engine).disconnect();
+        {
+            let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            // Cleared before disconnecting, which persists the state itself, so
+            // one write covers both. Leaving it set would let `oxidom status`
+            // keep naming a profile that owns nothing.
+            engine.state.active_profile = None;
+            engine.disconnect();
+        }
         *oxidom_core::sync::lock(&self.shared.override_status) = None;
         Ok(())
+    }
+
+    fn list_profiles(&self) -> fdo::Result<String> {
+        let names = profile::list().map_err(failed)?;
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            // One unreadable file must not hide every other profile: the CLI
+            // uses this to tell the user what they can bring up.
+            match profile::load(&name) {
+                Ok(profile) => entries.push(ProfileEntry {
+                    name,
+                    description: profile.description,
+                    server: profile.select.server,
+                    socks_port: profile.proxy.socks_port,
+                    http_port: profile.proxy.http_port,
+                }),
+                Err(error) => log::warn!("skipping profile {name:?}: {error:#}"),
+            }
+        }
+        json(&entries)
+    }
+
+    fn get_profile(&self, name: String) -> fdo::Result<String> {
+        json(&profile::load(&name).map_err(failed)?)
+    }
+
+    fn save_profile(&self, name: String, profile_json: String) -> fdo::Result<()> {
+        let profile: Profile = serde_json::from_str(&profile_json).map_err(failed)?;
+        // `save` re-checks both the name and the ports. The daemon owns the
+        // profiles directory — on the system bus it is root's — so validation
+        // that only ran in the caller would be no validation at all.
+        profile::save(&name, &profile).map_err(failed)
+    }
+
+    fn remove_profile(&self, name: String) -> fdo::Result<bool> {
+        // `active_profile` deliberately survives the file: a tunnel this
+        // profile brought up is still its tunnel, and `oxidom down --profile`
+        // (i.e. the unit's ExecStop) has to keep being able to take it down.
+        profile::remove(&name).map_err(failed)
+    }
+
+    fn up_profile(&self, name: String) -> fdo::Result<String> {
+        let profile = profile::load(&name).map_err(failed)?;
+        // Only files written through `SaveProfile` were validated on the way
+        // in; this one may have been edited by hand since.
+        profile.validate().map_err(failed)?;
+        if profile.select.server.is_empty() {
+            return Err(failed(format!(
+                "profile {name:?} does not name a server yet; set select.server to an alias or id"
+            )));
+        }
+
+        // Resolve and apply everything that needs the engine, then drop the
+        // guard: `start_connection` takes the same lock itself.
+        let (server, ignored_ports) = {
+            let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            let (socks_port, http_port, ignored_ports) = self
+                .shared
+                .reconcile_profile_ports(&engine.config, &profile);
+            if socks_port == http_port {
+                return Err(failed(
+                    "the profile's SOCKS and HTTP inbounds would share a port",
+                ));
+            }
+
+            let server = match handle::resolve(engine.all_servers(), &profile.select.server) {
+                HandleMatch::One(server) => server.clone(),
+                HandleMatch::None => {
+                    return Err(failed(format!(
+                        "profile {name:?} names no server this daemon knows: {:?}",
+                        profile.select.server
+                    )));
+                }
+                HandleMatch::Ambiguous(candidates) => {
+                    return Err(failed(format!(
+                        "{:?} matches {} servers ({}); use an alias or an id",
+                        profile.select.server,
+                        candidates.len(),
+                        candidate_list(&candidates)
+                    )));
+                }
+            };
+
+            if engine.config.socks_port != socks_port || engine.config.http_port != http_port {
+                engine.config.socks_port = socks_port;
+                engine.config.http_port = http_port;
+                engine.core.socks_port = socks_port;
+                engine.core.http_port = http_port;
+                engine.save().map_err(failed)?;
+            }
+            (server, ignored_ports)
+        };
+
+        *oxidom_core::sync::lock(&self.shared.override_status) = None;
+        let generation = self.shared.next_connect_generation();
+        let result =
+            self.shared
+                .start_connection(&server.id, generation, ConnectionOrigin::Explicit);
+        *oxidom_core::sync::lock(&self.shared.override_status) = None;
+        result.map_err(failed)?;
+
+        {
+            let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            engine.state.active_profile = Some(name);
+            if let Err(error) = engine.state.save() {
+                log::warn!("could not persist the active profile: {error:#}");
+            }
+        }
+
+        json(&UpResult {
+            server: UpServer {
+                id: server.id,
+                alias: server.alias,
+                name: server.name,
+            },
+            ignored_ports,
+        })
+    }
+
+    fn down(&self, profile: String) -> fdo::Result<bool> {
+        // A named stop only matches the profile that brought the tunnel up.
+        // Otherwise `systemctl stop oxidom@work` would tear down whatever
+        // `home` had running, which is not what stopping a unit means.
+        if !profile.is_empty()
+            && oxidom_core::sync::lock(&self.shared.engine)
+                .state
+                .active_profile
+                .as_deref()
+                != Some(profile.as_str())
+        {
+            return Ok(false);
+        }
+        self.disconnect()?;
+        Ok(true)
     }
 
     fn status(&self) -> fdo::Result<String> {
@@ -926,6 +1111,14 @@ pub fn run(options: DaemonOptions) -> Result<()> {
             resolved.source.label()
         ),
         Err(error) => log::warn!("no usable Xray core: {error:#}"),
+    }
+
+    // Seeded from the running config, so `oxidom up` works on a fresh install
+    // without the user first writing a profile by hand. Never fatal: a daemon
+    // that refuses to start because it could not write an example profile is
+    // worse than one with no profiles.
+    if let Err(error) = profile::ensure_default(&engine) {
+        log::warn!("could not create the default profile: {error:#}");
     }
 
     let shared = Shared::new(
@@ -1185,6 +1378,171 @@ mod tests {
                 .set_server_alias(second_id, "NOT-PORTABLE".to_string())
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_pinned_port_outranks_the_profile_and_is_reported() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("profile-pinned-ports")?;
+        let service = for_test_with_pinned_ports();
+        let config = oxidom_core::sync::lock(&service.shared.engine)
+            .config
+            .clone();
+        let profile = Profile {
+            proxy: oxidom_core::profile::ProfileProxy {
+                socks_port: config.socks_port + 1000,
+                http_port: config.http_port + 1000,
+            },
+            ..Profile::default()
+        };
+
+        let (socks_port, http_port, ignored) =
+            service.shared.reconcile_profile_ports(&config, &profile);
+
+        assert_eq!(socks_port, config.socks_port);
+        assert_eq!(http_port, config.http_port);
+        assert_eq!(ignored, vec!["SOCKS port", "HTTP port"]);
+        // The refusal is reported, not written: the running config keeps the
+        // ports the unit gave it.
+        let after = oxidom_core::sync::lock(&service.shared.engine)
+            .config
+            .clone();
+        assert_eq!(after.socks_port, config.socks_port);
+        assert_eq!(after.http_port, config.http_port);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unpinned_daemon_takes_the_profile_ports_verbatim() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("profile-free-ports")?;
+        let service = for_test();
+        let config = oxidom_core::sync::lock(&service.shared.engine)
+            .config
+            .clone();
+        let profile = Profile {
+            proxy: oxidom_core::profile::ProfileProxy {
+                socks_port: 21080,
+                http_port: 21081,
+            },
+            ..Profile::default()
+        };
+
+        let (socks_port, http_port, ignored) =
+            service.shared.reconcile_profile_ports(&config, &profile);
+
+        assert_eq!((socks_port, http_port), (21080, 21081));
+        assert!(ignored.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_another_profile_leaves_this_one_running() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("profile-down-mismatch")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.state.active_profile = Some("home".to_string());
+            engine.state.active_server_id = Some("1111111111111111".to_string());
+        }
+
+        assert!(!service.down("work".to_string())?);
+
+        // `systemctl stop oxidom@work` must be a no-op while `home` owns the
+        // tunnel, so neither the profile nor the server may have been cleared.
+        let engine = oxidom_core::sync::lock(&service.shared.engine);
+        assert_eq!(engine.state.active_profile.as_deref(), Some("home"));
+        assert_eq!(
+            engine.state.active_server_id.as_deref(),
+            Some("1111111111111111")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_the_owning_profile_clears_it() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("profile-down-match")?;
+        let service = for_test();
+        oxidom_core::sync::lock(&service.shared.engine)
+            .state
+            .active_profile = Some("home".to_string());
+
+        assert!(service.down("home".to_string())?);
+
+        assert!(
+            oxidom_core::sync::lock(&service.shared.engine)
+                .state
+                .active_profile
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unnamed_stop_is_unconditional() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("profile-down-any")?;
+        let service = for_test();
+        oxidom_core::sync::lock(&service.shared.engine)
+            .state
+            .active_profile = Some("home".to_string());
+
+        assert!(service.down(String::new())?);
+
+        assert!(
+            oxidom_core::sync::lock(&service.shared.engine)
+                .state
+                .active_profile
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profiles_round_trip_through_the_daemon() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("profile-crud")?;
+        let service = for_test();
+        let profile = Profile {
+            description: "работа".to_string(),
+            select: oxidom_core::profile::ProfileSelect {
+                server: "ch-trojan".to_string(),
+            },
+            proxy: oxidom_core::profile::ProfileProxy {
+                socks_port: 21080,
+                http_port: 21081,
+            },
+        };
+
+        service.save_profile("work".to_string(), serde_json::to_string(&profile)?)?;
+        let loaded: Profile = serde_json::from_str(&service.get_profile("work".to_string())?)?;
+        assert_eq!(loaded, profile);
+
+        let entries: Vec<ProfileEntry> = serde_json::from_str(&service.list_profiles()?)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "work");
+        assert_eq!(entries[0].server, "ch-trojan");
+        assert_eq!(entries[0].socks_port, 21080);
+
+        // A name that would escape the profiles directory is refused by the
+        // daemon, not merely by whoever called it.
+        assert!(
+            service
+                .save_profile("../evil".to_string(), serde_json::to_string(&profile)?)
+                .is_err()
+        );
+        assert!(
+            service
+                .save_profile("Work".to_string(), serde_json::to_string(&profile)?)
+                .is_err()
+        );
+
+        assert!(service.remove_profile("work".to_string())?);
+        assert!(!service.remove_profile("work".to_string())?);
+        assert!(service.list_profiles()?.contains("[]"));
         Ok(())
     }
 

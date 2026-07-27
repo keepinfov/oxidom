@@ -60,6 +60,10 @@ pub fn config_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
 }
 
+pub fn profiles_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("profiles"))
+}
+
 pub fn subscriptions_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("subscriptions.json"))
 }

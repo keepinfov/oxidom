@@ -588,6 +588,7 @@ mod tests {
         store::save(&[subscription])?;
         State {
             active_server_id: Some(old_active),
+            active_profile: None,
             xray_pid: None,
         }
         .save()?;
@@ -652,6 +653,7 @@ mod tests {
         store::save(&[subscription])?;
         State {
             active_server_id: Some("different-old-id".to_string()),
+            active_profile: None,
             xray_pid: None,
         }
         .save()?;

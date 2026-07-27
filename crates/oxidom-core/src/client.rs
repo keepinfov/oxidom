@@ -8,9 +8,11 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 use crate::ipc::{
-    ApplySettingsResult, BUS_NAME, INTERFACE, OBJECT_PATH, ProbeState, RuntimeInfo, StatusInfo,
+    ApplySettingsResult, BUS_NAME, INTERFACE, OBJECT_PATH, ProbeState, ProfileEntry, RuntimeInfo,
+    StatusInfo, UpResult,
 };
 use crate::model::Subscription;
+use crate::profile::Profile;
 
 /// Ceiling on any single daemon call. zbus waits forever by default, and a
 /// daemon that stops replying — wedged on its engine lock, killed mid-call —
@@ -77,6 +79,18 @@ fn friendly(error: zbus::Error) -> anyhow::Error {
         zbus::Error::MethodError(_, Some(message), _) => anyhow::anyhow!(message),
         other => anyhow::anyhow!(other),
     }
+}
+
+/// `friendly`, plus the one diagnosis it cannot make on its own: a daemon that
+/// predates profiles answers `UnknownMethod`, which as raw bus text tells the
+/// user nothing about what to do.
+fn profiles_unsupported(error: zbus::Error) -> anyhow::Error {
+    if let zbus::Error::MethodError(name, _, _) = &error
+        && name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
+    {
+        return anyhow::anyhow!("this oxidom daemon is older than profiles; restart it to upgrade");
+    }
+    friendly(error)
 }
 
 /// Is a system daemon installed at all? Only its D-Bus policy file can say:
@@ -241,6 +255,55 @@ impl DaemonClient {
         self.proxy
             .call("SetServerAlias", &(server_id, alias))
             .map_err(friendly)
+    }
+
+    /// Profiles arrived after the first daemons shipped, so every call below
+    /// can meet an `UnknownMethod` from a daemon that predates them. Say so in
+    /// those words rather than passing the bus error through.
+    pub fn list_profiles(&self) -> Result<Vec<ProfileEntry>> {
+        let json: String = self
+            .proxy
+            .call("ListProfiles", &())
+            .map_err(profiles_unsupported)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn profile(&self, name: &str) -> Result<Profile> {
+        let json: String = self
+            .proxy
+            .call("GetProfile", &(name,))
+            .map_err(profiles_unsupported)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn save_profile(&self, name: &str, profile: &Profile) -> Result<()> {
+        let payload = serde_json::to_string(profile)?;
+        self.proxy
+            .call("SaveProfile", &(name, payload))
+            .map_err(profiles_unsupported)
+    }
+
+    pub fn remove_profile(&self, name: &str) -> Result<bool> {
+        self.proxy
+            .call("RemoveProfile", &(name,))
+            .map_err(profiles_unsupported)
+    }
+
+    pub fn up_profile(&self, name: &str) -> Result<UpResult> {
+        let json: String = self
+            .proxy
+            .call("UpProfile", &(name,))
+            .map_err(profiles_unsupported)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Bring the tunnel down. An empty `profile` stops it unconditionally;
+    /// otherwise it stops only if that profile is the one that started it, and
+    /// returns false when it is not.
+    pub fn down(&self, profile: &str) -> Result<bool> {
+        self.proxy
+            .call("Down", &(profile,))
+            .map_err(profiles_unsupported)
     }
 
     pub fn set_hwid(&self, subscription_id: &str, enabled: bool) -> Result<()> {

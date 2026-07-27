@@ -10,6 +10,7 @@ pub mod model;
 pub mod netns;
 pub mod paths;
 pub mod probe;
+pub mod profile;
 pub mod state;
 pub mod subscription;
 pub mod subscription_format;
