@@ -13,12 +13,15 @@ pub mod model;
 pub mod netns;
 pub mod paths;
 pub mod probe;
+pub mod proc;
 pub mod profile;
+pub mod resolve;
 pub mod state;
 pub mod subscription;
 pub mod subscription_format;
 pub mod sync;
 pub mod sysproxy;
+pub mod tun;
 pub mod xray;
 
 pub const APP_ID: &str = "dev.keepinfov.oxidom";

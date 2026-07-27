@@ -560,7 +560,7 @@ fn edit_profile(client: &DaemonClient, name: &str) -> CliResult {
         return Ok(());
     }
     let profile = Profile::from_toml(&edited).map_err(Failure::error)?;
-    profile.validate().map_err(Failure::error)?;
+    profile.validate(name).map_err(Failure::error)?;
     client.save_profile(name, &profile).map_err(Failure::error)
 }
 

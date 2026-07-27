@@ -1,21 +1,15 @@
-use std::io::{BufRead, BufReader};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
 use crate::model::{OutboundSpec, Server};
+use crate::proc::{push_log, spawn_reader, stop_child};
 use crate::xray::config;
 use crate::xray::resolve::{self, ResolvedXray};
 use crate::{fsutil, paths};
-
-const LOG_CAP: usize = 500;
-/// How long the core gets to exit on SIGTERM before it is killed outright.
-const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// Said before every hysteria2 connect. Cheaper and more reliable than probing
 /// the core's version: a git build or a fork can report anything, and the cost
@@ -243,48 +237,6 @@ impl Drop for XrayCore {
     fn drop(&mut self) {
         self.disconnect();
     }
-}
-
-/// Stop the core the way the spec requires: SIGTERM, then SIGKILL once the
-/// grace period is up. `Child::kill` alone is an unconditional SIGKILL, which
-/// severs every in-flight connection instead of letting xray close them.
-fn stop_child(child: &mut Child) {
-    let signalled = i32::try_from(child.id()).is_ok_and(|pid| {
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGTERM,
-        )
-        .is_ok()
-    });
-    if signalled {
-        let deadline = Instant::now() + STOP_GRACE;
-        while Instant::now() < deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(Duration::from_millis(25)),
-                Err(_) => break,
-            }
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, logs: Arc<Mutex<Vec<String>>>) {
-    thread::spawn(move || {
-        let buf = BufReader::new(reader);
-        for line in buf.lines().map_while(Result::ok) {
-            push_log(&logs, line);
-        }
-    });
-}
-
-fn push_log(logs: &Arc<Mutex<Vec<String>>>, line: String) {
-    let mut logs = crate::sync::lock(logs);
-    if logs.len() >= LOG_CAP {
-        logs.remove(0);
-    }
-    logs.push(line);
 }
 
 #[cfg(test)]

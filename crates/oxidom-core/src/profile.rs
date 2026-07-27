@@ -3,7 +3,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
@@ -44,6 +46,7 @@ pub struct Profile {
     pub description: String,
     pub select: ProfileSelect,
     pub proxy: ProfileProxy,
+    pub interface: ProfileInterface,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -59,6 +62,32 @@ pub struct ProfileProxy {
     pub http_port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProfileInterface {
+    /// Off by default so existing profiles remain unprivileged proxy-only
+    /// sessions.
+    pub enable: bool,
+    /// Empty derives `oxi-<profile>`.
+    pub device: String,
+    /// Empty derives an address from the profile name.
+    pub address: String,
+    /// Zero selects 1500.
+    pub mtu: u16,
+    pub routes: RouteMode,
+    /// CIDRs used only by `routes = "list"`.
+    pub list: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteMode {
+    #[default]
+    Manual,
+    List,
+    Default,
+}
+
 impl Default for ProfileProxy {
     fn default() -> Self {
         let config = Config::default();
@@ -70,12 +99,50 @@ impl Default for ProfileProxy {
 }
 
 impl Profile {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self, name: &str) -> Result<()> {
         if self.proxy.socks_port == 0 || self.proxy.http_port == 0 {
             bail!("profile ports must be between 1 and 65535");
         }
         if self.proxy.socks_port == self.proxy.http_port {
             bail!("the profile's SOCKS and HTTP inbounds cannot share a port");
+        }
+
+        if !self.interface.device.is_empty() {
+            crate::bind::validate_device_name(&self.interface.device)?;
+        } else if self.interface.enable {
+            crate::bind::device_name(name)?;
+        }
+        if !self.interface.address.is_empty() {
+            self.interface
+                .address
+                .parse::<Ipv4Addr>()
+                .with_context(|| {
+                    format!(
+                        "[interface] address must be an IPv4 address, got {:?}",
+                        self.interface.address
+                    )
+                })?;
+        }
+        if self.interface.mtu != 0 && !(576..=u16::MAX).contains(&self.interface.mtu) {
+            bail!("[interface] mtu must be 0 or between 576 and 65535");
+        }
+        if self.interface.routes != RouteMode::Manual && !self.interface.enable {
+            bail!(
+                "interface routes require [interface] enable = true; enable the interface or set \
+                 routes = \"manual\""
+            );
+        }
+        if self.interface.routes == RouteMode::List {
+            if self.interface.list.is_empty() {
+                bail!(
+                    "[interface] routes = \"list\" requires at least one CIDR in [interface] list"
+                );
+            }
+            for value in &self.interface.list {
+                crate::tun::plan::Cidr::from_str(value).with_context(|| {
+                    format!("[interface] list entry {value:?} must be an IPv4 CIDR")
+                })?;
+            }
         }
         Ok(())
     }
@@ -177,7 +244,7 @@ pub fn save(name: &str, profile: &Profile) -> Result<()> {
         bail!("profile name {name:?} is reserved by the oxidom CLI");
     }
     let path = profile_path(name)?;
-    profile.validate()?;
+    profile.validate(name)?;
     let body = profile.to_toml()?;
     fsutil::write_private_atomic(&path, body.as_bytes())
         .with_context(|| format!("writing profile {name:?}"))
@@ -233,7 +300,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{Profile, is_reserved, list, valid_name};
+    use super::{Profile, RouteMode, is_reserved, list, valid_name};
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -279,10 +346,84 @@ http_port = 12081
         assert_eq!(profile.select.server, "ch-trojan");
         assert_eq!(profile.proxy.socks_port, 12080);
         assert_eq!(profile.proxy.http_port, 12081);
+        assert!(!profile.interface.enable);
+        assert_eq!(profile.interface.routes, RouteMode::Manual);
 
         let encoded = toml::to_string_pretty(&profile)?;
         assert_eq!(toml::from_str::<Profile>(&encoded)?, profile);
         Ok(())
+    }
+
+    #[test]
+    fn a_profile_without_interface_section_keeps_proxy_only_defaults() -> Result<()> {
+        let profile = Profile::from_toml(
+            r#"
+description = "legacy"
+
+[select]
+server = "server"
+
+[proxy]
+socks_port = 10808
+http_port = 10809
+"#,
+        )?;
+        assert!(!profile.interface.enable);
+        assert_eq!(profile.interface.routes, RouteMode::Manual);
+        assert!(profile.interface.device.is_empty());
+        assert!(profile.interface.address.is_empty());
+        assert_eq!(profile.interface.mtu, 0);
+        assert!(profile.interface.list.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn interface_validation_names_actionable_profile_keys() {
+        let mut profile = Profile::default();
+        profile.interface.enable = true;
+        let error = profile
+            .validate("profile-name-too-long")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[interface] device"), "{error}");
+
+        profile.interface.device = "oxi-work".to_string();
+        profile.interface.address = "not-an-address".to_string();
+        let error = profile.validate("work").unwrap_err().to_string();
+        assert!(error.contains("[interface] address"), "{error}");
+
+        profile.interface.address.clear();
+        profile.interface.mtu = 575;
+        let error = profile.validate("work").unwrap_err().to_string();
+        assert!(error.contains("[interface] mtu"), "{error}");
+    }
+
+    #[test]
+    fn route_validation_requires_an_enabled_interface_and_valid_list() {
+        let mut profile = Profile::default();
+        profile.interface.routes = RouteMode::Default;
+        let error = profile.validate("work").unwrap_err().to_string();
+        assert!(error.contains("[interface] enable = true"), "{error}");
+
+        profile.interface.enable = true;
+        profile.interface.routes = RouteMode::List;
+        let error = profile.validate("work").unwrap_err().to_string();
+        assert!(error.contains("at least one CIDR"), "{error}");
+
+        profile.interface.list = vec!["not-a-cidr".to_string()];
+        let error = profile.validate("work").unwrap_err().to_string();
+        assert!(error.contains("[interface] list entry"), "{error}");
+
+        profile.interface.list = vec!["10.0.0.0/8".to_string()];
+        profile.validate("work").unwrap();
+    }
+
+    #[test]
+    fn list_is_retained_and_ignored_outside_list_mode() {
+        let mut profile = Profile::default();
+        profile.interface.list = vec!["temporarily invalid".to_string()];
+        profile.validate("work").unwrap();
+        assert_eq!(profile.interface.list, ["temporarily invalid"]);
     }
 
     #[test]

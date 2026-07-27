@@ -597,6 +597,7 @@ fn show_profile_dialog(
                 socks_port: socks.value() as u16,
                 http_port: http.value() as u16,
             },
+            interface: Default::default(),
         };
         (callbacks.save)(name, profile);
         window_for_save.close();

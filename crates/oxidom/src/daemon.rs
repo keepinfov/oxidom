@@ -1234,7 +1234,7 @@ impl Service {
         let profile = profile::load(&name).map_err(failed)?;
         // Only files written through `SaveProfile` were validated on the way
         // in; this one may have been edited by hand since.
-        profile.validate().map_err(failed)?;
+        profile.validate(&name).map_err(failed)?;
         if profile.select.server.is_empty() {
             return Err(failed(format!(
                 "profile {name:?} does not name a server yet; set select.server to an alias or id"
@@ -1554,7 +1554,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
         Ok(resolved) => log::info!(
             "using the Xray core at {} (from {})",
             resolved.path.display(),
-            resolved.source.label()
+            resolved.source.label(&oxidom_core::xray::resolve::XRAY)
         ),
         Err(error) => log::warn!("no usable Xray core: {error:#}"),
     }
@@ -2207,6 +2207,7 @@ mod tests {
                 socks_port: 21080,
                 http_port: 21081,
             },
+            interface: Default::default(),
         };
 
         service.save_profile("work".to_string(), serde_json::to_string(&profile)?)?;

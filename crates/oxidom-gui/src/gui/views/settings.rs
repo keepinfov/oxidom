@@ -17,6 +17,9 @@ pub struct SettingsValues {
     pub subscription_user_agent: String,
     /// Empty means "let the daemon fall back to $OXIDOM_XRAY_BIN, then $PATH".
     pub xray_binary: String,
+    /// Kept in the draft so applying unrelated GUI settings cannot erase a
+    /// path configured outside the GUI. Its row belongs to phase 4c.
+    pub tun2socks_binary: String,
 }
 
 impl From<&Config> for SettingsValues {
@@ -30,6 +33,7 @@ impl From<&Config> for SettingsValues {
             latency_test_url: config.latency_test_url.clone(),
             subscription_user_agent: config.subscription_user_agent.clone(),
             xray_binary: config.xray_binary.clone(),
+            tun2socks_binary: config.tun2socks_binary.clone(),
         }
     }
 }
@@ -108,7 +112,7 @@ struct SettingsWidgets {
 }
 
 impl SettingsWidgets {
-    fn values(&self) -> SettingsValues {
+    fn values(&self, tun2socks_binary: String) -> SettingsValues {
         SettingsValues {
             socks_port: self.socks.value() as u16,
             http_port: self.http.value() as u16,
@@ -125,6 +129,7 @@ impl SettingsWidgets {
             // Trimmed here so trailing whitespace never counts as an edit and
             // never reaches the daemon's path resolution.
             xray_binary: self.xray_binary.text().trim().to_string(),
+            tun2socks_binary,
         }
     }
 
@@ -456,7 +461,12 @@ impl SettingsView {
             (Some(path), _) => {
                 let source = info
                     .xray_source
-                    .map(|source| format!(" (from {})", source.label()))
+                    .map(|source| {
+                        format!(
+                            " (from {})",
+                            source.label(&oxidom_core::xray::resolve::XRAY)
+                        )
+                    })
                     .unwrap_or_default();
                 widgets
                     .xray_effective
@@ -569,7 +579,8 @@ fn connect_draft_signals(
             if updating_widgets.get() {
                 return;
             }
-            model.borrow_mut().draft = widgets.values();
+            let tun2socks_binary = model.borrow().draft.tun2socks_binary.clone();
+            model.borrow_mut().draft = widgets.values(tun2socks_binary);
             refresh_state(&widgets, &model);
         })
     };
@@ -711,6 +722,7 @@ mod tests {
             latency_test_url: "https://www.gstatic.com/generate_204".into(),
             subscription_user_agent: "oxidom/test".into(),
             xray_binary: String::new(),
+            tun2socks_binary: String::new(),
         }
     }
 

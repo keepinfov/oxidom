@@ -26,7 +26,10 @@ url = "2"
 percent-encoding = "2"
 shell-words = "1"
 libc = "0.2"
-nix = { version = "0.29", features = ["sched", "process", "mount", "user", "net", "signal"] }
+nix = { version = "0.29", features = ["sched", "process", "mount", "user", "net", "signal", "ioctl"] }
+rtnetlink = "0.18.1"
+tokio = { version = "1", features = ["rt"] }
+futures-util = "0.3"
 log = "0.4"
 env_logger = "0.11"
 # The former single crate got zbus's runtime from ksni's `tokio` feature.

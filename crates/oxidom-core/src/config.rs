@@ -23,6 +23,9 @@ pub struct Config {
     /// Path (or bare command name) of the Xray core. Empty falls back to
     /// `$OXIDOM_XRAY_BIN` — set by the nix wrapper — and then `xray` on `$PATH`.
     pub xray_binary: String,
+    /// Path (or bare command name) of tun2socks. Empty falls back to
+    /// `$OXIDOM_TUN2SOCKS_BIN` — set by the nix wrapper — and then `PATH`.
+    pub tun2socks_binary: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -48,6 +51,7 @@ impl Default for Config {
             latency_test_url: "https://www.gstatic.com/generate_204".to_string(),
             subscription_user_agent: "v2rayNG/1.9.5".to_string(),
             xray_binary: String::new(),
+            tun2socks_binary: String::new(),
         }
     }
 }
