@@ -71,33 +71,32 @@ fn chain_name(profile: &str) -> Result<String> {
     Ok(format!("profile_{profile}"))
 }
 
-fn quote(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('"');
-    for character in value.chars() {
-        match character {
-            '\\' => quoted.push_str("\\\\"),
-            '"' => quoted.push_str("\\\""),
-            other => quoted.push(other),
-        }
+/// nft reads a quoted string literally: it has no escape sequences to undo.
+/// Doubling a backslash therefore does not protect the value, it corrupts it —
+/// a cgroup path containing systemd's `\x2d` became `\\x2d` and no longer named
+/// any directory. A quote or a newline genuinely cannot be carried, so rather
+/// than mangle one this refuses. `profile::valid_name` already makes that
+/// unreachable for every value oxidom builds; the guard is what keeps it so.
+fn quote(value: &str) -> Result<String> {
+    if value.contains(['"', '\n']) {
+        bail!("nft strings cannot carry quotes or newlines, refusing to emit {value:?}");
     }
-    quoted.push('"');
-    quoted
+    Ok(format!("\"{value}\""))
 }
 
 /// `add` is idempotent for an existing table/chain. Flushing only our
 /// deterministic chain before re-adding its one rule makes retries and daemon
 /// recovery safe while leaving every foreign nftables object untouched.
 pub fn install_ruleset(profile: &str, slice: &CgroupSlice, mark: u32) -> Result<String> {
-    let chain = quote(&chain_name(profile)?);
+    let chain = quote(&chain_name(profile)?)?;
     Ok(format!(
         "add table inet oxidom\n\
          add chain inet oxidom {chain} {{ type route hook output priority mangle; policy accept; }}\n\
          flush chain inet oxidom {chain}\n\
          add rule inet oxidom {chain} socket cgroupv2 level {} {} meta mark set {mark:#x} comment {}\n",
         slice.level,
-        quote(&slice.path),
-        quote(&format!("oxidom profile {profile}"))
+        quote(&slice.path)?,
+        quote(&format!("oxidom profile {profile}"))?
     ))
 }
 
@@ -105,7 +104,7 @@ pub fn install_ruleset(profile: &str, slice: &CgroupSlice, mark: u32) -> Result<
 /// partial start or a previous cleanup. The table itself is intentionally
 /// retained as oxidom's private container for other live profile chains.
 pub fn remove_ruleset(profile: &str) -> Result<String> {
-    let chain = quote(&chain_name(profile)?);
+    let chain = quote(&chain_name(profile)?)?;
     Ok(format!(
         "add table inet oxidom\n\
          add chain inet oxidom {chain} {{ type route hook output priority mangle; policy accept; }}\n\
@@ -128,15 +127,28 @@ mod tests {
              add chain inet oxidom \"profile_work\" { type route hook output priority mangle; policy accept; }\n\
              flush chain inet oxidom \"profile_work\"\n\
              add rule inet oxidom \"profile_work\" socket cgroupv2 level 4 \
-             \"user.slice/user-1000.slice/user@1000.service/oxidom-work.slice\" meta mark set \
+             \"user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice\" meta mark set \
              0x6f21 comment \"oxidom profile work\"\n"
         );
         assert_eq!(ruleset.matches("socket cgroupv2").count(), 1);
     }
 
+    /// The cgroup path systemd creates carries `\x2d`, and nft resolves the
+    /// string it is given with no unescaping at all. Doubling that backslash
+    /// silently pointed the rule at a directory that does not exist, so every
+    /// `oxidom run` command left the tunnel unmarked.
     #[test]
-    fn quoted_nft_strings_cannot_break_out() {
-        assert_eq!(quote("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    fn a_backslash_reaches_nft_exactly_as_written() {
+        assert_eq!(
+            quote("oxidom\\x2dwork.slice").unwrap(),
+            "\"oxidom\\x2dwork.slice\""
+        );
+    }
+
+    #[test]
+    fn unrepresentable_nft_strings_are_refused_rather_than_mangled() {
+        assert!(quote("a\"b").is_err());
+        assert!(quote("a\nb").is_err());
     }
 
     #[test]

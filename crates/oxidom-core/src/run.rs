@@ -34,10 +34,10 @@ struct ScopedRequest {
 /// Path of the user slice for one profile, and the ancestor level nftables
 /// needs for `socket cgroupv2`.
 pub fn user_slice(profile: &str, uid: u32) -> Result<CgroupSlice> {
-    if !crate::profile::valid_name(profile) {
-        bail!("invalid profile name {profile:?}");
-    }
-    let path = format!("user.slice/user-{uid}.slice/user@{uid}.service/oxidom-{profile}.slice");
+    // systemd names the cgroup directory after the unit verbatim, escapes and
+    // all, so the path has to be built from the same string `--slice` receives.
+    let unit = slice_unit(profile)?;
+    let path = format!("user.slice/user-{uid}.slice/user@{uid}.service/{unit}");
     let level = u32::try_from(path.split('/').count()).context("cgroup slice path is too deep")?;
     Ok(CgroupSlice { path, level })
 }
@@ -46,10 +46,16 @@ pub fn slice_unit(profile: &str) -> Result<String> {
     if !crate::profile::valid_name(profile) {
         bail!("invalid profile name {profile:?}");
     }
-    // Literal dashes are hierarchy separators in a systemd slice name:
-    // `oxidom-work.slice` would actually live below `oxidom.slice`. Escape
-    // them in the unit identifier so systemd creates the direct cgroup path
-    // `oxidom-work.slice` required by the nft ancestor match.
+    // Literal dashes are hierarchy separators in a systemd slice name, and the
+    // nesting they cause is not cosmetic. Unescaped, profile `work` would sit
+    // at `oxidom.slice/oxidom-work.slice` while profile `work-eu` would sit
+    // *below it*, at `oxidom.slice/oxidom-work.slice/oxidom-work-eu.slice` — so
+    // the ancestor match written for `work` would also claim every process of
+    // `work-eu` and push its traffic into the wrong tunnel.
+    //
+    // Escaping keeps each profile in one flat directory at a fixed depth. The
+    // escape survives into the cgroup path verbatim: systemd really does create
+    // a directory named `oxidom\x2dwork.slice`. Verified on systemd 258.
     Ok(format!(
         "oxidom\\x2d{}.slice",
         profile.replace('-', "\\x2d")
@@ -237,7 +243,8 @@ mod tests {
         assert_eq!(
             slice,
             CgroupSlice {
-                path: "user.slice/user-1000.slice/user@1000.service/oxidom-work.slice".to_string(),
+                path: "user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice"
+                    .to_string(),
                 level: 4,
             }
         );
@@ -251,18 +258,44 @@ mod tests {
         );
     }
 
+    /// Escaping is what stops one profile's rule from claiming another's
+    /// traffic: unescaped, `work` would be an ancestor slice of `work-eu`, and
+    /// an ancestor match is exactly what `socket cgroupv2 level N` performs.
     #[test]
-    fn dashes_in_profile_names_are_literal_cgroup_path_characters() {
-        let slice = user_slice("client-work", 1000).unwrap();
+    fn related_profile_names_stay_flat_and_never_nest() {
+        let work = user_slice("work", 1000).unwrap();
+        let work_eu = user_slice("work-eu", 1000).unwrap();
         assert_eq!(
-            slice.path,
-            "user.slice/user-1000.slice/user@1000.service/oxidom-client-work.slice"
+            work_eu.path,
+            "user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork\\x2deu.slice"
         );
-        assert_eq!(slice.level, 4);
         assert_eq!(
-            slice_unit("client-work").unwrap(),
-            "oxidom\\x2dclient\\x2dwork.slice"
+            slice_unit("work-eu").unwrap(),
+            "oxidom\\x2dwork\\x2deu.slice"
         );
+        assert_eq!(work.level, work_eu.level, "every profile sits at one depth");
+        assert!(
+            !work_eu.path.starts_with(&format!("{}/", work.path)),
+            "{} must not contain {}",
+            work.path,
+            work_eu.path
+        );
+    }
+
+    /// `user_slice` is the path nft matches and `slice_unit` is what systemd is
+    /// asked for. They drifted apart once, and the only symptom was `oxidom
+    /// run` refusing every command it was given.
+    #[test]
+    fn the_matched_path_ends_in_the_unit_systemd_is_asked_for() {
+        for profile in ["work", "work-eu", "default"] {
+            let slice = user_slice(profile, 1000).unwrap();
+            let unit = slice_unit(profile).unwrap();
+            assert_eq!(
+                slice.path,
+                format!("user.slice/user-1000.slice/user@1000.service/{unit}")
+            );
+            assert_eq!(slice.level, 4);
+        }
     }
 
     #[test]
@@ -278,24 +311,33 @@ mod tests {
     #[test]
     fn actual_scope_must_be_the_expected_slice_or_its_child() {
         let expected = user_slice("work", 1000).unwrap();
+        // Shape taken verbatim from `systemd-run --user --scope` on systemd 258.
         verify_cgroup(
-            "/user.slice/user-1000.slice/user@1000.service/oxidom-work.slice/run-1.scope",
+            "/user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice/run-p1-i1.scope",
             &expected,
         )
         .unwrap();
         assert!(
             verify_cgroup(
-                "user.slice/user-1000.slice/user@1000.service/oxidom-home.slice/run-1.scope",
+                "user.slice/user-1000.slice/user@1000.service/oxidom\\x2dhome.slice/run-1.scope",
                 &expected,
             )
             .unwrap_err()
             .to_string()
             .contains("refusing")
         );
+        // The unescaped spelling is a different directory, not a synonym.
+        assert!(
+            verify_cgroup(
+                "user.slice/user-1000.slice/user@1000.service/oxidom-work.slice/run-1.scope",
+                &expected,
+            )
+            .is_err()
+        );
         assert!(
             verify_cgroup(
                 "user.slice/user-1000.slice/user@1000.service/\
-                 oxidom-work.slice-escape/run.scope",
+                 oxidom\\x2dwork.slice-escape/run.scope",
                 &expected,
             )
             .is_err()
