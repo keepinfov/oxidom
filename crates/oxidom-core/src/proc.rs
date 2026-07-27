@@ -36,6 +36,43 @@ pub(crate) fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Stop a recovered child for which no `Child` handle survived the crash.
+///
+/// Callers must verify the process identity first: unlike `stop_child`, a PID
+/// from persistent state may already have been recycled.
+pub(crate) fn stop_pid(pid: u32) -> bool {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let process = nix::unistd::Pid::from_raw(raw_pid);
+    match nix::sys::signal::kill(process, nix::sys::signal::Signal::SIGTERM) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => return true,
+        Err(_) => return false,
+    }
+    if wait_until_gone(process, STOP_GRACE) {
+        return true;
+    }
+    match nix::sys::signal::kill(process, nix::sys::signal::Signal::SIGKILL) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => return true,
+        Err(_) => return false,
+    }
+    wait_until_gone(process, STOP_GRACE)
+}
+
+fn wait_until_gone(pid: nix::unistd::Pid, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match nix::sys::signal::kill(pid, None) {
+            Err(nix::errno::Errno::ESRCH) => return true,
+            Err(_) => return false,
+            Ok(()) if Instant::now() >= deadline => return false,
+            Ok(()) => thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
+
 pub(crate) fn spawn_reader<R: std::io::Read + Send + 'static>(
     reader: R,
     logs: Arc<Mutex<Vec<String>>>,

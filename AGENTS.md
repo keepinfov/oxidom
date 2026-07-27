@@ -13,7 +13,8 @@ idiomatic, small, and robust. Do not add features beyond this spec without notin
 `.notes/IDEAS.md`.
 
 ## Non-negotiable constraints
-- The **GUI runs unprivileged** (no root). Only the per-app netns helper is privileged.
+- The **GUI and CLI run unprivileged** (no root). Only the opt-in system daemon receives
+  `CAP_NET_ADMIN`; oxidom never escalates on its own.
 - **No secret exfiltration:** HWID/device identifiers are **never** sent unless the user opts in
   per-subscription. No telemetry.
 - **Commits:** Conventional Commits, **no AI/Co-Authored-By trailer** (strict). Commit only when
@@ -25,7 +26,8 @@ idiomatic, small, and robust. Do not add features beyond this spec without notin
   an actionable error naming both the path tried and where it came from.
 
 ## Build / dev
-- `nix develop` gives a shell with gtk4/libadwaita/glib + rust toolchain + `xray`.
+- `nix develop` gives a shell with gtk4/libadwaita/glib + rust toolchain + `xray` +
+  `tun2socks`.
 - `nix develop -c cargo build` builds the workspace; use
   `nix develop -c cargo run -p oxidom-gui` for the GUI and
   `nix develop -c cargo run -p oxidom -- <command>` for the CLI/daemon.
@@ -41,8 +43,10 @@ missing files (treat as defaults/empty).
 - `~/.config/oxidom/profiles/<name>.toml` — named CLI/systemd connection profiles.
 - `~/.local/share/oxidom/subscriptions.json` — cached subscriptions + parsed servers.
 - `~/.local/share/oxidom/state.toml` — ephemeral `[[sessions]]` records: profile, server id,
-  loopback address, fixed SOCKS/HTTP ports and the recovery PID of its Xray child. The legacy
-  flat active-server fields are accepted only as migration input.
+  loopback address, fixed SOCKS/HTTP ports, recovery PIDs and the planned interface routes/rule.
+  Interface intent is written before kernel application so crash cleanup may safely over-delete
+  idempotent records but can never forget an applied route. The legacy flat active-server fields
+  are accepted only as migration input.
 - `~/.local/share/oxidom/hwid` — random per-install id (only generated/used if a sub opts in).
 - `~/.cache/oxidom/egress.json` — user-owned 60-second cache for `oxidom ip --egress`, keyed by
   profile and server id.
@@ -72,6 +76,7 @@ latency_method = "http_get"   # one of: icmp | tcp | http_head | http_get
 latency_test_url = "https://www.gstatic.com/generate_204"
 subscription_user_agent = "v2rayNG/1.9.5"  # panels gate the body on this
 xray_binary = ""              # empty: use $OXIDOM_XRAY_BIN, then xray on PATH
+tun2socks_binary = ""         # empty: use $OXIDOM_TUN2SOCKS_BIN, then tun2socks on PATH
 ```
 
 ## Data model
@@ -246,10 +251,13 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
 - `oxidom status [PROFILE] [--json]`, `oxidom ip [PROFILE] [--egress] [--fresh]`,
   `oxidom env [PROFILE]`, `oxidom list [servers|profiles|subscriptions|sessions] [--json]`, and
   `oxidom ping <HANDLE>` are read commands and never spawn a session daemon.
+- `oxidom tun [PROFILE] [--down]` inspects the session interface or explicitly removes it.
 - `oxidom alias <HANDLE> <NEW>` changes a server alias.
 - `oxidom profile {list,show,new,edit,rm}` manages daemon-owned profiles.
 - `oxidom daemon [--system --socks-port --http-port]` runs the D-Bus service.
-- `oxidom run -- <cmd>...` is the reserved per-process network-namespace launcher.
+- `oxidom <PROFILE> run -- <cmd>...` is reserved for per-process marking. In phase 4b it still
+  refuses safely: a proxy-only profile points to `oxidom env`; an interface profile reports its
+  table and fwmark and says process marking arrives in the next step.
 
 Only `up` and `connect` may spawn a private session daemon; every other control command requires
 an existing daemon.
@@ -289,6 +297,10 @@ server = "ch-trojan"
 [proxy]
 socks_port = 10808
 http_port = 10809
+
+[interface]
+enable = true
+routes = "manual"
 ```
 
 Names match `^[a-z0-9][a-z0-9_-]{0,31}$`; command names and aliases are reserved so profile-first
@@ -306,15 +318,39 @@ profile reuse the same SOCKS/HTTP ports.
 
 Subscriptions and servers are global sources. A profile is persistent configuration; a session
 is the ephemeral running instance of one profile: its Xray process, selected server, loopback
-address, ports and status. “Connect one server” means the `default` session, not a separate global
-mode. Several profiles may run at once, including several profiles on the same server.
+address, ports, optional interface and status. “Connect one server” means the `default` session,
+not a separate global mode. Several profiles may run at once, including several profiles on the
+same server.
 
 `Sessions` is a `BTreeMap` keyed by profile, so listings are stable. A profile already up cannot
 be brought up twice. `DownProfile` removes exactly that runtime; `Down("")` removes all sessions.
 The single GNOME system-proxy owner is runtime state in `Sessions`, not persistent configuration:
-it is released when its session stops or its core dies. On daemon startup, every state entry with
-a recovery PID is checked against its own `current-config-<profile>.json`, reaped, and removed
-from `state.toml`.
+it is released when its session stops or its core dies. On daemon startup, each recovered Xray
+PID is checked against its own `current-config-<profile>.json`, each tun2socks PID must contain
+`--device <our-device>`, and recorded interface resources are removed before the state entry is
+forgotten.
+
+## Interfaces (binding)
+
+`[interface] enable = false` is exactly the unprivileged proxy-only behavior. When enabled, the
+system daemon (and only it) requires `CAP_NET_ADMIN`; the NixOS module grants it only with
+`services.oxidom.tun.enable = true` and keeps `oxi-*` unmanaged by NetworkManager.
+
+- Device names default to `oxi-<profile>` and fit Linux's 15-byte IFNAMSIZ payload; an explicit
+  valid `device` is required for longer profile names.
+- Device addresses are stable `198.18.<c>.<d>/32` values from the RFC 2544 benchmark block.
+  `default` is fixed at `198.18.0.1`; `/32` is binding because it adds no connected route.
+- fwmark, private table id and rule priority are the same stable value. `default` is `0x6f00`;
+  other profiles probe within `0x6f01..=0x6fff`, avoiding the user's `0x1`/`0x2`/`0x3` policy.
+- Every enabled interface gets `default dev <device>` in its private table and a matching fwmark
+  rule. `routes = "manual"` changes no system route; `list` adds only its CIDRs; `default` adds a
+  host route to the server via the old gateway plus two half-defaults through the device.
+- Bring-up order is persistent TUN, address `/32`, tun2socks spawn, link-up, private route/rule,
+  then system routes. The spawn-before-link order and double-dash tun2socks flags are live-tested
+  contracts.
+- Ordinary `down` stops tun2socks and removes oxidom routes/rule but leaves the persistent device,
+  preserving hand-written routes across reconnects. `tun --down` and crash recovery additionally
+  delete the device only when oxidom created it.
 
 ## GUI (Phase 2 — codex brief)
 Build with `adw::Application` (app id `dev.keepinfov.oxidom`). Wire to the core modules; do not
@@ -354,12 +390,14 @@ crates/
   oxidom-core/
     src/
       lib.rs
-      bind.rs                    # stable per-profile 127.x inbound address
+      bind.rs                    # stable inbound/interface identities and routing marks
       client.rs                  # blocking D-Bus client, shared by GUI and CLI
       config.rs                  # config.toml load/save
       state.rs                   # state.toml
       model.rs                   # Server/Subscription/OutboundSpec types
       engine.rs                  # Registry + per-profile Session/Sessions facade
+      proc.rs                    # shared child supervision and recovered PID inspection
+      resolve.rs                 # shared config → env → PATH binary resolver
       link.rs                    # share-link parsers
       subscription.rs            # fetch + decode + userinfo headers + hwid
       xray/
@@ -367,7 +405,15 @@ crates/
         core.rs                  # process supervisor + status
         resolve.rs               # Xray binary preflight
       probe.rs                   # latency probes
-      netns.rs                   # `oxidom run` per-process routing
+      netns.rs                   # phase-B2-safe `oxidom run` refusal
+      tun.rs
+      tun/
+        caps.rs                  # CAP_NET_ADMIN preflight
+        core.rs                  # tun2socks process supervisor
+        device.rs                # persistent TUN ioctls
+        net.rs                   # blocking rtnetlink facade
+        plan.rs                  # pure route planning
+        resolve.rs               # tun2socks binary spec
   oxidom/
     src/
       main.rs                    # CLI entry + dispatch
@@ -388,6 +434,6 @@ crates/
 - Selecting a server + Connect starts Xray, exposes the local SOCKS/HTTP proxy, and shows
   Connected + a real latency; Disconnect stops it cleanly.
 - HWID is never sent unless the per-sub switch is on.
-- `oxidom run -- <cmd>` routes that process (or, until the helper lands, exits non-zero with a
-  clear "not yet implemented" message — current state).
+- `oxidom run -- <cmd>` routes that process (or, until B3 lands, exits non-zero with the
+  profile's actionable interface/table/mark state — current state).
 ```

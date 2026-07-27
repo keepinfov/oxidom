@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::{ProfileEntry, SessionInfo};
+use crate::ipc::{InterfaceInfo, ProfileEntry, SessionInfo};
 use crate::model::{Server, Subscription, UserInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +48,7 @@ pub struct SessionOutput {
     pub latency_ms: Option<u32>,
     pub error: Option<String>,
     pub owns_system_proxy: bool,
+    pub interface: Option<InterfaceInfo>,
 }
 
 impl SessionOutput {
@@ -64,6 +65,7 @@ impl SessionOutput {
             latency_ms,
             error: session.error.clone(),
             owns_system_proxy: session.owns_system_proxy,
+            interface: session.interface.clone(),
         }
     }
 }
@@ -251,12 +253,21 @@ mod tests {
             socks_port: 10808,
             http_port: 10809,
             owns_system_proxy: true,
+            interface: Some(InterfaceInfo {
+                device: "oxi-work".to_string(),
+                address: "198.18.9.7".to_string(),
+                mtu: 1500,
+                routes: "manual".to_string(),
+                table: 28449,
+                mark: 28449,
+                up: true,
+            }),
             ..SessionInfo::default()
         };
 
         assert_eq!(
             serde_json::to_string(&SessionOutput::new(&session, Some(84))).unwrap(),
-            r#"{"profile":"work","state":"connected","server_id":"0123456789abcdef","server_alias":"ch-trojan","server_name":"Swiss","address":"127.72.14.1","socks_port":10808,"http_port":10809,"latency_ms":84,"error":null,"owns_system_proxy":true}"#
+            r#"{"profile":"work","state":"connected","server_id":"0123456789abcdef","server_alias":"ch-trojan","server_name":"Swiss","address":"127.72.14.1","socks_port":10808,"http_port":10809,"latency_ms":84,"error":null,"owns_system_proxy":true,"interface":{"device":"oxi-work","address":"198.18.9.7","mtu":1500,"routes":"manual","table":28449,"mark":28449,"up":true}}"#
         );
     }
 

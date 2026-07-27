@@ -350,6 +350,12 @@ impl DaemonClient {
             .map_err(profiles_unsupported)
     }
 
+    pub fn delete_interface(&self, name: &str) -> Result<bool> {
+        self.proxy
+            .call("DeleteInterface", &(name,))
+            .map_err(profiles_unsupported)
+    }
+
     pub fn set_hwid(&self, subscription_id: &str, enabled: bool) -> Result<()> {
         self.proxy
             .call("SetHwid", &(subscription_id, enabled))

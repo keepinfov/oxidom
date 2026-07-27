@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::tun::plan::{Cidr, RouteSpec, Via};
 use crate::{bind, fsutil, paths};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -23,6 +24,7 @@ pub struct SessionState {
     /// PID of the xray child of the last run, so a crash never leaves an
     /// orphaned tunnel: the next start kills it if it is still an xray process.
     pub xray_pid: Option<u32>,
+    pub interface: Option<InterfaceState>,
 }
 
 impl Default for SessionState {
@@ -34,6 +36,86 @@ impl Default for SessionState {
             socks_port: 0,
             http_port: 0,
             xray_pid: None,
+            interface: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InterfaceState {
+    pub device: String,
+    pub address: Ipv4Addr,
+    pub mtu: u16,
+    pub table: u32,
+    pub mark: u32,
+    /// Only an interface created by oxidom may be removed during recovery.
+    pub created: bool,
+    pub tun2socks_pid: Option<u32>,
+    /// System routes are recorded before application so crash cleanup may
+    /// harmlessly over-delete, but can never forget a route already applied.
+    pub routes: Vec<RouteRecord>,
+    pub rule: bool,
+}
+
+impl Default for InterfaceState {
+    fn default() -> Self {
+        Self {
+            device: String::new(),
+            address: Ipv4Addr::UNSPECIFIED,
+            mtu: 0,
+            table: 0,
+            mark: 0,
+            created: false,
+            tun2socks_pid: None,
+            routes: Vec::new(),
+            rule: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RouteRecord {
+    pub address: Ipv4Addr,
+    pub prefix: u8,
+    pub table: u32,
+    /// `None` means the route goes through the profile device.
+    pub gateway: Option<Ipv4Addr>,
+}
+
+impl Default for RouteRecord {
+    fn default() -> Self {
+        Self {
+            address: Ipv4Addr::UNSPECIFIED,
+            prefix: 0,
+            table: 0,
+            gateway: None,
+        }
+    }
+}
+
+impl RouteRecord {
+    pub fn from_spec(spec: &RouteSpec) -> Self {
+        Self {
+            address: spec.destination.address,
+            prefix: spec.destination.prefix,
+            table: spec.table,
+            gateway: match spec.via {
+                Via::Device => None,
+                Via::Gateway(gateway) => Some(gateway),
+            },
+        }
+    }
+
+    pub fn to_spec(&self) -> RouteSpec {
+        RouteSpec {
+            destination: Cidr {
+                address: self.address,
+                prefix: self.prefix,
+            },
+            via: self.gateway.map_or(Via::Device, Via::Gateway),
+            table: self.table,
         }
     }
 }
@@ -106,6 +188,7 @@ fn migrate(stored: StoredState, config: &Config) -> State {
             socks_port: config.socks_port,
             http_port: config.http_port,
             xray_pid: stored.xray_pid,
+            interface: None,
         }],
     };
     if let Err(error) = state.save() {
@@ -280,6 +363,7 @@ mod tests {
                 socks_port: 10808,
                 http_port: 10809,
                 xray_pid: None,
+                interface: None,
             }],
         };
         state.save()?;

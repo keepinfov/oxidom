@@ -66,7 +66,6 @@ pub struct RuleSpec {
 }
 
 pub struct PlanInput<'a> {
-    pub device_index_known: bool,
     pub table: u32,
     pub mark: u32,
     pub mode: RouteMode,
@@ -83,10 +82,6 @@ pub struct RoutePlan {
 }
 
 pub fn plan_routes(input: &PlanInput<'_>) -> Result<RoutePlan> {
-    if !input.device_index_known {
-        bail!("cannot plan routes before the network interface index is known");
-    }
-
     let private = vec![RouteSpec {
         destination: cidr(Ipv4Addr::UNSPECIFIED, 0),
         via: Via::Device,
@@ -158,7 +153,6 @@ mod tests {
 
     fn input(mode: RouteMode) -> PlanInput<'static> {
         PlanInput {
-            device_index_known: true,
             table: 0x6f21,
             mark: 0x6f21,
             mode,
@@ -265,13 +259,6 @@ mod tests {
         missing_gateway.default_gateway = None;
         let error = plan_routes(&missing_gateway).unwrap_err().to_string();
         assert!(error.contains("default IPv4 gateway"), "{error}");
-    }
-
-    #[test]
-    fn routes_need_a_known_device_index() {
-        let mut input = input(RouteMode::Manual);
-        input.device_index_known = false;
-        assert!(plan_routes(&input).is_err());
     }
 
     #[test]

@@ -65,6 +65,15 @@ pub enum Command {
         /// Session whose proxy variables to print (defaults to `default`).
         profile: Option<String>,
     },
+    /// Inspect or remove one session's persistent TUN interface.
+    Tun {
+        /// Session whose interface to inspect (defaults to `default`).
+        #[arg(default_value = "default")]
+        profile: String,
+        /// Stop interface routing and remove the device if oxidom created it.
+        #[arg(long)]
+        down: bool,
+    },
     /// List daemon objects.
     List {
         /// Object type to list.
@@ -115,6 +124,9 @@ pub enum Command {
     },
     /// Run a single process routed through the active proxy (via a network namespace).
     Run {
+        /// Profile whose routing domain should carry the command.
+        #[arg(long, default_value = "default")]
+        profile: String,
         /// The command and arguments to run, e.g. `oxidom run -- curl https://ifconfig.me`.
         #[arg(trailing_var_arg = true, required = true)]
         args: Vec<String>,
@@ -168,11 +180,16 @@ pub fn normalize(mut args: Vec<OsString>) -> Vec<OsString> {
         return args;
     }
 
-    if args[2]
-        .to_str()
-        .is_some_and(|verb| PROFILE_SUBCOMMANDS.contains(&verb))
+    if let Some(verb) = args[2].to_str()
+        && PROFILE_SUBCOMMANDS.contains(&verb)
     {
-        args.swap(1, 2);
+        if verb == "run" {
+            let profile = args.remove(1);
+            args.insert(2, OsString::from("--profile"));
+            args.insert(3, profile);
+        } else {
+            args.swap(1, 2);
+        }
     }
     args
 }
@@ -235,6 +252,10 @@ mod tests {
                 &["oxidom", "env", "work"][..],
                 &["oxidom", "work", "env"][..],
             ),
+            (
+                &["oxidom", "tun", "work", "--down"][..],
+                &["oxidom", "work", "tun", "--down"][..],
+            ),
         ] {
             assert_eq!(
                 format!("{:?}", parse(verb_first).unwrap().command),
@@ -265,10 +286,11 @@ mod tests {
     #[test]
     fn profile_first_run_preserves_the_separator_and_tail() {
         let cli = parse(&["oxidom", "work", "run", "--", "curl", "x"]).unwrap();
-        let Command::Run { args } = cli.command else {
+        let Command::Run { profile, args } = cli.command else {
             panic!("run did not parse");
         };
-        assert_eq!(args, ["work", "--", "curl", "x"]);
+        assert_eq!(profile, "work");
+        assert_eq!(args, ["curl", "x"]);
     }
 
     #[test]

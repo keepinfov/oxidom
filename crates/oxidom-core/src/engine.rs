@@ -1,15 +1,18 @@
 //! Daemon-owned registry and per-profile runtime sessions.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
 use crate::model::{Server, Subscription};
-use crate::state::{self, SessionState, State, store};
+use crate::profile::{ProfileInterface, RouteMode};
+use crate::state::{self, InterfaceState, RouteRecord, SessionState, State, store};
+use crate::tun::core::Tun2socks;
+use crate::tun::plan::{Cidr, PlanInput, RoutePlan, RouteSpec, Via, plan_routes};
 use crate::xray::core::{Status, XrayCore};
-use crate::{alias, link, probe, subscription};
+use crate::{alias, bind, link, probe, subscription};
 
 /// Fixed id of the local group that holds servers imported by share-link,
 /// not tied to any subscription URL. It is a sentinel rather than a hash, so
@@ -295,6 +298,54 @@ impl Registry {
     }
 }
 
+/// Runtime half of a profile interface. Its plan remains available while the
+/// interface is stopped so an opted-in reconnect can restore the same routing
+/// domain after the new SOCKS inbound has proved ready.
+pub struct Interface {
+    pub device: String,
+    pub address: Ipv4Addr,
+    pub mtu: u16,
+    pub table: u32,
+    pub mark: u32,
+    pub routes: RouteMode,
+    pub created: bool,
+    pub tun2socks: Tun2socks,
+    pub plan: RoutePlan,
+    pub up: bool,
+    fresh: bool,
+}
+
+impl Interface {
+    fn state(&self) -> InterfaceState {
+        InterfaceState {
+            device: self.device.clone(),
+            address: self.address,
+            mtu: self.mtu,
+            table: self.table,
+            mark: self.mark,
+            created: self.created,
+            tun2socks_pid: self.tun2socks.child_pid(),
+            routes: self
+                .plan
+                .system
+                .iter()
+                .map(RouteRecord::from_spec)
+                .collect(),
+            // Like routes, the rule is recorded as planned before it is
+            // applied. Idempotent netlink cleanup makes that the safe side.
+            rule: true,
+        }
+    }
+
+    pub fn route_mode(&self) -> &'static str {
+        match self.routes {
+            RouteMode::Manual => "manual",
+            RouteMode::List => "list",
+            RouteMode::Default => "default",
+        }
+    }
+}
+
 /// One running profile and the Xray process that carries it.
 pub struct Session {
     /// Name of the profile that started this session. This is the runtime key.
@@ -304,6 +355,7 @@ pub struct Session {
     pub socks_port: u16,
     pub http_port: u16,
     pub server_id: Option<String>,
+    pub interface: Option<Interface>,
 }
 
 impl Session {
@@ -321,6 +373,7 @@ impl Session {
             socks_port,
             http_port,
             server_id: None,
+            interface: None,
         }
     }
 
@@ -378,6 +431,7 @@ impl Session {
             socks_port: self.socks_port,
             http_port: self.http_port,
             xray_pid: self.child_pid(),
+            interface: self.interface.as_ref().map(Interface::state),
         }
     }
 }
@@ -425,6 +479,25 @@ impl Sessions {
 
     pub fn taken_addresses(&self) -> Vec<Ipv4Addr> {
         self.inner.values().map(|session| session.address).collect()
+    }
+
+    pub fn taken_device_addresses(&self) -> Vec<Ipv4Addr> {
+        self.inner
+            .values()
+            .filter_map(|session| {
+                session
+                    .interface
+                    .as_ref()
+                    .map(|interface| interface.address)
+            })
+            .collect()
+    }
+
+    pub fn taken_routing_marks(&self) -> Vec<u32> {
+        self.inner
+            .values()
+            .filter_map(|session| session.interface.as_ref().map(|interface| interface.mark))
+            .collect()
     }
 
     pub fn owner_of_system_proxy(&self) -> Option<&str> {
@@ -493,33 +566,45 @@ impl Engine {
 
     /// Undo each resource a crashed previous instance could have left behind.
     fn recover(&mut self) {
-        self.recover_stale_cores();
-        // Phase 4b adds the TUN device and the routes we added here.
-    }
-
-    fn recover_stale_cores(&mut self) {
-        let stale_sessions = self
-            .state
-            .sessions
-            .iter()
-            .filter_map(|session| session.xray_pid.map(|pid| (session.profile.clone(), pid)))
-            .collect::<Vec<_>>();
+        let stale_sessions = self.state.sessions.clone();
         if stale_sessions.is_empty() {
             return;
         }
         let mut cleaned_profiles = Vec::new();
-        for (profile, pid) in &stale_sessions {
-            if kill_stale_xray(*pid, profile) {
-                log::info!(
-                    "stopped orphaned xray process {pid} for profile {:?} from a previous run",
-                    profile
-                );
-                cleaned_profiles.push(profile.clone());
-            } else {
-                log::warn!(
-                    "could not confirm that orphaned xray process {pid} for profile {:?} stopped",
-                    profile
-                );
+        for saved in &stale_sessions {
+            let core_clean = saved.xray_pid.is_none_or(|pid| {
+                if kill_stale_xray(pid, &saved.profile) {
+                    log::info!(
+                        "stopped orphaned xray process {pid} for profile {:?} from a previous run",
+                        saved.profile
+                    );
+                    true
+                } else {
+                    log::warn!(
+                        "could not confirm that orphaned xray process {pid} for profile {:?} \
+                         stopped",
+                        saved.profile
+                    );
+                    false
+                }
+            });
+            let interface_clean = saved.interface.as_ref().is_none_or(|interface| {
+                match recover_interface(interface) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::warn!(
+                            "could not clean the recovered interface for profile {:?}: {error:#}",
+                            saved.profile
+                        );
+                        false
+                    }
+                }
+            });
+            if core_clean
+                && interface_clean
+                && (saved.xray_pid.is_some() || saved.interface.is_some())
+            {
+                cleaned_profiles.push(saved.profile.clone());
             }
         }
         if cleaned_profiles.is_empty() {
@@ -537,7 +622,7 @@ impl Engine {
             .sessions
             .retain(|session| !cleaned_profiles.contains(&session.profile));
         if let Err(error) = self.state.save() {
-            log::warn!("could not persist stale-core recovery state: {error:#}");
+            log::warn!("could not persist recovered session state: {error:#}");
         }
     }
 
@@ -658,6 +743,238 @@ impl Engine {
         Ok(())
     }
 
+    /// Attach the profile's requested interface plan to an existing session.
+    ///
+    /// This is a preflight only: the actual device is created after the Xray
+    /// SOCKS inbound has passed its connection probe.
+    pub fn configure_interface(
+        &mut self,
+        profile: &str,
+        requested: &ProfileInterface,
+        server: &Server,
+    ) -> Result<()> {
+        if !requested.enable {
+            if self
+                .sessions
+                .get(profile)
+                .and_then(|session| session.interface.as_ref())
+                .is_some()
+            {
+                self.stop_interface(profile)?;
+            }
+            if let Some(session) = self.sessions.get_mut(profile) {
+                session.interface = None;
+            }
+            return Ok(());
+        }
+        if !crate::tun::caps::has_net_admin() {
+            bail!("{}", crate::tun::caps::missing_capability_error(profile));
+        }
+
+        let device = if requested.device.is_empty() {
+            bind::device_name(profile)?
+        } else {
+            requested.device.clone()
+        };
+        let address = if requested.address.is_empty() {
+            bind::device_address_for(profile, &self.sessions.taken_device_addresses())
+                .context("no free profile interface addresses remain")?
+        } else {
+            requested
+                .address
+                .parse()
+                .context("parsing [interface] address")?
+        };
+        let mark = bind::routing_mark(profile, &self.sessions.taken_routing_marks())
+            .context("no free profile routing marks remain")?;
+        let mtu = if requested.mtu == 0 {
+            1500
+        } else {
+            requested.mtu
+        };
+        let list = requested
+            .list
+            .iter()
+            .map(|entry| entry.parse::<Cidr>())
+            .collect::<Result<Vec<_>>>()?;
+        let (server_address, default_gateway) = if requested.routes == RouteMode::Default {
+            let server_address = resolve_server_ipv4(server)?;
+            let gateway = crate::tun::net::Net::new()?
+                .default_gateway()?
+                .context("routes = \"default\" requires the current default IPv4 gateway")?;
+            (Some(server_address), Some(gateway))
+        } else {
+            (None, None)
+        };
+        let plan = plan_routes(&PlanInput {
+            table: mark,
+            mark,
+            mode: requested.routes,
+            list: &list,
+            server_address,
+            default_gateway,
+        })?;
+        let mut tun2socks = Tun2socks::new(self.registry.config.tun2socks_binary.clone());
+        tun2socks.resolve_binary()?;
+        let previous_created = self
+            .sessions
+            .get(profile)
+            .and_then(|session| session.interface.as_ref())
+            .is_some_and(|interface| interface.device == device && interface.created);
+        if self
+            .sessions
+            .get(profile)
+            .and_then(|session| session.interface.as_ref())
+            .is_some()
+        {
+            self.stop_interface(profile)?;
+        }
+        // Keep interface diagnostics beside the core output exposed by Logs.
+        if let Some(session) = self.sessions.get(profile) {
+            tun2socks.logs = session.core.logs.clone();
+        }
+        let interface = Interface {
+            device: device.clone(),
+            address,
+            mtu,
+            table: mark,
+            mark,
+            routes: requested.routes,
+            created: previous_created || !crate::tun::device::exists(&device),
+            tun2socks,
+            plan,
+            up: false,
+            fresh: false,
+        };
+        self.sessions
+            .get_mut(profile)
+            .context("cannot configure an interface before creating its session")?
+            .interface = Some(interface);
+        Ok(())
+    }
+
+    /// Apply an already planned interface after the session's SOCKS inbound
+    /// has proved it can carry traffic.
+    pub fn start_interface(&mut self, profile: &str) -> Result<()> {
+        let Some(mut interface) = self
+            .sessions
+            .get_mut(profile)
+            .and_then(|session| session.interface.take())
+        else {
+            return Ok(());
+        };
+        if interface.up {
+            self.sessions
+                .get_mut(profile)
+                .expect("the session existed above")
+                .interface = Some(interface);
+            return Ok(());
+        }
+        if !crate::tun::caps::has_net_admin() {
+            let error = anyhow!(crate::tun::caps::missing_capability_error(profile));
+            self.sessions
+                .get_mut(profile)
+                .expect("the session existed above")
+                .interface = Some(interface);
+            return Err(error);
+        }
+        let proxy = self
+            .sessions
+            .get(profile)
+            .map(Session::socks_endpoint)
+            .expect("the session existed above");
+
+        // The state is intentionally a superset of what reached the kernel:
+        // every cleanup operation is idempotent, while an unrecorded route
+        // would survive a crash forever.
+        if let Err(error) = self.persist_interface_state(profile, &interface) {
+            self.sessions
+                .get_mut(profile)
+                .expect("the session existed above")
+                .interface = Some(interface);
+            return Err(error);
+        }
+        let result = start_interface_steps(&mut interface, proxy, |interface| {
+            self.persist_interface_state(profile, interface)
+        });
+        if let Err(error) = result {
+            let delete_fresh_device = interface.fresh;
+            let rollback = cleanup_live_interface(&mut interface, delete_fresh_device);
+            self.sessions
+                .get_mut(profile)
+                .expect("the session existed above")
+                .interface = Some(interface);
+            self.sync_session(profile);
+            let _ = self.state.save();
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(anyhow!(
+                    "{error:#}; additionally, rolling the interface back failed: {rollback:#}"
+                )),
+            };
+        }
+        self.sessions
+            .get_mut(profile)
+            .expect("the session existed above")
+            .interface = Some(interface);
+        self.sync_session(profile);
+        self.state.save()?;
+        Ok(())
+    }
+
+    /// Stop routing through the interface but keep its persistent device and
+    /// plan so reconnect can reuse hand-written routes and the same identity.
+    pub fn stop_interface(&mut self, profile: &str) -> Result<()> {
+        let Some(mut interface) = self
+            .sessions
+            .get_mut(profile)
+            .and_then(|session| session.interface.take())
+        else {
+            return Ok(());
+        };
+        let result = cleanup_live_interface(&mut interface, false);
+        self.sessions
+            .get_mut(profile)
+            .expect("the session existed above")
+            .interface = Some(interface);
+        self.sync_session(profile);
+        self.state.save()?;
+        result
+    }
+
+    /// Explicit `oxidom tun --down`: unlike a profile disconnect, this removes
+    /// a device oxidom created and forgets the plan from the live session.
+    pub fn delete_interface(&mut self, profile: &str) -> Result<bool> {
+        let Some(mut interface) = self
+            .sessions
+            .get_mut(profile)
+            .and_then(|session| session.interface.take())
+        else {
+            return Ok(false);
+        };
+        if let Err(error) = cleanup_live_interface(&mut interface, true) {
+            self.sessions
+                .get_mut(profile)
+                .expect("the session existed above")
+                .interface = Some(interface);
+            return Err(error);
+        }
+        self.sync_session(profile);
+        self.state.save()?;
+        Ok(true)
+    }
+
+    fn persist_interface_state(&mut self, profile: &str, interface: &Interface) -> Result<()> {
+        let saved = self
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.profile == profile)
+            .with_context(|| format!("session {profile:?} is missing from recovery state"))?;
+        saved.interface = Some(interface.state());
+        self.state.save()
+    }
+
     pub fn set_default_ports(&mut self, socks_port: u16, http_port: u16) {
         let Some(session) = self.sessions.get_mut("default") else {
             return;
@@ -722,11 +1039,7 @@ impl Engine {
             )
             .collect();
         for profile in &affected {
-            if let Some(session) = self.sessions.get_mut(profile) {
-                session.disconnect();
-            }
-            self.sessions.release_system_proxy(profile);
-            self.sync_session(profile);
+            self.stop_session(profile);
         }
         if !affected.is_empty()
             && let Err(error) = self.state.save()
@@ -744,6 +1057,14 @@ impl Engine {
         let server = self
             .find_server(server_id)
             .ok_or_else(|| anyhow!("server not found"))?;
+        if self
+            .sessions
+            .get(profile)
+            .and_then(|session| session.interface.as_ref())
+            .is_some_and(|interface| interface.up || interface.tun2socks.child_pid().is_some())
+        {
+            self.stop_interface(profile)?;
+        }
         self.sessions
             .get_mut(profile)
             .ok_or_else(|| anyhow!("profile {profile:?} has no session"))?
@@ -764,6 +1085,9 @@ impl Engine {
     /// Stop a core but keep its session entry so a failed connection remains
     /// inspectable until the user explicitly brings the profile down.
     pub fn stop_session(&mut self, profile: &str) {
+        if let Err(error) = self.stop_interface(profile) {
+            log::warn!("could not clean interface for profile {profile:?}: {error:#}");
+        }
         if let Some(session) = self.sessions.get_mut(profile) {
             session.disconnect();
         }
@@ -776,9 +1100,14 @@ impl Engine {
 
     /// Bring one profile down and forget its ephemeral runtime allocation.
     pub fn remove_session(&mut self, profile: &str) -> Result<bool> {
-        let Some(mut session) = self.sessions.remove(profile) else {
+        if self.sessions.get(profile).is_none() {
             return Ok(false);
-        };
+        }
+        self.stop_interface(profile)?;
+        let mut session = self
+            .sessions
+            .remove(profile)
+            .expect("the session was checked above");
         session.disconnect();
         self.state.sessions.retain(|saved| saved.profile != profile);
         self.state.save()?;
@@ -789,13 +1118,22 @@ impl Engine {
     /// visible through the compatibility status fields.
     pub fn disconnect_all(&mut self) -> Result<bool> {
         let had_sessions = !self.sessions.is_empty();
-        for session in self.sessions.inner.values_mut() {
-            session.disconnect();
+        let profiles = self
+            .sessions
+            .iter()
+            .map(|(profile, _)| profile.to_string())
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for profile in profiles {
+            if let Err(error) = self.remove_session(&profile)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        self.sessions.inner.clear();
-        self.sessions.system_proxy_owner = None;
-        self.state.sessions.clear();
-        self.state.save()?;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         Ok(had_sessions)
     }
 
@@ -833,6 +1171,164 @@ impl Engine {
     }
 }
 
+fn resolve_server_ipv4(server: &Server) -> Result<Ipv4Addr> {
+    if let Ok(address) = server.address.parse::<Ipv4Addr>() {
+        return Ok(address);
+    }
+    (server.address.as_str(), server.port)
+        .to_socket_addrs()
+        .with_context(|| {
+            format!(
+                "resolving server endpoint {}:{} for routes = \"default\"",
+                server.address, server.port
+            )
+        })?
+        .find_map(|address| match address.ip() {
+            std::net::IpAddr::V4(address) => Some(address),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .context("routes = \"default\" requires the server IPv4 address")
+}
+
+fn start_interface_steps(
+    interface: &mut Interface,
+    proxy: SocketAddrV4,
+    mut persist: impl FnMut(&Interface) -> Result<()>,
+) -> Result<()> {
+    let created = crate::tun::device::create_persistent(
+        &interface.device,
+        nix::unistd::Uid::effective().as_raw(),
+    )?;
+    if created == crate::tun::device::Created::Fresh {
+        interface.created = true;
+        interface.fresh = true;
+    }
+    persist(interface)?;
+
+    let net = crate::tun::net::Net::new()?;
+    let index = net.link_index(&interface.device)?;
+    net.address_add(index, interface.address, 32)?;
+    interface
+        .tun2socks
+        .start(&interface.device, proxy, interface.mtu)?;
+    // Persist the recovery PID before another kernel mutation. If the daemon
+    // dies between spawn and link-up, the next start can still identify and
+    // reap only this tun2socks process.
+    persist(interface)?;
+
+    // Gate 4 proved this order with tun2socks 2.7: the helper must attach
+    // before administrative link-up. The reverse order was not validated and
+    // risks exposing a route before anything can consume its packets.
+    net.link_up(index)?;
+    for route in &interface.plan.private {
+        net.route_add(route, index)?;
+    }
+    net.rule_add(
+        interface.plan.rule.mark,
+        interface.plan.rule.table,
+        interface.plan.rule.priority,
+    )?;
+    for route in &interface.plan.system {
+        net.route_add(route, index)?;
+    }
+    interface.up = true;
+    interface.fresh = false;
+    Ok(())
+}
+
+fn private_route(table: u32) -> RouteSpec {
+    RouteSpec {
+        destination: Cidr {
+            address: Ipv4Addr::UNSPECIFIED,
+            prefix: 0,
+        },
+        via: Via::Device,
+        table,
+    }
+}
+
+fn cleanup_live_interface(interface: &mut Interface, delete_device: bool) -> Result<()> {
+    interface.tun2socks.stop();
+    interface.up = false;
+    let device_exists = crate::tun::device::exists(&interface.device);
+    let mut errors = Vec::new();
+    match crate::tun::net::Net::new().and_then(|net| {
+        let index = device_exists
+            .then(|| net.link_index(&interface.device))
+            .transpose()?;
+        for route in interface.plan.system.iter().rev() {
+            if (matches!(route.via, Via::Gateway(_)) || index.is_some())
+                && let Err(error) = net.route_del(route, index.unwrap_or(0))
+            {
+                errors.push(format!("{error:#}"));
+            }
+        }
+        if let Err(error) = net.rule_del(
+            interface.plan.rule.mark,
+            interface.plan.rule.table,
+            interface.plan.rule.priority,
+        ) {
+            errors.push(format!("{error:#}"));
+        }
+        if let Some(index) = index {
+            for route in interface.plan.private.iter().rev() {
+                if let Err(error) = net.route_del(route, index) {
+                    errors.push(format!("{error:#}"));
+                }
+            }
+        }
+        Ok(())
+    }) {
+        Ok(()) => {}
+        Err(error) => errors.push(format!("{error:#}")),
+    }
+    if delete_device
+        && device_exists
+        && interface.created
+        && let Err(error) = crate::tun::device::delete(&interface.device)
+    {
+        errors.push(format!("{error:#}"));
+    }
+    interface.fresh = false;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errors.join("; "))
+    }
+}
+
+fn recover_interface(interface: &InterfaceState) -> Result<()> {
+    if let Some(pid) = interface.tun2socks_pid
+        && !kill_stale_tun2socks(pid, &interface.device)
+    {
+        bail!(
+            "could not confirm that recovered tun2socks PID {pid} for device {:?} stopped",
+            interface.device
+        );
+    }
+    let device_exists = crate::tun::device::exists(&interface.device);
+    let net = crate::tun::net::Net::new()?;
+    let index = device_exists
+        .then(|| net.link_index(&interface.device))
+        .transpose()?;
+    for route in interface.routes.iter().rev() {
+        let route = route.to_spec();
+        if matches!(route.via, Via::Gateway(_)) || index.is_some() {
+            net.route_del(&route, index.unwrap_or(0))?;
+        }
+    }
+    if interface.rule {
+        net.rule_del(interface.mark, interface.table, interface.mark)?;
+    }
+    if let Some(index) = index {
+        net.route_del(&private_route(interface.table), index)?;
+    }
+    if device_exists && interface.created {
+        crate::tun::device::delete(&interface.device)?;
+    }
+    Ok(())
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         // Stop the child before the struct fields drop so the recovery flag
@@ -866,48 +1362,21 @@ fn kill_stale_xray(pid: u32, profile: &str) -> bool {
         log::warn!("refusing to signal stale PID {pid}: it is not an oxidom Xray core");
         return false;
     }
-    let Ok(raw_pid) = i32::try_from(pid) else {
-        log::warn!("stale Xray PID {pid} is outside the platform PID range");
-        return false;
-    };
-    let process = nix::unistd::Pid::from_raw(raw_pid);
-    match nix::sys::signal::kill(process, nix::sys::signal::Signal::SIGTERM) {
-        Ok(()) => {}
-        Err(nix::errno::Errno::ESRCH) => return true,
-        Err(error) => {
-            log::warn!("could not send SIGTERM to stale Xray PID {pid}: {error}");
-            return false;
-        }
-    }
-    if wait_until_gone(process, std::time::Duration::from_secs(2)) {
-        return true;
-    }
-
-    log::warn!("stale Xray PID {pid} ignored SIGTERM; sending SIGKILL");
-    match nix::sys::signal::kill(process, nix::sys::signal::Signal::SIGKILL) {
-        Ok(()) => {}
-        Err(nix::errno::Errno::ESRCH) => return true,
-        Err(error) => {
-            log::warn!("could not send SIGKILL to stale Xray PID {pid}: {error}");
-            return false;
-        }
-    }
-    wait_until_gone(process, std::time::Duration::from_secs(2))
+    crate::proc::stop_pid(pid)
 }
 
-fn wait_until_gone(pid: nix::unistd::Pid, timeout: std::time::Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match nix::sys::signal::kill(pid, None) {
-            Err(nix::errno::Errno::ESRCH) => return true,
-            Err(error) => {
-                log::warn!("could not inspect stale Xray PID {pid}: {error}");
-                return false;
-            }
-            Ok(()) if std::time::Instant::now() >= deadline => return false,
-            Ok(()) => std::thread::sleep(std::time::Duration::from_millis(25)),
+fn kill_stale_tun2socks(pid: u32, device: &str) -> bool {
+    if !is_our_tun2socks(pid, device) {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            return true;
         }
+        log::warn!(
+            "refusing to signal stale PID {pid}: it is not oxidom's tun2socks for device \
+             {device:?}"
+        );
+        return false;
     }
+    crate::proc::stop_pid(pid)
 }
 
 /// Does this PID belong to a core oxidom started?
@@ -919,15 +1388,24 @@ fn wait_until_gone(pid: nix::unistd::Pid, timeout: std::time::Duration) -> bool 
 /// it. A process merely named `xray` is not enough: with multiple sessions
 /// that could be another profile's core.
 fn is_our_xray(pid: u32, profile: &str) -> bool {
-    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+    let Some(cmdline) = crate::proc::cmdline(pid) else {
         return false;
     };
-    let cmdline = String::from_utf8_lossy(&raw);
     XrayCore::config_path(profile).is_ok_and(|config| {
         cmdline
-            .split('\0')
-            .any(|arg| !arg.is_empty() && std::path::Path::new(arg) == config)
+            .iter()
+            .any(|argument| std::path::Path::new(argument) == config)
     })
+}
+
+fn is_our_tun2socks(pid: u32, device: &str) -> bool {
+    crate::proc::cmdline(pid).is_some_and(|arguments| arguments_name_tun2socks(&arguments, device))
+}
+
+fn arguments_name_tun2socks(arguments: &[String], device: &str) -> bool {
+    arguments
+        .windows(2)
+        .any(|pair| pair[0] == "--device" && pair[1] == device)
 }
 
 #[cfg(test)]
@@ -942,7 +1420,7 @@ mod tests {
     use crate::bind;
     use crate::link::parse_link;
     use crate::model::{Server, Subscription};
-    use crate::state::{SessionState, State, store};
+    use crate::state::{InterfaceState, RouteRecord, SessionState, State, store};
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -1000,6 +1478,7 @@ mod tests {
             socks_port: 10808,
             http_port: 10809,
             xray_pid: None,
+            interface: None,
         }
     }
 
@@ -1093,6 +1572,54 @@ mod tests {
         let persisted = State::load(&engine.registry.config);
         assert!(persisted.sessions.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn recovery_state_records_every_planned_interface_resource() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("recover-interface-record")?;
+        let mut saved = saved_profile_session("work", None);
+        let interface = InterfaceState {
+            device: "oxi-b2-recover".to_string(),
+            address: Ipv4Addr::new(198, 18, 9, 7),
+            mtu: 1500,
+            table: 0x6f21,
+            mark: 0x6f21,
+            created: true,
+            tun2socks_pid: None,
+            routes: vec![RouteRecord {
+                address: Ipv4Addr::new(10, 0, 0, 0),
+                prefix: 8,
+                table: 254,
+                gateway: None,
+            }],
+            rule: true,
+        };
+        saved.interface = Some(interface.clone());
+        State {
+            sessions: vec![saved],
+        }
+        .save()?;
+
+        let loaded = State::load(&crate::config::Config::default());
+
+        assert_eq!(loaded.sessions.len(), 1);
+        assert_eq!(loaded.sessions[0].interface.as_ref(), Some(&interface));
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_tun2socks_identity_requires_our_exact_long_option_pair() {
+        let ours =
+            ["tun2socks", "--device", "oxi-work", "--proxy", "socks5://x"].map(str::to_string);
+        assert!(super::arguments_name_tun2socks(&ours, "oxi-work"));
+        let wrong_device = ["tun2socks", "--device", "oxi-home"].map(str::to_string);
+        assert!(!super::arguments_name_tun2socks(&wrong_device, "oxi-work"));
+        let broken_single_dash = ["tun2socks", "-device", "oxi-work"].map(str::to_string);
+        assert!(!super::arguments_name_tun2socks(
+            &broken_single_dash,
+            "oxi-work"
+        ));
     }
 
     #[test]

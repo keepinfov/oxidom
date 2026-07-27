@@ -67,6 +67,15 @@ in {
         only needed for accounts that are not administrators.
       '';
     };
+
+    tun.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Allow profile TUN interfaces. This grants only the oxidom system daemon
+        CAP_NET_ADMIN and keeps NetworkManager away from oxi-* devices.
+      '';
+    };
   };
 
   config = lib.mkMerge [
@@ -98,6 +107,9 @@ in {
       # that asks for the name while the unit is still starting *wait* for it
       # (share/dbus-1/system-services) instead of racing it.
       services.dbus.packages = [daemonCfg.package];
+      networking.networkmanager.unmanaged = lib.mkIf daemonCfg.tun.enable [
+        "interface-name:oxi-*"
+      ];
 
       systemd.services.oxidom = {
         description = "oxidom Xray tunnel daemon";
@@ -128,6 +140,11 @@ in {
           ProtectHome = true;
           ProtectSystem = "strict";
           PrivateTmp = true;
+        }
+        // lib.optionalAttrs daemonCfg.tun.enable {
+          AmbientCapabilities = ["CAP_NET_ADMIN"];
+          CapabilityBoundingSet = ["CAP_NET_ADMIN"];
+          RestrictAddressFamilies = ["AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK"];
         };
       };
 

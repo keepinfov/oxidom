@@ -111,44 +111,18 @@ impl Net {
         )
     }
 
-    /// Apply a gateway route. Device routes require an output-interface index,
-    /// which is absent from the phase's public `RouteSpec`; callers must use
-    /// [`Net::route_add_on`] for those routes.
-    pub fn route_add(&self, spec: &RouteSpec) -> Result<()> {
-        self.route_add_with_device(spec, None)
-    }
-
-    /// Apply a route with the interface index that netlink requires for
-    /// `Via::Device`. This supplements the B1 facade without weakening its
-    /// exact one-argument entry point.
-    pub fn route_add_on(&self, spec: &RouteSpec, device_index: u32) -> Result<()> {
-        self.route_add_with_device(spec, Some(device_index))
-    }
-
-    fn route_add_with_device(&self, spec: &RouteSpec, device_index: Option<u32>) -> Result<()> {
-        let message = route_message(spec, device_index)?;
+    pub fn route_add(&self, spec: &RouteSpec, device_index: u32) -> Result<()> {
+        let message = route_message(spec, device_index);
         let result = self
             .runtime
             .block_on(self.handle.route().add(message).execute());
         settle(result, Change::Add, format!("adding route {spec:?}"))
     }
 
-    pub fn route_del(&self, spec: &RouteSpec) -> Result<()> {
-        self.route_del_with_device(spec, None)
-    }
-
-    pub fn route_del_on(&self, spec: &RouteSpec, device_index: u32) -> Result<()> {
-        self.route_del_with_device(spec, Some(device_index))
-    }
-
-    fn route_del_with_device(&self, spec: &RouteSpec, device_index: Option<u32>) -> Result<()> {
-        // Deletion can match by destination and table alone, but including the
-        // known output interface avoids removing a same-prefix route owned by
-        // somebody else.
-        let message = match (spec.via, device_index) {
-            (Via::Device, None) => route_message_without_next_hop(spec),
-            _ => route_message(spec, device_index)?,
-        };
+    pub fn route_del(&self, spec: &RouteSpec, device_index: u32) -> Result<()> {
+        // Including the known output interface avoids removing a same-prefix
+        // device route owned by somebody else.
+        let message = route_message(spec, device_index);
         let result = self
             .runtime
             .block_on(self.handle.route().del(message).execute());
@@ -229,27 +203,17 @@ fn validate_prefix(prefix: u8) -> Result<()> {
     Ok(())
 }
 
-fn route_message(spec: &RouteSpec, device_index: Option<u32>) -> Result<RouteMessage> {
+fn route_message(spec: &RouteSpec, device_index: u32) -> RouteMessage {
     let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
         .destination_prefix(spec.destination.address, spec.destination.prefix)
         .table_id(spec.table);
-    builder =
-        match spec.via {
-            Via::Device => builder
-                .output_interface(device_index.context(
-                    "a device route requires its network-interface index; use route_add_on",
-                )?)
-                .scope(RouteScope::Link),
-            Via::Gateway(gateway) => builder.gateway(gateway),
-        };
-    Ok(builder.build())
-}
-
-fn route_message_without_next_hop(spec: &RouteSpec) -> RouteMessage {
-    RouteMessageBuilder::<Ipv4Addr>::new()
-        .destination_prefix(spec.destination.address, spec.destination.prefix)
-        .table_id(spec.table)
-        .build()
+    builder = match spec.via {
+        Via::Device => builder
+            .output_interface(device_index)
+            .scope(RouteScope::Link),
+        Via::Gateway(gateway) => builder.gateway(gateway),
+    };
+    builder.build()
 }
 
 fn route_table(route: &RouteMessage) -> u32 {

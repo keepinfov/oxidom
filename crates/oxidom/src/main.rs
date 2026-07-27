@@ -129,6 +129,7 @@ fn dispatch(cli: Cli) -> CliResult {
             fresh,
         } => ip(profile.as_deref(), egress, fresh),
         Command::Env { profile } => env(profile.as_deref()),
+        Command::Tun { profile, down } => tun(&profile, down),
         Command::List { target, json } => list(target, json),
         Command::Ping { handle } => ping(&handle),
         Command::Alias { handle, new } => set_alias(&handle, &new),
@@ -146,7 +147,7 @@ fn dispatch(cli: Cli) -> CliResult {
             http_port,
         })
         .map_err(Failure::error),
-        Command::Run { args } => oxidom_core::netns::run(&args).map_err(Failure::error),
+        Command::Run { profile, args } => run(&profile, &args),
     }
 }
 
@@ -169,6 +170,9 @@ fn up(profile: &str) -> CliResult {
         let normalized = ignored.to_ascii_lowercase();
         let name = normalized.strip_suffix(" port").unwrap_or(&normalized);
         eprintln!("{name} port is pinned by the unit, profile value ignored");
+    }
+    for warning in result.warnings {
+        eprintln!("warning: {warning}");
     }
     Ok(())
 }
@@ -253,6 +257,46 @@ fn env(profile: Option<&str>) -> CliResult {
     print_text(session_environment(&session))
 }
 
+fn tun(profile: &str, down: bool) -> CliResult {
+    let client = existing_client()?;
+    if down {
+        let removed = client.delete_interface(profile).map_err(Failure::error)?;
+        if !removed {
+            eprintln!("profile {profile:?} has no interface; nothing to remove");
+        }
+        return Ok(());
+    }
+    let session = client.session_status(profile).map_err(Failure::error)?;
+    let interface = session.interface.ok_or_else(|| {
+        Failure::message(format!(
+            "profile {profile:?} has no interface; set [interface] enable = true and bring it up"
+        ))
+    })?;
+    print_line(format!(
+        "{}\t{}/32\tmtu {}\troutes {}\ttable {}\tmark {:#x}\t{}",
+        interface.device,
+        interface.address,
+        interface.mtu,
+        interface.routes,
+        interface.table,
+        interface.mark,
+        if interface.up { "up" } else { "down" }
+    ))
+}
+
+fn run(profile: &str, args: &[String]) -> CliResult {
+    let client = existing_client()?;
+    let session = client.session_status(profile).map_err(Failure::error)?;
+    let configured = client.profile(profile).map_err(Failure::error)?;
+    oxidom_core::netns::run(
+        profile,
+        args,
+        session.interface.as_ref(),
+        configured.interface.enable,
+    )
+    .map_err(Failure::error)
+}
+
 fn session_environment(session: &SessionInfo) -> String {
     format!(
         "export ALL_PROXY=socks5h://{}:{}\n\
@@ -313,16 +357,21 @@ fn print_sessions(client: &DaemonClient, json: bool) -> CliResult {
 }
 
 fn session_table(sessions: &[SessionOutput]) -> String {
+    let show_device = sessions.iter().any(|session| session.interface.is_some());
     let mut rows = Vec::with_capacity(sessions.len() + 1);
-    rows.push([
+    let mut header = vec![
         "PROFILE".to_string(),
         "STATE".to_string(),
         "SERVER".to_string(),
         "ADDRESS".to_string(),
-        "LATENCY".to_string(),
-    ]);
+    ];
+    if show_device {
+        header.push("DEVICE".to_string());
+    }
+    header.push("LATENCY".to_string());
+    rows.push(header);
     rows.extend(sessions.iter().map(|session| {
-        [
+        let mut row = vec![
             session.profile.clone(),
             session.state.clone(),
             session
@@ -331,13 +380,25 @@ fn session_table(sessions: &[SessionOutput]) -> String {
                 .or_else(|| session.server_id.clone())
                 .unwrap_or_else(|| "—".to_string()),
             format!("{}:{}", session.address, session.socks_port),
+        ];
+        if show_device {
+            row.push(
+                session
+                    .interface
+                    .as_ref()
+                    .map(|interface| interface.device.clone())
+                    .unwrap_or_else(|| "—".to_string()),
+            );
+        }
+        row.push(
             session
                 .latency_ms
                 .map(|latency| format!("{latency}ms"))
                 .unwrap_or_else(|| "—".to_string()),
-        ]
+        );
+        row
     }));
-    let mut widths = [0usize; 5];
+    let mut widths = vec![0usize; rows[0].len()];
     for row in &rows {
         for (column, value) in row.iter().enumerate() {
             widths[column] = widths[column].max(value.chars().count());
@@ -770,6 +831,7 @@ mod tests {
                 latency_ms: Some(84),
                 error: None,
                 owns_system_proxy: false,
+                interface: None,
             },
             SessionOutput {
                 profile: "work".to_string(),
@@ -783,6 +845,7 @@ mod tests {
                 latency_ms: Some(112),
                 error: None,
                 owns_system_proxy: false,
+                interface: None,
             },
         ];
 
@@ -791,6 +854,50 @@ mod tests {
             "PROFILE  STATE      SERVER     ADDRESS            LATENCY\n\
              default  connected  ch-trojan  127.0.0.1:10808    84ms\n\
              work     connected  nl-vless   127.72.14.1:10808  112ms\n"
+        );
+    }
+
+    #[test]
+    fn session_table_adds_the_device_column_only_when_needed() {
+        let sessions = [
+            SessionOutput {
+                profile: "default".to_string(),
+                state: "connected".to_string(),
+                server_id: Some("id-one".to_string()),
+                server_alias: Some("ch".to_string()),
+                server_name: None,
+                address: "127.0.0.1".to_string(),
+                socks_port: 10808,
+                http_port: 10809,
+                latency_ms: Some(84),
+                error: None,
+                owns_system_proxy: false,
+                interface: Some(oxidom_core::ipc::InterfaceInfo {
+                    device: "oxi-default".to_string(),
+                    ..Default::default()
+                }),
+            },
+            SessionOutput {
+                profile: "work".to_string(),
+                state: "connected".to_string(),
+                server_id: Some("id-two".to_string()),
+                server_alias: Some("nl".to_string()),
+                server_name: None,
+                address: "127.72.14.1".to_string(),
+                socks_port: 10808,
+                http_port: 10809,
+                latency_ms: None,
+                error: None,
+                owns_system_proxy: false,
+                interface: None,
+            },
+        ];
+
+        assert_eq!(
+            session_table(&sessions),
+            "PROFILE  STATE      SERVER  ADDRESS            DEVICE       LATENCY\n\
+             default  connected  ch      127.0.0.1:10808    oxi-default  84ms\n\
+             work     connected  nl      127.72.14.1:10808  —            —\n"
         );
     }
 

@@ -109,6 +109,20 @@ pub struct SessionInfo {
     pub http_port: u16,
     /// Whether this session is the logical owner of the desktop system proxy.
     pub owns_system_proxy: bool,
+    pub interface: Option<InterfaceInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct InterfaceInfo {
+    pub device: String,
+    pub address: String,
+    pub mtu: u16,
+    /// "manual" | "list" | "default"
+    pub routes: String,
+    pub table: u32,
+    pub mark: u32,
+    pub up: bool,
 }
 
 /// How a probe reached the server. Mirrors `probe::Route` rather than reusing
@@ -296,6 +310,7 @@ pub struct UpResult {
     pub server: UpServer,
     /// Profile port names ignored because the daemon unit pins them.
     pub ignored_ports: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// A follow-up the GUI can offer for a failure. Errors cross D-Bus as free

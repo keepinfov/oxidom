@@ -239,6 +239,20 @@ pub fn load(name: &str) -> Result<Profile> {
     Profile::from_toml(&body).with_context(|| format!("in profile {name:?}"))
 }
 
+/// Load a profile, treating an absent file as the built-in defaults.
+///
+/// The bare `Connect` path needs the `default` profile only to learn whether an
+/// interface was asked for, and `ensure_default` is deliberately non-fatal. A
+/// user who deleted `default.toml` must still be able to connect, so only a
+/// malformed file is an error here.
+pub fn load_or_default(name: &str) -> Result<Profile> {
+    let path = profile_path(name)?;
+    if !path.exists() {
+        return Ok(Profile::default());
+    }
+    load(name)
+}
+
 pub fn save(name: &str, profile: &Profile) -> Result<()> {
     if is_reserved(name) {
         bail!("profile name {name:?} is reserved by the oxidom CLI");
@@ -472,6 +486,27 @@ http_port = 10809
             super::editor_command(r#"code --wait "--profile=Work Tree""#)?,
             ["code", "--wait", "--profile=Work Tree"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deleted_default_profile_still_lets_bare_connect_run() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("load-or-default");
+
+        // Bare Connect reads the profile only for its [interface] section, so
+        // an absent file has to mean "proxy only", not "cannot connect".
+        let fallback = super::load_or_default("default")?;
+        assert!(!fallback.interface.enable);
+        fallback.validate("default")?;
+        assert!(super::load("default").is_err());
+
+        // A file that exists but is broken stays an error: silently connecting
+        // without the interface the user asked for would be worse.
+        let path = super::profile_path("default")?;
+        std::fs::create_dir_all(path.parent().expect("profiles directory"))?;
+        std::fs::write(&path, "this is not toml = = =")?;
+        assert!(super::load_or_default("default").is_err());
         Ok(())
     }
 

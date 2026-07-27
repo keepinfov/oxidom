@@ -26,7 +26,9 @@
           # the nix-provided core by hand: an unwrapped binary falls back to `xray` on
           # $PATH and a systemd unit has none.
           postFixup = ''
-            wrapProgram $out/bin/oxidom --set-default OXIDOM_XRAY_BIN ${pkgs.xray}/bin/xray
+            wrapProgram $out/bin/oxidom \
+              --set-default OXIDOM_XRAY_BIN ${pkgs.xray}/bin/xray \
+              --set-default OXIDOM_TUN2SOCKS_BIN ${pkgs.tun2socks}/bin/tun2socks
           '';
           postInstall = ''
             install -Dm444 data/dev.keepinfov.oxidom.Daemon.conf \
@@ -89,10 +91,12 @@
             clippy
             rustfmt
             xray
+            tun2socks
           ];
           # In the dev shell, find Xray on PATH from the shell.
           shellHook = ''
             export OXIDOM_XRAY_BIN=${pkgs.xray}/bin/xray
+            export OXIDOM_TUN2SOCKS_BIN=${pkgs.tun2socks}/bin/tun2socks
           '';
         };
         formatter = pkgs.alejandra;

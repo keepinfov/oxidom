@@ -12,16 +12,36 @@
 //! error instead of silently running the process un-proxied (which would leak
 //! traffic).
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
-pub fn run(args: &[String]) -> Result<()> {
+use crate::ipc::InterfaceInfo;
+
+pub fn run(
+    profile: &str,
+    args: &[String],
+    interface: Option<&InterfaceInfo>,
+    interface_enabled: bool,
+) -> Result<()> {
     if args.is_empty() {
         bail!("no command given to `oxidom run`");
     }
+    if !interface_enabled {
+        bail!(
+            "profile `{profile}` has no network interface. Use `oxidom env {profile}` for \
+             programs that honor proxy environment variables"
+        );
+    }
+    let interface = interface.context(
+        "the profile asks for an interface, but its running session has none; bring the profile \
+         down and up again",
+    )?;
     bail!(
-        "`oxidom run` is not yet available: per-process routing will arrive with profile \
-         interfaces. `oxidom env <profile>` works now for programs that honor proxy \
-         environment variables. Command requested: {}",
+        "`oxidom run` process marking arrives in the next implementation step. Profile \
+         `{profile}` currently uses routing table {} and fwmark {:#x}; apply that mark yourself \
+         to route the command through {}. Command requested: {}",
+        interface.table,
+        interface.mark,
+        interface.device,
         shell_words::join(args)
     );
 }

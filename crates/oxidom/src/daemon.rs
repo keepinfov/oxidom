@@ -17,12 +17,13 @@ use oxidom_core::config::{Config, LatencyMethod};
 use oxidom_core::engine::Engine;
 use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
-    ApplySettingsResult, BUS_NAME, LatencyReading, OBJECT_PATH, PROBE_STATE_VERSION, ProbeFailure,
-    ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo, SessionInfo, StatusInfo, UpResult, UpServer,
+    ApplySettingsResult, BUS_NAME, InterfaceInfo, LatencyReading, OBJECT_PATH, PROBE_STATE_VERSION,
+    ProbeFailure, ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo, SessionInfo, StatusInfo,
+    UpResult, UpServer,
 };
 use oxidom_core::model::Server;
 use oxidom_core::probe;
-use oxidom_core::profile::{self, Profile};
+use oxidom_core::profile::{self, Profile, RouteMode};
 use oxidom_core::xray::core::Status;
 
 /// How many servers may be measured at once. This is now a cap on *processes*:
@@ -301,6 +302,12 @@ impl Shared {
             dead.push((profile, server_id));
         }
         for (profile, _) in &dead {
+            if let Err(error) = engine.stop_interface(profile) {
+                log::warn!(
+                    "could not clean the interface after profile {profile:?}'s core exited: \
+                     {error:#}"
+                );
+            }
             engine.sessions.release_system_proxy(profile);
         }
         dead
@@ -782,6 +789,24 @@ impl Shared {
                 let current = shared.generation_is_current(&profile, generation);
                 if current {
                     let mut engine = oxidom_core::sync::lock(&shared.engine);
+                    if let Err(error) = engine.start_interface(&profile) {
+                        let reason = format!("could not bring up the profile interface: {error:#}");
+                        if let Some(session) = engine.sessions.get(&profile) {
+                            session.core.note(&reason);
+                        }
+                        engine.stop_session(&profile);
+                        if origin == ConnectionOrigin::Explicit {
+                            oxidom_core::sync::lock(&shared.override_status).insert(
+                                profile.clone(),
+                                ErrorOverride {
+                                    status: Status::Error(reason),
+                                    server_id: server_id.clone(),
+                                },
+                            );
+                        }
+                        let _ = confirmed.send(false);
+                        return;
+                    }
                     if engine.registry.config.system_proxy
                         && let Err(error) = engine.sessions.claim_system_proxy(&profile)
                     {
@@ -1030,6 +1055,15 @@ fn session_info_with_status(
         socks_port: session.socks_port,
         http_port: session.http_port,
         owns_system_proxy: engine.sessions.owner_of_system_proxy() == Some(profile),
+        interface: session.interface.as_ref().map(|interface| InterfaceInfo {
+            device: interface.device.clone(),
+            address: interface.address.to_string(),
+            mtu: interface.mtu,
+            routes: interface.route_mode().to_string(),
+            table: interface.table,
+            mark: interface.mark,
+            up: interface.up,
+        }),
     }
 }
 
@@ -1149,6 +1183,11 @@ impl Service {
     }
 
     fn connect(&self, server_id: String) -> fdo::Result<()> {
+        // Bare Connect predates profiles and must keep working for a user who
+        // has no `default.toml`: it is read here only to learn whether an
+        // interface was requested.
+        let default_profile = profile::load_or_default("default").map_err(failed)?;
+        default_profile.validate("default").map_err(failed)?;
         self.shared.clear_override("default");
         let generation = self.shared.next_connect_generation("default");
         {
@@ -1163,9 +1202,23 @@ impl Service {
                     "the system proxy is already held by profile {owner:?}"
                 )));
             }
+            let existed = engine.sessions.get("default").is_some();
+            // Resolved before the session is prepared so an unknown id cannot
+            // leave a half-built session behind.
+            let server = engine
+                .find_server(&server_id)
+                .ok_or_else(|| failed("server not found"))?;
             engine
                 .prepare_session("default", Ipv4Addr::LOCALHOST, socks_port, http_port)
                 .map_err(failed)?;
+            if let Err(error) =
+                engine.configure_interface("default", &default_profile.interface, &server)
+            {
+                if !existed {
+                    engine.sessions.remove("default");
+                }
+                return Err(failed(error));
+            }
             if engine.registry.config.system_proxy {
                 engine
                     .sessions
@@ -1300,6 +1353,10 @@ impl Service {
             engine
                 .prepare_session(&name, address, socks_port, http_port)
                 .map_err(failed)?;
+            if let Err(error) = engine.configure_interface(&name, &profile.interface, &server) {
+                engine.sessions.remove(&name);
+                return Err(failed(error));
+            }
             if wants_system_proxy {
                 engine.sessions.claim_system_proxy(&name).map_err(failed)?;
             }
@@ -1308,11 +1365,23 @@ impl Service {
 
         self.shared.clear_override(&name);
         let generation = self.shared.next_connect_generation(&name);
-        let result =
+        let confirmation =
             self.shared
                 .start_connection(&name, &server.id, generation, ConnectionOrigin::Explicit);
         self.shared.clear_override(&name);
-        result.map_err(failed)?;
+        let confirmation = confirmation.map_err(failed)?;
+        if profile.interface.enable
+            && !confirmation.is_some_and(|confirmation| confirmation.recv().unwrap_or(false))
+        {
+            let message = self
+                .shared
+                .session_info(&name)
+                .and_then(|session| session.error)
+                .unwrap_or_else(|| {
+                    format!("profile {name:?} did not finish bringing up its interface")
+                });
+            return Err(failed(message));
+        }
 
         json(&UpResult {
             server: UpServer {
@@ -1321,6 +1390,14 @@ impl Service {
                 name: server.name,
             },
             ignored_ports,
+            warnings: (profile.interface.routes == RouteMode::Default)
+                .then(|| {
+                    "routes = \"default\" does not move the system resolver into the tunnel; DNS \
+                     may still use the existing network path"
+                        .to_string()
+                })
+                .into_iter()
+                .collect(),
         })
     }
 
@@ -1348,6 +1425,12 @@ impl Service {
 
     fn down_profile(&self, profile: String) -> fdo::Result<bool> {
         self.stop_profile(&profile)
+    }
+
+    fn delete_interface(&self, profile: String) -> fdo::Result<bool> {
+        oxidom_core::sync::lock(&self.shared.engine)
+            .delete_interface(&profile)
+            .map_err(failed)
     }
 
     fn status(&self) -> fdo::Result<String> {
@@ -1406,6 +1489,14 @@ impl Service {
         // which has no checkbox for this key, applies its settings payload.
         if raw.get("reconnect").is_none() {
             config.reconnect = engine.registry.config.reconnect;
+        }
+        if raw.get("tun2socks_binary").is_none() || self.shared.system_bus {
+            if self.shared.system_bus
+                && config.tun2socks_binary != engine.registry.config.tun2socks_binary
+            {
+                ignored_settings.push("tun2socks binary path".to_string());
+            }
+            config.tun2socks_binary = engine.registry.config.tun2socks_binary.clone();
         }
 
         // Rejected here as well as in the GUI: any D-Bus client can send a
