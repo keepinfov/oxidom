@@ -84,6 +84,9 @@ pub enum Command {
         /// keep working, activating the app again presents the window).
         #[arg(long)]
         background: bool,
+        /// Stay in the foreground and log at debug level.
+        #[arg(long)]
+        debug: bool,
     },
     /// Run the headless daemon that owns the tunnel and serves D-Bus.
     Daemon {
@@ -144,11 +147,14 @@ fn gui_binary() -> PathBuf {
     PathBuf::from("oxidom-gui")
 }
 
-pub fn run_gui(background: bool) -> Result<()> {
+pub fn run_gui(background: bool, debug: bool) -> Result<()> {
     let executable = gui_binary();
     let mut command = std::process::Command::new(&executable);
     if background {
         command.arg("--background");
+    }
+    if debug {
+        command.arg("--debug");
     }
     let error = command.exec();
     Err(error).with_context(|| {

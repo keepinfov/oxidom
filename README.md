@@ -94,9 +94,15 @@ oxidom ping HANDLE                   # print only milliseconds on success
 oxidom alias HANDLE NEW
 oxidom profile {list,show,new,edit,rm}
 oxidom daemon [--system]             # headless daemon (session bus by default)
-oxidom gui --background              # compatibility shim to oxidom-gui
+oxidom gui [--background] [--debug]  # compatibility shim to oxidom-gui
 oxidom run -- CMD                    # reserved per-process proxy launcher
 ```
+
+Started from a terminal, `oxidom-gui` forks into the background so closing that
+terminal does not take the window and tray with it. `--debug` keeps it in the
+foreground and raises the default log level; `$RUST_LOG` still overrides either
+way. Nothing is detached when stdout is not a terminal, so the tray unit and
+`oxidom-gui | tee` behave as before.
 
 Structured data is printed only to stdout; diagnostics and ambiguous-handle
 candidates go to stderr. Stable exit codes are `0` (success), `1` (command

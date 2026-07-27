@@ -221,7 +221,17 @@ rather than once a second.
 
 ## CLI (clap derive)
 `oxidom` is the headless CLI/daemon and `oxidom-gui` is the graphical client.
-`oxidom gui` remains a compatibility shim that execs the latter.
+`oxidom gui` remains a compatibility shim that execs the latter, passing
+`--background` and `--debug` through.
+
+`oxidom-gui` detaches from a terminal it was started from: `main` forks, calls
+`setsid`, and points stdio at `/dev/null` **before** GTK or any thread exists —
+fork carries only the calling thread over, so there is no later moment at which
+this is safe. It is skipped when stdout is not a terminal, because then a
+supervisor is watching: the tray unit runs `oxidom-gui --background` as
+`Type=simple`, and a main process that forks and exits reads to systemd as a
+service that died on startup. `--debug` also skips it and defaults the log
+level to `debug`; `$RUST_LOG` overrides that default in either mode.
 
 - `oxidom up [PROFILE]` (`connect-profile`) connects the `default` profile or the named one.
 - `oxidom down [PROFILE]` (`disconnect`) stops the tunnel unconditionally unless a profile

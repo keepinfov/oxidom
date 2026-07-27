@@ -123,7 +123,9 @@ fn dispatch(cli: Cli) -> CliResult {
         Command::Ping { handle } => ping(&handle),
         Command::Alias { handle, new } => set_alias(&handle, &new),
         Command::Profile { command } => profile_command(command),
-        Command::Gui { background } => cli::run_gui(background).map_err(Failure::error),
+        Command::Gui { background, debug } => {
+            cli::run_gui(background, debug).map_err(Failure::error)
+        }
         Command::Daemon {
             system,
             socks_port,
