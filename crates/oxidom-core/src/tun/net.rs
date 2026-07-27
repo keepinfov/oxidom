@@ -1,5 +1,6 @@
 //! Blocking rtnetlink facade for profile interfaces.
 
+use std::future::Future;
 use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result, bail};
@@ -37,8 +38,24 @@ impl Net {
         Ok(Self { runtime, handle })
     }
 
+    /// Drive one netlink exchange to completion.
+    ///
+    /// The blocking has to happen on a thread that is not already driving a
+    /// runtime. The daemon answers D-Bus on zbus's tokio workers, and calling
+    /// `Runtime::block_on` there aborts the worker with "Cannot start a runtime
+    /// from within a runtime" — the method then never replies and the client
+    /// hangs forever. A scoped plain thread is never a worker.
+    fn block<T: Send>(&self, future: impl Future<Output = T> + Send) -> T {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| self.runtime.block_on(future))
+                .join()
+                .expect("the netlink worker thread panicked")
+        })
+    }
+
     pub fn link_index(&self, name: &str) -> Result<u32> {
-        self.runtime.block_on(async {
+        self.block(async {
             let mut links = self
                 .handle
                 .link()
@@ -80,14 +97,13 @@ impl Net {
         message: rtnetlink::packet_route::link::LinkMessage,
         context: String,
     ) -> Result<()> {
-        self.runtime
-            .block_on(self.handle.link().set(message).execute())
+        self.block(self.handle.link().set(message).execute())
             .with_context(|| context)
     }
 
     pub fn address_add(&self, index: u32, address: Ipv4Addr, prefix: u8) -> Result<()> {
         validate_prefix(prefix)?;
-        let result = self.runtime.block_on(
+        let result = self.block(
             self.handle
                 .address()
                 .add(index, address.into(), prefix)
@@ -106,9 +122,7 @@ impl Net {
             .index(index)
             .address(address, prefix)
             .build();
-        let result = self
-            .runtime
-            .block_on(self.handle.address().del(message).execute());
+        let result = self.block(self.handle.address().del(message).execute());
         settle(
             result,
             Change::Delete,
@@ -118,9 +132,7 @@ impl Net {
 
     pub fn route_add(&self, spec: &RouteSpec, device_index: u32) -> Result<()> {
         let message = route_message(spec, device_index);
-        let result = self
-            .runtime
-            .block_on(self.handle.route().add(message).execute());
+        let result = self.block(self.handle.route().add(message).execute());
         settle(result, Change::Add, format!("adding route {spec:?}"))
     }
 
@@ -128,14 +140,12 @@ impl Net {
         // Including the known output interface avoids removing a same-prefix
         // device route owned by somebody else.
         let message = route_message(spec, device_index);
-        let result = self
-            .runtime
-            .block_on(self.handle.route().del(message).execute());
+        let result = self.block(self.handle.route().del(message).execute());
         settle(result, Change::Delete, format!("deleting route {spec:?}"))
     }
 
     pub fn rule_add(&self, mark: u32, table: u32, priority: u32) -> Result<()> {
-        let result = self.runtime.block_on(
+        let result = self.block(
             self.handle
                 .rule()
                 .add()
@@ -164,9 +174,7 @@ impl Net {
             .priority(priority)
             .action(RuleAction::ToTable);
         let message = request.message_mut().clone();
-        let result = self
-            .runtime
-            .block_on(self.handle.rule().del(message).execute());
+        let result = self.block(self.handle.rule().del(message).execute());
         settle(
             result,
             Change::Delete,
@@ -182,7 +190,7 @@ impl Net {
     /// These are copied into a profile's private table so a process selected
     /// by fwmark does not lose its LAN or gateway.
     pub fn default_network(&self) -> Result<Option<DefaultNetwork>> {
-        self.runtime.block_on(async {
+        self.block(async {
             let request = RouteMessageBuilder::<Ipv4Addr>::new().build();
             let mut routes = self.handle.route().get(request).execute();
             let mut messages = Vec::new();
