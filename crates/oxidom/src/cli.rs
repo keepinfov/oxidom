@@ -29,8 +29,7 @@ pub enum Command {
     /// Disconnect the active tunnel.
     #[command(visible_alias = "disconnect")]
     Down {
-        /// Disconnect only when this profile owns the active tunnel.
-        #[arg(long)]
+        /// Profile to stop. Omitted, the tunnel is stopped whoever owns it.
         profile: Option<String>,
     },
     /// Connect directly to one server, without a profile.

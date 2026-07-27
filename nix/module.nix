@@ -144,7 +144,7 @@ in {
           Type = "oneshot";
           RemainAfterExit = true;
           ExecStart = "${daemonCfg.package}/bin/oxidom up %i";
-          ExecStop = "${daemonCfg.package}/bin/oxidom down --profile %i";
+          ExecStop = "${daemonCfg.package}/bin/oxidom down %i";
         };
       };
     })

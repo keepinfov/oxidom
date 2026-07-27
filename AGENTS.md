@@ -224,7 +224,7 @@ rather than once a second.
 `oxidom gui` remains a compatibility shim that execs the latter.
 
 - `oxidom up [PROFILE]` (`connect-profile`) connects the `default` profile or the named one.
-- `oxidom down [--profile NAME]` (`disconnect`) stops the tunnel unconditionally unless a profile
+- `oxidom down [PROFILE]` (`disconnect`) stops the tunnel unconditionally unless a profile
   is named.
 - `oxidom connect <HANDLE>` connects one server without a profile.
 - `oxidom status [--json]`, `oxidom ip [--egress] [--fresh]`,
@@ -274,7 +274,7 @@ http_port = 10809
 Names match `^[a-z0-9][a-z0-9_-]{0,31}$`. `UpProfile` resolves `select.server` as a handle and
 applies ports unless the daemon unit pins them. `Down("")` disconnects unconditionally;
 `Down(name)` disconnects only when `state.active_profile == name`, otherwise it returns `false`
-without touching the active tunnel. `oxidom down --profile` still exits `0` in that case: it is
+without touching the active tunnel. `oxidom down <PROFILE>` still exits `0` in that case: it is
 the unit's `ExecStop`, and the post-condition it was asked for — that profile is not running —
 already holds. Removing a profile deliberately leaves `active_profile` set, so the unit can still
 stop the tunnel it started.

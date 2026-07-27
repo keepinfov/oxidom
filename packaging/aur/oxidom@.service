@@ -7,7 +7,7 @@ After=oxidom.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/oxidom up %i
-ExecStop=/usr/bin/oxidom down --profile %i
+ExecStop=/usr/bin/oxidom down %i
 
 [Install]
 WantedBy=multi-user.target

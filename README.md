@@ -85,7 +85,7 @@ Without nix you need GTK4 ≥ 4.14, libadwaita ≥ 1.4, a Rust toolchain, and an
 
 ```sh
 oxidom up [PROFILE]                  # connect a profile (default: default)
-oxidom down [--profile NAME]         # stop unconditionally or only its owner
+oxidom down [PROFILE]                # stop unconditionally or only its owner
 oxidom connect HANDLE                # connect one server without a profile
 oxidom status [--json]               # active server, ports, and tunnel latency
 oxidom ip [--egress] [--fresh]       # endpoint IP or cached public egress IP
