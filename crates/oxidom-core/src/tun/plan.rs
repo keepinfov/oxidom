@@ -46,7 +46,10 @@ impl Display for Cidr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Via {
+    /// The profile TUN, whose current ifindex is supplied at application time.
     Device,
+    /// An existing system interface, captured while reading connected routes.
+    Interface(u32),
     Gateway(Ipv4Addr),
 }
 
@@ -65,6 +68,12 @@ pub struct RuleSpec {
     pub priority: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectedRoute {
+    pub destination: Cidr,
+    pub interface: u32,
+}
+
 pub struct PlanInput<'a> {
     pub table: u32,
     pub mark: u32,
@@ -72,6 +81,9 @@ pub struct PlanInput<'a> {
     pub list: &'a [Cidr],
     pub server_address: Option<Ipv4Addr>,
     pub default_gateway: Option<Ipv4Addr>,
+    /// Link-scope routes of the interface carrying the system default. They
+    /// keep LAN hosts reachable after a cgroup mark selects the private table.
+    pub connected: &'a [ConnectedRoute],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,11 +94,20 @@ pub struct RoutePlan {
 }
 
 pub fn plan_routes(input: &PlanInput<'_>) -> Result<RoutePlan> {
-    let private = vec![RouteSpec {
+    let mut private = input
+        .connected
+        .iter()
+        .map(|route| RouteSpec {
+            destination: route.destination,
+            via: Via::Interface(route.interface),
+            table: input.table,
+        })
+        .collect::<Vec<_>>();
+    private.push(RouteSpec {
         destination: cidr(Ipv4Addr::UNSPECIFIED, 0),
         via: Via::Device,
         table: input.table,
-    }];
+    });
     let rule = RuleSpec {
         mark: input.mark,
         table: input.table,
@@ -151,6 +172,14 @@ const fn cidr(address: Ipv4Addr, prefix: u8) -> Cidr {
 mod tests {
     use super::*;
 
+    const CONNECTED: [ConnectedRoute; 1] = [ConnectedRoute {
+        destination: Cidr {
+            address: Ipv4Addr::new(192, 0, 2, 0),
+            prefix: 24,
+        },
+        interface: 7,
+    }];
+
     fn input(mode: RouteMode) -> PlanInput<'static> {
         PlanInput {
             table: 0x6f21,
@@ -159,17 +188,25 @@ mod tests {
             list: &[],
             server_address: Some(Ipv4Addr::new(203, 0, 113, 7)),
             default_gateway: Some(Ipv4Addr::new(192, 0, 2, 1)),
+            connected: &CONNECTED,
         }
     }
 
     fn common_is_present(plan: &RoutePlan) {
         assert_eq!(
             plan.private,
-            [RouteSpec {
-                destination: cidr(Ipv4Addr::UNSPECIFIED, 0),
-                via: Via::Device,
-                table: 0x6f21,
-            }]
+            [
+                RouteSpec {
+                    destination: cidr(Ipv4Addr::new(192, 0, 2, 0), 24),
+                    via: Via::Interface(7),
+                    table: 0x6f21,
+                },
+                RouteSpec {
+                    destination: cidr(Ipv4Addr::UNSPECIFIED, 0),
+                    via: Via::Device,
+                    table: 0x6f21,
+                },
+            ]
         );
         assert_eq!(
             plan.rule,
@@ -186,6 +223,45 @@ mod tests {
         let plan = plan_routes(&input(RouteMode::Manual)).unwrap();
         common_is_present(&plan);
         assert!(plan.system.is_empty());
+    }
+
+    #[test]
+    fn connected_routes_precede_the_private_default_and_keep_their_interfaces() {
+        let connected = [
+            ConnectedRoute {
+                destination: cidr(Ipv4Addr::new(192, 168, 1, 0), 24),
+                interface: 4,
+            },
+            ConnectedRoute {
+                destination: cidr(Ipv4Addr::new(169, 254, 0, 0), 16),
+                interface: 4,
+            },
+        ];
+        let mut input = input(RouteMode::Manual);
+        input.connected = &connected;
+
+        let plan = plan_routes(&input).unwrap();
+
+        assert_eq!(
+            plan.private,
+            [
+                RouteSpec {
+                    destination: connected[0].destination,
+                    via: Via::Interface(4),
+                    table: 0x6f21,
+                },
+                RouteSpec {
+                    destination: connected[1].destination,
+                    via: Via::Interface(4),
+                    table: 0x6f21,
+                },
+                RouteSpec {
+                    destination: cidr(Ipv4Addr::UNSPECIFIED, 0),
+                    via: Via::Device,
+                    table: 0x6f21,
+                },
+            ]
+        );
     }
 
     #[test]

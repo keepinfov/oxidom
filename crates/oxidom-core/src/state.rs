@@ -52,10 +52,14 @@ pub struct InterfaceState {
     /// Only an interface created by oxidom may be removed during recovery.
     pub created: bool,
     pub tun2socks_pid: Option<u32>,
-    /// System routes are recorded before application so crash cleanup may
+    /// Planned routes are recorded before application so crash cleanup may
     /// harmlessly over-delete, but can never forget a route already applied.
+    /// This is the entire private + system plan, not a reconstruction.
     pub routes: Vec<RouteRecord>,
     pub rule: bool,
+    /// The profile's nft chain was planned before application. Cleanup may
+    /// harmlessly remove a chain that the atomic transaction never created.
+    pub nft_rule: bool,
 }
 
 impl Default for InterfaceState {
@@ -70,6 +74,7 @@ impl Default for InterfaceState {
             tun2socks_pid: None,
             routes: Vec::new(),
             rule: false,
+            nft_rule: false,
         }
     }
 }
@@ -80,8 +85,11 @@ pub struct RouteRecord {
     pub address: Ipv4Addr,
     pub prefix: u8,
     pub table: u32,
-    /// `None` means the route goes through the profile device.
+    /// Gateway for a routed next hop; device routes leave this empty.
     pub gateway: Option<Ipv4Addr>,
+    /// Existing system interface for a copied connected route. Both `None`
+    /// means the profile device, preserving the B2 on-disk representation.
+    pub interface: Option<u32>,
 }
 
 impl Default for RouteRecord {
@@ -91,6 +99,7 @@ impl Default for RouteRecord {
             prefix: 0,
             table: 0,
             gateway: None,
+            interface: None,
         }
     }
 }
@@ -102,8 +111,12 @@ impl RouteRecord {
             prefix: spec.destination.prefix,
             table: spec.table,
             gateway: match spec.via {
-                Via::Device => None,
+                Via::Device | Via::Interface(_) => None,
                 Via::Gateway(gateway) => Some(gateway),
+            },
+            interface: match spec.via {
+                Via::Interface(index) => Some(index),
+                Via::Device | Via::Gateway(_) => None,
             },
         }
     }
@@ -114,7 +127,11 @@ impl RouteRecord {
                 address: self.address,
                 prefix: self.prefix,
             },
-            via: self.gateway.map_or(Via::Device, Via::Gateway),
+            via: match (self.gateway, self.interface) {
+                (Some(gateway), _) => Via::Gateway(gateway),
+                (None, Some(index)) => Via::Interface(index),
+                (None, None) => Via::Device,
+            },
             table: self.table,
         }
     }
@@ -162,9 +179,34 @@ impl State {
 
 fn migrate(stored: StoredState, config: &Config) -> State {
     if !stored.sessions.is_empty() {
-        return State {
-            sessions: stored.sessions,
-        };
+        let mut sessions = stored.sessions;
+        // B2 recorded only system routes and reconstructed the private
+        // default during recovery. Promote that old on-disk shape once so B3
+        // cleanup has one source of truth and an upgrade after a crash cannot
+        // strand the pre-B3 private route.
+        for session in &mut sessions {
+            let Some(interface) = session.interface.as_mut() else {
+                continue;
+            };
+            if interface.rule
+                && !interface
+                    .routes
+                    .iter()
+                    .any(|route| route.table == interface.table)
+            {
+                interface.routes.insert(
+                    0,
+                    RouteRecord {
+                        address: Ipv4Addr::UNSPECIFIED,
+                        prefix: 0,
+                        table: interface.table,
+                        gateway: None,
+                        interface: None,
+                    },
+                );
+            }
+        }
+        return State { sessions };
     }
     if stored.active_server_id.is_none()
         && stored.active_profile.is_none()
@@ -379,6 +421,44 @@ mod tests {
 
         assert_eq!(loaded.sessions, state.sessions);
         assert_eq!(std::fs::metadata(path)?.ino(), inode);
+        Ok(())
+    }
+
+    #[test]
+    fn b2_interface_state_is_promoted_to_a_complete_route_plan() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("b2-interface-plan");
+        let path = crate::paths::state_file()?;
+        crate::fsutil::write_private_atomic(
+            &path,
+            b"[[sessions]]\n\
+              profile = \"work\"\n\
+              address = \"127.91.37.1\"\n\
+              socks_port = 10808\n\
+              http_port = 10809\n\
+              \n\
+              [sessions.interface]\n\
+              device = \"oxi-work\"\n\
+              address = \"198.18.9.7\"\n\
+              mtu = 1500\n\
+              table = 28449\n\
+              mark = 28449\n\
+              rule = true\n\
+              \n\
+              [[sessions.interface.routes]]\n\
+              address = \"10.0.0.0\"\n\
+              prefix = 8\n\
+              table = 254\n",
+        )?;
+
+        let state = State::load(&Config::default());
+        let routes = &state.sessions[0].interface.as_ref().unwrap().routes;
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].address, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(routes[0].prefix, 0);
+        assert_eq!(routes[0].table, 28449);
+        assert_eq!(routes[1].table, 254);
         Ok(())
     }
 }

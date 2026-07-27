@@ -7,10 +7,12 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
 use crate::model::{Server, Subscription};
+use crate::nft::Nft;
 use crate::profile::{ProfileInterface, RouteMode};
+use crate::run::CgroupSlice;
 use crate::state::{self, InterfaceState, RouteRecord, SessionState, State, store};
 use crate::tun::core::Tun2socks;
-use crate::tun::plan::{Cidr, PlanInput, RoutePlan, RouteSpec, Via, plan_routes};
+use crate::tun::plan::{Cidr, PlanInput, RoutePlan, Via, plan_routes};
 use crate::xray::core::{Status, XrayCore};
 use crate::{alias, bind, link, probe, subscription};
 
@@ -302,6 +304,7 @@ impl Registry {
 /// interface is stopped so an opted-in reconnect can restore the same routing
 /// domain after the new SOCKS inbound has proved ready.
 pub struct Interface {
+    pub profile: String,
     pub device: String,
     pub address: Ipv4Addr,
     pub mtu: u16,
@@ -310,6 +313,9 @@ pub struct Interface {
     pub routes: RouteMode,
     pub created: bool,
     pub tun2socks: Tun2socks,
+    pub nft_binary: String,
+    pub cgroup: Option<CgroupSlice>,
+    nft_active: bool,
     pub plan: RoutePlan,
     pub up: bool,
     fresh: bool,
@@ -327,13 +333,15 @@ impl Interface {
             tun2socks_pid: self.tun2socks.child_pid(),
             routes: self
                 .plan
-                .system
+                .private
                 .iter()
+                .chain(&self.plan.system)
                 .map(RouteRecord::from_spec)
                 .collect(),
             // Like routes, the rule is recorded as planned before it is
             // applied. Idempotent netlink cleanup makes that the safe side.
             rule: true,
+            nft_rule: self.cgroup.is_some(),
         }
     }
 
@@ -589,7 +597,8 @@ impl Engine {
                 }
             });
             let interface_clean = saved.interface.as_ref().is_none_or(|interface| {
-                match recover_interface(interface) {
+                match recover_interface(&saved.profile, interface, &self.registry.config.nft_binary)
+                {
                     Ok(()) => true,
                     Err(error) => {
                         log::warn!(
@@ -797,10 +806,19 @@ impl Engine {
             .iter()
             .map(|entry| entry.parse::<Cidr>())
             .collect::<Result<Vec<_>>>()?;
+        // Copied LAN routes are a convenience for marked processes, so a box
+        // with no default route at this moment still gets its interface. Only
+        // `routes = "default"` genuinely cannot be planned without a gateway.
+        let network = crate::tun::net::Net::new()?.default_network()?;
+        let connected = network
+            .as_ref()
+            .map(|network| network.connected.as_slice())
+            .unwrap_or_default();
         let (server_address, default_gateway) = if requested.routes == RouteMode::Default {
             let server_address = resolve_server_ipv4(server)?;
-            let gateway = crate::tun::net::Net::new()?
-                .default_gateway()?
+            let gateway = network
+                .as_ref()
+                .and_then(|network| network.gateway)
                 .context("routes = \"default\" requires the current default IPv4 gateway")?;
             (Some(server_address), Some(gateway))
         } else {
@@ -813,6 +831,7 @@ impl Engine {
             list: &list,
             server_address,
             default_gateway,
+            connected,
         })?;
         let mut tun2socks = Tun2socks::new(self.registry.config.tun2socks_binary.clone());
         tun2socks.resolve_binary()?;
@@ -834,6 +853,7 @@ impl Engine {
             tun2socks.logs = session.core.logs.clone();
         }
         let interface = Interface {
+            profile: profile.to_string(),
             device: device.clone(),
             address,
             mtu,
@@ -842,6 +862,9 @@ impl Engine {
             routes: requested.routes,
             created: previous_created || !crate::tun::device::exists(&device),
             tun2socks,
+            nft_binary: self.registry.config.nft_binary.clone(),
+            cgroup: None,
+            nft_active: false,
             plan,
             up: false,
             fresh: false,
@@ -851,6 +874,68 @@ impl Engine {
             .context("cannot configure an interface before creating its session")?
             .interface = Some(interface);
         Ok(())
+    }
+
+    /// Install the one cgroup mark rule belonging to this live session. The
+    /// intent reaches state before nftables for the same reason routes do:
+    /// cleanup may over-delete safely, but must never forget an applied rule.
+    pub fn mark_cgroup(&mut self, profile: &str, uid: u32) -> Result<CgroupSlice> {
+        let slice = crate::run::user_slice(profile, uid)?;
+        let Some(mut interface) = self
+            .sessions
+            .get_mut(profile)
+            .and_then(|session| session.interface.take())
+        else {
+            bail!(
+                "profile `{profile}` has no network interface. Use `oxidom env {profile}` for \
+                 programs that honor proxy environment variables"
+            );
+        };
+        if !interface.up {
+            self.sessions
+                .get_mut(profile)
+                .expect("the session existed above")
+                .interface = Some(interface);
+            bail!("profile {profile:?} has no live interface to mark a cgroup for");
+        }
+        if let Some(existing) = interface.cgroup.as_ref()
+            && existing != &slice
+        {
+            let existing_path = existing.path.clone();
+            self.sessions
+                .get_mut(profile)
+                .expect("the session existed above")
+                .interface = Some(interface);
+            bail!(
+                "profile {profile:?} is already bound to cgroup {:?}; bring it down before using \
+                 it from another uid",
+                existing_path
+            );
+        }
+        if interface.cgroup.as_ref() == Some(&slice) && interface.nft_active {
+            self.sessions
+                .get_mut(profile)
+                .expect("the session existed above")
+                .interface = Some(interface);
+            return Ok(slice);
+        }
+        interface.cgroup = Some(slice.clone());
+        if let Err(error) = self.persist_interface_state(profile, &interface) {
+            self.sessions
+                .get_mut(profile)
+                .expect("the session existed above")
+                .interface = Some(interface);
+            return Err(error);
+        }
+        let result =
+            Nft::new(interface.nft_binary.clone()).install(profile, &slice, interface.mark);
+        interface.nft_active = result.is_ok();
+        self.sessions
+            .get_mut(profile)
+            .expect("the session existed above")
+            .interface = Some(interface);
+        result?;
+        Ok(slice)
     }
 
     /// Apply an already planned interface after the session's SOCKS inbound
@@ -1231,23 +1316,27 @@ fn start_interface_steps(
     for route in &interface.plan.system {
         net.route_add(route, index)?;
     }
+    if let Some(slice) = interface.cgroup.as_ref() {
+        Nft::new(interface.nft_binary.clone()).install(
+            &interface.profile,
+            slice,
+            interface.mark,
+        )?;
+        interface.nft_active = true;
+    }
     interface.up = true;
     interface.fresh = false;
     Ok(())
 }
 
-fn private_route(table: u32) -> RouteSpec {
-    RouteSpec {
-        destination: Cidr {
-            address: Ipv4Addr::UNSPECIFIED,
-            prefix: 0,
-        },
-        via: Via::Device,
-        table,
-    }
-}
-
 fn cleanup_live_interface(interface: &mut Interface, delete_device: bool) -> Result<()> {
+    // Stop assigning the mark before removing its rule/table routes. If nft
+    // cannot do that atomically, leave the routing domain intact rather than
+    // silently releasing marked traffic onto the ordinary default route.
+    if interface.cgroup.is_some() {
+        Nft::new(interface.nft_binary.clone()).remove(&interface.profile)?;
+        interface.nft_active = false;
+    }
     interface.tun2socks.stop();
     interface.up = false;
     let device_exists = crate::tun::device::exists(&interface.device);
@@ -1257,7 +1346,7 @@ fn cleanup_live_interface(interface: &mut Interface, delete_device: bool) -> Res
             .then(|| net.link_index(&interface.device))
             .transpose()?;
         for route in interface.plan.system.iter().rev() {
-            if (matches!(route.via, Via::Gateway(_)) || index.is_some())
+            if (matches!(route.via, Via::Gateway(_) | Via::Interface(_)) || index.is_some())
                 && let Err(error) = net.route_del(route, index.unwrap_or(0))
             {
                 errors.push(format!("{error:#}"));
@@ -1270,11 +1359,11 @@ fn cleanup_live_interface(interface: &mut Interface, delete_device: bool) -> Res
         ) {
             errors.push(format!("{error:#}"));
         }
-        if let Some(index) = index {
-            for route in interface.plan.private.iter().rev() {
-                if let Err(error) = net.route_del(route, index) {
-                    errors.push(format!("{error:#}"));
-                }
+        for route in interface.plan.private.iter().rev() {
+            if (matches!(route.via, Via::Gateway(_) | Via::Interface(_)) || index.is_some())
+                && let Err(error) = net.route_del(route, index.unwrap_or(0))
+            {
+                errors.push(format!("{error:#}"));
             }
         }
         Ok(())
@@ -1297,7 +1386,10 @@ fn cleanup_live_interface(interface: &mut Interface, delete_device: bool) -> Res
     }
 }
 
-fn recover_interface(interface: &InterfaceState) -> Result<()> {
+fn recover_interface(profile: &str, interface: &InterfaceState, nft_binary: &str) -> Result<()> {
+    if interface.nft_rule {
+        Nft::new(nft_binary.to_string()).remove(profile)?;
+    }
     if let Some(pid) = interface.tun2socks_pid
         && !kill_stale_tun2socks(pid, &interface.device)
     {
@@ -1311,17 +1403,30 @@ fn recover_interface(interface: &InterfaceState) -> Result<()> {
     let index = device_exists
         .then(|| net.link_index(&interface.device))
         .transpose()?;
-    for route in interface.routes.iter().rev() {
+    for route in interface
+        .routes
+        .iter()
+        .rev()
+        .filter(|route| route.table != interface.table)
+    {
         let route = route.to_spec();
-        if matches!(route.via, Via::Gateway(_)) || index.is_some() {
+        if matches!(route.via, Via::Gateway(_) | Via::Interface(_)) || index.is_some() {
             net.route_del(&route, index.unwrap_or(0))?;
         }
     }
     if interface.rule {
         net.rule_del(interface.mark, interface.table, interface.mark)?;
     }
-    if let Some(index) = index {
-        net.route_del(&private_route(interface.table), index)?;
+    for route in interface
+        .routes
+        .iter()
+        .rev()
+        .filter(|route| route.table == interface.table)
+    {
+        let route = route.to_spec();
+        if matches!(route.via, Via::Interface(_)) || index.is_some() {
+            net.route_del(&route, index.unwrap_or(0))?;
+        }
     }
     if device_exists && interface.created {
         crate::tun::device::delete(&interface.device)?;
@@ -1416,11 +1521,14 @@ mod tests {
 
     use anyhow::{Context, Result, anyhow};
 
-    use super::{Engine, LOCAL_ID, Session, Sessions};
+    use super::{Engine, Interface, LOCAL_ID, Session, Sessions};
     use crate::bind;
     use crate::link::parse_link;
     use crate::model::{Server, Subscription};
-    use crate::state::{InterfaceState, RouteRecord, SessionState, State, store};
+    use crate::profile::RouteMode;
+    use crate::state::{RouteRecord, SessionState, State, store};
+    use crate::tun::core::Tun2socks;
+    use crate::tun::plan::{Cidr, RoutePlan, RouteSpec, RuleSpec, Via};
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -1579,22 +1687,83 @@ mod tests {
         let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("recover-interface-record")?;
         let mut saved = saved_profile_session("work", None);
-        let interface = InterfaceState {
+        let planned = Interface {
+            profile: "work".to_string(),
             device: "oxi-b2-recover".to_string(),
             address: Ipv4Addr::new(198, 18, 9, 7),
             mtu: 1500,
             table: 0x6f21,
             mark: 0x6f21,
+            routes: RouteMode::List,
             created: true,
-            tun2socks_pid: None,
-            routes: vec![RouteRecord {
-                address: Ipv4Addr::new(10, 0, 0, 0),
-                prefix: 8,
-                table: 254,
-                gateway: None,
-            }],
-            rule: true,
+            tun2socks: Tun2socks::new(String::new()),
+            nft_binary: String::new(),
+            cgroup: Some(crate::run::user_slice("work", 1000)?),
+            nft_active: false,
+            plan: RoutePlan {
+                private: vec![
+                    RouteSpec {
+                        destination: Cidr {
+                            address: Ipv4Addr::new(192, 168, 1, 0),
+                            prefix: 24,
+                        },
+                        via: Via::Interface(4),
+                        table: 0x6f21,
+                    },
+                    RouteSpec {
+                        destination: Cidr {
+                            address: Ipv4Addr::UNSPECIFIED,
+                            prefix: 0,
+                        },
+                        via: Via::Device,
+                        table: 0x6f21,
+                    },
+                ],
+                system: vec![RouteSpec {
+                    destination: Cidr {
+                        address: Ipv4Addr::new(10, 0, 0, 0),
+                        prefix: 8,
+                    },
+                    via: Via::Device,
+                    table: 254,
+                }],
+                rule: RuleSpec {
+                    mark: 0x6f21,
+                    table: 0x6f21,
+                    priority: 0x6f21,
+                },
+            },
+            up: false,
+            fresh: false,
         };
+        let interface = planned.state();
+        assert_eq!(
+            interface.routes,
+            [
+                RouteRecord {
+                    address: Ipv4Addr::new(192, 168, 1, 0),
+                    prefix: 24,
+                    table: 0x6f21,
+                    gateway: None,
+                    interface: Some(4),
+                },
+                RouteRecord {
+                    address: Ipv4Addr::UNSPECIFIED,
+                    prefix: 0,
+                    table: 0x6f21,
+                    gateway: None,
+                    interface: None,
+                },
+                RouteRecord {
+                    address: Ipv4Addr::new(10, 0, 0, 0),
+                    prefix: 8,
+                    table: 254,
+                    gateway: None,
+                    interface: None,
+                },
+            ]
+        );
+        assert!(interface.nft_rule);
         saved.interface = Some(interface.clone());
         State {
             sessions: vec![saved],

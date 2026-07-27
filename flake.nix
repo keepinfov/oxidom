@@ -28,7 +28,8 @@
           postFixup = ''
             wrapProgram $out/bin/oxidom \
               --set-default OXIDOM_XRAY_BIN ${pkgs.xray}/bin/xray \
-              --set-default OXIDOM_TUN2SOCKS_BIN ${pkgs.tun2socks}/bin/tun2socks
+              --set-default OXIDOM_TUN2SOCKS_BIN ${pkgs.tun2socks}/bin/tun2socks \
+              --set-default OXIDOM_NFT_BIN ${pkgs.nftables}/bin/nft
           '';
           postInstall = ''
             install -Dm444 data/dev.keepinfov.oxidom.Daemon.conf \
@@ -92,11 +93,13 @@
             rustfmt
             xray
             tun2socks
+            nftables
           ];
           # In the dev shell, find Xray on PATH from the shell.
           shellHook = ''
             export OXIDOM_XRAY_BIN=${pkgs.xray}/bin/xray
             export OXIDOM_TUN2SOCKS_BIN=${pkgs.tun2socks}/bin/tun2socks
+            export OXIDOM_NFT_BIN=${pkgs.nftables}/bin/nft
           '';
         };
         formatter = pkgs.alejandra;

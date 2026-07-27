@@ -13,6 +13,7 @@ use crate::ipc::{
 };
 use crate::model::Subscription;
 use crate::profile::Profile;
+use crate::run::CgroupSlice;
 
 /// Ceiling on any single daemon call. zbus waits forever by default, and a
 /// daemon that stops replying — wedged on its engine lock, killed mid-call —
@@ -354,6 +355,14 @@ impl DaemonClient {
         self.proxy
             .call("DeleteInterface", &(name,))
             .map_err(profiles_unsupported)
+    }
+
+    pub fn mark_cgroup(&self, name: &str, uid: u32) -> Result<CgroupSlice> {
+        let json: String = self
+            .proxy
+            .call("MarkCgroup", &(name, uid))
+            .map_err(profiles_unsupported)?;
+        Ok(serde_json::from_str(&json)?)
     }
 
     pub fn set_hwid(&self, subscription_id: &str, enabled: bool) -> Result<()> {

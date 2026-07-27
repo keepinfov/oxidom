@@ -26,6 +26,9 @@ pub struct Config {
     /// Path (or bare command name) of tun2socks. Empty falls back to
     /// `$OXIDOM_TUN2SOCKS_BIN` — set by the nix wrapper — and then `PATH`.
     pub tun2socks_binary: String,
+    /// Path (or bare command name) of nft. Empty falls back to
+    /// `$OXIDOM_NFT_BIN` — set by the nix wrapper — and then `PATH`.
+    pub nft_binary: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -52,6 +55,7 @@ impl Default for Config {
             subscription_user_agent: "v2rayNG/1.9.5".to_string(),
             xray_binary: String::new(),
             tun2socks_binary: String::new(),
+            nft_binary: String::new(),
         }
     }
 }

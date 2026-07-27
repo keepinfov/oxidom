@@ -1433,6 +1433,13 @@ impl Service {
             .map_err(failed)
     }
 
+    fn mark_cgroup(&self, profile: String, uid: u32) -> fdo::Result<String> {
+        let slice = oxidom_core::sync::lock(&self.shared.engine)
+            .mark_cgroup(&profile, uid)
+            .map_err(failed)?;
+        json(&slice)
+    }
+
     fn status(&self) -> fdo::Result<String> {
         json(&self.shared.status_info())
     }
@@ -1497,6 +1504,12 @@ impl Service {
                 ignored_settings.push("tun2socks binary path".to_string());
             }
             config.tun2socks_binary = engine.registry.config.tun2socks_binary.clone();
+        }
+        if raw.get("nft_binary").is_none() || self.shared.system_bus {
+            if self.shared.system_bus && config.nft_binary != engine.registry.config.nft_binary {
+                ignored_settings.push("nft binary path".to_string());
+            }
+            config.nft_binary = engine.registry.config.nft_binary.clone();
         }
 
         // Rejected here as well as in the GUI: any D-Bus client can send a
@@ -1819,27 +1832,33 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_reconnect_key_keeps_the_old_value() -> Result<()> {
+    fn an_old_settings_payload_keeps_newer_daemon_only_values() -> Result<()> {
         let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("old-settings-client")?;
         let service = for_test();
-        oxidom_core::sync::lock(&service.shared.engine)
-            .registry
-            .config
-            .reconnect = true;
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.config.reconnect = true;
+            engine.registry.config.tun2socks_binary = "/configured/tun2socks".to_string();
+            engine.registry.config.nft_binary = "/configured/nft".to_string();
+        }
         let mut raw = serde_json::to_value(Config::default())?;
-        raw.as_object_mut()
-            .context("serialized config is not an object")?
-            .remove("reconnect");
+        let object = raw
+            .as_object_mut()
+            .context("serialized config is not an object")?;
+        object.remove("reconnect");
+        object.remove("tun2socks_binary");
+        object.remove("nft_binary");
 
         service.set_settings(raw.to_string())?;
 
-        assert!(
-            oxidom_core::sync::lock(&service.shared.engine)
-                .registry
-                .config
-                .reconnect
+        let engine = oxidom_core::sync::lock(&service.shared.engine);
+        assert!(engine.registry.config.reconnect);
+        assert_eq!(
+            engine.registry.config.tun2socks_binary,
+            "/configured/tun2socks"
         );
+        assert_eq!(engine.registry.config.nft_binary, "/configured/nft");
         Ok(())
     }
 

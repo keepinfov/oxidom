@@ -20,6 +20,9 @@ pub struct SettingsValues {
     /// Kept in the draft so applying unrelated GUI settings cannot erase a
     /// path configured outside the GUI. Its row belongs to phase 4c.
     pub tun2socks_binary: String,
+    /// Hidden for the same reason as tun2socks: applying an unrelated GUI
+    /// setting must not erase the daemon's configured nft path.
+    pub nft_binary: String,
 }
 
 impl From<&Config> for SettingsValues {
@@ -34,6 +37,7 @@ impl From<&Config> for SettingsValues {
             subscription_user_agent: config.subscription_user_agent.clone(),
             xray_binary: config.xray_binary.clone(),
             tun2socks_binary: config.tun2socks_binary.clone(),
+            nft_binary: config.nft_binary.clone(),
         }
     }
 }
@@ -112,7 +116,7 @@ struct SettingsWidgets {
 }
 
 impl SettingsWidgets {
-    fn values(&self, tun2socks_binary: String) -> SettingsValues {
+    fn values(&self, tun2socks_binary: String, nft_binary: String) -> SettingsValues {
         SettingsValues {
             socks_port: self.socks.value() as u16,
             http_port: self.http.value() as u16,
@@ -130,6 +134,7 @@ impl SettingsWidgets {
             // never reaches the daemon's path resolution.
             xray_binary: self.xray_binary.text().trim().to_string(),
             tun2socks_binary,
+            nft_binary,
         }
     }
 
@@ -580,7 +585,8 @@ fn connect_draft_signals(
                 return;
             }
             let tun2socks_binary = model.borrow().draft.tun2socks_binary.clone();
-            model.borrow_mut().draft = widgets.values(tun2socks_binary);
+            let nft_binary = model.borrow().draft.nft_binary.clone();
+            model.borrow_mut().draft = widgets.values(tun2socks_binary, nft_binary);
             refresh_state(&widgets, &model);
         })
     };
@@ -723,6 +729,7 @@ mod tests {
             subscription_user_agent: "oxidom/test".into(),
             xray_binary: String::new(),
             tun2socks_binary: String::new(),
+            nft_binary: String::new(),
         }
     }
 

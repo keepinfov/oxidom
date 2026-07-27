@@ -122,13 +122,16 @@ pub enum Command {
         #[arg(long)]
         http_port: Option<u16>,
     },
-    /// Run a single process routed through the active proxy (via a network namespace).
+    /// Run one process in the routing domain of a profile interface.
     Run {
         /// Profile whose routing domain should carry the command.
         #[arg(long, default_value = "default")]
         profile: String,
+        /// Split a command string without invoking a shell.
+        #[arg(short = 'c', value_name = "COMMAND", conflicts_with = "args")]
+        command: Option<String>,
         /// The command and arguments to run, e.g. `oxidom run -- curl https://ifconfig.me`.
-        #[arg(trailing_var_arg = true, required = true)]
+        #[arg(trailing_var_arg = true, required_unless_present = "command")]
         args: Vec<String>,
     },
 }
@@ -286,11 +289,33 @@ mod tests {
     #[test]
     fn profile_first_run_preserves_the_separator_and_tail() {
         let cli = parse(&["oxidom", "work", "run", "--", "curl", "x"]).unwrap();
-        let Command::Run { profile, args } = cli.command else {
+        let Command::Run {
+            profile,
+            command,
+            args,
+        } = cli.command
+        else {
             panic!("run did not parse");
         };
         assert_eq!(profile, "work");
+        assert_eq!(command, None);
         assert_eq!(args, ["curl", "x"]);
+    }
+
+    #[test]
+    fn profile_first_run_command_string_is_not_a_shell_subcommand() {
+        let cli = parse(&["oxidom", "work", "run", "-c", "printf '%s' one"]).unwrap();
+        let Command::Run {
+            profile,
+            command,
+            args,
+        } = cli.command
+        else {
+            panic!("run did not parse");
+        };
+        assert_eq!(profile, "work");
+        assert_eq!(command.as_deref(), Some("printf '%s' one"));
+        assert!(args.is_empty());
     }
 
     #[test]

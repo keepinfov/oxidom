@@ -4,12 +4,17 @@ use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result, bail};
 use futures_util::TryStreamExt;
-use rtnetlink::packet_route::route::RouteScope;
-use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
+use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, RouteScope};
 use rtnetlink::packet_route::rule::RuleAction;
 use rtnetlink::{AddressMessageBuilder, Handle, LinkUnspec, RouteMessageBuilder};
 
-use crate::tun::plan::{RouteSpec, Via};
+use crate::tun::plan::{Cidr, ConnectedRoute, RouteSpec, Via};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultNetwork {
+    pub gateway: Option<Ipv4Addr>,
+    pub connected: Vec<ConnectedRoute>,
+}
 
 pub struct Net {
     runtime: tokio::runtime::Runtime,
@@ -170,28 +175,64 @@ impl Net {
     }
 
     pub fn default_gateway(&self) -> Result<Option<Ipv4Addr>> {
+        Ok(self.default_network()?.and_then(|network| network.gateway))
+    }
+
+    /// Link-scope IPv4 routes of the interface carrying main-table default.
+    /// These are copied into a profile's private table so a process selected
+    /// by fwmark does not lose its LAN or gateway.
+    pub fn default_network(&self) -> Result<Option<DefaultNetwork>> {
         self.runtime.block_on(async {
             let request = RouteMessageBuilder::<Ipv4Addr>::new().build();
             let mut routes = self.handle.route().get(request).execute();
+            let mut messages = Vec::new();
             while let Some(route) = routes
                 .try_next()
                 .await
-                .context("reading IPv4 routes for the default gateway")?
+                .context("reading IPv4 routes for the default network")?
             {
-                if route.header.destination_prefix_length != 0 || route_table(&route) != 254 {
-                    continue;
-                }
-                if let Some(gateway) = route.attributes.iter().find_map(|attribute| {
-                    if let RouteAttribute::Gateway(RouteAddress::Inet(address)) = attribute {
-                        Some(*address)
-                    } else {
-                        None
-                    }
-                }) {
-                    return Ok(Some(gateway));
-                }
+                messages.push(route);
             }
-            Ok(None)
+            let Some(default) = messages.iter().find(|route| {
+                route.header.destination_prefix_length == 0 && route_table(route) == 254
+            }) else {
+                return Ok(None);
+            };
+            let interface = route_oif(default)
+                .context("the current default IPv4 route has no output interface")?;
+            let gateway = default.attributes.iter().find_map(|attribute| {
+                if let RouteAttribute::Gateway(RouteAddress::Inet(address)) = attribute {
+                    Some(*address)
+                } else {
+                    None
+                }
+            });
+            let connected = messages
+                .iter()
+                .filter(|route| {
+                    route_table(route) == 254
+                        && route.header.scope == RouteScope::Link
+                        && route.header.destination_prefix_length > 0
+                        && route_oif(route) == Some(interface)
+                })
+                .filter_map(|route| {
+                    route.attributes.iter().find_map(|attribute| {
+                        if let RouteAttribute::Destination(RouteAddress::Inet(address)) = attribute
+                        {
+                            Some(ConnectedRoute {
+                                destination: Cidr {
+                                    address: *address,
+                                    prefix: route.header.destination_prefix_length,
+                                },
+                                interface,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            Ok(Some(DefaultNetwork { gateway, connected }))
         })
     }
 }
@@ -211,6 +252,7 @@ fn route_message(spec: &RouteSpec, device_index: u32) -> RouteMessage {
         Via::Device => builder
             .output_interface(device_index)
             .scope(RouteScope::Link),
+        Via::Interface(index) => builder.output_interface(index).scope(RouteScope::Link),
         Via::Gateway(gateway) => builder.gateway(gateway),
     };
     builder.build()
@@ -228,6 +270,16 @@ fn route_table(route: &RouteMessage) -> u32 {
             }
         })
         .unwrap_or(u32::from(route.header.table))
+}
+
+fn route_oif(route: &RouteMessage) -> Option<u32> {
+    route.attributes.iter().find_map(|attribute| {
+        if let RouteAttribute::Oif(index) = attribute {
+            Some(*index)
+        } else {
+            None
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -5,6 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -42,6 +43,7 @@ enum FailureKind {
     Error,
     NotConnected,
     DaemonUnavailable,
+    Child(u8),
 }
 
 struct Failure {
@@ -98,10 +100,22 @@ fn exit_code_for(kind: FailureKind) -> u8 {
         FailureKind::Error => EXIT_ERROR,
         FailureKind::NotConnected => EXIT_NOT_CONNECTED,
         FailureKind::DaemonUnavailable => EXIT_DAEMON_UNAVAILABLE,
+        FailureKind::Child(code) => code,
     }
 }
 
 fn main() -> ExitCode {
+    if let Some(expected) = std::env::var_os(oxidom_core::run::SCOPED_CGROUP_ENV) {
+        let expected = expected.to_string_lossy();
+        let argv = std::env::args_os().skip(1).collect::<Vec<_>>();
+        return match oxidom_core::run::exec_scoped(&expected, &argv) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error:#}");
+                ExitCode::from(EXIT_ERROR)
+            }
+        };
+    }
     let cli = Cli::parse_from(cli::normalize(std::env::args_os().collect()));
     // The daemon's log is its journal, and `journalctl -u oxidom` is the only
     // window into it. For every other subcommand the same lines are noise in
@@ -147,7 +161,11 @@ fn dispatch(cli: Cli) -> CliResult {
             http_port,
         })
         .map_err(Failure::error),
-        Command::Run { profile, args } => run(&profile, &args),
+        Command::Run {
+            profile,
+            command,
+            args,
+        } => run(&profile, &args, command.as_deref()),
     }
 }
 
@@ -284,17 +302,31 @@ fn tun(profile: &str, down: bool) -> CliResult {
     ))
 }
 
-fn run(profile: &str, args: &[String]) -> CliResult {
+fn run(profile: &str, args: &[String], command: Option<&str>) -> CliResult {
+    let argv = oxidom_core::run::command_argv(args, command).map_err(Failure::error)?;
     let client = existing_client()?;
-    let session = client.session_status(profile).map_err(Failure::error)?;
     let configured = client.profile(profile).map_err(Failure::error)?;
-    oxidom_core::netns::run(
+    let session = client.session_status(profile).map_err(Failure::error)?;
+    oxidom_core::run::validate_interface(
         profile,
-        args,
         session.interface.as_ref(),
         configured.interface.enable,
     )
-    .map_err(Failure::error)
+    .map_err(Failure::error)?;
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let status = oxidom_core::run::run_in_scope(profile, uid, &argv).map_err(Failure::error)?;
+    if status.success() {
+        return Ok(());
+    }
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(i32::from(EXIT_ERROR))
+        .clamp(1, 255) as u8;
+    Err(Failure {
+        kind: FailureKind::Child(code),
+        message: None,
+    })
 }
 
 fn session_environment(session: &SessionInfo) -> String {

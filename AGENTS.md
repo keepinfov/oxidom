@@ -77,6 +77,7 @@ latency_test_url = "https://www.gstatic.com/generate_204"
 subscription_user_agent = "v2rayNG/1.9.5"  # panels gate the body on this
 xray_binary = ""              # empty: use $OXIDOM_XRAY_BIN, then xray on PATH
 tun2socks_binary = ""         # empty: use $OXIDOM_TUN2SOCKS_BIN, then tun2socks on PATH
+nft_binary = ""               # empty: use $OXIDOM_NFT_BIN, then nft on PATH
 ```
 
 ## Data model
@@ -255,9 +256,9 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
 - `oxidom alias <HANDLE> <NEW>` changes a server alias.
 - `oxidom profile {list,show,new,edit,rm}` manages daemon-owned profiles.
 - `oxidom daemon [--system --socks-port --http-port]` runs the D-Bus service.
-- `oxidom <PROFILE> run -- <cmd>...` is reserved for per-process marking. In phase 4b it still
-  refuses safely: a proxy-only profile points to `oxidom env`; an interface profile reports its
-  table and fwmark and says process marking arrives in the next step.
+- `oxidom <PROFILE> run -- <cmd>...` and `oxidom <PROFILE> run -c "<cmd>"` run one command
+  inside the profile's routing domain. The `-c` string is split with shell-word rules but never
+  passed to a shell. A proxy-only profile refuses safely and points to `oxidom env`.
 
 Only `up` and `connect` may spawn a private session daemon; every other control command requires
 an existing daemon.
@@ -342,15 +343,22 @@ system daemon (and only it) requires `CAP_NET_ADMIN`; the NixOS module grants it
   `default` is fixed at `198.18.0.1`; `/32` is binding because it adds no connected route.
 - fwmark, private table id and rule priority are the same stable value. `default` is `0x6f00`;
   other profiles probe within `0x6f01..=0x6fff`, avoiding the user's `0x1`/`0x2`/`0x3` policy.
-- Every enabled interface gets `default dev <device>` in its private table and a matching fwmark
-  rule. `routes = "manual"` changes no system route; `list` adds only its CIDRs; `default` adds a
-  host route to the server via the old gateway plus two half-defaults through the device.
+- Every enabled interface gets the current default network's link-scope connected routes plus
+  `default dev <device>` in its private table, and a matching fwmark rule. The connected routes
+  keep LAN and its resolver reachable from `oxidom run`. `routes = "manual"` changes no system
+  route; `list` adds only its CIDRs; `default` adds a host route to the server via the old gateway
+  plus two half-defaults through the device.
 - Bring-up order is persistent TUN, address `/32`, tun2socks spawn, link-up, private route/rule,
   then system routes. The spawn-before-link order and double-dash tun2socks flags are live-tested
   contracts.
 - Ordinary `down` stops tun2socks and removes oxidom routes/rule but leaves the persistent device,
   preserving hand-written routes across reconnects. `tun --down` and crash recovery additionally
   delete the device only when oxidom created it.
+- Per-process routing uses a transient `systemd --user` scope below
+  `oxidom-<profile>.slice`. The daemon atomically owns one `socket cgroupv2` mark rule per session
+  in `table inet oxidom`; the CLI verifies `/proc/self/cgroup` inside the scope before `exec`.
+  Cleanup removes the profile chain before taking down its routing domain, so traffic is never
+  silently released onto the ordinary default route.
 
 ## GUI (Phase 2 — codex brief)
 Build with `adw::Application` (app id `dev.keepinfov.oxidom`). Wire to the core modules; do not
@@ -398,6 +406,10 @@ crates/
       engine.rs                  # Registry + per-profile Session/Sessions facade
       proc.rs                    # shared child supervision and recovered PID inspection
       resolve.rs                 # shared config → env → PATH binary resolver
+      run.rs                     # systemd user scope + cgroup verification/exec
+      nft.rs                     # atomic per-profile cgroup mark rules
+      nft/
+        resolve.rs               # nft binary spec
       link.rs                    # share-link parsers
       subscription.rs            # fetch + decode + userinfo headers + hwid
       xray/
@@ -405,7 +417,6 @@ crates/
         core.rs                  # process supervisor + status
         resolve.rs               # Xray binary preflight
       probe.rs                   # latency probes
-      netns.rs                   # phase-B2-safe `oxidom run` refusal
       tun.rs
       tun/
         caps.rs                  # CAP_NET_ADMIN preflight
@@ -434,6 +445,6 @@ crates/
 - Selecting a server + Connect starts Xray, exposes the local SOCKS/HTTP proxy, and shows
   Connected + a real latency; Disconnect stops it cleanly.
 - HWID is never sent unless the per-sub switch is on.
-- `oxidom run -- <cmd>` routes that process (or, until B3 lands, exits non-zero with the
-  profile's actionable interface/table/mark state — current state).
+- `oxidom <profile> run -- <cmd>` routes only that command through the profile while ordinary
+  neighboring commands keep their existing route.
 ```

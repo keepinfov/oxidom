@@ -1860,6 +1860,7 @@ impl Controller {
             subscription_user_agent: values.subscription_user_agent.clone(),
             xray_binary: values.xray_binary.clone(),
             tun2socks_binary: values.tun2socks_binary.clone(),
+            nft_binary: values.nft_binary.clone(),
         };
         self.client_job(
             UiOperation::new(UiOperationKind::ApplySettings),
