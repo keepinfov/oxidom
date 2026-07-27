@@ -224,7 +224,13 @@ pub struct ProbeState {
     pub running: Vec<String>,
     /// Ids accepted but still waiting for a slot.
     pub queued: Vec<String>,
+    /// Direct measurements keyed by server id.
     pub readings: std::collections::HashMap<String, LatencyReading>,
+    /// Measurements through running sessions, keyed by profile name.
+    ///
+    /// Kept separate from `readings`: two profiles may carry the same server,
+    /// but their tunnels are still independent connections.
+    pub proxied: std::collections::HashMap<String, LatencyReading>,
 }
 
 /// Result of applying settings daemon-side.
@@ -380,12 +386,14 @@ mod tests {
             serde_json::from_str(r#"{"checking":[],"latencies":{"a":41}}"#).unwrap();
         assert_eq!(state.version, 0);
         assert!(state.readings.is_empty());
+        assert!(state.proxied.is_empty());
         assert!(state.running.is_empty());
         assert!(state.queued.is_empty());
 
         let empty: ProbeState = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.version, 0);
         assert!(empty.readings.is_empty());
+        assert!(empty.proxied.is_empty());
     }
 
     /// A reading that predates a field still describes its measurement; only

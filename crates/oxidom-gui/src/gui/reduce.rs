@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use oxidom_core::ipc::{
-    LatencyReading, PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, StatusInfo,
+    LatencyReading, PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, SessionInfo,
+    StatusInfo,
 };
 use oxidom_core::xray::core::Status;
 
@@ -31,6 +32,12 @@ pub(super) struct PolledSnapshot {
     pub epoch: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RouteTarget {
+    profile: Option<String>,
+    server_id: String,
+}
+
 /// Everything a poll snapshot reads or writes. No widgets, no `Rc`, no D-Bus —
 /// the fields the window keeps beside this one (`client`, `subscriptions`,
 /// `selected_id`) are deliberately absent because [`reduce`] never touches them.
@@ -39,10 +46,15 @@ pub(super) struct SnapshotState {
     pub connected_id: Option<String>,
     /// Profile that brought the tunnel up, as reported by the daemon.
     pub active_profile: Option<String>,
-    /// The daemon's measurements as last seen. Whole readings rather than bare
-    /// numbers: when a number was taken, through what and by which method is
-    /// what separates a fact about the current tunnel from a leftover.
+    /// Every runtime session. The compatibility fields above still drive the
+    /// header; this list keeps cards and the system-proxy owner honest.
+    pub sessions: Vec<SessionInfo>,
+    /// Connected profiles grouped by the server they carry.
+    pub connected_profiles: HashMap<String, Vec<String>>,
+    /// Direct server measurements as last seen.
     pub readings: HashMap<String, LatencyReading>,
+    /// Connection measurements keyed by profile.
+    pub proxied: HashMap<String, LatencyReading>,
     /// Last successful measurement of the connected server, tagged with the
     /// server id it belongs to. Shown (dimmed) in the status chips whenever
     /// no probe has confirmed a fresh reading for the *current* connection
@@ -51,7 +63,7 @@ pub(super) struct SnapshotState {
     /// different one — it is intentionally never reset on disconnect, since
     /// a stale-but-correct reading for the same server is exactly what
     /// should resurface on reconnect.
-    pub last_active_latency: Option<(String, u32)>,
+    last_active_latency: Option<(RouteTarget, u32)>,
     /// Ids whose card is showing a spinner, and what that spinner is waiting
     /// for. Entries appear here before the D-Bus request that creates them even
     /// lands, so the daemon's own sets cannot be mirrored directly.
@@ -80,7 +92,7 @@ pub(super) struct SnapshotState {
     /// itself applies when it picks a probe's route, and judging a reading's
     /// route against anything else would call it superseded on every connect
     /// and re-probe forever.
-    route_target: Option<String>,
+    route_target: Option<RouteTarget>,
     /// Last daemon error already shown to the user, so the 500 ms poll does
     /// not re-toast the same failure on every tick.
     pub notified_error: Option<String>,
@@ -122,7 +134,10 @@ impl SnapshotState {
         Self {
             connected_id: status.active_id.clone(),
             active_profile: status.active_profile.clone(),
+            sessions: status.sessions.clone(),
+            connected_profiles: connected_profiles(status),
             readings: HashMap::new(),
+            proxied: HashMap::new(),
             last_active_latency: None,
             checking: HashMap::new(),
             notify_probe: HashSet::new(),
@@ -165,10 +180,28 @@ impl SnapshotState {
     /// so a card rebuilt from scratch, a card updated by the poll and a card
     /// swept for age cannot disagree about what the same reading means.
     pub fn card_state(&self, id: &str, now_unix_ms: u64) -> LatencyState {
+        let is_active = self
+            .route_target
+            .as_ref()
+            .is_some_and(|target| target.server_id == id);
+        let reading = if is_active {
+            self.route_target
+                .as_ref()
+                .and_then(|target| proxied_reading(self, target))
+                // Compatibility with an A2 daemon: it put the active
+                // connection reading in the server-id map.
+                .or_else(|| {
+                    self.readings
+                        .get(id)
+                        .filter(|reading| reading.route == ProbeRoute::Proxied)
+                })
+        } else {
+            self.readings.get(id)
+        };
         latency_state(
-            self.readings.get(id),
+            reading,
             self.checking.contains_key(id),
-            self.route_target.as_deref() == Some(id),
+            is_active,
             now_unix_ms,
         )
     }
@@ -254,6 +287,8 @@ pub(super) fn reduce(
     let mut new_error: Option<String> = None;
     state.daemon_status = snapshot.status.to_status();
     state.active_profile = snapshot.status.active_profile.clone();
+    state.sessions.clone_from(&snapshot.status.sessions);
+    state.connected_profiles = connected_profiles(&snapshot.status);
     // Only the daemon's override path knows which server a failure belongs to;
     // failures that never reached the daemon are named by the connect handler
     // instead, which is why this only ever adds.
@@ -281,7 +316,7 @@ pub(super) fn reduce(
             .route_target
             .iter()
             .chain(route_target.iter())
-            .cloned()
+            .map(|target| target.server_id.clone())
             .collect();
         state.route_target = route_target;
         touched
@@ -304,24 +339,20 @@ pub(super) fn reduce(
             // the *previous* measurement, and showing it now is the fake ping.
             // The card gets its number when the probe it is waiting on retires.
             if !held.contains(id) && !state.checking.contains_key(id) {
-                let shown = latency_state(
-                    Some(reading),
-                    false,
-                    state.route_target.as_deref() == Some(id.as_str()),
-                    now_unix_ms,
-                );
+                let shown = state.card_state(id, now_unix_ms);
                 if shown == LatencyState::Superseded {
                     effects.push(Effect::Reprobe(id.clone()));
                 }
                 effects.push(Effect::Latency(id.clone(), shown));
             }
-            // Same rule as `active_latency_for`: only a proxied reading is a
-            // fact about the connection, so only one is worth carrying over.
-            if state.connected_id.as_deref() == Some(id)
-                && reading.route == ProbeRoute::Proxied
+            // Compatibility with an A2 daemon, which has no `proxied` map.
+            if state.route_target.as_ref().is_some_and(|target| {
+                target.server_id == *id && target.profile == state.active_profile
+            }) && reading.route == ProbeRoute::Proxied
                 && let Some(ms) = reading.value
+                && let Some(target) = state.route_target.clone()
             {
-                state.last_active_latency = Some((id.clone(), ms));
+                state.last_active_latency = Some((target, ms));
             }
             if state.notify_probe.remove(id) && reading.value.is_none() {
                 if reading.failure == Some(ProbeFailure::NoNetwork) {
@@ -329,6 +360,38 @@ pub(super) fn reduce(
                 } else {
                     toast_unreachable = true;
                 }
+            }
+        }
+    }
+    for (profile, reading) in &snapshot.probe.proxied {
+        if state.proxied.get(profile) == Some(reading) {
+            continue;
+        }
+        state.proxied.insert(profile.clone(), *reading);
+        let target_id = state
+            .route_target
+            .as_ref()
+            .filter(|target| target.profile.as_deref() == Some(profile.as_str()))
+            .map(|target| target.server_id.clone());
+        let Some(id) = target_id else {
+            continue;
+        };
+        if !held.contains(&id) && !state.checking.contains_key(&id) {
+            effects.push(Effect::Latency(
+                id.clone(),
+                state.card_state(&id, now_unix_ms),
+            ));
+        }
+        if let Some(ms) = reading.value
+            && let Some(target) = state.route_target.clone()
+        {
+            state.last_active_latency = Some((target, ms));
+        }
+        if state.notify_probe.remove(&id) && reading.value.is_none() {
+            if reading.failure == Some(ProbeFailure::NoNetwork) {
+                toast_no_network = true;
+            } else {
+                toast_unreachable = true;
             }
         }
     }
@@ -340,6 +403,9 @@ pub(super) fn reduce(
         state
             .readings
             .retain(|id, _| snapshot.probe.readings.contains_key(id));
+        state
+            .proxied
+            .retain(|profile, _| snapshot.probe.proxied.contains_key(profile));
     }
     for id in &held {
         match state.checking.get_mut(*id) {
@@ -481,10 +547,71 @@ fn push_card(effects: &mut Vec<Effect>, state: &SnapshotState, id: &str, now_uni
 /// the condition `daemon::Shared::probe_target` applies when it picks a route.
 /// Mirrored rather than approximated on purpose — see
 /// [`SnapshotState::route_target`].
-fn route_target(status: &StatusInfo) -> Option<String> {
-    matches!(status.to_status(), Status::Connected)
-        .then(|| status.active_id.clone())
-        .flatten()
+fn route_target(status: &StatusInfo) -> Option<RouteTarget> {
+    if !matches!(status.to_status(), Status::Connected) {
+        return None;
+    }
+    Some(RouteTarget {
+        profile: status.active_profile.clone(),
+        server_id: status.active_id.clone()?,
+    })
+}
+
+fn proxied_reading<'a>(
+    state: &'a SnapshotState,
+    target: &RouteTarget,
+) -> Option<&'a LatencyReading> {
+    target
+        .profile
+        .as_deref()
+        .and_then(|profile| state.proxied.get(profile))
+}
+
+/// Which profiles visibly use each server. Kept pure because this is the
+/// multi-session fact every card consumes; widgets must not independently
+/// reinterpret the compatibility `active_id`.
+pub(super) fn connected_profiles(status: &StatusInfo) -> HashMap<String, Vec<String>> {
+    let mut by_server = HashMap::<String, Vec<String>>::new();
+    for session in &status.sessions {
+        if session.state != "connected" {
+            continue;
+        }
+        let Some(server_id) = &session.server_id else {
+            continue;
+        };
+        by_server
+            .entry(server_id.clone())
+            .or_default()
+            .push(session.profile.clone());
+    }
+    // An older daemon has no session list. Preserve the exact one-tunnel
+    // appearance it had before this additive field existed.
+    if by_server.is_empty()
+        && matches!(status.to_status(), Status::Connected)
+        && let Some(server_id) = &status.active_id
+    {
+        by_server.insert(
+            server_id.clone(),
+            vec![
+                status
+                    .active_profile
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
+            ],
+        );
+    }
+    by_server
+}
+
+pub(super) fn other_sessions_message(status: &StatusInfo) -> Option<String> {
+    let count = status.sessions.len().saturating_sub(1);
+    match count {
+        0 => None,
+        1 => Some("1 more session is running — “oxidom status”".to_string()),
+        count => Some(format!(
+            "{count} more sessions are running — “oxidom status”"
+        )),
+    }
 }
 
 /// The single mapper from "what the daemon told us" to "what the card shows".
@@ -550,11 +677,23 @@ pub(super) fn latency_states(
     state: &SnapshotState,
     now_unix_ms: u64,
 ) -> HashMap<String, LatencyState> {
-    state
+    let mut ids = state
         .readings
         .keys()
         .chain(state.checking.keys())
-        .map(|id| (id.clone(), state.card_state(id, now_unix_ms)))
+        .cloned()
+        .collect::<HashSet<_>>();
+    if let Some(target) = &state.route_target
+        && (proxied_reading(state, target).is_some()
+            || state
+                .readings
+                .get(&target.server_id)
+                .is_some_and(|reading| reading.route == ProbeRoute::Proxied))
+    {
+        ids.insert(target.server_id.clone());
+    }
+    ids.into_iter()
+        .map(|id| (id.clone(), state.card_state(&id, now_unix_ms)))
         .collect()
 }
 
@@ -565,19 +704,27 @@ pub(super) fn active_latency_for(state: &SnapshotState) -> (Option<u32>, bool) {
     let Some(id) = state.connected_id.as_deref() else {
         return (None, false);
     };
+    let display_target = RouteTarget {
+        profile: state.active_profile.clone(),
+        server_id: id.to_string(),
+    };
     // Only a proxied reading describes the connection. A direct one for the
     // same server measures the server, not the tunnel through it, and putting
     // that in the header is the original lie this phase set out to remove.
-    if let Some(ms) = state
-        .readings
-        .get(id)
+    if let Some(ms) = proxied_reading(state, &display_target)
+        .or_else(|| {
+            state
+                .readings
+                .get(id)
+                .filter(|reading| reading.route == ProbeRoute::Proxied)
+        })
         .filter(|reading| reading.route == ProbeRoute::Proxied)
         .and_then(|reading| reading.value)
     {
         return (Some(ms), false);
     }
     match &state.last_active_latency {
-        Some((last_id, ms)) if last_id == id => (Some(*ms), true),
+        Some((last_target, ms)) if last_target == &display_target => (Some(*ms), true),
         _ => (None, false),
     }
 }
@@ -635,6 +782,7 @@ mod tests {
                 .iter()
                 .map(|(id, value)| (id.to_string(), reading(*value)))
                 .collect(),
+            proxied: HashMap::new(),
         }
     }
 
@@ -802,6 +950,87 @@ mod tests {
         let current = StatusInfo::default().with_active_profile(Some("work".to_string()));
         fold(&mut state, &snapshot(current, idle()), Instant::now(), true);
         assert_eq!(state.active_profile.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn connected_profiles_group_two_sessions_on_the_same_server() {
+        let status = StatusInfo {
+            state: "connected".to_string(),
+            active_id: Some("same".to_string()),
+            active_profile: Some("home".to_string()),
+            sessions: vec![
+                SessionInfo {
+                    profile: "home".to_string(),
+                    state: "connected".to_string(),
+                    server_id: Some("same".to_string()),
+                    ..SessionInfo::default()
+                },
+                SessionInfo {
+                    profile: "work".to_string(),
+                    state: "connected".to_string(),
+                    server_id: Some("same".to_string()),
+                    ..SessionInfo::default()
+                },
+                SessionInfo {
+                    profile: "broken".to_string(),
+                    state: "error".to_string(),
+                    server_id: Some("same".to_string()),
+                    ..SessionInfo::default()
+                },
+            ],
+            ..StatusInfo::default()
+        };
+
+        assert_eq!(
+            connected_profiles(&status).get("same"),
+            Some(&vec!["home".to_string(), "work".to_string()])
+        );
+        assert_eq!(
+            other_sessions_message(&status).as_deref(),
+            Some("2 more sessions are running — “oxidom status”")
+        );
+    }
+
+    #[test]
+    fn proxied_latency_is_selected_by_profile_even_on_the_same_server() {
+        let mut status = connected_to("same");
+        status.active_profile = Some("home".to_string());
+        status.sessions = vec![
+            SessionInfo {
+                profile: "home".to_string(),
+                state: "connected".to_string(),
+                server_id: Some("same".to_string()),
+                ..SessionInfo::default()
+            },
+            SessionInfo {
+                profile: "work".to_string(),
+                state: "connected".to_string(),
+                server_id: Some("same".to_string()),
+                ..SessionInfo::default()
+            },
+        ];
+        let mut probes = idle();
+        probes.proxied.insert(
+            "home".to_string(),
+            LatencyReading::ok(41, ProbeRoute::Proxied, LatencyMethod::HttpGet),
+        );
+        probes.proxied.insert(
+            "work".to_string(),
+            LatencyReading::ok(83, ProbeRoute::Proxied, LatencyMethod::HttpGet),
+        );
+        let mut state = SnapshotState::new(&status);
+
+        fold(
+            &mut state,
+            &snapshot(status.clone(), probes.clone()),
+            Instant::now(),
+            true,
+        );
+        assert_eq!(active_latency_for(&state), (Some(41), false));
+
+        status.active_profile = Some("work".to_string());
+        fold(&mut state, &snapshot(status, probes), Instant::now(), true);
+        assert_eq!(active_latency_for(&state), (Some(83), false));
     }
 
     /// The flicker in one test: a round that started before the click reports

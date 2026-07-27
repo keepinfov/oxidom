@@ -19,7 +19,8 @@ use oxidom_core::{paths, sysproxy};
 
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
-    Effect, PolledSnapshot, ProbeWait, SnapshotState, active_latency_for, latency_states, reduce,
+    Effect, PolledSnapshot, ProbeWait, SnapshotState, active_latency_for, latency_states,
+    other_sessions_message, reduce,
 };
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
@@ -139,6 +140,7 @@ struct Controller {
     search: gtk::SearchEntry,
     compact_search: gtk::SearchEntry,
     search_bar: gtk::SearchBar,
+    sessions_banner: adw::Banner,
     search_toggle: gtk::ToggleButton,
     sidebar_toggle: gtk::Button,
     header_status: gtk::Button,
@@ -172,6 +174,10 @@ struct Controller {
     tray_pushed: RefCell<(bool, String)>,
     /// True while this GUI holds the GNOME system proxy applied.
     proxy_applied: Cell<bool>,
+    /// Endpoint the applied GNOME proxy points at. `None` with
+    /// `proxy_applied == true` means it came from a crash marker and must be
+    /// reconciled even if a connection is already up.
+    applied_proxy_endpoint: Cell<Option<(std::net::Ipv4Addr, u16, u16)>>,
     /// Last (active, connecting) pair pushed to the cards, to avoid an
     /// O(cards) pass on every poll tick.
     applied_connection: RefCell<CardConnection>,
@@ -459,6 +465,14 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
     let search_bar = gtk::SearchBar::builder().show_close_button(true).build();
     search_bar.connect_entry(&compact_search);
     search_bar.set_child(Some(&compact_search));
+    let sessions_banner = adw::Banner::builder()
+        .title(
+            other_sessions_message(&initial_status)
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .revealed(other_sessions_message(&initial_status).is_some())
+        .build();
     let search_toggle = gtk::ToggleButton::builder()
         .icon_name("edit-find-symbolic")
         .tooltip_text("Search servers")
@@ -514,6 +528,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
     content.append(&search_bar);
+    content.append(&sessions_banner);
     content.append(&stack);
 
     let controller_holder = Rc::new(RefCell::new(std::rc::Weak::<Controller>::new()));
@@ -572,6 +587,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         search,
         compact_search,
         search_bar,
+        sessions_banner,
         search_toggle,
         sidebar_toggle,
         header_status,
@@ -601,6 +617,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         tray_commands,
         tray_pushed: RefCell::new((false, String::new())),
         proxy_applied: Cell::new(gui_proxy_marker_exists()),
+        applied_proxy_endpoint: Cell::new(None),
         applied_connection: RefCell::new(CardConnection::default()),
         poll_in_flight: Arc::new(AtomicBool::new(false)),
         sweep_tick: Cell::new(0),
@@ -1158,12 +1175,20 @@ impl Controller {
     }
 
     fn rebuild_views(self: &Rc<Self>) {
-        let (subscriptions, selected_id, connected_id, latency_states, operation) = {
+        let (
+            subscriptions,
+            selected_id,
+            connected_id,
+            connected_profiles,
+            latency_states,
+            operation,
+        ) = {
             let state = self.state.borrow();
             (
                 state.subscriptions.clone(),
                 state.selected_id.clone(),
                 state.ui.connected_id.clone(),
+                state.ui.connected_profiles.clone(),
                 latency_states(&state.ui, ipc::now_unix_ms()),
                 state.ui.operation.clone(),
             )
@@ -1221,6 +1246,7 @@ impl Controller {
         self.servers.rebuild(
             &subscriptions,
             connected_id.as_deref(),
+            &connected_profiles,
             selected_id.as_deref(),
             &latency_states,
             callbacks,
@@ -1296,6 +1322,7 @@ impl Controller {
         // the rebuild actually painted, then let the sync reconcile it.
         *self.applied_connection.borrow_mut() = CardConnection {
             active: connected_id,
+            profiles: connected_profiles,
             ..CardConnection::default()
         };
         self.sync_connection_cards();
@@ -1459,6 +1486,7 @@ impl Controller {
         self.bump_epoch();
         self.set_cards_connection(CardConnection {
             active: Some(server_id.clone()),
+            profiles: self.state.borrow().ui.connected_profiles.clone(),
             connecting: Some(server_id.clone()),
             failed: None,
         });
@@ -1486,6 +1514,7 @@ impl Controller {
                     }
                     controller.set_cards_connection(CardConnection {
                         active: None,
+                        profiles: controller.state.borrow().ui.connected_profiles.clone(),
                         connecting: None,
                         failed: Some(failed_id.clone()),
                     });
@@ -1606,6 +1635,7 @@ impl Controller {
                         controller.bump_epoch();
                         controller.set_cards_connection(CardConnection {
                             active: Some(server_id.clone()),
+                            profiles: controller.state.borrow().ui.connected_profiles.clone(),
                             connecting: Some(server_id.clone()),
                             failed: None,
                         });
@@ -1864,6 +1894,7 @@ impl Controller {
                             };
                             controller.set_cards_connection(CardConnection {
                                 active: None,
+                                profiles: controller.state.borrow().ui.connected_profiles.clone(),
                                 connecting: None,
                                 failed,
                             });
@@ -2104,6 +2135,7 @@ impl Controller {
         let Some(effects) = effects else {
             return;
         };
+        self.update_sessions_banner(&snapshot.status);
         // Collected rather than issued inline: `probe_one` borrows the state the
         // effects were just produced from.
         let mut reprobe = Vec::new();
@@ -2139,6 +2171,15 @@ impl Controller {
         self.refresh_status();
     }
 
+    fn update_sessions_banner(&self, status: &ipc::StatusInfo) {
+        if let Some(message) = other_sessions_message(status) {
+            self.sessions_banner.set_title(&message);
+            self.sessions_banner.set_revealed(true);
+        } else {
+            self.sessions_banner.set_revealed(false);
+        }
+    }
+
     /// Re-date every badge. Readings do not change when they get older, so
     /// nothing in the poll would ever notice a number crossing from "just
     /// measured" into "measured 3 minutes ago"; the card compares against what
@@ -2156,10 +2197,11 @@ impl Controller {
     /// Push the current connection onto the cards, skipping the O(cards)
     /// pass when nothing changed.
     fn sync_connection_cards(&self) {
-        let (active, failed, status) = {
+        let (active, profiles, failed, status) = {
             let state = self.state.borrow();
             (
                 state.ui.connected_id.clone(),
+                state.ui.connected_profiles.clone(),
                 state.ui.failed_id.clone(),
                 state.ui.current_status(),
             )
@@ -2167,21 +2209,28 @@ impl Controller {
         let desired = match status {
             Status::Connecting => CardConnection {
                 active: active.clone(),
+                profiles,
                 connecting: active,
                 failed: None,
             },
             Status::Connected => CardConnection {
                 active,
+                profiles,
                 connecting: None,
                 failed: None,
             },
             // A failure keeps naming its server; a plain disconnect names none.
             Status::Error(_) => CardConnection {
                 active: None,
+                profiles,
                 connecting: None,
                 failed,
             },
-            Status::Disconnected => CardConnection::default(),
+            Status::Disconnected if profiles.is_empty() => CardConnection::default(),
+            Status::Disconnected => CardConnection {
+                profiles,
+                ..CardConnection::default()
+            },
         };
         if *self.applied_connection.borrow() == desired {
             return;
@@ -2199,25 +2248,32 @@ impl Controller {
     /// marker file survives crashes so the next start can undo a stale proxy.
     fn reconcile_system_proxy(&self) {
         let applied_settings = self.settings.applied();
-        let status = {
+        let desired = {
             let state = self.state.borrow();
-            state.ui.current_status()
-        };
-        let want = applied_settings.system_proxy && status == Status::Connected;
-        if want && !self.proxy_applied.get() {
-            if sysproxy::apply(
-                std::net::Ipv4Addr::LOCALHOST,
+            desired_system_proxy_endpoint(
+                applied_settings.system_proxy,
+                &state.ui.current_status(),
+                &state.ui.sessions,
                 applied_settings.socks_port,
                 applied_settings.http_port,
             )
-            .is_ok()
+        };
+        if let Some((address, socks_port, http_port)) = desired {
+            let endpoint = (address, socks_port, http_port);
+            if self.proxy_applied.get() && self.applied_proxy_endpoint.get() != Some(endpoint) {
+                // Never leave the previous owner's dead inbound installed if
+                // replacing it fails partway through.
+                self.clear_system_proxy();
+            }
+            if !self.proxy_applied.get() && sysproxy::apply(address, socks_port, http_port).is_ok()
             {
                 self.proxy_applied.set(true);
+                self.applied_proxy_endpoint.set(Some(endpoint));
                 if let Some(marker) = gui_proxy_marker() {
                     let _ = std::fs::write(marker, b"1");
                 }
             }
-        } else if !want {
+        } else {
             self.clear_system_proxy();
         }
     }
@@ -2230,6 +2286,7 @@ impl Controller {
         }
         let _ = sysproxy::clear();
         self.proxy_applied.set(false);
+        self.applied_proxy_endpoint.set(None);
         if let Some(marker) = gui_proxy_marker() {
             let _ = std::fs::remove_file(marker);
         }
@@ -2585,6 +2642,36 @@ fn gui_proxy_marker_exists() -> bool {
     gui_proxy_marker().is_some_and(|marker| marker.exists())
 }
 
+fn desired_system_proxy_endpoint(
+    enabled: bool,
+    compatibility_status: &Status,
+    sessions: &[ipc::SessionInfo],
+    compatibility_socks_port: u16,
+    compatibility_http_port: u16,
+) -> Option<(std::net::Ipv4Addr, u16, u16)> {
+    if !enabled {
+        return None;
+    }
+    if sessions.is_empty() {
+        // Compatibility with a daemon that predates the additive session list.
+        return (*compatibility_status == Status::Connected).then_some((
+            std::net::Ipv4Addr::LOCALHOST,
+            compatibility_socks_port,
+            compatibility_http_port,
+        ));
+    }
+    sessions
+        .iter()
+        .find(|session| session.owns_system_proxy && session.state == "connected")
+        .and_then(|session| {
+            session
+                .address
+                .parse()
+                .ok()
+                .map(|address| (address, session.socks_port, session.http_port))
+        })
+}
+
 /// Toasts are one line; anyhow cause chains are not. Keep the headline and
 /// enough of the detail to recognize the failure, leaving the rest to Details.
 fn summarize_error(title: &str, detail: &str) -> String {
@@ -2742,7 +2829,48 @@ fn install_css() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResponsiveMode, SearchState, responsive_mode_for_width, summarize_error};
+    use oxidom_core::ipc::SessionInfo;
+    use oxidom_core::xray::core::Status;
+
+    use super::{
+        ResponsiveMode, SearchState, desired_system_proxy_endpoint, responsive_mode_for_width,
+        summarize_error,
+    };
+
+    #[test]
+    fn system_proxy_follows_only_a_live_owner() {
+        let sessions = [
+            SessionInfo {
+                profile: "home".to_string(),
+                state: "connected".to_string(),
+                address: "127.31.8.1".to_string(),
+                socks_port: 10808,
+                http_port: 10809,
+                owns_system_proxy: true,
+                ..SessionInfo::default()
+            },
+            SessionInfo {
+                profile: "work".to_string(),
+                state: "connected".to_string(),
+                address: "127.72.14.1".to_string(),
+                socks_port: 20808,
+                http_port: 20809,
+                ..SessionInfo::default()
+            },
+        ];
+
+        assert_eq!(
+            desired_system_proxy_endpoint(true, &Status::Disconnected, &sessions, 1, 2),
+            Some(("127.31.8.1".parse().unwrap(), 10808, 10809))
+        );
+
+        let mut dead = sessions;
+        dead[0].state = "error".to_string();
+        assert_eq!(
+            desired_system_proxy_endpoint(true, &Status::Connected, &dead, 1, 2),
+            None
+        );
+    }
 
     #[test]
     fn summarize_error_truncates_on_char_boundaries() {

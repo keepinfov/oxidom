@@ -26,8 +26,10 @@ const RESIZE_SETTLE_MS: u64 = 120;
 /// with what the cards were last told.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CardConnection {
-    /// The server the tunnel is running for.
+    /// Compatibility server the header controls.
     pub active: Option<String>,
+    /// Connected profiles grouped by the server they carry.
+    pub profiles: HashMap<String, Vec<String>>,
     /// The server an attempt is being built for.
     pub connecting: Option<String>,
     /// The server whose attempt failed, until something replaces it.
@@ -197,6 +199,7 @@ impl ServersView {
         &self,
         subscriptions: &[Subscription],
         connected_id: Option<&str>,
+        connected_profiles: &HashMap<String, Vec<String>>,
         selected_id: Option<&str>,
         latency_states: &HashMap<String, LatencyState>,
         callbacks: CardCallbacks,
@@ -398,10 +401,13 @@ impl ServersView {
                     let id = id.clone();
                     move |alias| cb(id.clone(), alias)
                 };
-                let connection_state = match connected_id {
-                    Some(connected_id) if connected_id == id => CardConnectionState::ConnectedHere,
-                    Some(_) => CardConnectionState::ConnectedElsewhere,
-                    None => CardConnectionState::Disconnected,
+                let connection_state = match (connected_profiles.get(&id), connected_id) {
+                    (Some(_), _) => CardConnectionState::ConnectedHere,
+                    (None, Some(connected_id)) if connected_id == id => {
+                        CardConnectionState::ConnectedHere
+                    }
+                    (None, Some(_)) => CardConnectionState::ConnectedElsewhere,
+                    (None, None) => CardConnectionState::Disconnected,
                 };
                 let card = ServerCard::new(
                     server,
@@ -557,15 +563,23 @@ impl ServersView {
         for (id, card) in self.cards.borrow().iter() {
             let state = match (&connection.connecting, &connection.failed) {
                 // An attempt in flight outranks everything: no other card may
-                // claim a connection while one is being built.
+                // claim `default` while one is being built. Sessions belonging
+                // to other profiles remain real and stay highlighted.
                 (Some(connecting), _) if connecting == id => CardConnectionState::Connecting,
+                (Some(_), _) if connection.profiles.contains_key(id) => {
+                    CardConnectionState::ConnectedHere
+                }
                 (Some(_), _) => CardConnectionState::Disconnected,
+                (None, Some(_)) if connection.profiles.contains_key(id) => {
+                    CardConnectionState::ConnectedHere
+                }
                 (None, Some(failed)) if failed == id => CardConnectionState::Failed,
-                _ => match connection.active.as_deref() {
-                    Some(active) if active == id => CardConnectionState::ConnectedHere,
-                    Some(_) => CardConnectionState::ConnectedElsewhere,
-                    None => CardConnectionState::Disconnected,
-                },
+                _ if connection.profiles.contains_key(id) => CardConnectionState::ConnectedHere,
+                _ if connection.active.as_deref() == Some(id) => CardConnectionState::ConnectedHere,
+                _ if !connection.profiles.is_empty() || connection.active.is_some() => {
+                    CardConnectionState::ConnectedElsewhere
+                }
+                _ => CardConnectionState::Disconnected,
             };
             card.set_connection_state(state);
         }

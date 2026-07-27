@@ -40,9 +40,12 @@ missing files (treat as defaults/empty).
 - `~/.config/oxidom/config.toml` — user settings (see schema).
 - `~/.config/oxidom/profiles/<name>.toml` — named CLI/systemd connection profiles.
 - `~/.local/share/oxidom/subscriptions.json` — cached subscriptions + parsed servers.
-- `~/.local/share/oxidom/state.toml` — last active server, per-app route memory.
+- `~/.local/share/oxidom/state.toml` — ephemeral `[[sessions]]` records: profile, server id,
+  loopback address, fixed SOCKS/HTTP ports and the recovery PID of its Xray child. The legacy
+  flat active-server fields are accepted only as migration input.
 - `~/.local/share/oxidom/hwid` — random per-install id (only generated/used if a sub opts in).
-- `~/.cache/oxidom/egress.json` — user-owned 60-second cache for `oxidom ip --egress`.
+- `~/.cache/oxidom/egress.json` — user-owned 60-second cache for `oxidom ip --egress`, keyed by
+  profile and server id.
 
 ### Which daemon owns the store (binding)
 A system daemon run from the NixOS module keeps all of the above in its `StateDirectory`
@@ -133,7 +136,7 @@ Derive `country` from a leading flag emoji or country code in the name when pres
 Emit Xray JSON to a temp file, then spawn the core. Structure:
 - `log`: `{ loglevel: "warning" }`.
 - `inbounds`: a SOCKS inbound on `socks_port` and an HTTP inbound on `http_port`, both bound to
-  `127.0.0.1`, `sniffing` enabled (`http`, `tls`).
+  the session's stable loopback address, `sniffing` enabled (`http`, `tls`).
 - `outbounds`: `[ <selected server outbound>, { protocol: "freedom", tag: "direct" },
   { protocol: "blackhole", tag: "block" } ]`.
 - `routing`: default rules (v1: everything through proxy; direct for private IPs). A full rules
@@ -161,12 +164,12 @@ against a real core with `xray run -test -c <file>` rather than against document
 - Stop cleanly on disconnect/app-exit (SIGTERM, then SIGKILL after timeout). The same escalation
   applies to an orphan inherited from a crashed run (`engine::kill_stale_xray`), which verifies
   the process is gone rather than assuming SIGTERM worked.
-- Only one core process at a time (single active server).
+- One core process per running profile; `Sessions` owns them in stable profile-name order.
 - **An unexpected exit is noticed by the daemon itself** (`daemon::spawn_core_supervisor`, 1 s
-  tick), not only while a GUI polls `Status()` — a headless daemon used to stay "connected" over a
-  dead core indefinitely. With `reconnect = true` the supervisor redials the same server with a
-  1 s→30 s backoff, cancelled by any explicit `Connect`/`Disconnect` through `connect_generation`.
-  Default is off: silently redialling hides a server going bad.
+  tick), for every session and not only while a GUI polls `Status()`. With `reconnect = true` the
+  supervisor redials that profile's server with a 1 s→30 s backoff, cancelled by an explicit
+  operation in the same profile's generation domain. Default is off: silently redialling hides a
+  server going bad.
 
 ## Latency probes (`latency_method`)
 - `icmp` — spawn `ping -c1 -W1 <host>` and parse (avoids raw-socket privileges).
@@ -205,15 +208,18 @@ as `ipc::LatencyReading { value, measured_at_unix_ms, route, method, failure }` 
   card — shown as `—`, never as a number.
 - **`failure.is_some()` ⟺ `value.is_none()`**, upheld by `LatencyReading::ok`/`failed`. Build them
   through those constructors.
-- **Every id that enters `ProbeQueue::running` leaves with a `readings` entry**, including ids that
-  no longer resolve. The GUI retires its spinner on the id leaving `running ∪ queued`, so a silent
-  early return leaves a card checking forever.
+- **Every direct id that enters `ProbeQueue::running` leaves with a `readings` entry**, including
+  ids that no longer resolve; a job for a still-current session leaves its result in `proxied`.
+  The GUI retires its spinner on the id leaving `running ∪ queued`, so a silent early return
+  leaves a card checking forever.
 - **`queued ≠ finished`.** `ProbeState` reports `running` and `queued` separately; a card waiting
   for a slot still carries its *previous* number and must not present it as this measurement's.
-- **`ProbeState.version`** is bumped whenever the shape changes. A GUI seeing a lower version
-  reports everything as unmeasured and says why, rather than guessing.
-- Readings are dropped for servers that no longer exist (`Shared::prune_readings`, called by every
-  mutating `Service` method) — ids are reissued on subscription refresh.
+- **`ProbeState.version`** is bumped for incompatible semantic changes. The additive,
+  serde-defaulted `proxied` map does not bump it. A GUI seeing a lower required version reports
+  everything as unmeasured and says why, rather than guessing.
+- `ProbeState.readings` contains direct measurements keyed by server id.
+  `ProbeState.proxied` contains connection measurements keyed by profile; two profiles on one
+  server must never overwrite each other. Readings are pruned with their server or session.
 
 Freshness is the GUI's job: `gui::reduce::latency_state` is the **single** mapper from a reading to
 a `LatencyState`, and ages are bucketed to whole minutes so the badge repaints on a bucket change
@@ -237,8 +243,8 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
 - `oxidom down [PROFILE]` (`disconnect`) stops the tunnel unconditionally unless a profile
   is named.
 - `oxidom connect <HANDLE>` connects one server without a profile.
-- `oxidom status [--json]`, `oxidom ip [--egress] [--fresh]`,
-  `oxidom list [servers|profiles|subscriptions] [--json]`, and
+- `oxidom status [PROFILE] [--json]`, `oxidom ip [PROFILE] [--egress] [--fresh]`,
+  `oxidom env [PROFILE]`, `oxidom list [servers|profiles|subscriptions|sessions] [--json]`, and
   `oxidom ping <HANDLE>` are read commands and never spawn a session daemon.
 - `oxidom alias <HANDLE> <NEW>` changes a server alias.
 - `oxidom profile {list,show,new,edit,rm}` manages daemon-owned profiles.
@@ -247,6 +253,10 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
 
 Only `up` and `connect` may spawn a private session daemon; every other control command requires
 an existing daemon.
+
+The canonical order is verb first (`oxidom up work`). For profile-scoped commands, profile first
+is an argv-normalized synonym (`oxidom work up`); a real subcommand in the first position always
+wins. `oxidom env` prints POSIX `export` statements for both SOCKS and HTTP endpoints.
 
 Data goes only to stdout; warnings, errors, and ambiguous-handle candidates go to stderr. JSON
 uses the fixed DTOs in `oxidom-core/src/cli_json.rs`. Exit codes are binding:
@@ -281,13 +291,30 @@ socks_port = 10808
 http_port = 10809
 ```
 
-Names match `^[a-z0-9][a-z0-9_-]{0,31}$`. `UpProfile` resolves `select.server` as a handle and
-applies ports unless the daemon unit pins them. `Down("")` disconnects unconditionally;
-`Down(name)` disconnects only when `state.active_profile == name`, otherwise it returns `false`
-without touching the active tunnel. `oxidom down <PROFILE>` still exits `0` in that case: it is
-the unit's `ExecStop`, and the post-condition it was asked for — that profile is not running —
-already holds. Removing a profile deliberately leaves `active_profile` set, so the unit can still
-stop the tunnel it started.
+Names match `^[a-z0-9][a-z0-9_-]{0,31}$`; command names and aliases are reserved so profile-first
+argv is never ambiguous. Existing reserved-name files remain readable/listed with a warning, but
+new writes are refused. `UpProfile` resolves `select.server` as a handle and applies that
+profile's ports; unit-pinned ports constrain only `default`. Removing a profile deliberately
+leaves its running session intact so the unit can still stop what it started.
+
+Every profile gets a stable `127.<a>.<b>.1` inbound address derived with the same FNV-1a 64 used
+for ids; collisions probe forward through the address space. `default` is permanently
+`127.0.0.1`, an external contract with consumers such as redsocks. Different addresses let every
+profile reuse the same SOCKS/HTTP ports.
+
+### Sessions (binding)
+
+Subscriptions and servers are global sources. A profile is persistent configuration; a session
+is the ephemeral running instance of one profile: its Xray process, selected server, loopback
+address, ports and status. “Connect one server” means the `default` session, not a separate global
+mode. Several profiles may run at once, including several profiles on the same server.
+
+`Sessions` is a `BTreeMap` keyed by profile, so listings are stable. A profile already up cannot
+be brought up twice. `DownProfile` removes exactly that runtime; `Down("")` removes all sessions.
+The single GNOME system-proxy owner is runtime state in `Sessions`, not persistent configuration:
+it is released when its session stops or its core dies. On daemon startup, every state entry with
+a recovery PID is checked against its own `current-config-<profile>.json`, reaped, and removed
+from `state.toml`.
 
 ## GUI (Phase 2 — codex brief)
 Build with `adw::Application` (app id `dev.keepinfov.oxidom`). Wire to the core modules; do not
@@ -302,13 +329,16 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
     top that filters servers by name/protocol/country.
 - **Server card** (custom widget): country **flag**, server **name**, protocol **subtitle**
   (`transport_label`, e.g. "vless + xhttp + reality"), optional **latency badge** (green when
-  low). Whole card is a click target → selects that server. The active server is visually marked.
+  low). Whole card is a click target → selects that server. Every server carried by a connected
+  profile is visually marked; the one-profile case is unchanged.
 - **Server grid:** a top group of "loose"/favorite servers, then per-**subscription groups**:
   each group shows its **title** + **description** (name + quota/expiry from userinfo) followed by
   that subscription's server cards. Multi-column grid in wide mode, single column in narrow
   (use `adw::WrapBox`/`FlowBox` with a breakpoint via `adw::Breakpoint`).
-- **Connect control:** a single primary **Connect/Disconnect** toggle in the header (single active
-  server). Show live status (Connecting/Connected/Error) and active latency.
+- **Connect control:** a single primary **Connect/Disconnect** toggle in the header for the
+  compatibility `default` session. Show its live status (Connecting/Connected/Error) and active
+  latency. If other sessions run, a persistent banner reports their count and points to
+  `oxidom status`.
 - **Subscriptions view:** add (URL + optional name), update-now, delete; per-sub **"send HWID"**
   switch (default OFF) with a privacy hint.
 - **Settings view:** ports, system-proxy toggle, latency method + test URL.
@@ -324,10 +354,12 @@ crates/
   oxidom-core/
     src/
       lib.rs
+      bind.rs                    # stable per-profile 127.x inbound address
       client.rs                  # blocking D-Bus client, shared by GUI and CLI
       config.rs                  # config.toml load/save
       state.rs                   # state.toml
       model.rs                   # Server/Subscription/OutboundSpec types
+      engine.rs                  # Registry + per-profile Session/Sessions facade
       link.rs                    # share-link parsers
       subscription.rs            # fetch + decode + userinfo headers + hwid
       xray/

@@ -498,25 +498,45 @@ impl Engine {
     }
 
     fn recover_stale_cores(&mut self) {
-        let mut changed = false;
-        for session in &mut self.state.sessions {
-            let Some(pid) = session.xray_pid.take() else {
-                continue;
-            };
-            changed = true;
-            if kill_stale_xray(pid, &session.profile) {
+        let stale_sessions = self
+            .state
+            .sessions
+            .iter()
+            .filter_map(|session| session.xray_pid.map(|pid| (session.profile.clone(), pid)))
+            .collect::<Vec<_>>();
+        if stale_sessions.is_empty() {
+            return;
+        }
+        let mut cleaned_profiles = Vec::new();
+        for (profile, pid) in &stale_sessions {
+            if kill_stale_xray(*pid, profile) {
                 log::info!(
                     "stopped orphaned xray process {pid} for profile {:?} from a previous run",
-                    session.profile
+                    profile
                 );
+                cleaned_profiles.push(profile.clone());
             } else {
                 log::warn!(
                     "could not confirm that orphaned xray process {pid} for profile {:?} stopped",
-                    session.profile
+                    profile
                 );
             }
         }
-        if changed && let Err(error) = self.state.save() {
+        if cleaned_profiles.is_empty() {
+            return;
+        }
+        // A session is a running profile, not a remembered connection. Once
+        // an inherited child has been reaped there is no runtime left to
+        // restore, and keeping its entry would make the next `up` reject it as
+        // a phantom session. A child we could not stop stays recorded so the
+        // next daemon start can try again rather than orphaning it forever.
+        for profile in &cleaned_profiles {
+            self.sessions.remove(profile);
+        }
+        self.state
+            .sessions
+            .retain(|session| !cleaned_profiles.contains(&session.profile));
+        if let Err(error) = self.state.save() {
             log::warn!("could not persist stale-core recovery state: {error:#}");
         }
     }
@@ -705,6 +725,7 @@ impl Engine {
             if let Some(session) = self.sessions.get_mut(profile) {
                 session.disconnect();
             }
+            self.sessions.release_system_proxy(profile);
             self.sync_session(profile);
         }
         if !affected.is_empty()
@@ -746,6 +767,7 @@ impl Engine {
         if let Some(session) = self.sessions.get_mut(profile) {
             session.disconnect();
         }
+        self.sessions.release_system_proxy(profile);
         self.sync_session(profile);
         if let Err(error) = self.state.save() {
             log::warn!("could not persist the disconnected state: {error:#}");
@@ -894,21 +916,18 @@ fn wait_until_gone(pid: nix::unistd::Pid, timeout: std::time::Duration) -> bool 
 /// insisting on `comm == "xray"` would skip a core installed as, say,
 /// `xray-linux-amd64` and leave its tunnel up with no way to stop it. The
 /// generated config path is the reliable marker: nothing else is run against
-/// it. The name check stays as a fallback for when the data dir has moved.
+/// it. A process merely named `xray` is not enough: with multiple sessions
+/// that could be another profile's core.
 fn is_our_xray(pid: u32, profile: &str) -> bool {
     let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
     let cmdline = String::from_utf8_lossy(&raw);
-    if let Ok(config) = XrayCore::config_path(profile)
-        && cmdline
+    XrayCore::config_path(profile).is_ok_and(|config| {
+        cmdline
             .split('\0')
             .any(|arg| !arg.is_empty() && std::path::Path::new(arg) == config)
-    {
-        return true;
-    }
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .is_ok_and(|comm| comm.trim().starts_with("xray"))
+    })
 }
 
 #[cfg(test)]
@@ -993,6 +1012,23 @@ mod tests {
         }
     }
 
+    fn wait_for_process_identity(child: &mut std::process::Child, profile: &str) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if super::is_our_xray(child.id(), profile) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let pid = child.id();
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(anyhow!(
+            "test process {pid} never exposed the {profile} config path"
+        ))
+    }
+
     #[test]
     fn sessions_iterate_in_profile_order_and_report_endpoints() {
         let mut sessions = Sessions::default();
@@ -1039,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_clears_every_recorded_session_pid() -> Result<()> {
+    fn recovery_reaps_every_recorded_session_and_clears_runtime_state() -> Result<()> {
         let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("recover-all-sessions")?;
         State {
@@ -1052,14 +1088,95 @@ mod tests {
 
         let engine = Engine::load();
 
-        assert_eq!(engine.state.sessions.len(), 2);
-        assert!(
-            engine
-                .state
-                .sessions
-                .iter()
-                .all(|session| session.xray_pid.is_none())
-        );
+        assert!(engine.state.sessions.is_empty());
+        assert!(engine.sessions.is_empty());
+        let persisted = State::load(&engine.registry.config);
+        assert!(persisted.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_matches_each_orphan_against_its_own_config_path() -> Result<()> {
+        use std::process::{Command, Stdio};
+
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("recover-profile-configs")?;
+        let mut saved = Vec::new();
+        let mut waiters = Vec::new();
+        for profile in ["home", "work"] {
+            let config = crate::xray::core::XrayCore::config_path(profile)?;
+            std::fs::create_dir_all(config.parent().context("config parent")?)?;
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "while :; do sleep 1; done"])
+                .arg(&config)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("starting test orphan for {profile}"))?;
+            wait_for_process_identity(&mut child, profile)?;
+            let pid = child.id();
+            waiters.push(std::thread::spawn(move || child.wait()));
+            saved.push(saved_profile_session(profile, Some(pid)));
+        }
+        State { sessions: saved }.save()?;
+
+        let engine = Engine::load();
+
+        assert!(engine.state.sessions.is_empty());
+        assert!(engine.sessions.is_empty());
+        for waiter in waiters {
+            waiter.join().map_err(|_| anyhow!("waiter panicked"))??;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn one_profile_never_claims_another_profiles_core() -> Result<()> {
+        use std::process::{Command, Stdio};
+
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("recover-profile-identity")?;
+        let config = crate::xray::core::XrayCore::config_path("work")?;
+        std::fs::create_dir_all(config.parent().context("config parent")?)?;
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "while :; do sleep 1; done"])
+            .arg(&config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        wait_for_process_identity(&mut child, "work")?;
+        assert!(super::is_our_xray(child.id(), "work"));
+        assert!(!super::is_our_xray(child.id(), "home"));
+
+        child.kill()?;
+        child.wait()?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_does_not_forget_an_unrelated_live_process() -> Result<()> {
+        use std::process::{Command, Stdio};
+
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("recover-unrelated-process")?;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        State {
+            sessions: vec![saved_profile_session("work", Some(child.id()))],
+        }
+        .save()?;
+
+        let engine = Engine::load();
+
+        assert_eq!(engine.state.sessions.len(), 1);
+        assert_eq!(engine.state.sessions[0].xray_pid, Some(child.id()));
+        assert!(engine.sessions.get("work").is_some());
+        child.kill()?;
+        child.wait()?;
         Ok(())
     }
 

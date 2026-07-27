@@ -46,63 +46,113 @@ fn reconnect_delay(attempt: u32) -> Duration {
 /// this id already spoken for?", "may another probe start?" — spans both sets,
 /// so the old pair carried an unwritten `checking` → `probe_queue` ordering
 /// that held only because the two call sites remembered to take them that way.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ProbeTarget {
+    Direct(String),
+    Proxied(String),
+}
+
+#[derive(Clone, Debug)]
+struct ProbeJob {
+    token: u64,
+    target: ProbeTarget,
+    server_id: String,
+}
+
 #[derive(Default)]
 struct ProbeQueue {
-    running: HashSet<String>,
-    queued: VecDeque<String>,
+    next_token: u64,
+    running: HashMap<u64, ProbeJob>,
+    queued: VecDeque<ProbeJob>,
 }
 
 impl ProbeQueue {
-    /// Take an id unless it is already spoken for. Returns whether it was
-    /// newly queued.
-    fn enqueue(&mut self, server_id: String) -> bool {
-        if self.holds(&server_id) {
+    /// Take a logical target unless it is already spoken for. Direct probes
+    /// deduplicate by server; proxied probes deduplicate by profile, because
+    /// two profiles on one server are two independent connections.
+    fn enqueue(&mut self, target: ProbeTarget, server_id: String) -> bool {
+        if self.holds(&target) {
             return false;
         }
-        self.queued.push_back(server_id);
+        let job = self.job(target, server_id);
+        self.queued.push_back(job);
         true
     }
 
-    fn holds(&self, server_id: &str) -> bool {
-        self.running.contains(server_id) || self.queued.iter().any(|id| id == server_id)
+    fn holds(&self, target: &ProbeTarget) -> bool {
+        self.running.values().any(|job| &job.target == target)
+            || self.queued.iter().any(|job| &job.target == target)
     }
 
-    /// Promote the next waiting id, when a slot is free.
-    fn start_next(&mut self) -> Option<String> {
+    fn job(&mut self, target: ProbeTarget, server_id: String) -> ProbeJob {
+        loop {
+            self.next_token = self.next_token.wrapping_add(1);
+            if self.next_token != 0
+                && !self.running.contains_key(&self.next_token)
+                && !self.queued.iter().any(|job| job.token == self.next_token)
+            {
+                return ProbeJob {
+                    token: self.next_token,
+                    target,
+                    server_id,
+                };
+            }
+        }
+    }
+
+    /// Promote the next waiting job, when a slot is free.
+    fn start_next(&mut self) -> Option<ProbeJob> {
         if self.running.len() >= MAX_CONCURRENT_PROBES {
             return None;
         }
-        let server_id = self.queued.pop_front()?;
-        self.running.insert(server_id.clone());
-        Some(server_id)
+        let job = self.queued.pop_front()?;
+        self.running.insert(job.token, job.clone());
+        Some(job)
     }
 
-    /// Run `server_id` now, past the queue and past the cap. The confirmation
+    /// Run this profile now, past the queue and past the cap. The confirmation
     /// after a connect is not a queued measurement: it decides whether the
     /// tunnel the user is watching stays up, and cannot wait behind a bulk
     /// re-check of a whole subscription.
-    fn start_now(&mut self, server_id: &str) {
-        self.queued.retain(|id| id != server_id);
-        self.running.insert(server_id.to_string());
+    fn start_now(&mut self, profile: &str, server_id: &str) -> ProbeJob {
+        let target = ProbeTarget::Proxied(profile.to_string());
+        self.queued.retain(|job| job.target != target);
+        // A superseded confirmation may still be unwinding. Give the new one
+        // its own token so the old worker cannot release the new worker's slot.
+        let job = self.job(target, server_id.to_string());
+        self.running.insert(job.token, job.clone());
+        job
     }
 
-    fn finish(&mut self, server_id: &str) {
-        self.running.remove(server_id);
+    fn finish(&mut self, token: u64) {
+        self.running.remove(&token);
     }
 
     /// Both sets as the wire wants them.
     fn snapshot(&self) -> (Vec<String>, Vec<String>) {
         (
-            self.running.iter().cloned().collect(),
-            self.queued.iter().cloned().collect(),
+            self.running
+                .values()
+                .map(|job| job.server_id.clone())
+                .collect(),
+            self.queued
+                .iter()
+                .map(|job| job.server_id.clone())
+                .collect(),
         )
     }
 
     /// Drop queued ids that are no longer backed by a server. `running` is left
     /// alone on purpose: each of those has a thread that will `finish` it, and
     /// removing the entry early would hand out a slot that is still occupied.
-    fn retain_alive(&mut self, alive: &HashSet<String>) {
-        self.queued.retain(|id| alive.contains(id));
+    fn retain_alive(&mut self, servers: &HashSet<String>, profiles: &HashSet<String>) {
+        self.queued.retain(|job| {
+            servers.contains(&job.server_id)
+                && match &job.target {
+                    ProbeTarget::Direct(_) => true,
+                    ProbeTarget::Proxied(profile) => profiles.contains(profile),
+                }
+        });
     }
 }
 
@@ -135,6 +185,7 @@ pub struct DaemonOptions {
 pub(crate) struct Shared {
     engine: Arc<Mutex<Engine>>,
     readings: Arc<Mutex<HashMap<String, LatencyReading>>>,
+    proxied: Arc<Mutex<HashMap<String, LatencyReading>>>,
     probes: Arc<Mutex<ProbeQueue>>,
     /// Layered over the core status, e.g. when the confirming probe after a
     /// connect fails and the daemon shuts the tunnel back down.
@@ -162,6 +213,7 @@ impl Shared {
         Shared {
             engine: Arc::new(Mutex::new(engine)),
             readings: Arc::new(Mutex::new(HashMap::new())),
+            proxied: Arc::new(Mutex::new(HashMap::new())),
             probes: Arc::new(Mutex::new(ProbeQueue::default())),
             override_status: Arc::new(Mutex::new(HashMap::new())),
             connect_generation: Arc::new(AtomicU64::new(0)),
@@ -222,19 +274,36 @@ impl Shared {
         oxidom_core::sync::lock(&self.current_generations).clear();
     }
 
-    /// Returns the compatibility session and server whose core has just been
-    /// found dead, once. A3 extends the background sweep to every profile.
-    fn note_core_death(&self) -> Option<(String, String)> {
+    /// Return every session whose core has just been found dead, once.
+    ///
+    /// The sweep is deliberately per profile: two sessions may carry the same
+    /// server, and the health of one process says nothing about the other.
+    fn note_core_deaths(&self) -> Vec<(String, String)> {
         let mut engine = oxidom_core::sync::lock(&self.engine);
-        let profile = engine.default_session()?.profile.clone();
-        let session = engine.sessions.get_mut(&profile)?;
-        let alive = session.is_alive();
-        if session.status() != Status::Connected || alive {
-            return None;
+        let profiles = engine
+            .sessions
+            .iter()
+            .map(|(profile, _)| profile.to_string())
+            .collect::<Vec<_>>();
+        let mut dead = Vec::new();
+        for profile in profiles {
+            let Some(session) = engine.sessions.get_mut(&profile) else {
+                continue;
+            };
+            let alive = session.is_alive();
+            if session.status() != Status::Connected || alive {
+                continue;
+            }
+            let Some(server_id) = session.server_id.clone() else {
+                continue;
+            };
+            session.core.fail(CORE_EXITED_MESSAGE);
+            dead.push((profile, server_id));
         }
-        let server_id = session.server_id.clone()?;
-        session.core.fail(CORE_EXITED_MESSAGE);
-        Some((profile, server_id))
+        for (profile, _) in &dead {
+            engine.sessions.release_system_proxy(profile);
+        }
+        dead
     }
 
     fn begin_reconnect(&self, profile: String, server_id: String, generation: u64) {
@@ -358,10 +427,10 @@ impl Shared {
     }
 
     fn status_info(&self) -> StatusInfo {
-        if let Some((profile, server_id)) = self.note_core_death()
-            && let Some(generation) = self.current_generation(&profile)
-        {
-            self.begin_reconnect(profile, server_id, generation);
+        for (profile, server_id) in self.note_core_deaths() {
+            if let Some(generation) = self.current_generation(&profile) {
+                self.begin_reconnect(profile, server_id, generation);
+            }
         }
         // Scoped, not `if let`: in edition 2024 an `if let` scrutinee's
         // temporary lives for the whole body, so holding this guard while
@@ -442,33 +511,33 @@ impl Shared {
         }
     }
 
-    /// The server to probe, the config to probe it with, and how to reach it:
-    /// only the server the tunnel is actually carrying may be measured through
-    /// the proxy, everything else is measured on its own merits.
-    fn probe_target(&self, server_id: &str) -> Option<(Server, Config, probe::Route, Ipv4Addr)> {
+    /// Pick the connection a generic server probe describes. A server carried
+    /// by a session is measured through the first such profile in stable
+    /// profile order; everything else is a direct server measurement.
+    fn probe_target(&self, server_id: &str) -> ProbeTarget {
         let engine = oxidom_core::sync::lock(&self.engine);
-        let server = engine.find_server(server_id)?;
-        let active = engine.active_server_id().as_deref() == Some(server_id)
-            && engine.status() == Status::Connected;
-        let route = if active {
-            probe::Route::Proxied
-        } else {
-            probe::Route::Direct
-        };
-        let mut config = engine.registry.config.clone();
-        let address = if active {
-            let session = engine.default_session()?;
-            config.socks_port = session.socks_port;
-            config.http_port = session.http_port;
-            session.address
-        } else {
-            Ipv4Addr::LOCALHOST
-        };
-        Some((server, config, route, address))
+        engine
+            .sessions
+            .iter()
+            .find(|(_, session)| {
+                session.status() == Status::Connected
+                    && session.server_id.as_deref() == Some(server_id)
+            })
+            .map(|(profile, _)| ProbeTarget::Proxied(profile.to_string()))
+            .unwrap_or_else(|| ProbeTarget::Direct(server_id.to_string()))
     }
 
     fn enqueue_probe(&self, server_id: String) {
-        if !oxidom_core::sync::lock(&self.probes).enqueue(server_id) {
+        let target = self.probe_target(&server_id);
+        if !oxidom_core::sync::lock(&self.probes).enqueue(target, server_id) {
+            return;
+        }
+        self.pump_probes();
+    }
+
+    fn enqueue_session_probe(&self, profile: String, server_id: String) {
+        if !oxidom_core::sync::lock(&self.probes).enqueue(ProbeTarget::Proxied(profile), server_id)
+        {
             return;
         }
         self.pump_probes();
@@ -482,30 +551,43 @@ impl Shared {
             let shared = self.clone();
             std::thread::spawn(move || {
                 shared.run_probe(&next);
-                oxidom_core::sync::lock(&shared.probes).finish(&next);
+                oxidom_core::sync::lock(&shared.probes).finish(next.token);
                 shared.pump_probes();
             });
         }
     }
 
-    /// Probe one server and record the outcome. Every id that enters the queue
-    /// leaves with a `readings` entry, including ids that no longer resolve —
-    /// the GUI keys its spinner off that entry appearing, so a silent early
-    /// return would leave the card checking forever.
-    fn run_probe(&self, server_id: &str) -> Option<u32> {
-        let reading = match self.probe_target(server_id) {
-            Some((server, config, route, address)) => {
+    /// Probe one server and record the outcome in the map belonging to the
+    /// job's route. Direct jobs complete in `readings`; live connection jobs
+    /// complete in `proxied`.
+    fn run_probe(&self, job: &ProbeJob) -> Option<u32> {
+        match &job.target {
+            ProbeTarget::Direct(_) => self.run_direct_probe(&job.server_id),
+            ProbeTarget::Proxied(profile) => self.run_session_probe(profile, &job.server_id),
+        }
+    }
+
+    fn run_direct_probe(&self, server_id: &str) -> Option<u32> {
+        let target = {
+            let engine = oxidom_core::sync::lock(&self.engine);
+            engine
+                .find_server(server_id)
+                .map(|server| (server, engine.registry.config.clone()))
+        };
+        let reading = match target {
+            Some((server, config)) => {
                 let method = config.latency_method;
-                let wire = wire_route(route);
-                match probe::measure(&server, &config, route, address) {
+                match probe::measure(&server, &config, probe::Route::Direct, Ipv4Addr::LOCALHOST) {
                     // The reading carries the method that produced it, not the
                     // one the config asked for: a hysteria2 server may answer
                     // only ICMP. The card says which it was rather than
                     // passing a handshake off as the user's chosen probe.
                     probe::ProbeOutcome::Reachable(measured) => {
-                        LatencyReading::ok(measured.ms, wire, measured.method)
+                        LatencyReading::ok(measured.ms, ProbeRoute::Direct, measured.method)
                     }
-                    outcome => LatencyReading::failed(wire_failure(&outcome), wire, method),
+                    outcome => {
+                        LatencyReading::failed(wire_failure(&outcome), ProbeRoute::Direct, method)
+                    }
                 }
             }
             // The server was removed between the request and its slot. Nothing
@@ -523,13 +605,15 @@ impl Shared {
         value
     }
 
-    /// Measure the tunnel owned by one profile. The result still uses the
-    /// legacy server-id map until A3 splits proxied readings by session.
+    /// Measure the tunnel owned by one profile.
     fn run_session_probe(&self, profile: &str, server_id: &str) -> Option<u32> {
         let target = {
             let engine = oxidom_core::sync::lock(&self.engine);
             match (engine.find_server(server_id), engine.sessions.get(profile)) {
-                (Some(server), Some(session)) => {
+                (Some(server), Some(session))
+                    if session.status() == Status::Connected
+                        && session.server_id.as_deref() == Some(server_id) =>
+                {
                     let mut config = engine.registry.config.clone();
                     config.socks_port = session.socks_port;
                     config.http_port = session.http_port;
@@ -557,7 +641,16 @@ impl Shared {
             ),
         };
         let value = reading.value;
-        oxidom_core::sync::lock(&self.readings).insert(server_id.to_string(), reading);
+        let still_current = {
+            let engine = oxidom_core::sync::lock(&self.engine);
+            engine.sessions.get(profile).is_some_and(|session| {
+                session.status() == Status::Connected
+                    && session.server_id.as_deref() == Some(server_id)
+            })
+        };
+        if still_current {
+            oxidom_core::sync::lock(&self.proxied).insert(profile.to_string(), reading);
+        }
         value
     }
 
@@ -574,8 +667,8 @@ impl Shared {
         if !self.generation_is_current(profile, generation) {
             return Ok(None);
         }
-        oxidom_core::sync::lock(&self.readings).remove(server_id);
-        oxidom_core::sync::lock(&self.probes).start_now(server_id);
+        oxidom_core::sync::lock(&self.proxied).remove(profile);
+        let probe_job = oxidom_core::sync::lock(&self.probes).start_now(profile, server_id);
 
         let connect_result = {
             let mut engine = oxidom_core::sync::lock(&self.engine);
@@ -587,11 +680,14 @@ impl Shared {
         };
         match connect_result {
             None => {
-                oxidom_core::sync::lock(&self.probes).finish(server_id);
+                oxidom_core::sync::lock(&self.probes).finish(probe_job.token);
                 Ok(None)
             }
             Some(Err(error)) => {
-                oxidom_core::sync::lock(&self.probes).finish(server_id);
+                oxidom_core::sync::lock(&self.probes).finish(probe_job.token);
+                oxidom_core::sync::lock(&self.engine)
+                    .sessions
+                    .release_system_proxy(profile);
                 Err(error)
             }
             Some(Ok(())) => Ok(Some(self.confirm_connection(
@@ -599,6 +695,7 @@ impl Shared {
                 server_id.to_string(),
                 generation,
                 origin,
+                probe_job.token,
             ))),
         }
     }
@@ -636,6 +733,7 @@ impl Shared {
         server_id: String,
         generation: u64,
         origin: ConnectionOrigin,
+        probe_token: u64,
     ) -> mpsc::Receiver<bool> {
         let (confirmed, confirmation) = mpsc::channel();
         let shared = self.clone();
@@ -643,15 +741,15 @@ impl Shared {
             let (address, socks_port, method) = {
                 let engine = oxidom_core::sync::lock(&shared.engine);
                 let Some(session) = engine.sessions.get(&profile) else {
-                    oxidom_core::sync::lock(&shared.readings).insert(
-                        server_id.clone(),
+                    oxidom_core::sync::lock(&shared.proxied).insert(
+                        profile.clone(),
                         LatencyReading::failed(
                             ProbeFailure::Unknown,
                             ProbeRoute::Proxied,
                             LatencyMethod::default(),
                         ),
                     );
-                    oxidom_core::sync::lock(&shared.probes).finish(&server_id);
+                    oxidom_core::sync::lock(&shared.probes).finish(probe_token);
                     let _ = confirmed.send(false);
                     return;
                 };
@@ -673,15 +771,25 @@ impl Shared {
                 // Nothing could be measured, but the GUI is waiting on this id
                 // and would otherwise see the spinner retire onto whatever the
                 // map still held. Record the failure it actually is.
-                oxidom_core::sync::lock(&shared.readings).insert(
-                    server_id.clone(),
+                oxidom_core::sync::lock(&shared.proxied).insert(
+                    profile.clone(),
                     LatencyReading::failed(ProbeFailure::Timeout, ProbeRoute::Proxied, method),
                 );
                 None
             };
-            oxidom_core::sync::lock(&shared.probes).finish(&server_id);
+            oxidom_core::sync::lock(&shared.probes).finish(probe_token);
             if ready && latency.is_some() {
                 let current = shared.generation_is_current(&profile, generation);
+                if current {
+                    let mut engine = oxidom_core::sync::lock(&shared.engine);
+                    if engine.registry.config.system_proxy
+                        && let Err(error) = engine.sessions.claim_system_proxy(&profile)
+                    {
+                        log::warn!(
+                            "profile {profile:?} reconnected without the system proxy: {error:#}"
+                        );
+                    }
+                }
                 let _ = confirmed.send(current);
                 return;
             }
@@ -750,15 +858,24 @@ impl Shared {
     fn prune_readings(&self) {
         // engine → readings, the same order `run_probe` takes them in, and the
         // engine lock is dropped before either of the others is touched.
-        let alive: HashSet<String> = {
+        let (alive_servers, alive_profiles): (HashSet<String>, HashSet<String>) = {
             let engine = oxidom_core::sync::lock(&self.engine);
-            engine
-                .all_servers()
-                .map(|server| server.id.clone())
-                .collect()
+            (
+                engine
+                    .all_servers()
+                    .map(|server| server.id.clone())
+                    .collect(),
+                engine
+                    .sessions
+                    .iter()
+                    .map(|(profile, _)| profile.to_string())
+                    .collect(),
+            )
         };
-        oxidom_core::sync::lock(&self.readings).retain(|id, _| alive.contains(id));
-        oxidom_core::sync::lock(&self.probes).retain_alive(&alive);
+        oxidom_core::sync::lock(&self.readings).retain(|id, _| alive_servers.contains(id));
+        oxidom_core::sync::lock(&self.proxied)
+            .retain(|profile, _| alive_profiles.contains(profile));
+        oxidom_core::sync::lock(&self.probes).retain_alive(&alive_servers, &alive_profiles);
     }
 
     /// Periodic re-probe of the active server; keeps the latency reading
@@ -770,18 +887,29 @@ impl Shared {
                 std::thread::sleep(ACTIVE_PROBE_INTERVAL);
                 let active = {
                     let mut engine = oxidom_core::sync::lock(&shared.engine);
-                    let alive = engine
-                        .default_session_mut()
-                        .is_some_and(|session| session.is_alive());
-                    if engine.status() != Status::Connected || !alive {
-                        continue;
+                    let profiles = engine
+                        .sessions
+                        .iter()
+                        .map(|(profile, _)| profile.to_string())
+                        .collect::<Vec<_>>();
+                    let mut active = Vec::new();
+                    for profile in profiles {
+                        let Some(session) = engine.sessions.get_mut(&profile) else {
+                            continue;
+                        };
+                        if session.status() == Status::Connected
+                            && session.is_alive()
+                            && let Some(server_id) = session.server_id.clone()
+                        {
+                            active.push((profile, server_id));
+                        }
                     }
-                    engine.active_server_id()
+                    active
                 };
-                if let Some(id) = active {
-                    // `enqueue_probe` already refuses an id that is running or
-                    // waiting, so this cannot pile up behind a slow probe.
-                    shared.enqueue_probe(id);
+                for (profile, server_id) in active {
+                    // The queue refuses a profile already running or waiting,
+                    // so a slow session cannot pile up copies of itself.
+                    shared.enqueue_session_probe(profile, server_id);
                 }
             }
         });
@@ -796,9 +924,11 @@ impl Service {
     fn stop_profile(&self, profile: &str) -> fdo::Result<bool> {
         self.shared.clear_override(profile);
         self.shared.invalidate_generation(profile);
-        oxidom_core::sync::lock(&self.shared.engine)
+        let stopped = oxidom_core::sync::lock(&self.shared.engine)
             .remove_session(profile)
-            .map_err(failed)
+            .map_err(failed)?;
+        self.shared.prune_readings();
+        Ok(stopped)
     }
 
     fn stop_all_profiles(&self) -> fdo::Result<()> {
@@ -807,7 +937,9 @@ impl Service {
         oxidom_core::sync::lock(&self.shared.engine)
             .disconnect_all()
             .map(|_| ())
-            .map_err(failed)
+            .map_err(failed)?;
+        self.shared.prune_readings();
+        Ok(())
     }
 }
 
@@ -833,16 +965,7 @@ fn failed(error: impl std::fmt::Display) -> fdo::Error {
     fdo::Error::Failed(format!("{error:#}"))
 }
 
-/// The prober's route as the wire spells it. Kept as an explicit mapping so
-/// adding a route to one side is a compile error rather than a silent
-/// mislabelling of where a number came from.
-fn wire_route(route: probe::Route) -> ProbeRoute {
-    match route {
-        probe::Route::Direct => ProbeRoute::Direct,
-        probe::Route::Proxied => ProbeRoute::Proxied,
-    }
-}
-
+/// Translate the prober's richer local outcome into the stable wire failure.
 fn wire_failure(outcome: &probe::ProbeOutcome) -> ProbeFailure {
     match outcome {
         probe::ProbeOutcome::Unreachable => ProbeFailure::Unreachable,
@@ -1250,6 +1373,7 @@ impl Service {
             running,
             queued,
             readings: oxidom_core::sync::lock(&self.shared.readings).clone(),
+            proxied: oxidom_core::sync::lock(&self.shared.proxied).clone(),
         };
         json(&state)
     }
@@ -1309,9 +1433,9 @@ impl Service {
 
         let ports_changed = engine.registry.config.socks_port != config.socks_port
             || engine.registry.config.http_port != config.http_port;
-        let compatibility_profile = engine
-            .default_session()
-            .map(|session| session.profile.clone());
+        let compatibility_profile = engine.default_session().and_then(|session| {
+            (session.status() == Status::Connected).then(|| session.profile.clone())
+        });
         if config.system_proxy {
             if let Some(profile) = compatibility_profile.as_deref() {
                 engine
@@ -1332,6 +1456,7 @@ impl Service {
         }
         engine.save().map_err(failed)?;
         let mut reconnect_error = None;
+        let mut confirmation = None;
         if ports_changed && engine.status() == Status::Connected {
             // Same treatment as a user-driven connect: the restarted core has
             // to prove the new inbound is up before this counts as connected.
@@ -1342,17 +1467,23 @@ impl Service {
             {
                 let generation = self.shared.next_connect_generation("default");
                 match engine.connect_session("default", &active) {
-                    Ok(()) => {
-                        self.shared.confirm_connection(
-                            "default".to_string(),
-                            active,
-                            generation,
-                            ConnectionOrigin::Explicit,
-                        );
-                    }
+                    Ok(()) => confirmation = Some((active, generation)),
                     Err(error) => reconnect_error = Some(format!("{error:#}")),
                 }
             }
+        }
+        drop(engine);
+        if let Some((active, generation)) = confirmation {
+            let probe_token = oxidom_core::sync::lock(&self.shared.probes)
+                .start_now("default", &active)
+                .token;
+            self.shared.confirm_connection(
+                "default".to_string(),
+                active,
+                generation,
+                ConnectionOrigin::Explicit,
+                probe_token,
+            );
         }
         json(&ApplySettingsResult {
             reconnect_error,
@@ -1383,10 +1514,10 @@ fn spawn_core_supervisor(shared: Shared) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(CORE_WATCH_INTERVAL);
-            if let Some((profile, server_id)) = shared.note_core_death()
-                && let Some(generation) = shared.current_generation(&profile)
-            {
-                shared.begin_reconnect(profile, server_id, generation);
+            for (profile, server_id) in shared.note_core_deaths() {
+                if let Some(generation) = shared.current_generation(&profile) {
+                    shared.begin_reconnect(profile, server_id, generation);
+                }
             }
         }
     });
@@ -1542,7 +1673,14 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn drain_slots(queue: &mut ProbeQueue) -> Vec<String> {
+    fn enqueue_direct(queue: &mut ProbeQueue, server_id: &str) -> bool {
+        queue.enqueue(
+            ProbeTarget::Direct(server_id.to_string()),
+            server_id.to_string(),
+        )
+    }
+
+    fn drain_slots(queue: &mut ProbeQueue) -> Vec<ProbeJob> {
         std::iter::from_fn(|| queue.start_next()).collect()
     }
 
@@ -1628,14 +1766,53 @@ mod tests {
         }
 
         assert_eq!(
-            service.shared.note_core_death(),
-            Some(("default".to_string(), "dead-server".to_string()))
+            service.shared.note_core_deaths(),
+            vec![("default".to_string(), "dead-server".to_string())]
         );
         assert!(matches!(
             oxidom_core::sync::lock(&service.shared.engine).status(),
             Status::Error(message) if message == "Xray exited unexpectedly"
         ));
-        assert_eq!(service.shared.note_core_death(), None);
+        assert!(service.shared.note_core_deaths().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn every_dead_session_is_noticed_and_releases_the_system_proxy() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("all-dead-cores")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            for (profile, server) in [("home", "same"), ("work", "same")] {
+                mark_active(&mut engine, profile, server)?;
+                *oxidom_core::sync::lock(
+                    &engine
+                        .sessions
+                        .get(profile)
+                        .context("test session")?
+                        .core
+                        .status,
+                ) = Status::Connected;
+            }
+            engine.sessions.claim_system_proxy("home")?;
+        }
+
+        assert_eq!(
+            service.shared.note_core_deaths(),
+            vec![
+                ("home".to_string(), "same".to_string()),
+                ("work".to_string(), "same".to_string()),
+            ]
+        );
+        let engine = oxidom_core::sync::lock(&service.shared.engine);
+        assert!(engine.sessions.owner_of_system_proxy().is_none());
+        assert!(matches!(
+            engine.sessions.get("home").map(|session| session.status()),
+            Some(Status::Error(message)) if message == CORE_EXITED_MESSAGE
+        ));
+        drop(engine);
+        assert!(service.shared.note_core_deaths().is_empty());
         Ok(())
     }
 
@@ -1854,6 +2031,13 @@ mod tests {
                 .get("work")
                 .is_none()
         );
+        assert!(service.down_profile("home".to_string())?);
+        assert!(
+            oxidom_core::sync::lock(&service.shared.engine)
+                .sessions
+                .owner_of_system_proxy()
+                .is_none()
+        );
         Ok(())
     }
 
@@ -2068,7 +2252,7 @@ mod tests {
     fn probes_past_the_cap_stay_queued() {
         let mut queue = ProbeQueue::default();
         for index in 0..MAX_CONCURRENT_PROBES + 3 {
-            assert!(queue.enqueue(format!("s{index}")));
+            assert!(enqueue_direct(&mut queue, &format!("s{index}")));
         }
         let started = drain_slots(&mut queue);
         assert_eq!(started.len(), MAX_CONCURRENT_PROBES);
@@ -2078,7 +2262,7 @@ mod tests {
         assert_eq!(queued.len(), 3);
 
         // A slot freeing up lets exactly one more through.
-        queue.finish(&started[0]);
+        queue.finish(started[0].token);
         assert!(queue.start_next().is_some());
         assert_eq!(queue.snapshot().1.len(), 2);
     }
@@ -2086,12 +2270,55 @@ mod tests {
     #[test]
     fn an_id_is_never_queued_twice() {
         let mut queue = ProbeQueue::default();
-        assert!(queue.enqueue("a".into()));
-        assert!(!queue.enqueue("a".into()), "already waiting");
+        assert!(enqueue_direct(&mut queue, "a"));
+        assert!(!enqueue_direct(&mut queue, "a"), "already waiting");
         queue.start_next();
-        assert!(!queue.enqueue("a".into()), "already running");
-        queue.finish("a");
-        assert!(queue.enqueue("a".into()), "free to measure again");
+        assert!(!enqueue_direct(&mut queue, "a"), "already running");
+        let token = queue.running.values().next().unwrap().token;
+        queue.finish(token);
+        assert!(enqueue_direct(&mut queue, "a"), "free to measure again");
+    }
+
+    #[test]
+    fn two_profiles_on_one_server_get_independent_probe_jobs() {
+        let mut queue = ProbeQueue::default();
+        assert!(queue.enqueue(ProbeTarget::Proxied("home".to_string()), "same".to_string(),));
+        assert!(queue.enqueue(ProbeTarget::Proxied("work".to_string()), "same".to_string(),));
+        assert!(!queue.enqueue(ProbeTarget::Proxied("home".to_string()), "same".to_string(),));
+
+        let jobs = drain_slots(&mut queue);
+        assert_eq!(jobs.len(), 2);
+        assert_ne!(jobs[0].target, jobs[1].target);
+    }
+
+    #[test]
+    fn proxied_readings_cross_the_wire_independently_by_profile() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("proxied-reading-keys")?;
+        let service = for_test();
+        oxidom_core::sync::lock(&service.shared.proxied).extend([
+            (
+                "home".to_string(),
+                LatencyReading::ok(41, ProbeRoute::Proxied, LatencyMethod::HttpGet),
+            ),
+            (
+                "work".to_string(),
+                LatencyReading::ok(83, ProbeRoute::Proxied, LatencyMethod::HttpGet),
+            ),
+        ]);
+
+        let state: ProbeState = serde_json::from_str(&service.probe_state()?)?;
+
+        assert_eq!(
+            state.proxied.get("home").and_then(|reading| reading.value),
+            Some(41)
+        );
+        assert_eq!(
+            state.proxied.get("work").and_then(|reading| reading.value),
+            Some(83)
+        );
+        assert!(state.readings.is_empty());
+        Ok(())
     }
 
     /// The confirmation after a connect decides whether the tunnel the user is
@@ -2100,12 +2327,15 @@ mod tests {
     fn a_confirmation_probe_jumps_the_queue_and_the_cap() {
         let mut queue = ProbeQueue::default();
         for index in 0..MAX_CONCURRENT_PROBES {
-            queue.enqueue(format!("s{index}"));
+            enqueue_direct(&mut queue, &format!("s{index}"));
         }
         drain_slots(&mut queue);
-        queue.enqueue("active".into());
+        queue.enqueue(
+            ProbeTarget::Proxied("default".to_string()),
+            "active".to_string(),
+        );
 
-        queue.start_now("active");
+        queue.start_now("default", "active");
         let (running, queued) = queue.snapshot();
         assert!(running.contains(&"active".to_string()));
         assert!(!queued.contains(&"active".to_string()), "no double start");
@@ -2116,11 +2346,11 @@ mod tests {
     #[test]
     fn removed_servers_leave_the_queue() {
         let mut queue = ProbeQueue::default();
-        queue.enqueue("gone".into());
-        queue.enqueue("kept".into());
+        enqueue_direct(&mut queue, "gone");
+        enqueue_direct(&mut queue, "kept");
         queue.start_next();
 
-        queue.retain_alive(&HashSet::from(["kept".to_string()]));
+        queue.retain_alive(&HashSet::from(["kept".to_string()]), &HashSet::new());
         let (_, queued) = queue.snapshot();
         assert_eq!(queued, vec!["kept".to_string()]);
     }
@@ -2130,10 +2360,10 @@ mod tests {
     #[test]
     fn a_running_probe_keeps_its_slot_through_a_prune() {
         let mut queue = ProbeQueue::default();
-        queue.enqueue("gone".into());
+        enqueue_direct(&mut queue, "gone");
         let started = queue.start_next().unwrap();
 
-        queue.retain_alive(&HashSet::new());
-        assert_eq!(queue.snapshot().0, vec![started]);
+        queue.retain_alive(&HashSet::new(), &HashSet::new());
+        assert_eq!(queue.snapshot().0, vec![started.server_id]);
     }
 }

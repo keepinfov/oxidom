@@ -16,7 +16,8 @@ use oxidom_core::cli_json::{
 use oxidom_core::client::DaemonClient;
 use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
-    PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry, SessionInfo,
+    LatencyReading, PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry,
+    SessionInfo,
 };
 use oxidom_core::model::{Server, Subscription};
 use oxidom_core::profile::{Profile, ProfileProxy};
@@ -207,7 +208,7 @@ fn status(profile: Option<&str>, json: bool) -> CliResult {
     };
     let (session, server) = connected_session(&client, profile)?;
     let probes = client.probe_state().map_err(Failure::error)?;
-    let latency_ms = current_latency(&probes, &server.id);
+    let latency_ms = current_latency(&probes, &session.profile, &server.id);
     let output = StatusOutput::new(&session, Some(&server), latency_ms);
 
     if json {
@@ -232,8 +233,14 @@ fn ip(profile: Option<&str>, egress: bool, fresh: bool) -> CliResult {
             .address
             .parse()
             .map_err(|error| Failure::message(format!("invalid session address: {error}")))?;
-        oxidom_core::egress::address(&server.id, bind, session.socks_port, fresh)
-            .map_err(Failure::error)?
+        oxidom_core::egress::address(
+            &session.profile,
+            &server.id,
+            bind,
+            session.socks_port,
+            fresh,
+        )
+        .map_err(Failure::error)?
     } else {
         endpoint_ip(&server)?
     };
@@ -292,7 +299,7 @@ fn print_sessions(client: &DaemonClient, json: bool) -> CliResult {
                     session
                         .server_id
                         .as_deref()
-                        .and_then(|server_id| current_latency(&probes, server_id))
+                        .and_then(|server_id| current_latency(&probes, &session.profile, server_id))
                 })
                 .flatten();
             SessionOutput::new(session, latency)
@@ -422,7 +429,8 @@ fn ping(handle: &str) -> CliResult {
         let pending = probes.running.iter().any(|id| id == &server.id)
             || probes.queued.iter().any(|id| id == &server.id);
         if !pending {
-            return print_probe_result(&probes, server);
+            let sessions = client.list_sessions().map_err(Failure::error)?;
+            return print_probe_result(&probes, &sessions, server);
         }
         if Instant::now() >= deadline {
             return Err(Failure::message(format!(
@@ -435,8 +443,8 @@ fn ping(handle: &str) -> CliResult {
     }
 }
 
-fn print_probe_result(probes: &ProbeState, server: &Server) -> CliResult {
-    let reading = probes.readings.get(&server.id).ok_or_else(|| {
+fn print_probe_result(probes: &ProbeState, sessions: &[SessionInfo], server: &Server) -> CliResult {
+    let reading = probe_reading_for_server(probes, sessions, &server.id).ok_or_else(|| {
         Failure::message(format!(
             "daemon finished the probe for {} without a reading",
             display_handle(server)
@@ -458,6 +466,20 @@ fn print_probe_result(probes: &ProbeState, server: &Server) -> CliResult {
         "{}: {reason}",
         display_handle(server)
     )))
+}
+
+fn probe_reading_for_server<'a>(
+    probes: &'a ProbeState,
+    sessions: &[SessionInfo],
+    server_id: &str,
+) -> Option<&'a LatencyReading> {
+    sessions
+        .iter()
+        .find(|session| {
+            session.state == "connected" && session.server_id.as_deref() == Some(server_id)
+        })
+        .and_then(|session| probes.proxied.get(&session.profile))
+        .or_else(|| probes.readings.get(server_id))
 }
 
 fn set_alias(handle: &str, new: &str) -> CliResult {
@@ -663,18 +685,29 @@ fn display_handle(server: &Server) -> &str {
     server.alias.as_deref().unwrap_or(server.id.as_str())
 }
 
-fn current_latency(probes: &ProbeState, server_id: &str) -> Option<u32> {
+fn current_latency(probes: &ProbeState, profile: &str, server_id: &str) -> Option<u32> {
     if probes.version < PROBE_STATE_VERSION
         || probes.running.iter().any(|id| id == server_id)
         || probes.queued.iter().any(|id| id == server_id)
     {
         return None;
     }
-    probes.readings.get(server_id).and_then(|reading| {
-        (reading.route == ProbeRoute::Proxied && reading.failure.is_none())
-            .then_some(reading.value)
-            .flatten()
-    })
+    probes
+        .proxied
+        .get(profile)
+        // Compatibility with an A2 daemon, which stored the active tunnel
+        // reading under the server id before the additive `proxied` field.
+        .or_else(|| {
+            probes
+                .readings
+                .get(server_id)
+                .filter(|reading| reading.route == ProbeRoute::Proxied)
+        })
+        .and_then(|reading| {
+            (reading.route == ProbeRoute::Proxied && reading.failure.is_none())
+                .then_some(reading.value)
+                .flatten()
+        })
 }
 
 fn endpoint_ip(server: &Server) -> CliResult<IpAddr> {
@@ -781,5 +814,43 @@ mod tests {
              export NO_PROXY=localhost,127.0.0.0/8,::1\n\
              export no_proxy=localhost,127.0.0.0/8,::1\n"
         );
+    }
+
+    #[test]
+    fn proxied_probe_results_are_selected_by_profile_before_direct_cache() {
+        let direct = LatencyReading::ok(
+            10,
+            ProbeRoute::Direct,
+            oxidom_core::config::LatencyMethod::Tcp,
+        );
+        let proxied = LatencyReading::ok(
+            20,
+            ProbeRoute::Proxied,
+            oxidom_core::config::LatencyMethod::HttpGet,
+        );
+        let probes = ProbeState {
+            version: PROBE_STATE_VERSION,
+            readings: std::collections::HashMap::from([("same".to_string(), direct)]),
+            proxied: std::collections::HashMap::from([("work".to_string(), proxied)]),
+            ..ProbeState::default()
+        };
+        let sessions = [SessionInfo {
+            profile: "work".to_string(),
+            state: "connected".to_string(),
+            server_id: Some("same".to_string()),
+            ..SessionInfo::default()
+        }];
+
+        assert_eq!(
+            probe_reading_for_server(&probes, &sessions, "same").map(|reading| reading.value),
+            Some(Some(20))
+        );
+
+        let legacy = ProbeState {
+            version: PROBE_STATE_VERSION,
+            readings: std::collections::HashMap::from([("same".to_string(), proxied)]),
+            ..ProbeState::default()
+        };
+        assert_eq!(current_latency(&legacy, "work", "same"), Some(20));
     }
 }
