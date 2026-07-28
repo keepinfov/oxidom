@@ -64,6 +64,10 @@ impl Nft {
     }
 }
 
+/// nft identifiers are bare words: quoting one is a syntax error, not extra
+/// safety. `profile::valid_name` admits only `[a-z0-9_-]`, which is exactly
+/// what the nft scanner accepts as a name, so the guard below is what lets the
+/// result be interpolated unquoted.
 fn chain_name(profile: &str) -> Result<String> {
     if !crate::profile::valid_name(profile) {
         bail!("invalid profile name {profile:?}");
@@ -88,7 +92,7 @@ fn quote(value: &str) -> Result<String> {
 /// deterministic chain before re-adding its one rule makes retries and daemon
 /// recovery safe while leaving every foreign nftables object untouched.
 pub fn install_ruleset(profile: &str, slice: &CgroupSlice, mark: u32) -> Result<String> {
-    let chain = quote(&chain_name(profile)?)?;
+    let chain = chain_name(profile)?;
     Ok(format!(
         "add table inet oxidom\n\
          add chain inet oxidom {chain} {{ type route hook output priority mangle; policy accept; }}\n\
@@ -104,7 +108,7 @@ pub fn install_ruleset(profile: &str, slice: &CgroupSlice, mark: u32) -> Result<
 /// partial start or a previous cleanup. The table itself is intentionally
 /// retained as oxidom's private container for other live profile chains.
 pub fn remove_ruleset(profile: &str) -> Result<String> {
-    let chain = quote(&chain_name(profile)?)?;
+    let chain = chain_name(profile)?;
     Ok(format!(
         "add table inet oxidom\n\
          add chain inet oxidom {chain} {{ type route hook output priority mangle; policy accept; }}\n\
@@ -124,9 +128,9 @@ mod tests {
         assert_eq!(
             ruleset,
             "add table inet oxidom\n\
-             add chain inet oxidom \"profile_work\" { type route hook output priority mangle; policy accept; }\n\
-             flush chain inet oxidom \"profile_work\"\n\
-             add rule inet oxidom \"profile_work\" socket cgroupv2 level 4 \
+             add chain inet oxidom profile_work { type route hook output priority mangle; policy accept; }\n\
+             flush chain inet oxidom profile_work\n\
+             add rule inet oxidom profile_work socket cgroupv2 level 4 \
              \"user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice\" meta mark set \
              0x6f21 comment \"oxidom profile work\"\n"
         );
@@ -154,15 +158,22 @@ mod tests {
     #[test]
     fn removal_only_destroys_the_profiles_own_chain() {
         let ruleset = remove_ruleset("work").unwrap();
-        assert!(ruleset.contains("destroy chain inet oxidom \"profile_work\""));
+        assert!(ruleset.contains("destroy chain inet oxidom profile_work"));
         assert!(!ruleset.contains("profile_home"));
     }
 
+    /// A chain name is an nft identifier, and identifiers are bare words —
+    /// quoting one is a syntax error that rejected the whole ruleset, so no
+    /// profile could ever be marked. A dash needs no quoting to survive.
     #[test]
-    fn hyphens_in_profile_names_stay_inside_a_quoted_chain_identifier() {
+    fn chain_identifiers_are_never_quoted() {
         let slice = crate::run::user_slice("client-work", 1000).unwrap();
         let ruleset = install_ruleset("client-work", &slice, 0x6f21).unwrap();
-        assert!(ruleset.contains("chain inet oxidom \"profile_client-work\""));
+        assert!(ruleset.contains("chain inet oxidom profile_client-work "));
+        assert!(
+            !ruleset.contains("\"profile_client-work\""),
+            "chain identifiers must not be quoted: {ruleset}"
+        );
     }
 
     #[test]

@@ -1334,7 +1334,14 @@ fn cleanup_live_interface(interface: &mut Interface, delete_device: bool) -> Res
     // cannot do that atomically, leave the routing domain intact rather than
     // silently releasing marked traffic onto the ordinary default route.
     if interface.cgroup.is_some() {
-        Nft::new(interface.nft_binary.clone()).remove(&interface.profile)?;
+        let removed = Nft::new(interface.nft_binary.clone()).remove(&interface.profile);
+        // Refusing teardown only makes sense while a mark rule is actually
+        // assigning traffic. A profile whose install failed has no rule to
+        // release, and treating that as fatal strands its device: the removal
+        // fails again on every `down`, so nothing can ever bring it back.
+        if interface.nft_active {
+            removed?;
+        }
         interface.nft_active = false;
     }
     interface.tun2socks.stop();
