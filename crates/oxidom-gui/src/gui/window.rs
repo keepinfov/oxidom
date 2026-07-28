@@ -317,6 +317,15 @@ pub fn start(
     }
     gtk::Window::set_default_icon_name(APP_ID);
 
+    // Taken before anything is shown: GTK gives the id to the first window
+    // that maps and forgets it, and the first window here is a splash that
+    // does not survive. The real window claims it again below.
+    let startup_id = gtk::gdk::Display::default().and_then(|display| {
+        display
+            .startup_notification_id()
+            .map(|id| id.as_str().to_string())
+    });
+
     // `--background` shows nothing by definition, so it gets no splash either;
     // its progress goes to the log.
     let cancelled = Rc::new(Cell::new(false));
@@ -336,6 +345,7 @@ pub fn start(
 
     let app = app.clone();
     let on_ready = Rc::new(on_ready);
+    let mut startup_id = startup_id;
     glib::timeout_add_local(STARTUP_POLL, move || {
         if cancelled.get() {
             return glib::ControlFlow::Break;
@@ -354,12 +364,23 @@ pub fn start(
                 Err("the daemon connection ended without an answer".to_string())
             }
         };
-        if let Some(splash) = splash.borrow_mut().take() {
-            splash.dismiss();
-        }
         match outcome {
-            Ok(client) => on_ready(Some(build(&app, background, client))),
+            Ok(client) => {
+                // Built and presented *before* the splash comes down. Taking
+                // the splash away first leaves the application with no window
+                // at all for a moment, and a desktop that follows a launch by
+                // watching for its window sees the launch abandoned rather
+                // than finished — which is a busy cursor that never clears.
+                let window = build(&app, background, client, startup_id.take());
+                if let Some(splash) = splash.borrow_mut().take() {
+                    splash.dismiss();
+                }
+                on_ready(Some(window));
+            }
             Err(message) => {
+                if let Some(splash) = splash.borrow_mut().take() {
+                    splash.dismiss();
+                }
                 show_daemon_error(&app, &message);
                 on_ready(None);
             }
@@ -401,7 +422,12 @@ fn refresh_profiles_after<R>(client: &DaemonClient, result: R) -> (R, Vec<Profil
     (result, client.list_profiles().unwrap_or_default())
 }
 
-fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw::ApplicationWindow {
+fn build(
+    app: &adw::Application,
+    background: bool,
+    client: DaemonClient,
+    startup_id: Option<String>,
+) -> adw::ApplicationWindow {
     if client.source() != DaemonSource::System {
         log::info!(
             "driving a session daemon ({:?}); its subscriptions are stored per-user",
@@ -697,7 +723,21 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
     });
 
     if !background {
+        // The window the launcher is waiting for is not the first one this
+        // process shows. GTK hands the startup id to whatever maps first —
+        // here the splash, which is then destroyed — and the desktop is left
+        // with a launch that never finished and a busy cursor to match.
+        // Adopting the id here has to happen before the window maps; after
+        // that it is ignored.
+        if let Some(startup_id) = &startup_id {
+            window.set_startup_id(startup_id);
+        }
         window.present();
+    } else if let Some(startup_id) = &startup_id {
+        // Nothing will ever map, so nothing would ever end the sequence.
+        if let Some(display) = gtk::gdk::Display::default() {
+            display.notify_startup_complete(startup_id);
+        }
     }
 
     // Repair a system proxy left over from a previous GUI run and reflect
