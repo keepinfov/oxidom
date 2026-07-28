@@ -430,6 +430,12 @@ forgotten.
 system daemon (and only it) requires `CAP_NET_ADMIN`; the NixOS module grants it only with
 `services.oxidom.tun.enable = true` and keeps `oxi-*` unmanaged by NetworkManager.
 
+The daemon unit sets `KillMode=process` because the Xray cores, not the daemon, carry the
+traffic. Under systemd's default the whole cgroup dies with the daemon, so a crash drops every
+tunnel and the restarted daemon finds nothing to adopt — which silently made the pool-adoption
+path in `recover()` unreachable in production. A clean stop still tears the cores down through
+the daemon's own signal handler, and anything that leaks is reaped on the next start.
+
 - Device names default to `oxi-<profile>` and fit Linux's 15-byte IFNAMSIZ payload; an explicit
   valid `device` is required for longer profile names.
 - Device addresses are stable `198.18.<c>.<d>/32` values from the RFC 2544 benchmark block.

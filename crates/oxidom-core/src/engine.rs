@@ -737,22 +737,34 @@ impl Engine {
                     saved.profile
                 );
             }
-            let core_clean = adopted_pool.is_some() || saved.xray_pid.is_none_or(|pid| {
-                if kill_stale_xray(pid, &saved.profile) {
-                    log::info!(
-                        "stopped orphaned xray process {pid} for profile {:?} from a previous run",
-                        saved.profile
-                    );
-                    true
-                } else {
-                    log::warn!(
-                        "could not confirm that orphaned xray process {pid} for profile {:?} \
+            let core_clean = adopted_pool.is_some()
+                || saved.xray_pid.is_none_or(|pid| {
+                    if kill_stale_xray(pid, &saved.profile) {
+                        // A PID that is simply gone also counts as clean, and
+                        // claiming to have stopped it sent one debugging session
+                        // looking for a killer that never existed.
+                        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                            log::info!(
+                                "stopped orphaned xray process {pid} for profile {:?} from a \
+                             previous run",
+                                saved.profile
+                            );
+                        } else {
+                            log::info!(
+                                "xray process {pid} for profile {:?} was already gone",
+                                saved.profile
+                            );
+                        }
+                        true
+                    } else {
+                        log::warn!(
+                            "could not confirm that orphaned xray process {pid} for profile {:?} \
                          stopped",
-                        saved.profile
-                    );
-                    false
-                }
-            });
+                            saved.profile
+                        );
+                        false
+                    }
+                });
             let interface_clean = saved.interface.as_ref().is_none_or(|interface| {
                 match recover_interface(&saved.profile, interface, &self.registry.config.nft_binary)
                 {

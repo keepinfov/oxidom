@@ -136,6 +136,15 @@ in {
           StateDirectory = "oxidom";
           Restart = "on-failure";
           RestartSec = 2;
+          # The Xray cores carry the traffic; the daemon only supervises them.
+          # Under the default control-group killing, a daemon crash takes every
+          # tunnel down with it and the restarted daemon has nothing left to
+          # adopt — including the `default` session that redsocks points at.
+          # Only the main process is signalled, so a crash costs a few seconds
+          # of supervision rather than the connection. A clean stop still tears
+          # the cores down, because the daemon's own SIGTERM handler does it;
+          # anything that does leak is reaped by `recover()` on the next start.
+          KillMode = "process";
           NoNewPrivileges = true;
           ProtectHome = true;
           ProtectSystem = "strict";
