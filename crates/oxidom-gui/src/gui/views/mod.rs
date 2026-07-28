@@ -1,8 +1,9 @@
 use adw::prelude::*;
 
 pub mod logs;
-pub mod profiles;
+pub mod profile_dialog;
 pub mod servers;
+pub mod sessions;
 pub mod settings;
 pub mod subscriptions;
 

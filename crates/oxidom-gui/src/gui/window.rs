@@ -20,14 +20,15 @@ use oxidom_core::{paths, sysproxy};
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     Effect, PolledSnapshot, ProbeWait, SnapshotState, active_latency_for, latency_states,
-    other_sessions_message, reduce,
+    other_sessions_message, reduce, session_rows,
 };
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
 use super::tray::{OxidomTray, TrayCommand};
 use super::views::logs::LogsView;
-use super::views::profiles::{ProfileCallbacks, ProfilesView, server_choices};
+use super::views::profile_dialog::server_choices;
 use super::views::servers::{CardConnection, ServersView};
+use super::views::sessions::{SessionCallbacks, SessionsView};
 use super::views::settings::{SettingsValues, SettingsView};
 use super::views::subscriptions::SubscriptionsView;
 use oxidom_core::client::{ConnectStage, DaemonClient, DaemonSource};
@@ -159,7 +160,7 @@ struct Controller {
     sidebar_status_label: gtk::Label,
     sidebar_list: gtk::ListBox,
     servers: ServersView,
-    profiles: ProfilesView,
+    sessions: SessionsView,
     subscriptions: SubscriptionsView,
     settings: SettingsView,
     logs: LogsView,
@@ -415,9 +416,9 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         ui: SnapshotState::new(&initial_status),
     }));
 
-    let profiles = ProfilesView::new();
-    profiles.set_header_actions_embedded(false);
-    let profile_actions = profiles.header_actions();
+    let sessions = SessionsView::new();
+    sessions.set_header_actions_embedded(false);
+    let profile_actions = sessions.header_actions();
     profile_actions.set_visible(false);
     let subscriptions = SubscriptionsView::new();
     subscriptions.set_header_actions_embedded(false);
@@ -431,7 +432,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         .hexpand(true)
         .build();
     stack.add_named(&servers.root, Some(Page::General.stack_name()));
-    stack.add_named(&profiles.root, Some(Page::Profiles.stack_name()));
+    stack.add_named(&sessions.root, Some(Page::Sessions.stack_name()));
     stack.add_named(&subscriptions.root, Some(Page::Subscriptions.stack_name()));
 
     let settings_callback: Rc<RefCell<Option<SettingsCallback>>> = Rc::new(RefCell::new(None));
@@ -606,7 +607,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         sidebar_status_label: sidebar.status_label,
         sidebar_list: sidebar.list,
         servers,
-        profiles,
+        sessions,
         subscriptions,
         settings,
         logs,
@@ -752,7 +753,7 @@ impl Controller {
         );
         for (index, page) in [
             Page::General,
-            Page::Profiles,
+            Page::Sessions,
             Page::Subscriptions,
             Page::Settings,
             Page::Logs,
@@ -952,15 +953,56 @@ impl Controller {
         dialog.present();
     }
 
-    fn show_page(&self, page: Page) {
+    fn show_page(self: &Rc<Self>, page: Page) {
         if self.is_general_page() {
             self.remember_visible_search();
         }
         self.stack.set_visible_child_name(page.stack_name());
         self.sync_search_chrome();
+        if page == Page::Sessions {
+            self.refresh_profiles_from_daemon();
+        }
         if self.split.is_collapsed() {
             self.split.set_show_sidebar(false);
         }
+    }
+
+    /// Profiles are daemon-owned files and can change through the CLI while
+    /// the window stays open, so entering Sessions takes a fresh snapshot
+    /// without making the GTK main loop wait on D-Bus.
+    fn refresh_profiles_from_daemon(self: &Rc<Self>) {
+        let client = self.state.borrow().client.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = client.list_profiles().map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(40), move || {
+            match receiver.try_recv() {
+                Ok(Ok(profiles)) => {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.state.borrow_mut().profiles = profiles;
+                        controller.rebuild_sessions();
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.show_message(&format!("Could not refresh profiles: {error}"));
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.show_message("Profile refresh stopped unexpectedly");
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
     }
 
     fn is_general_page(&self) -> bool {
@@ -1012,7 +1054,7 @@ impl Controller {
     fn sync_search_chrome(&self) {
         let general = self.is_general_page();
         let profiles =
-            self.stack.visible_child_name().as_deref() == Some(Page::Profiles.stack_name());
+            self.stack.visible_child_name().as_deref() == Some(Page::Sessions.stack_name());
         let subscriptions =
             self.stack.visible_child_name().as_deref() == Some(Page::Subscriptions.stack_name());
         let settings =
@@ -1062,7 +1104,7 @@ impl Controller {
             self.sidebar_toggle.set_visible(false);
         }
 
-        self.profiles.set_ultra_compact(enabled);
+        self.sessions.set_ultra_compact(enabled);
         self.subscriptions.set_ultra_compact(enabled);
         self.settings.set_ultra_compact(enabled);
         self.header.set_show_title(!enabled);
@@ -1124,31 +1166,26 @@ impl Controller {
         self.window.add_breakpoint(breakpoint);
     }
 
-    fn rebuild_profiles(self: &Rc<Self>) {
-        let (profiles, choices, active, connected, operation) = {
+    fn rebuild_sessions(self: &Rc<Self>) {
+        let (profiles, choices, rows, operation) = {
             let state = self.state.borrow();
             (
                 state.profiles.clone(),
                 server_choices(&state.subscriptions),
-                state.ui.active_profile.clone(),
-                matches!(state.ui.current_status(), Status::Connected),
+                session_rows(&state.profiles, &state.ui, ipc::now_unix_ms()),
                 state.ui.operation.clone(),
             )
         };
-        let callbacks = ProfileCallbacks {
-            up: {
+        let callbacks = SessionCallbacks {
+            toggle: {
                 let weak = Rc::downgrade(self);
-                Rc::new(move |name| {
+                Rc::new(move |name, active| {
                     if let Some(controller) = weak.upgrade() {
-                        controller.up_profile(name);
-                    }
-                })
-            },
-            down: {
-                let weak = Rc::downgrade(self);
-                Rc::new(move |name| {
-                    if let Some(controller) = weak.upgrade() {
-                        controller.down_profile(name);
+                        if active {
+                            controller.up_profile(name);
+                        } else {
+                            controller.down_profile(name);
+                        }
                     }
                 })
             },
@@ -1169,9 +1206,20 @@ impl Controller {
                 })
             },
         };
-        self.profiles
-            .rebuild(&profiles, &choices, active.as_deref(), connected, callbacks);
-        self.profiles.set_operation(operation);
+        self.sessions.rebuild(&profiles, &choices, &rows, callbacks);
+        self.sessions.set_operation(operation);
+    }
+
+    fn sync_session_rows(self: &Rc<Self>) {
+        let rows = {
+            let state = self.state.borrow();
+            session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
+        };
+        // The profile list itself changed under the page — only a full rebuild
+        // can hand each row the profile its dialog edits.
+        if !self.sessions.set_rows(&rows) {
+            self.rebuild_sessions();
+        }
     }
 
     fn rebuild_views(self: &Rc<Self>) {
@@ -1251,7 +1299,7 @@ impl Controller {
             &latency_states,
             callbacks,
         );
-        self.rebuild_profiles();
+        self.rebuild_sessions();
 
         let sub_callbacks = super::views::subscriptions::SubscriptionCallbacks {
             add: {
@@ -1496,7 +1544,7 @@ impl Controller {
             failed: None,
         });
         self.servers.set_selected(Some(&server_id));
-        self.rebuild_profiles();
+        self.rebuild_sessions();
         self.refresh_status();
         let work_id = server_id.clone();
         let failed_id = server_id.clone();
@@ -1525,7 +1573,7 @@ impl Controller {
                         connecting: None,
                         failed: Some(failed_id.clone()),
                     });
-                    controller.rebuild_profiles();
+                    controller.rebuild_sessions();
                     // The daemon reports the same failure on its next poll;
                     // claim it now so it is not toasted twice.
                     controller.mark_error_notified(&message);
@@ -1550,7 +1598,7 @@ impl Controller {
         }
         self.bump_epoch();
         self.set_cards_connection(CardConnection::default());
-        self.rebuild_profiles();
+        self.rebuild_sessions();
         self.refresh_status();
         self.client_job(
             UiOperation::new(UiOperationKind::Disconnect),
@@ -1657,7 +1705,7 @@ impl Controller {
                             failed: None,
                         });
                         controller.servers.set_selected(Some(&server_id));
-                        controller.rebuild_profiles();
+                        controller.rebuild_sessions();
                         if !result.ignored_ports.is_empty() {
                             controller.show_message(&format!(
                                 "{} left unchanged — fixed by the system service unit",
@@ -1702,7 +1750,7 @@ impl Controller {
                 };
                 match operation {
                     Ok(false) => {
-                        controller.rebuild_profiles();
+                        controller.rebuild_sessions();
                         controller.show_message(&format!(
                             "«{message_name}» is not the profile running the tunnel"
                         ));
@@ -1718,12 +1766,12 @@ impl Controller {
                         }
                         controller.bump_epoch();
                         controller.set_cards_connection(CardConnection::default());
-                        controller.rebuild_profiles();
+                        controller.rebuild_sessions();
                         controller.refresh_status();
                         controller.reconcile_system_proxy();
                     }
                     Err(error) => {
-                        controller.rebuild_profiles();
+                        controller.rebuild_sessions();
                         controller.show_message(&format!(
                             "Could not disconnect «{message_name}»: {error}"
                         ));
@@ -1973,7 +2021,7 @@ impl Controller {
             }
             state.ui.operation = Some(operation.clone());
         }
-        self.profiles.set_operation(Some(operation.clone()));
+        self.sessions.set_operation(Some(operation.clone()));
         self.subscriptions.set_operation(Some(operation));
         self.refresh_activity_status();
 
@@ -2022,7 +2070,7 @@ impl Controller {
                         // its deadline.
                         state.ui.operation = None;
                     }
-                    controller.profiles.set_operation(None);
+                    controller.sessions.set_operation(None);
                     controller.subscriptions.set_operation(None);
                     // The handler runs *before* the snapshot is applied: it is
                     // where a failed connect pins its outcome, and applying
@@ -2053,7 +2101,7 @@ impl Controller {
                         state.ui.operation = None;
                         drop(state);
                         controller.bump_epoch();
-                        controller.profiles.set_operation(None);
+                        controller.sessions.set_operation(None);
                         controller.subscriptions.set_operation(None);
                         controller.show_message("Background operation stopped unexpectedly");
                         controller.refresh_status();
@@ -2137,24 +2185,15 @@ impl Controller {
     }
 
     fn apply_snapshot(self: &Rc<Self>, snapshot: PolledSnapshot) {
-        let (effects, profile_state_changed) = {
+        let effects = {
             let mut state = self.state.borrow_mut();
-            let before = (
-                state.ui.active_profile.clone(),
-                matches!(state.ui.current_status(), Status::Connected),
-            );
-            let effects = reduce(
+            reduce(
                 &mut state.ui,
                 &snapshot,
                 Instant::now(),
                 ipc::now_unix_ms(),
                 self.window.is_visible(),
-            );
-            let after = (
-                state.ui.active_profile.clone(),
-                matches!(state.ui.current_status(), Status::Connected),
-            );
-            (effects, before != after)
+            )
         };
         // A round that predates the user's last action is dropped whole — logs,
         // cards and the system-proxy reconciliation included.
@@ -2189,9 +2228,7 @@ impl Controller {
             self.probe_one(id, false);
         }
         self.logs.set_logs(&snapshot.logs);
-        if profile_state_changed {
-            self.rebuild_profiles();
-        }
+        self.sync_session_rows();
         self.sync_connection_cards();
         self.reconcile_system_proxy();
         self.refresh_status();
@@ -2837,8 +2874,17 @@ fn install_css() {
         .latency-error { color: @error_color; background: alpha(@error_color, 0.13); }
         .latency-offline { color: @warning_color; background: alpha(@warning_color, 0.13); }
         .status-badge { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; font-weight: 600; }
+        .status-badge.status-neutral { color: alpha(@window_fg_color, 0.68); background: alpha(@window_fg_color, 0.07); }
         .status-badge.status-working { color: @accent_color; background: alpha(@accent_color, 0.13); }
+        .status-badge.status-connected { color: @success_color; background: alpha(@success_color, 0.14); }
         .status-badge.status-error { color: @error_color; background: alpha(@error_color, 0.13); }
+        .session-chip { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; background: alpha(@window_fg_color, 0.07); }
+        .session-chip-interface { color: @accent_color; background: alpha(@accent_color, 0.12); }
+        .session-chip-inbound { color: alpha(@window_fg_color, 0.78); }
+        .session-chip-latency { color: @success_color; background: alpha(@success_color, 0.14); }
+        .session-chip-system-proxy { color: @warning_color; background: alpha(@warning_color, 0.13); }
+        .session-chip-proxy-only { color: alpha(@window_fg_color, 0.62); }
+        .dns-leak-banner { color: @error_color; }
         /* An inset ring rather than a border: `.server-card` is a fixed-height
            frame with overflow hidden, and a real border would eat 2px of the
            content it clips. */

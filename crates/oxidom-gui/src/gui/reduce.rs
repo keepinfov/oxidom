@@ -18,7 +18,7 @@ use oxidom_core::ipc::{
 use oxidom_core::profile::RouteMode;
 use oxidom_core::xray::core::Status;
 
-use super::operation::UiOperation;
+use super::operation::{UiOperation, UiOperationKind};
 use super::server_card::{LatencyAge, LatencyState};
 
 /// One round of daemon polling, produced off the main thread.
@@ -741,9 +741,14 @@ fn latency_chip(reading: Option<&LatencyReading>, now_unix_ms: u64) -> Option<Se
     })
 }
 
+/// The operation currently running for `profile`, if any.
+fn operation_kind_for(state: &SnapshotState, profile: &str) -> Option<UiOperationKind> {
+    let operation = state.operation.as_ref()?;
+    (operation.profile.as_deref() == Some(profile)).then_some(operation.kind)
+}
+
 /// Build every row on the Sessions page without asking a widget to interpret
 /// daemon state.
-#[allow(dead_code)]
 pub(super) fn session_rows(
     profiles: &[ProfileEntry],
     state: &SnapshotState,
@@ -753,7 +758,15 @@ pub(super) fn session_rows(
         .iter()
         .map(|entry| {
             let session = session_for(state, &entry.name);
-            let row_state = session_row_state(session);
+            let in_flight = operation_kind_for(state, &entry.name);
+            let row_state = match in_flight {
+                // The daemon has been asked but has not answered yet. Reporting
+                // the world it described half a second ago would put the row —
+                // and its switch — back where the user just moved it away from.
+                Some(UiOperationKind::UpProfile) => SessionRowState::Connecting,
+                Some(UiOperationKind::DownProfile) => SessionRowState::Stopped,
+                _ => session_row_state(session),
+            };
             let mut chips = Vec::new();
 
             if let Some(interface) = session.and_then(|session| session.interface.as_ref()) {
@@ -821,11 +834,7 @@ pub(super) fn session_rows(
                     row_state,
                     SessionRowState::Connected | SessionRowState::Connecting
                 ),
-                busy: state
-                    .operation
-                    .as_ref()
-                    .and_then(|operation| operation.profile.as_deref())
-                    == Some(entry.name.as_str()),
+                busy: in_flight.is_some(),
                 error: session.and_then(|session| session.error.clone()),
             }
         })
@@ -1403,6 +1412,40 @@ mod tests {
                 kind: SessionChipKind::Interface,
             }]
         );
+    }
+
+    /// The window repaints the page twice a second off the daemon's status. If
+    /// the row ignored the request in flight, the switch the user just moved
+    /// would be dragged back by the first tick and forward again by the answer.
+    #[test]
+    fn a_row_shows_the_operation_in_flight_rather_than_the_daemon_it_is_waiting_on() {
+        let work = profile("work", "shared");
+        let mut state = state();
+        state.operation = Some(UiOperation::for_profile(UiOperationKind::UpProfile, "work"));
+
+        let rows = session_rows(std::slice::from_ref(&work), &state, NOW_MS);
+        assert_eq!(rows[0].state, SessionRowState::Connecting);
+        assert!(rows[0].toggle_on);
+        assert!(rows[0].busy);
+
+        state.sessions = vec![session("work", "connected", "same")];
+        state.operation = Some(UiOperation::for_profile(
+            UiOperationKind::DownProfile,
+            "work",
+        ));
+        let rows = session_rows(std::slice::from_ref(&work), &state, NOW_MS);
+        assert_eq!(rows[0].state, SessionRowState::Stopped);
+        assert!(!rows[0].toggle_on);
+
+        // An operation on another profile leaves this row on the daemon's word.
+        state.operation = Some(UiOperation::for_profile(
+            UiOperationKind::DownProfile,
+            "home",
+        ));
+        let rows = session_rows(&[work], &state, NOW_MS);
+        assert_eq!(rows[0].state, SessionRowState::Connected);
+        assert!(rows[0].toggle_on);
+        assert!(!rows[0].busy);
     }
 
     #[test]

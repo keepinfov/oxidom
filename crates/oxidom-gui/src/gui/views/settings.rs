@@ -18,10 +18,9 @@ pub struct SettingsValues {
     /// Empty means "let the daemon fall back to $OXIDOM_XRAY_BIN, then $PATH".
     pub xray_binary: String,
     /// Kept in the draft so applying unrelated GUI settings cannot erase a
-    /// path configured outside the GUI. Its row belongs to phase 4c.
+    /// path configured outside the GUI.
     pub tun2socks_binary: String,
-    /// Hidden for the same reason as tun2socks: applying an unrelated GUI
-    /// setting must not erase the daemon's configured nft path.
+    /// Kept for the same reason as tun2socks.
     pub nft_binary: String,
 }
 
@@ -107,6 +106,8 @@ struct SettingsWidgets {
     user_agent: adw::EntryRow,
     ua_preset: adw::ComboRow,
     xray_binary: adw::EntryRow,
+    tun2socks_binary: adw::EntryRow,
+    nft_binary: adw::EntryRow,
     xray_effective: adw::ActionRow,
     ports_error: gtk::Label,
     url_error: gtk::Label,
@@ -116,7 +117,7 @@ struct SettingsWidgets {
 }
 
 impl SettingsWidgets {
-    fn values(&self, tun2socks_binary: String, nft_binary: String) -> SettingsValues {
+    fn values(&self) -> SettingsValues {
         SettingsValues {
             socks_port: self.socks.value() as u16,
             http_port: self.http.value() as u16,
@@ -133,8 +134,8 @@ impl SettingsWidgets {
             // Trimmed here so trailing whitespace never counts as an edit and
             // never reaches the daemon's path resolution.
             xray_binary: self.xray_binary.text().trim().to_string(),
-            tun2socks_binary,
-            nft_binary,
+            tun2socks_binary: self.tun2socks_binary.text().trim().to_string(),
+            nft_binary: self.nft_binary.text().trim().to_string(),
         }
     }
 
@@ -152,6 +153,8 @@ impl SettingsWidgets {
         self.test_url.set_text(&values.latency_test_url);
         self.user_agent.set_text(&values.subscription_user_agent);
         self.xray_binary.set_text(&values.xray_binary);
+        self.tun2socks_binary.set_text(&values.tun2socks_binary);
+        self.nft_binary.set_text(&values.nft_binary);
     }
 }
 
@@ -249,6 +252,14 @@ impl SettingsView {
             .title("Xray binary")
             .text(&applied.xray_binary)
             .build();
+        let tun2socks_binary = adw::EntryRow::builder()
+            .title("tun2socks binary")
+            .text(&applied.tun2socks_binary)
+            .build();
+        let nft_binary = adw::EntryRow::builder()
+            .title("nft binary")
+            .text(&applied.nft_binary)
+            .build();
         // Filled from the daemon over D-Bus, never computed here: the daemon
         // is a separate process, usually a different user, with its own $PATH.
         let xray_effective = adw::ActionRow::builder()
@@ -290,8 +301,10 @@ impl SettingsView {
 
         let advanced = adw::ExpanderRow::builder()
             .title("Advanced")
-            .subtitle("Technical subscription compatibility settings")
+            .subtitle("Core paths and subscription compatibility settings")
             .build();
+        advanced.add_row(&tun2socks_binary);
+        advanced.add_row(&nft_binary);
         advanced.add_row(&ua_preset);
         advanced.add_row(&user_agent);
         let advanced_group = adw::PreferencesGroup::new();
@@ -326,6 +339,8 @@ impl SettingsView {
             user_agent,
             ua_preset,
             xray_binary,
+            tun2socks_binary,
+            nft_binary,
             xray_effective,
             ports_error,
             url_error,
@@ -584,9 +599,7 @@ fn connect_draft_signals(
             if updating_widgets.get() {
                 return;
             }
-            let tun2socks_binary = model.borrow().draft.tun2socks_binary.clone();
-            let nft_binary = model.borrow().draft.nft_binary.clone();
-            model.borrow_mut().draft = widgets.values(tun2socks_binary, nft_binary);
+            model.borrow_mut().draft = widgets.values();
             refresh_state(&widgets, &model);
         })
     };
@@ -625,6 +638,14 @@ fn connect_draft_signals(
         }
     });
     widgets.xray_binary.connect_changed({
+        let update = update.clone();
+        move |_| update()
+    });
+    widgets.tun2socks_binary.connect_changed({
+        let update = update.clone();
+        move |_| update()
+    });
+    widgets.nft_binary.connect_changed({
         let update = update.clone();
         move |_| update()
     });
