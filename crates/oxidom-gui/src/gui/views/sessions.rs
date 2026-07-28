@@ -7,18 +7,20 @@ use adw::prelude::*;
 use crate::gui::operation::UiOperation;
 use crate::gui::reduce::{SessionChip, SessionChipKind, SessionRow, SessionRowState};
 use oxidom_core::ipc::ProfileEntry;
-use oxidom_core::profile::Profile;
 
 use super::icon_button;
-use super::profile_dialog::{ProfileDialog, ServerChoice, show_profile_dialog};
 
 #[derive(Clone)]
 pub struct SessionCallbacks {
     /// `(profile, active)` — the requested position of the session switch.
     pub toggle: Rc<dyn Fn(String, bool)>,
-    /// `(name, profile)` — both for editing and creating.
-    pub save: Rc<dyn Fn(String, Profile)>,
-    pub remove: Rc<dyn Fn(String)>,
+    /// Open the editor for this profile. The page deliberately does not open
+    /// it itself: the entry it holds is as old as the last time this page was
+    /// entered, and saving a whole profile from a stale copy silently undoes
+    /// whatever the CLI wrote in the meantime.
+    pub edit: Rc<dyn Fn(String)>,
+    /// Open the editor for a profile that does not exist yet.
+    pub create: Rc<dyn Fn()>,
 }
 
 #[derive(Clone)]
@@ -41,18 +43,11 @@ struct RowControls {
     applied: Rc<RefCell<Option<SessionRow>>>,
 }
 
-#[derive(Clone, Default)]
-struct DialogData {
-    profiles: Vec<ProfileEntry>,
-    choices: Vec<ServerChoice>,
-}
-
 #[derive(Clone)]
 pub struct SessionsView {
     pub root: gtk::ScrolledWindow,
     content: gtk::Box,
     callbacks: Rc<RefCell<Option<SessionCallbacks>>>,
-    dialog_data: Rc<RefCell<DialogData>>,
     header: HeaderControls,
     header_embedded: Rc<Cell<bool>>,
     operation: Rc<RefCell<Option<UiOperation>>>,
@@ -73,14 +68,12 @@ impl SessionsView {
             .vexpand(true)
             .build();
         let callbacks = Rc::new(RefCell::new(None::<SessionCallbacks>));
-        let dialog_data = Rc::new(RefCell::new(DialogData::default()));
-        let header = make_header_controls(&root, callbacks.clone(), dialog_data.clone());
+        let header = make_header_controls(callbacks.clone());
 
         Self {
             root,
             content,
             callbacks,
-            dialog_data,
             header,
             header_embedded: Rc::new(Cell::new(true)),
             operation: Rc::new(RefCell::new(None)),
@@ -99,15 +92,10 @@ impl SessionsView {
     pub fn rebuild(
         &self,
         profiles: &[ProfileEntry],
-        choices: &[ServerChoice],
         rows: &[SessionRow],
         callbacks: SessionCallbacks,
     ) {
         *self.callbacks.borrow_mut() = Some(callbacks.clone());
-        *self.dialog_data.borrow_mut() = DialogData {
-            profiles: profiles.to_vec(),
-            choices: choices.to_vec(),
-        };
 
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
@@ -135,14 +123,13 @@ impl SessionsView {
             list.add(&empty);
         }
 
-        // Matched by name rather than by position: a row and the profile whose
-        // dialog it opens must be the same profile even if the two lists ever
-        // drift apart.
+        // Only rows the profile list still knows about: a row whose profile
+        // has gone would carry an editor for a name that no longer exists.
         for row in rows {
-            let Some(entry) = profiles.iter().find(|entry| entry.name == row.profile) else {
+            if !profiles.iter().any(|entry| entry.name == row.profile) {
                 continue;
-            };
-            self.add_session_row(&list, entry, row, choices, callbacks.clone());
+            }
+            self.add_session_row(&list, row, callbacks.clone());
         }
 
         self.content.append(&list);
@@ -185,9 +172,7 @@ impl SessionsView {
     fn add_session_row(
         &self,
         list: &adw::PreferencesGroup,
-        entry: &ProfileEntry,
         model: &SessionRow,
-        choices: &[ServerChoice],
         callbacks: SessionCallbacks,
     ) {
         let row = adw::ActionRow::builder()
@@ -237,21 +222,11 @@ impl SessionsView {
             }
         });
 
-        let entry = entry.clone();
-        let entry_name = entry.name.clone();
-        let profiles = self.dialog_data.borrow().profiles.clone();
-        let choices = choices.to_vec();
-        row.connect_activated(move |row| {
-            show_profile_dialog(
-                row,
-                ProfileDialog::Edit {
-                    name: &entry.name,
-                    entry: &entry,
-                },
-                &profiles,
-                &choices,
-                callbacks.clone(),
-            );
+        let entry_name = model.profile.clone();
+        row.connect_activated({
+            let edit = callbacks.edit.clone();
+            let profile = model.profile.clone();
+            move |_| edit(profile.clone())
         });
 
         let controls = RowControls {
@@ -286,32 +261,16 @@ impl SessionsView {
     }
 }
 
-fn make_header_controls(
-    root: &gtk::ScrolledWindow,
-    callbacks: Rc<RefCell<Option<SessionCallbacks>>>,
-    dialog_data: Rc<RefCell<DialogData>>,
-) -> HeaderControls {
+fn make_header_controls(callbacks: Rc<RefCell<Option<SessionCallbacks>>>) -> HeaderControls {
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     actions.set_valign(gtk::Align::Center);
     let add = icon_button("list-add-symbolic", "New profile");
     add.add_css_class("header-icon-button");
 
-    let root = root.downgrade();
     add.connect_clicked(move |_| {
-        let Some(root) = root.upgrade() else {
-            return;
-        };
-        let Some(callbacks) = callbacks.borrow().clone() else {
-            return;
-        };
-        let data = dialog_data.borrow().clone();
-        show_profile_dialog(
-            &root,
-            ProfileDialog::New,
-            &data.profiles,
-            &data.choices,
-            callbacks,
-        );
+        if let Some(callbacks) = callbacks.borrow().clone() {
+            (callbacks.create)();
+        }
     });
 
     actions.append(&add);

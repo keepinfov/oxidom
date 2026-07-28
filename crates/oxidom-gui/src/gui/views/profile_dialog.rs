@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -9,7 +10,6 @@ use oxidom_core::profile::{
     self, Profile, ProfileInterface, ProfileProxy, ProfileSelect, RouteMode,
 };
 
-use super::sessions::SessionCallbacks;
 use super::{dialog_content, set_transient_parent, set_validation, validation_label};
 
 const PROFILE_NAME_ERROR: &str = "Use lowercase letters, digits, '_' and '-'; up to 32 \
@@ -18,6 +18,7 @@ const PROFILE_NAME_TAKEN: &str = "A profile with this name already exists.";
 const PORTS_ERROR: &str = "The SOCKS and HTTP inbounds cannot share a port.";
 const SERVER_ERROR: &str = "Choose the server this profile connects to.";
 const MISSING_SERVER_HINT: &str = "This handle matches no server the daemon knows.";
+const NO_SERVER_LABEL: &str = "Choose a server…";
 const DNS_LEAK_WARNING: &str = "All traffic will use the tunnel, but DNS is not routed through \
     it in this release. The system resolver will continue outside the tunnel.";
 
@@ -44,7 +45,16 @@ pub enum Preselect {
     Empty,
 }
 
-pub(super) enum ProfileDialog<'a> {
+/// What the dialog does with what the user typed. Separate from the page's
+/// own callbacks: the page no longer owns the dialog.
+#[derive(Clone)]
+pub struct ProfileDialogCallbacks {
+    /// `(name, profile)` — both for editing and creating.
+    pub save: Rc<dyn Fn(String, Profile)>,
+    pub remove: Rc<dyn Fn(String)>,
+}
+
+pub enum ProfileDialog<'a> {
     /// Editing `name`, whose current contents are `entry`.
     Edit {
         name: &'a str,
@@ -58,6 +68,12 @@ struct PickerEntry {
     handle: String,
     label: String,
     missing: bool,
+    /// Not a server: the "nothing chosen yet" entry. `AdwComboRow` wraps a
+    /// `GtkSingleSelection` that autoselects, so it refuses to hold
+    /// `INVALID_LIST_POSITION` and snaps to item 0 instead. Without a real
+    /// item to land on, opening a profile that has no server and pressing
+    /// Save would point it at whatever happened to sort first.
+    placeholder: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,12 +138,12 @@ fn profile_from_dialog(values: DialogValues) -> Profile {
     }
 }
 
-pub(super) fn show_profile_dialog(
+pub fn show_profile_dialog(
     parent: &impl IsA<gtk::Widget>,
     mode: ProfileDialog<'_>,
     profiles: &[ProfileEntry],
     choices: &[ServerChoice],
-    callbacks: SessionCallbacks,
+    callbacks: ProfileDialogCallbacks,
 ) {
     let (title, edit_name, initial) = match mode {
         ProfileDialog::Edit { name, entry } => (
@@ -222,6 +238,24 @@ pub(super) fn show_profile_dialog(
         .build();
     interface_group.add(&routes);
 
+    // A row of the group rather than an `adw::Banner`: a banner is meant to
+    // span a window edge to edge and keeps square corners, which inside a
+    // rounded dialog reads as a rendering fault. As a row it also sits
+    // directly under the setting it is about — and never last, so that a
+    // hidden trailing row cannot leave the real last row square-cornered.
+    let dns_warning = adw::ActionRow::builder()
+        .title("DNS stays outside the tunnel")
+        .subtitle(DNS_LEAK_WARNING)
+        .subtitle_lines(3)
+        .activatable(false)
+        .visible(dns_leak(initial.interface_enable, initial.interface_routes))
+        .build();
+    let dns_icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
+    dns_icon.add_css_class("dns-leak-icon");
+    dns_warning.add_prefix(&dns_icon);
+    dns_warning.add_css_class("dns-leak-row");
+    interface_group.add(&dns_warning);
+
     let device = adw::EntryRow::builder()
         .title("Device")
         .text(&initial.interface_device)
@@ -247,17 +281,9 @@ pub(super) fn show_profile_dialog(
         .build();
     interface_group.add(&routed_subnets);
 
-    let dns_warning = adw::Banner::builder()
-        .title(DNS_LEAK_WARNING)
-        .revealed(initial.interface_routes == RouteMode::Default)
-        .build();
-    dns_warning.add_css_class("error");
-    dns_warning.add_css_class("dns-leak-banner");
-
     let groups = gtk::Box::new(gtk::Orientation::Vertical, 24);
     groups.append(&profile_group);
     groups.append(&interface_group);
-    groups.append(&dns_warning);
     if let Some(name) = edit_name.as_deref() {
         let remove_group = adw::PreferencesGroup::builder().title("Remove").build();
         let delete = gtk::Button::with_label("Delete Profile");
@@ -328,6 +354,10 @@ pub(super) fn show_profile_dialog(
         move || {
             let name = dialog_name(name_entry.as_ref(), edit_name.as_deref());
             let selected = picker_entries.get(server.selected() as usize)?;
+            // No profile is ever written pointing at the placeholder.
+            if selected.placeholder {
+                return None;
+            }
             let values = DialogValues {
                 description: description_entry.text().to_string(),
                 server: selected.handle.clone(),
@@ -359,6 +389,7 @@ pub(super) fn show_profile_dialog(
         let save = save.clone();
         let validation = validation.clone();
         let collect_profile = collect_profile.clone();
+        let interface_enable = interface_enable.clone();
         move || {
             let name = dialog_name(name_entry.as_ref(), edit_name.as_deref());
             set_device_hint(&device_hint, &name);
@@ -373,14 +404,18 @@ pub(super) fn show_profile_dialog(
             });
             let route_mode = route_mode(routes.selected());
             routed_subnets.set_visible(route_mode == RouteMode::List);
-            dns_warning.set_revealed(route_mode == RouteMode::Default);
+            dns_warning.set_visible(dns_leak(interface_enable.is_active(), route_mode));
 
             let issue = name_issue
                 .map(str::to_string)
                 .or_else(|| {
                     (socks.value() as u16 == http.value() as u16).then(|| PORTS_ERROR.to_string())
                 })
-                .or_else(|| selected.is_none().then(|| SERVER_ERROR.to_string()))
+                .or_else(|| {
+                    selected
+                        .is_none_or(|entry| entry.placeholder)
+                        .then(|| SERVER_ERROR.to_string())
+                })
                 .or_else(|| {
                     collect_profile().and_then(|(_, profile)| {
                         profile.validate(&name).err().map(|error| error.to_string())
@@ -416,9 +451,38 @@ pub(super) fn show_profile_dialog(
         let update_validation = update_validation.clone();
         move |_| update_validation()
     });
+    // `default` is the one choice here that silently sends every DNS lookup
+    // around the tunnel it just routed everything into. A row can be scrolled
+    // past, so choosing it asks — and cancelling puts the combo back where it
+    // was, which is why the previous index is remembered.
+    let previous_route = Rc::new(Cell::new(routes.selected()));
+    // Putting the combo back must not look like a fresh choice to this very
+    // handler, or cancelling would ask again about the mode it just left.
+    let reverting_routes = Rc::new(Cell::new(false));
     routes.connect_selected_notify({
         let update_validation = update_validation.clone();
-        move |_| update_validation()
+        let window = window.clone();
+        let previous_route = previous_route.clone();
+        let reverting_routes = reverting_routes.clone();
+        move |routes| {
+            update_validation();
+            if reverting_routes.get() {
+                previous_route.set(routes.selected());
+                return;
+            }
+            if route_mode(routes.selected()) != RouteMode::Default {
+                previous_route.set(routes.selected());
+                return;
+            }
+            confirm_dns_leak(
+                &window,
+                routes,
+                previous_route.get(),
+                reverting_routes.clone(),
+                update_validation.clone(),
+            );
+            previous_route.set(routes.selected());
+        }
     });
     device.connect_changed({
         let update_validation = update_validation.clone();
@@ -464,6 +528,45 @@ fn set_device_hint(label: &gtk::Label, name: &str) {
     }
 }
 
+/// Does this combination actually send DNS outside the tunnel? Only a routed
+/// interface can; `routes = "default"` on a disabled interface is a stored
+/// intention, not a leak, and warning about it would be noise.
+fn dns_leak(enable: bool, routes: RouteMode) -> bool {
+    enable && routes == RouteMode::Default
+}
+
+fn confirm_dns_leak(
+    parent: &adw::Window,
+    routes: &adw::ComboRow,
+    previous: u32,
+    reverting: Rc<std::cell::Cell<bool>>,
+    update_validation: Rc<dyn Fn()>,
+) {
+    let dialog = adw::MessageDialog::new(
+        Some(parent),
+        Some("Route everything, but not DNS?"),
+        Some(DNS_LEAK_WARNING),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("accept", "Route Everything")]);
+    dialog.set_response_appearance("accept", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, {
+        let routes = routes.clone();
+        move |dialog, response| {
+            dialog.close();
+            if response == "accept" {
+                return;
+            }
+            reverting.set(true);
+            routes.set_selected(previous);
+            reverting.set(false);
+            update_validation();
+        }
+    });
+    dialog.present();
+}
+
 fn route_mode_index(mode: RouteMode) -> u32 {
     match mode {
         RouteMode::Manual => 0,
@@ -495,6 +598,7 @@ fn picker_entries(choices: &[ServerChoice], stored: &str) -> (Vec<PickerEntry>, 
             handle: choice.handle.clone(),
             label: choice.label.clone(),
             missing: false,
+            placeholder: false,
         })
         .collect();
     match preselect(choices, stored) {
@@ -506,11 +610,23 @@ fn picker_entries(choices: &[ServerChoice], stored: &str) -> (Vec<PickerEntry>, 
                     handle: stored.to_string(),
                     label,
                     missing: true,
+                    placeholder: false,
                 },
             );
             (entries, 0)
         }
-        Preselect::Empty => (entries, gtk::INVALID_LIST_POSITION),
+        Preselect::Empty => {
+            entries.insert(
+                0,
+                PickerEntry {
+                    handle: String::new(),
+                    label: NO_SERVER_LABEL.to_string(),
+                    missing: false,
+                    placeholder: true,
+                },
+            );
+            (entries, 0)
+        }
     }
 }
 
@@ -627,6 +743,34 @@ mod tests {
         assert_eq!(preselect(&choices, ""), Preselect::Empty);
     }
 
+    /// A profile with no server must land on something the dialog refuses to
+    /// save, because the combo will not stay unselected: without an entry of
+    /// its own it silently picks the first real server in the list.
+    #[test]
+    fn a_profile_without_a_server_gets_an_entry_that_is_not_a_server() {
+        let choices = vec![
+            ServerChoice {
+                handle: "alpha".to_string(),
+                label: "alpha  ·  Alpha".to_string(),
+            },
+            ServerChoice {
+                handle: "bravo".to_string(),
+                label: "bravo  ·  Bravo".to_string(),
+            },
+        ];
+
+        let (entries, selected) = picker_entries(&choices, "");
+        assert_eq!(selected, 0);
+        assert!(entries[0].placeholder);
+        assert!(entries[0].handle.is_empty());
+        assert_eq!(entries[1].handle, "alpha");
+
+        // A stored handle still selects its own server, and nothing is added.
+        let (entries, selected) = picker_entries(&choices, "bravo");
+        assert_eq!(selected, 1);
+        assert!(entries.iter().all(|entry| !entry.placeholder));
+    }
+
     #[test]
     fn profile_name_validation_covers_format_and_collisions() {
         let existing = vec!["work".to_string()];
@@ -649,6 +793,17 @@ mod tests {
             profile_name_validation("work", &existing),
             Some(PROFILE_NAME_TAKEN)
         );
+    }
+
+    /// `routes = "default"` on a profile whose interface is off routes
+    /// nothing, so warning about its DNS would train the user to dismiss the
+    /// warning that matters.
+    #[test]
+    fn only_a_routed_interface_counts_as_a_dns_leak() {
+        assert!(dns_leak(true, RouteMode::Default));
+        assert!(!dns_leak(false, RouteMode::Default));
+        assert!(!dns_leak(true, RouteMode::Manual));
+        assert!(!dns_leak(true, RouteMode::List));
     }
 
     #[test]

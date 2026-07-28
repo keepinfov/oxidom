@@ -27,7 +27,9 @@ use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
 use super::tray::{OxidomTray, TrayCommand};
 use super::views::logs::LogsView;
-use super::views::profile_dialog::server_choices;
+use super::views::profile_dialog::{
+    ProfileDialog, ProfileDialogCallbacks, server_choices, show_profile_dialog,
+};
 use super::views::servers::{CardConnection, ServersView};
 use super::views::sessions::{SessionCallbacks, SessionsView};
 use super::views::settings::{SettingsValues, SettingsView};
@@ -902,8 +904,6 @@ impl Controller {
                 }
             }
         });
-        self.sessions_banner.connect_button_clicked({
-            let weak = Rc::downgrade(self);
         // On the list, not on each row: `GtkListBoxRow::activate` is the
         // keyboard action signal and a mouse click never emits it — the row
         // would highlight and nothing else would happen. `row-activated` is
@@ -925,6 +925,8 @@ impl Controller {
                 }
             }
         });
+        self.sessions_banner.connect_button_clicked({
+            let weak = Rc::downgrade(self);
             move |_| {
                 if let Some(controller) = weak.upgrade() {
                     controller.navigate_to(Page::Sessions);
@@ -1032,6 +1034,16 @@ impl Controller {
     /// the window stays open, so entering Sessions takes a fresh snapshot
     /// without making the GTK main loop wait on D-Bus.
     fn refresh_profiles_from_daemon(self: &Rc<Self>) {
+        self.with_fresh_profiles(|_| {});
+    }
+
+    /// Take a fresh profile list from the daemon, then run `then`.
+    ///
+    /// The daemon owns `profiles/*.toml` and the CLI writes them behind the
+    /// window's back, so anything that is about to *rewrite* a whole profile
+    /// has to start from what is on disk now — not from the copy this page was
+    /// built with, which may be arbitrarily old.
+    fn with_fresh_profiles(self: &Rc<Self>, then: impl FnOnce(&Rc<Self>) + 'static) {
         let client = self.state.borrow().client.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -1040,12 +1052,16 @@ impl Controller {
         });
 
         let weak = Rc::downgrade(self);
+        let mut then = Some(then);
         glib::timeout_add_local(Duration::from_millis(40), move || {
             match receiver.try_recv() {
                 Ok(Ok(profiles)) => {
                     if let Some(controller) = weak.upgrade() {
                         controller.state.borrow_mut().profiles = profiles;
                         controller.rebuild_sessions();
+                        if let Some(then) = then.take() {
+                            then(&controller);
+                        }
                     }
                     glib::ControlFlow::Break
                 }
@@ -1228,11 +1244,10 @@ impl Controller {
     }
 
     fn rebuild_sessions(self: &Rc<Self>) {
-        let (profiles, choices, rows, operation) = {
+        let (profiles, rows, operation) = {
             let state = self.state.borrow();
             (
                 state.profiles.clone(),
-                server_choices(&state.subscriptions),
                 session_rows(&state.profiles, &state.ui, ipc::now_unix_ms()),
                 state.ui.operation.clone(),
             )
@@ -1250,6 +1265,43 @@ impl Controller {
                     }
                 })
             },
+            edit: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |name| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.edit_profile(name);
+                    }
+                })
+            },
+            create: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move || {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.open_profile_dialog(None);
+                    }
+                })
+            },
+        };
+        self.sessions.rebuild(&profiles, &rows, callbacks);
+        self.sessions.set_operation(operation);
+        self.sync_profile_switcher();
+    }
+
+    /// Reread the profile from the daemon before showing its editor. The
+    /// dialog saves the profile whole, so opening it from the page's cached
+    /// copy would quietly revert anything the CLI wrote since this page was
+    /// last entered.
+    fn edit_profile(self: &Rc<Self>, name: String) {
+        self.with_fresh_profiles(move |controller| controller.open_profile_dialog(Some(name)));
+    }
+
+    /// `None` opens the editor for a profile that does not exist yet.
+    fn open_profile_dialog(self: &Rc<Self>, name: Option<String>) {
+        let (profiles, choices) = {
+            let state = self.state.borrow();
+            (state.profiles.clone(), server_choices(&state.subscriptions))
+        };
+        let callbacks = ProfileDialogCallbacks {
             save: {
                 let weak = Rc::downgrade(self);
                 Rc::new(move |name, profile| {
@@ -1267,9 +1319,18 @@ impl Controller {
                 })
             },
         };
-        self.sessions.rebuild(&profiles, &choices, &rows, callbacks);
-        self.sessions.set_operation(operation);
-        self.sync_profile_switcher();
+        let mode = match name.as_deref() {
+            None => ProfileDialog::New,
+            Some(name) => {
+                let Some(entry) = profiles.iter().find(|entry| entry.name == name) else {
+                    // Removed through the CLI between the click and the reread.
+                    self.show_message(&format!("Profile «{name}» no longer exists"));
+                    return;
+                };
+                ProfileDialog::Edit { name, entry }
+            }
+        };
+        show_profile_dialog(&self.sessions.root, mode, &profiles, &choices, callbacks);
     }
 
     fn sync_session_rows(self: &Rc<Self>) {
@@ -3192,7 +3253,9 @@ fn install_css() {
         .session-chip-latency { color: @success_color; background: alpha(@success_color, 0.14); }
         .session-chip-system-proxy { color: @warning_color; background: alpha(@warning_color, 0.13); }
         .session-chip-proxy-only { color: alpha(@window_fg_color, 0.62); }
-        .dns-leak-banner { color: @error_color; }
+        .dns-leak-row { background: alpha(@warning_color, 0.10); }
+        .dns-leak-row > box > box > label.title { color: @warning_color; }
+        .dns-leak-icon { color: @warning_color; }
         /* An inset ring rather than a border: `.server-card` is a fixed-height
            frame with overflow hidden, and a real border would eat 2px of the
            content it clips. */
