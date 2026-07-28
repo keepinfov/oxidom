@@ -904,6 +904,27 @@ impl Controller {
         });
         self.sessions_banner.connect_button_clicked({
             let weak = Rc::downgrade(self);
+        // On the list, not on each row: `GtkListBoxRow::activate` is the
+        // keyboard action signal and a mouse click never emits it — the row
+        // would highlight and nothing else would happen. `row-activated` is
+        // also the only one of the two that a programmatic `select_row` does
+        // not raise, so rebuilding the popover cannot switch the profile.
+        self.profile_switcher_list.connect_row_activated({
+            let weak = Rc::downgrade(self);
+            move |_, row| {
+                let Some(controller) = weak.upgrade() else {
+                    return;
+                };
+                let profile = controller
+                    .profile_switcher_shown
+                    .borrow()
+                    .get(row.index() as usize)
+                    .map(|item| item.profile.clone());
+                if let Some(profile) = profile {
+                    controller.select_profile(profile);
+                }
+            }
+        });
             move |_| {
                 if let Some(controller) = weak.upgrade() {
                     controller.navigate_to(Page::Sessions);
@@ -1315,18 +1336,8 @@ impl Controller {
                 .selectable(true)
                 .tooltip_text(session_row_state_label(item.state))
                 .build();
-            let selected = item.selected;
-            row.connect_activate({
-                let weak = Rc::downgrade(self);
-                let profile = item.profile;
-                move |_| {
-                    if let Some(controller) = weak.upgrade() {
-                        controller.select_profile(profile.clone());
-                    }
-                }
-            });
             self.profile_switcher_list.append(&row);
-            if selected {
+            if item.selected {
                 self.profile_switcher_list.select_row(Some(&row));
             }
         }
@@ -3103,7 +3114,12 @@ fn install_css() {
             font-weight: 500;
             font-size: 0.85em;
         }
-        .profile-switcher-list { margin: 6px; min-width: 150px; }
+        /* A `listbox` node carries an opaque view background of its own. Left
+           alone it paints a square over the popover's rounded corners, which
+           is the classic "why is my menu clipped" artefact — the popover is
+           round, the sheet on top of it is not. */
+        .profile-switcher-list { background: transparent; padding: 4px; min-width: 150px; }
+        .profile-switcher-list > row { border-radius: 8px; }
         .profile-switcher-dot { font-size: 0.72em; }
         .profile-switcher-dot.status-neutral { color: alpha(@window_fg_color, 0.46); }
         .profile-switcher-dot.status-working { color: @accent_color; }
