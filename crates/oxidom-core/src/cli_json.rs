@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::{InterfaceInfo, ProfileEntry, SessionInfo};
+use crate::ipc::{InterfaceInfo, ProfileEntry, SelectionInfo, SessionInfo};
 use crate::model::{Server, Subscription, UserInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +19,8 @@ pub struct StatusOutput {
     pub error: Option<String>,
     /// Local SOCKS bind address for the selected session.
     pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionInfo>,
 }
 
 impl StatusOutput {
@@ -31,6 +33,7 @@ impl StatusOutput {
             latency_ms,
             error: session.error.clone(),
             address: session.address.clone(),
+            selection: (session.selection.kind == "pool").then(|| session.selection.clone()),
         }
     }
 }
@@ -49,6 +52,8 @@ pub struct SessionOutput {
     pub error: Option<String>,
     pub owns_system_proxy: bool,
     pub interface: Option<InterfaceInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionInfo>,
 }
 
 impl SessionOutput {
@@ -66,6 +71,7 @@ impl SessionOutput {
             error: session.error.clone(),
             owns_system_proxy: session.owns_system_proxy,
             interface: session.interface.clone(),
+            selection: (session.selection.kind == "pool").then(|| session.selection.clone()),
         }
     }
 }
@@ -305,6 +311,7 @@ mod tests {
             socks_port: 12080,
             http_port: 12081,
             interface: Default::default(),
+            pool: None,
         }];
 
         assert_eq!(

@@ -17,7 +17,7 @@ use crate::pool::PoolQuery;
 use crate::{fsutil, paths};
 
 const MAX_NAME_LEN: usize = 32;
-const MAX_POOL_MEMBERS: usize = 64;
+pub const MAX_POOL_MEMBERS: usize = 64;
 
 /// Top-level CLI words cannot also be profile-first profile names: the
 /// normalizer deliberately gives a verb in the first position precedence.

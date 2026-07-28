@@ -79,7 +79,7 @@ pub struct PlanInput<'a> {
     pub mark: u32,
     pub mode: RouteMode,
     pub list: &'a [Cidr],
-    pub server_address: Option<Ipv4Addr>,
+    pub server_addresses: Vec<Ipv4Addr>,
     pub default_gateway: Option<Ipv4Addr>,
     /// Link-scope routes of the interface carrying the system default. They
     /// keep LAN hosts reachable after a cgroup mark selects the private table.
@@ -131,18 +131,23 @@ pub fn plan_routes(input: &PlanInput<'_>) -> Result<RoutePlan> {
                 .collect()
         }
         RouteMode::Default => {
-            let server = input
-                .server_address
-                .context("routes = \"default\" requires the server IPv4 address")?;
+            if input.server_addresses.is_empty() {
+                bail!("routes = \"default\" requires at least one server IPv4 address");
+            }
             let gateway = input
                 .default_gateway
                 .context("routes = \"default\" requires the current default IPv4 gateway")?;
-            vec![
-                RouteSpec {
+            let mut routes = input
+                .server_addresses
+                .iter()
+                .copied()
+                .map(|server| RouteSpec {
                     destination: cidr(server, 32),
                     via: Via::Gateway(gateway),
                     table: 254,
-                },
+                })
+                .collect::<Vec<_>>();
+            routes.extend([
                 RouteSpec {
                     destination: cidr(Ipv4Addr::UNSPECIFIED, 1),
                     via: Via::Device,
@@ -153,7 +158,8 @@ pub fn plan_routes(input: &PlanInput<'_>) -> Result<RoutePlan> {
                     via: Via::Device,
                     table: 254,
                 },
-            ]
+            ]);
+            routes
         }
     };
 
@@ -186,7 +192,7 @@ mod tests {
             mark: 0x6f21,
             mode,
             list: &[],
-            server_address: Some(Ipv4Addr::new(203, 0, 113, 7)),
+            server_addresses: vec![Ipv4Addr::new(203, 0, 113, 7)],
             default_gateway: Some(Ipv4Addr::new(192, 0, 2, 1)),
             connected: &CONNECTED,
         }
@@ -300,13 +306,20 @@ mod tests {
 
     #[test]
     fn default_route_plan_has_the_required_order() {
-        let plan = plan_routes(&input(RouteMode::Default)).unwrap();
+        let mut input = input(RouteMode::Default);
+        input.server_addresses.push(Ipv4Addr::new(198, 51, 100, 8));
+        let plan = plan_routes(&input).unwrap();
         common_is_present(&plan);
         assert_eq!(
             plan.system,
             [
                 RouteSpec {
                     destination: cidr(Ipv4Addr::new(203, 0, 113, 7), 32),
+                    via: Via::Gateway(Ipv4Addr::new(192, 0, 2, 1)),
+                    table: 254,
+                },
+                RouteSpec {
+                    destination: cidr(Ipv4Addr::new(198, 51, 100, 8), 32),
                     via: Via::Gateway(Ipv4Addr::new(192, 0, 2, 1)),
                     table: 254,
                 },
@@ -327,7 +340,7 @@ mod tests {
     #[test]
     fn default_requires_server_and_gateway_separately() {
         let mut missing_server = input(RouteMode::Default);
-        missing_server.server_address = None;
+        missing_server.server_addresses.clear();
         let error = plan_routes(&missing_server).unwrap_err().to_string();
         assert!(error.contains("server IPv4 address"), "{error}");
 

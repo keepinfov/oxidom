@@ -25,6 +25,15 @@ pub struct SessionState {
     /// orphaned tunnel: the next start kills it if it is still an xray process.
     pub xray_pid: Option<u32>,
     pub interface: Option<InterfaceState>,
+    /// Pool selection is additive: an older daemon sees `server_id = None`
+    /// and therefore cannot mistake a pool for one of its members.
+    #[serde(default)]
+    pub pool_members: Vec<String>,
+    #[serde(default)]
+    pub pool_strategy: String,
+    /// Zero means this is not a pool session.
+    #[serde(default)]
+    pub api_port: u16,
 }
 
 impl Default for SessionState {
@@ -37,6 +46,9 @@ impl Default for SessionState {
             http_port: 0,
             xray_pid: None,
             interface: None,
+            pool_members: Vec::new(),
+            pool_strategy: String::new(),
+            api_port: 0,
         }
     }
 }
@@ -231,6 +243,9 @@ fn migrate(stored: StoredState, config: &Config) -> State {
             http_port: config.http_port,
             xray_pid: stored.xray_pid,
             interface: None,
+            pool_members: Vec::new(),
+            pool_strategy: String::new(),
+            api_port: 0,
         }],
     };
     if let Err(error) = state.save() {
@@ -406,6 +421,9 @@ mod tests {
                 http_port: 10809,
                 xray_pid: None,
                 interface: None,
+                pool_members: Vec::new(),
+                pool_strategy: String::new(),
+                api_port: 0,
             }],
         };
         state.save()?;
@@ -421,6 +439,35 @@ mod tests {
 
         assert_eq!(loaded.sessions, state.sessions);
         assert_eq!(std::fs::metadata(path)?.ino(), inode);
+        Ok(())
+    }
+
+    #[test]
+    fn pool_session_round_trips_without_claiming_one_active_server() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("pool-session");
+        let state = State {
+            sessions: vec![SessionState {
+                profile: "spread".to_string(),
+                server_id: None,
+                address: Ipv4Addr::new(127, 91, 37, 1),
+                socks_port: 10808,
+                http_port: 10809,
+                xray_pid: Some(42),
+                interface: None,
+                pool_members: vec!["one".to_string(), "two".to_string()],
+                pool_strategy: "roundRobin".to_string(),
+                api_port: 18082,
+            }],
+        };
+
+        state.save()?;
+        let loaded = State::load(&Config::default());
+
+        assert_eq!(loaded.sessions, state.sessions);
+        assert!(loaded.sessions[0].server_id.is_none());
+        assert_eq!(loaded.sessions[0].pool_members, ["one", "two"]);
+        assert_eq!(loaded.sessions[0].api_port, 18082);
         Ok(())
     }
 

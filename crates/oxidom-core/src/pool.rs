@@ -59,45 +59,19 @@ pub fn resolve<'a>(query: &PoolQuery, groups: &'a [Subscription]) -> Result<Vec<
     let mut matches = Vec::new();
 
     for group in groups {
-        if !query.subscriptions.is_empty()
-            && !query.subscriptions.iter().any(|selection| {
-                selection == &group.id || selection.eq_ignore_ascii_case(&group.name)
-            })
-        {
+        if !group_matches(query, group) {
             continue;
         }
 
         for server in &group.servers {
+            if !server_matches(query, server) {
+                continue;
+            }
             // Silent on purpose: this runs on every GUI filter keystroke and on
             // every daemon poll, so a `warn!` here would be a log flood. The one
             // place a user can act on it — bringing a pool profile up — says so
             // once, by comparing the resolved list against the group contents.
             if matches!(&server.spec, OutboundSpec::XrayProfile { .. }) {
-                continue;
-            }
-            if !query.countries.is_empty()
-                && !server.country.as_ref().is_some_and(|country| {
-                    query
-                        .countries
-                        .iter()
-                        .any(|selection| selection.eq_ignore_ascii_case(country))
-                })
-            {
-                continue;
-            }
-            if !query.protocols.is_empty()
-                && !query
-                    .protocols
-                    .iter()
-                    .any(|selection| selection.eq_ignore_ascii_case(server.protocol.as_str()))
-            {
-                continue;
-            }
-            // Exclusions deliberately do not use `handle::resolve`: substring
-            // matching here could silently remove many members from a pool.
-            if query.exclude.iter().any(|selection| {
-                selection == &server.id || server.alias.as_ref() == Some(selection)
-            }) {
                 continue;
             }
             matches.push(server);
@@ -111,6 +85,57 @@ pub fn resolve<'a>(query: &PoolQuery, groups: &'a [Subscription]) -> Result<Vec<
         bail!("{}", empty_pool_message(query));
     }
     Ok(matches)
+}
+
+/// Composite profiles that match the query but cannot become pool outbounds.
+///
+/// `resolve` stays silent because the GUI calls it continuously. Activation
+/// uses this companion once to make the omission visible in the daemon log.
+pub fn excluded_composites<'a>(query: &PoolQuery, groups: &'a [Subscription]) -> Vec<&'a Server> {
+    groups
+        .iter()
+        .filter(|group| group_matches(query, group))
+        .flat_map(|group| group.servers.iter())
+        .filter(|server| {
+            server_matches(query, server)
+                && matches!(&server.spec, OutboundSpec::XrayProfile { .. })
+        })
+        .collect()
+}
+
+fn group_matches(query: &PoolQuery, group: &Subscription) -> bool {
+    query.subscriptions.is_empty()
+        || query
+            .subscriptions
+            .iter()
+            .any(|selection| selection == &group.id || selection.eq_ignore_ascii_case(&group.name))
+}
+
+fn server_matches(query: &PoolQuery, server: &Server) -> bool {
+    if !query.countries.is_empty()
+        && !server.country.as_ref().is_some_and(|country| {
+            query
+                .countries
+                .iter()
+                .any(|selection| selection.eq_ignore_ascii_case(country))
+        })
+    {
+        return false;
+    }
+    if !query.protocols.is_empty()
+        && !query
+            .protocols
+            .iter()
+            .any(|selection| selection.eq_ignore_ascii_case(server.protocol.as_str()))
+    {
+        return false;
+    }
+    // Exclusions deliberately do not use `handle::resolve`: substring
+    // matching here could silently remove many members from a pool.
+    !query
+        .exclude
+        .iter()
+        .any(|selection| selection == &server.id || server.alias.as_ref() == Some(selection))
 }
 
 fn empty_pool_message(query: &PoolQuery) -> String {

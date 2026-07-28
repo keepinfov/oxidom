@@ -36,6 +36,10 @@ pub enum Status {
 /// Supervises a single Xray core process (one active server at a time).
 pub struct XrayCore {
     child: Option<Child>,
+    /// A pool core may outlive a killed daemon and be adopted by its next
+    /// instance. `Child` cannot be reconstructed from a PID, so this is the
+    /// equally supervised recovered form.
+    recovered: Option<(u32, String)>,
     pub status: Arc<Mutex<Status>>,
     pub logs: Arc<Mutex<Vec<String>>>,
     pub socks_port: u16,
@@ -50,6 +54,7 @@ impl XrayCore {
     pub fn new(socks_port: u16, http_port: u16, xray_binary: String) -> Self {
         XrayCore {
             child: None,
+            recovered: None,
             status: Arc::new(Mutex::new(Status::Disconnected)),
             logs: Arc::new(Mutex::new(Vec::new())),
             socks_port,
@@ -97,9 +102,27 @@ impl XrayCore {
 
     /// Refuse to start when a local inbound port is already taken; otherwise
     /// Xray exits instantly and the only symptom would be a failed probe.
-    fn ensure_ports_free(&self, bind: Ipv4Addr) -> Result<()> {
-        for (port, label) in [(self.socks_port, "SOCKS"), (self.http_port, "HTTP")] {
+    fn ensure_ports_free(&self, bind: Ipv4Addr, api_port: Option<u16>) -> Result<()> {
+        let mut ports = vec![(self.socks_port, "SOCKS"), (self.http_port, "HTTP")];
+        if let Some(api_port) = api_port {
+            ports.push((api_port, "API"));
+        }
+        for (index, (port, label)) in ports.iter().enumerate() {
+            if let Some((_, other_label)) = ports[..index]
+                .iter()
+                .find(|(other_port, _)| other_port == port)
+            {
+                bail!("local {label} and {other_label} endpoints cannot share port {port}");
+            }
+        }
+        for (port, label) in ports {
             if std::net::TcpListener::bind((bind, port)).is_err() {
+                if label == "API" {
+                    bail!(
+                        "local API endpoint {bind}:{port} was taken before Xray could bind it — \
+                         retry the connection to allocate another port"
+                    );
+                }
                 bail!(
                     "local {label} endpoint {bind}:{port} is already in use — pick a different \
                      port in Settings"
@@ -119,6 +142,30 @@ impl XrayCore {
             Err(error) => {
                 // `{:#}` keeps the anyhow cause chain: the outermost context
                 // alone ("spawning xray") never says *why* it failed.
+                let message = format!("{error:#}");
+                self.note(&message);
+                self.set_status(Status::Error(message));
+                Err(error)
+            }
+        }
+    }
+
+    /// Start (or restart) the core for a resolved pool.
+    pub fn connect_pool(
+        &mut self,
+        members: &[&Server],
+        strategy: &str,
+        probe_interval: &str,
+        bind: Ipv4Addr,
+        api_port: u16,
+        profile: &str,
+    ) -> Result<()> {
+        self.disconnect();
+        self.set_status(Status::Connecting);
+        crate::sync::lock(&self.logs).clear();
+        match self.try_connect_pool(members, strategy, probe_interval, bind, api_port, profile) {
+            Ok(()) => Ok(()),
+            Err(error) => {
                 let message = format!("{error:#}");
                 self.note(&message);
                 self.set_status(Status::Error(message));
@@ -170,8 +217,47 @@ impl XrayCore {
         // Resolve before checking ports: a busy port must not mask a missing core.
         let xray = self.resolve_binary()?;
         self.preflight_notes(server);
-        self.ensure_ports_free(bind)?;
+        self.ensure_ports_free(bind, None)?;
         let cfg = config::generate(server, bind, self.socks_port, self.http_port);
+        self.spawn_config(&xray, &cfg, profile)?;
+        self.active = Some(server.clone());
+        Ok(())
+    }
+
+    fn try_connect_pool(
+        &mut self,
+        members: &[&Server],
+        strategy: &str,
+        probe_interval: &str,
+        bind: Ipv4Addr,
+        api_port: u16,
+        profile: &str,
+    ) -> Result<()> {
+        let xray = self.resolve_binary()?;
+        for member in members {
+            self.preflight_notes(member);
+        }
+        self.ensure_ports_free(bind, Some(api_port))?;
+        let cfg = config::generate_pool(
+            members,
+            strategy,
+            probe_interval,
+            bind,
+            self.socks_port,
+            self.http_port,
+            api_port,
+        )?;
+        self.spawn_config(&xray, &cfg, profile)?;
+        self.active = None;
+        Ok(())
+    }
+
+    fn spawn_config(
+        &mut self,
+        xray: &ResolvedXray,
+        cfg: &serde_json::Value,
+        profile: &str,
+    ) -> Result<()> {
         let path = Self::config_path(profile)?;
         // The generated config embeds the server credentials — keep it private.
         fsutil::write_private_atomic(&path, serde_json::to_string_pretty(&cfg)?.as_bytes())
@@ -195,22 +281,34 @@ impl XrayCore {
         }
 
         self.child = Some(child);
-        self.active = Some(server.clone());
         // Process launched. Readiness is confirmed by a latency probe from the caller;
         // mark Connected optimistically and let the caller downgrade on probe failure.
         self.set_status(Status::Connected);
         Ok(())
     }
 
+    pub(crate) fn adopt(&mut self, pid: u32, profile: &str) {
+        self.child = None;
+        self.recovered = Some((pid, profile.to_string()));
+        self.active = None;
+        self.set_status(Status::Connected);
+    }
+
     /// PID of the running xray child, persisted so a crashed instance's tunnel
     /// can be reaped on the next start.
     pub fn child_pid(&self) -> Option<u32> {
-        self.child.as_ref().map(Child::id)
+        self.child
+            .as_ref()
+            .map(Child::id)
+            .or_else(|| self.recovered.as_ref().map(|(pid, _)| *pid))
     }
 
     pub fn disconnect(&mut self) {
         if let Some(mut child) = self.child.take() {
             stop_child(&mut child);
+        }
+        if let Some((pid, _)) = self.recovered.take() {
+            let _ = crate::proc::stop_pid(pid);
         }
         self.active = None;
         self.set_status(Status::Disconnected);
@@ -220,7 +318,16 @@ impl XrayCore {
     pub fn is_alive(&mut self) -> bool {
         match self.child.as_mut() {
             Some(c) => matches!(c.try_wait(), Ok(None)),
-            None => false,
+            None => self.recovered.as_ref().is_some_and(|(pid, profile)| {
+                let Ok(config) = Self::config_path(profile) else {
+                    return false;
+                };
+                crate::proc::cmdline(*pid).is_some_and(|arguments| {
+                    arguments
+                        .iter()
+                        .any(|argument| std::path::Path::new(argument) == config)
+                })
+            }),
         }
     }
 
@@ -256,5 +363,17 @@ mod tests {
         );
         assert!(XrayCore::config_path("../outside").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn pool_api_port_cannot_alias_a_proxy_inbound() {
+        let core = XrayCore::new(10808, 10809, String::new());
+
+        let error = core
+            .ensure_ports_free("127.77.1.1".parse().unwrap(), Some(10808))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("API and SOCKS endpoints cannot share port 10808"));
     }
 }

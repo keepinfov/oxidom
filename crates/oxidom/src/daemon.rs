@@ -3,10 +3,10 @@
 //! survives the GUI, logout only kills it in `--session` mode.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use nix::sys::signal::{SigSet, Signal};
@@ -14,16 +14,16 @@ use zbus::fdo;
 
 use oxidom_core::alias;
 use oxidom_core::config::{Config, LatencyMethod};
-use oxidom_core::engine::Engine;
+use oxidom_core::engine::{Engine, SessionSelection, pool_fingerprint};
 use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
     ApplySettingsResult, BUS_NAME, InterfaceInfo, LatencyReading, OBJECT_PATH, PROBE_STATE_VERSION,
-    ProbeFailure, ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo, SessionInfo, StatusInfo,
-    UpResult, UpServer,
+    PoolMember, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo, SelectionInfo,
+    SessionInfo, StatusInfo, UpResult, UpServer,
 };
 use oxidom_core::model::Server;
 use oxidom_core::probe;
-use oxidom_core::profile::{self, Profile, RouteMode};
+use oxidom_core::profile::{self, MAX_POOL_MEMBERS, Profile, RouteMode};
 use oxidom_core::xray::core::Status;
 
 /// How many servers may be measured at once. This is now a cap on *processes*:
@@ -33,6 +33,9 @@ use oxidom_core::xray::core::Status;
 const MAX_CONCURRENT_PROBES: usize = 8;
 const ACTIVE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const CORE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+const POOL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const BALANCER_INFO_TTL: Duration = Duration::from_secs(2);
+const BALANCER_API_TIMEOUT: Duration = Duration::from_secs(1);
 const CORE_EXITED_MESSAGE: &str = "Xray exited unexpectedly";
 const RECONNECTING_MESSAGE: &str = "Xray exited unexpectedly — reconnecting";
 
@@ -167,7 +170,54 @@ impl ProbeQueue {
 #[derive(Clone)]
 struct ErrorOverride {
     status: Status,
-    server_id: String,
+    selection: SessionSelection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConnectionTarget {
+    Server(String),
+    Pool {
+        members: Vec<String>,
+        strategy: String,
+        probe_interval: String,
+        api_port: u16,
+    },
+}
+
+impl ConnectionTarget {
+    fn selection(&self) -> SessionSelection {
+        match self {
+            Self::Server(server_id) => SessionSelection::Server(server_id.clone()),
+            Self::Pool {
+                members, strategy, ..
+            } => SessionSelection::pool(members.clone(), strategy.clone()),
+        }
+    }
+
+    fn server_id(&self) -> Option<&str> {
+        match self {
+            Self::Server(server_id) => Some(server_id),
+            Self::Pool { .. } => None,
+        }
+    }
+
+    fn probe_label(&self, profile: &str) -> String {
+        self.server_id()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("pool:{profile}"))
+    }
+}
+
+impl From<&str> for ConnectionTarget {
+    fn from(server_id: &str) -> Self {
+        Self::Server(server_id.to_string())
+    }
+}
+
+impl From<&ConnectionTarget> for ConnectionTarget {
+    fn from(target: &ConnectionTarget) -> Self {
+        target.clone()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -211,14 +261,29 @@ impl Shared {
         http_port_locked: bool,
         system_bus: bool,
     ) -> Self {
+        let mut generation = 0;
+        let current_generations = engine
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.selection.is_some() && session.status() == Status::Connected
+            })
+            .map(|(profile, _)| {
+                generation += 1;
+                (profile.to_string(), generation)
+            })
+            .collect();
         Shared {
             engine: Arc::new(Mutex::new(engine)),
             readings: Arc::new(Mutex::new(HashMap::new())),
             proxied: Arc::new(Mutex::new(HashMap::new())),
             probes: Arc::new(Mutex::new(ProbeQueue::default())),
             override_status: Arc::new(Mutex::new(HashMap::new())),
-            connect_generation: Arc::new(AtomicU64::new(0)),
-            current_generations: Arc::new(Mutex::new(HashMap::new())),
+            // An adopted pool core is already a live attempt. Giving it a
+            // generation makes its first post-recovery death reconnectable
+            // while retaining the same cancellation rules as a fresh `up`.
+            connect_generation: Arc::new(AtomicU64::new(generation)),
+            current_generations: Arc::new(Mutex::new(current_generations)),
             socks_port_locked,
             http_port_locked,
             system_bus,
@@ -279,7 +344,7 @@ impl Shared {
     ///
     /// The sweep is deliberately per profile: two sessions may carry the same
     /// server, and the health of one process says nothing about the other.
-    fn note_core_deaths(&self) -> Vec<(String, String)> {
+    fn note_core_deaths(&self) -> Vec<(String, ConnectionTarget)> {
         let mut engine = oxidom_core::sync::lock(&self.engine);
         let profiles = engine
             .sessions
@@ -295,11 +360,23 @@ impl Shared {
             if session.status() != Status::Connected || alive {
                 continue;
             }
-            let Some(server_id) = session.server_id.clone() else {
+            let Some(selection) = session.selection.clone() else {
                 continue;
             };
+            let target = match selection {
+                SessionSelection::Server(server_id) => ConnectionTarget::Server(server_id),
+                SessionSelection::Pool {
+                    members, strategy, ..
+                } => ConnectionTarget::Pool {
+                    members,
+                    strategy,
+                    probe_interval: session.pool_probe_interval.clone(),
+                    api_port: session.api_port,
+                },
+            };
             session.core.fail(CORE_EXITED_MESSAGE);
-            dead.push((profile, server_id));
+            session.balancer_info = None;
+            dead.push((profile, target));
         }
         for (profile, _) in &dead {
             if let Err(error) = engine.stop_interface(profile) {
@@ -313,18 +390,22 @@ impl Shared {
         dead
     }
 
-    fn begin_reconnect(&self, profile: String, server_id: String, generation: u64) {
+    fn begin_reconnect(&self, profile: String, target: ConnectionTarget, generation: u64) {
         if !self.generation_is_current(&profile, generation) {
             return;
         }
         let death_is_current = {
             let engine = oxidom_core::sync::lock(&self.engine);
             engine.registry.config.reconnect
-                && engine
-                    .sessions
-                    .get(&profile)
-                    .and_then(|session| session.server_id.as_deref())
-                    == Some(server_id.as_str())
+                && engine.sessions.get(&profile).is_some_and(|session| {
+                    session.selection.as_ref() == Some(&target.selection())
+                        && match &target {
+                            ConnectionTarget::Server(_) => true,
+                            ConnectionTarget::Pool { api_port, .. } => {
+                                session.api_port == *api_port
+                            }
+                        }
+                })
                 && matches!(
                     engine.sessions.get(&profile).map(|session| session.status()),
                     Some(Status::Error(message)) if message == CORE_EXITED_MESSAGE
@@ -337,8 +418,8 @@ impl Shared {
             oxidom_core::sync::lock(&self.override_status).get(&profile),
             Some(ErrorOverride {
                 status: Status::Error(message),
-                server_id: id,
-            }) if message == RECONNECTING_MESSAGE && id == &server_id
+                selection,
+            }) if message == RECONNECTING_MESSAGE && selection == &target.selection()
         );
         if already_reconnecting {
             return;
@@ -348,49 +429,50 @@ impl Shared {
             profile.clone(),
             ErrorOverride {
                 status: Status::Error(RECONNECTING_MESSAGE.to_string()),
-                server_id: server_id.clone(),
+                selection: target.selection(),
             },
         );
         let shared = self.clone();
-        std::thread::spawn(move || shared.reconnect(profile, server_id, generation));
+        std::thread::spawn(move || shared.reconnect(profile, target, generation));
     }
 
-    fn reconnect(&self, profile: String, server_id: String, generation: u64) {
+    fn reconnect(&self, profile: String, target: ConnectionTarget, generation: u64) {
         let mut attempt = 0;
         loop {
-            if !self.reconnect_is_pending(&profile, &server_id, generation) {
+            if !self.reconnect_is_pending(&profile, &target, generation) {
                 return;
             }
             std::thread::sleep(reconnect_delay(attempt));
-            if !self.reconnect_is_pending(&profile, &server_id, generation) {
+            if !self.reconnect_is_pending(&profile, &target, generation) {
                 return;
             }
 
-            let Some(result) = self.start_reconnect_attempt(&profile, &server_id, generation)
-            else {
+            let Some(result) = self.start_reconnect_attempt(&profile, &target, generation) else {
                 return;
             };
             match result {
                 Ok(confirmed) => {
                     if confirmed.recv().unwrap_or(false)
-                        && self.reconnect_is_pending(&profile, &server_id, generation)
+                        && self.reconnect_is_pending(&profile, &target, generation)
                     {
-                        self.clear_reconnect_override(&profile, &server_id);
+                        self.clear_reconnect_override(&profile, &target);
                         return;
                     }
                 }
                 Err(error) => {
-                    log::warn!(
-                        "automatic reconnect of profile {profile:?} to {server_id} failed: \
-                         {error:#}"
-                    );
+                    log::warn!("automatic reconnect of profile {profile:?} failed: {error:#}");
                 }
             }
             attempt = attempt.saturating_add(1);
         }
     }
 
-    fn reconnect_is_pending(&self, profile: &str, server_id: &str, generation: u64) -> bool {
+    fn reconnect_is_pending(
+        &self,
+        profile: &str,
+        target: &ConnectionTarget,
+        generation: u64,
+    ) -> bool {
         if !self.generation_is_current(profile, generation) {
             return false;
         }
@@ -399,26 +481,26 @@ impl Shared {
             .config
             .reconnect
         {
-            self.clear_reconnect_override(profile, server_id);
+            self.clear_reconnect_override(profile, target);
             return false;
         }
         matches!(
             oxidom_core::sync::lock(&self.override_status).get(profile),
             Some(ErrorOverride {
                 status: Status::Error(message),
-                server_id: id,
-            }) if message == RECONNECTING_MESSAGE && id == server_id
+                selection,
+            }) if message == RECONNECTING_MESSAGE && selection == &target.selection()
         )
     }
 
-    fn clear_reconnect_override(&self, profile: &str, server_id: &str) {
+    fn clear_reconnect_override(&self, profile: &str, target: &ConnectionTarget) {
         let mut override_status = oxidom_core::sync::lock(&self.override_status);
         let is_ours = matches!(
             override_status.get(profile),
             Some(ErrorOverride {
                 status: Status::Error(message),
-                server_id: id,
-            }) if message == RECONNECTING_MESSAGE && id == server_id
+                selection,
+            }) if message == RECONNECTING_MESSAGE && selection == &target.selection()
         );
         if is_ours {
             override_status.remove(profile);
@@ -434,9 +516,9 @@ impl Shared {
     }
 
     fn status_info(&self) -> StatusInfo {
-        for (profile, server_id) in self.note_core_deaths() {
+        for (profile, target) in self.note_core_deaths() {
             if let Some(generation) = self.current_generation(&profile) {
-                self.begin_reconnect(profile, server_id, generation);
+                self.begin_reconnect(profile, target, generation);
             }
         }
         // Scoped, not `if let`: in edition 2024 an `if let` scrutinee's
@@ -461,10 +543,10 @@ impl Shared {
         let profile = session.profile.as_str();
         let mut status = if let Some(failure) = overrides.get(profile) {
             StatusInfo::from_status(&failure.status, None)
-                .with_error_id(Some(failure.server_id.clone()))
+                .with_error_id(failure.selection.server_id().map(str::to_string))
         } else {
-            StatusInfo::from_status(&session.status(), session.server_id.clone())
-                .with_active_profile(session.server_id.as_ref().map(|_| profile.to_string()))
+            StatusInfo::from_status(&session.status(), session.server_id().map(str::to_string))
+                .with_active_profile(session.selection.as_ref().map(|_| profile.to_string()))
         };
         status.sessions = sessions;
         status
@@ -527,8 +609,7 @@ impl Shared {
             .sessions
             .iter()
             .find(|(_, session)| {
-                session.status() == Status::Connected
-                    && session.server_id.as_deref() == Some(server_id)
+                session.status() == Status::Connected && session.server_id() == Some(server_id)
             })
             .map(|(profile, _)| ProbeTarget::Proxied(profile.to_string()))
             .unwrap_or_else(|| ProbeTarget::Direct(server_id.to_string()))
@@ -542,9 +623,8 @@ impl Shared {
         self.pump_probes();
     }
 
-    fn enqueue_session_probe(&self, profile: String, server_id: String) {
-        if !oxidom_core::sync::lock(&self.probes).enqueue(ProbeTarget::Proxied(profile), server_id)
-        {
+    fn enqueue_session_probe(&self, profile: String, label: String) {
+        if !oxidom_core::sync::lock(&self.probes).enqueue(ProbeTarget::Proxied(profile), label) {
             return;
         }
         self.pump_probes();
@@ -570,7 +650,7 @@ impl Shared {
     fn run_probe(&self, job: &ProbeJob) -> Option<u32> {
         match &job.target {
             ProbeTarget::Direct(_) => self.run_direct_probe(&job.server_id),
-            ProbeTarget::Proxied(profile) => self.run_session_probe(profile, &job.server_id),
+            ProbeTarget::Proxied(profile) => self.run_session_probe(profile),
         }
     }
 
@@ -613,32 +693,60 @@ impl Shared {
     }
 
     /// Measure the tunnel owned by one profile.
-    fn run_session_probe(&self, profile: &str, server_id: &str) -> Option<u32> {
+    fn run_session_probe(&self, profile: &str) -> Option<u32> {
         let target = {
             let engine = oxidom_core::sync::lock(&self.engine);
-            match (engine.find_server(server_id), engine.sessions.get(profile)) {
-                (Some(server), Some(session))
-                    if session.status() == Status::Connected
-                        && session.server_id.as_deref() == Some(server_id) =>
-                {
+            match engine.sessions.get(profile) {
+                Some(session) if session.status() == Status::Connected => {
                     let mut config = engine.registry.config.clone();
                     config.socks_port = session.socks_port;
                     config.http_port = session.http_port;
-                    Some((server, config, session.address))
+                    let server = session
+                        .server_id()
+                        .and_then(|server_id| engine.find_server(server_id));
+                    Some((server, config, session.address, session.selection.clone()))
                 }
                 _ => None,
             }
         };
         let reading = match target {
-            Some((server, config, address)) => {
-                let method = config.latency_method;
-                match probe::measure(&server, &config, probe::Route::Proxied, address) {
+            Some((server, config, address, selection)) => {
+                let requested_method = config.latency_method;
+                let (outcome, attempted_method) = match (selection, server) {
+                    (Some(SessionSelection::Server(_)), Some(server)) => (
+                        probe::measure(&server, &config, probe::Route::Proxied, address),
+                        requested_method,
+                    ),
+                    (Some(SessionSelection::Pool { .. }), _) => {
+                        // ICMP/TCP name one member and therefore cannot measure
+                        // a rotating session. HTTP through the live SOCKS
+                        // inbound measures exactly what the balancer carries.
+                        let (verb, method) = pool_probe_method(requested_method);
+                        (
+                            probe::http_ping(
+                                address,
+                                config.socks_port,
+                                &config.latency_test_url,
+                                verb,
+                                Duration::from_secs(3),
+                            ),
+                            method,
+                        )
+                    }
+                    _ => (
+                        probe::ProbeOutcome::Internal("session selection is missing"),
+                        requested_method,
+                    ),
+                };
+                match outcome {
                     probe::ProbeOutcome::Reachable(measured) => {
                         LatencyReading::ok(measured.ms, ProbeRoute::Proxied, measured.method)
                     }
-                    outcome => {
-                        LatencyReading::failed(wire_failure(&outcome), ProbeRoute::Proxied, method)
-                    }
+                    outcome => LatencyReading::failed(
+                        wire_failure(&outcome),
+                        ProbeRoute::Proxied,
+                        attempted_method,
+                    ),
                 }
             }
             None => LatencyReading::failed(
@@ -651,8 +759,7 @@ impl Shared {
         let still_current = {
             let engine = oxidom_core::sync::lock(&self.engine);
             engine.sessions.get(profile).is_some_and(|session| {
-                session.status() == Status::Connected
-                    && session.server_id.as_deref() == Some(server_id)
+                session.status() == Status::Connected && session.selection.is_some()
             })
         };
         if still_current {
@@ -671,18 +778,50 @@ impl Shared {
         generation: u64,
         origin: ConnectionOrigin,
     ) -> Result<Option<mpsc::Receiver<bool>>> {
+        self.start_connection_target(
+            profile,
+            &ConnectionTarget::Server(server_id.to_string()),
+            generation,
+            origin,
+        )
+    }
+
+    fn start_connection_target(
+        &self,
+        profile: &str,
+        target: &ConnectionTarget,
+        generation: u64,
+        origin: ConnectionOrigin,
+    ) -> Result<Option<mpsc::Receiver<bool>>> {
         if !self.generation_is_current(profile, generation) {
             return Ok(None);
         }
         oxidom_core::sync::lock(&self.proxied).remove(profile);
-        let probe_job = oxidom_core::sync::lock(&self.probes).start_now(profile, server_id);
+        let probe_label = target.probe_label(profile);
+        let probe_job = oxidom_core::sync::lock(&self.probes).start_now(profile, &probe_label);
 
         let connect_result = {
             let mut engine = oxidom_core::sync::lock(&self.engine);
             if !self.generation_is_current(profile, generation) {
                 None
             } else {
-                Some(engine.connect_session(profile, server_id))
+                Some(match target {
+                    ConnectionTarget::Server(server_id) => {
+                        engine.connect_session(profile, server_id)
+                    }
+                    ConnectionTarget::Pool {
+                        members,
+                        strategy,
+                        probe_interval,
+                        api_port,
+                    } => engine.connect_pool_session(
+                        profile,
+                        members,
+                        strategy,
+                        probe_interval,
+                        *api_port,
+                    ),
+                })
             }
         };
         match connect_result {
@@ -699,7 +838,7 @@ impl Shared {
             }
             Some(Ok(())) => Ok(Some(self.confirm_connection(
                 profile.to_string(),
-                server_id.to_string(),
+                target.clone(),
                 generation,
                 origin,
                 probe_job.token,
@@ -709,16 +848,22 @@ impl Shared {
 
     /// `None` means an explicit operation has already superseded this retry,
     /// so no Xray start was attempted.
-    fn start_reconnect_attempt(
+    fn start_reconnect_attempt<T: Into<ConnectionTarget>>(
         &self,
         profile: &str,
-        server_id: &str,
+        target: T,
         generation: u64,
     ) -> Option<Result<mpsc::Receiver<bool>>> {
+        let target = target.into();
         if !self.generation_is_current(profile, generation) {
             return None;
         }
-        match self.start_connection(profile, server_id, generation, ConnectionOrigin::Reconnect) {
+        match self.start_connection_target(
+            profile,
+            &target,
+            generation,
+            ConnectionOrigin::Reconnect,
+        ) {
             Ok(Some(confirmed)) => Some(Ok(confirmed)),
             Ok(None) => None,
             Err(error) => Some(Err(error)),
@@ -737,7 +882,7 @@ impl Shared {
     fn confirm_connection(
         &self,
         profile: String,
-        server_id: String,
+        target: ConnectionTarget,
         generation: u64,
         origin: ConnectionOrigin,
         probe_token: u64,
@@ -773,7 +918,7 @@ impl Shared {
             let ready = probe::wait_for_socks(address, socks_port);
 
             let latency = if ready {
-                shared.run_session_probe(&profile, &server_id)
+                shared.run_session_probe(&profile)
             } else {
                 // Nothing could be measured, but the GUI is waiting on this id
                 // and would otherwise see the spinner retire onto whatever the
@@ -800,7 +945,7 @@ impl Shared {
                                 profile.clone(),
                                 ErrorOverride {
                                     status: Status::Error(reason),
-                                    server_id: server_id.clone(),
+                                    selection: target.selection(),
                                 },
                             );
                         }
@@ -844,7 +989,7 @@ impl Shared {
                     .to_string()
             };
             let still_active = engine.sessions.get(&profile).is_some_and(|session| {
-                session.server_id.as_deref() == Some(&server_id)
+                session.selection.as_ref() == Some(&target.selection())
                     && session.status() == Status::Connected
             });
             if still_active {
@@ -859,7 +1004,7 @@ impl Shared {
                         profile.clone(),
                         ErrorOverride {
                             status: Status::Error(reason),
-                            server_id: server_id.clone(),
+                            selection: target.selection(),
                         },
                     );
                 }
@@ -922,19 +1067,99 @@ impl Shared {
                         let Some(session) = engine.sessions.get_mut(&profile) else {
                             continue;
                         };
-                        if session.status() == Status::Connected
-                            && session.is_alive()
-                            && let Some(server_id) = session.server_id.clone()
-                        {
-                            active.push((profile, server_id));
+                        if session.status() == Status::Connected && session.is_alive() {
+                            let label = session
+                                .server_id()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("pool:{profile}"));
+                            active.push((profile, label));
                         }
                     }
                     active
                 };
-                for (profile, server_id) in active {
+                for (profile, label) in active {
                     // The queue refuses a profile already running or waiting,
                     // so a slow session cannot pile up copies of itself.
-                    shared.enqueue_session_probe(profile, server_id);
+                    shared.enqueue_session_probe(profile, label);
+                }
+            }
+        });
+    }
+
+    fn spawn_pool_status_loop(&self) {
+        let shared = self.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(POOL_POLL_INTERVAL);
+                let profiles = {
+                    let engine = oxidom_core::sync::lock(&shared.engine);
+                    engine
+                        .sessions
+                        .iter()
+                        .filter(|(_, session)| {
+                            matches!(&session.selection, Some(SessionSelection::Pool { .. }))
+                        })
+                        .map(|(profile, _)| profile.to_string())
+                        .collect::<Vec<_>>()
+                };
+
+                for profile_name in profiles {
+                    let profile_query = profile::load(&profile_name)
+                        .ok()
+                        .and_then(|profile| profile.select.pool);
+                    let api_task = {
+                        let mut engine = oxidom_core::sync::lock(&shared.engine);
+                        let selection = engine
+                            .sessions
+                            .get(&profile_name)
+                            .and_then(|session| session.selection.as_ref());
+                        let stale = pool_membership_stale(
+                            profile_query.as_ref(),
+                            selection,
+                            &engine.registry.subscriptions,
+                        );
+
+                        let xray_binary = engine.registry.config.xray_binary.clone();
+                        let Some(session) = engine.sessions.get_mut(&profile_name) else {
+                            continue;
+                        };
+                        session.pool_stale = stale;
+                        let due = session.status() == Status::Connected
+                            && session.api_port != 0
+                            && session
+                                .balancer_polled_at
+                                .is_none_or(|last| last.elapsed() >= BALANCER_INFO_TTL);
+                        if !due {
+                            None
+                        } else {
+                            session.balancer_polled_at = Some(Instant::now());
+                            Some((
+                                session.selection.clone(),
+                                xray_binary,
+                                SocketAddrV4::new(session.address, session.api_port),
+                                session.api_port,
+                            ))
+                        }
+                    };
+                    let Some((selection, xray_binary, api, api_port)) = api_task else {
+                        continue;
+                    };
+                    let result =
+                        oxidom_core::xray::resolve::resolve(&xray_binary).and_then(|resolved| {
+                            oxidom_core::xray::api::balancer_info(
+                                &resolved.path,
+                                api,
+                                "pool",
+                                BALANCER_API_TIMEOUT,
+                            )
+                        });
+                    let mut engine = oxidom_core::sync::lock(&shared.engine);
+                    let Some(session) = engine.sessions.get_mut(&profile_name) else {
+                        continue;
+                    };
+                    if session.selection == selection && session.api_port == api_port {
+                        session.balancer_info = result.ok();
+                    }
                 }
             }
         });
@@ -1007,6 +1232,14 @@ fn wire_failure(outcome: &probe::ProbeOutcome) -> ProbeFailure {
     }
 }
 
+fn pool_probe_method(requested: LatencyMethod) -> (&'static str, LatencyMethod) {
+    if requested == LatencyMethod::HttpHead {
+        ("HEAD", LatencyMethod::HttpHead)
+    } else {
+        ("GET", LatencyMethod::HttpGet)
+    }
+}
+
 fn json<T: serde::Serialize>(value: &T) -> fdo::Result<String> {
     serde_json::to_string(value).map_err(failed)
 }
@@ -1017,14 +1250,14 @@ fn session_info(
     session: &oxidom_core::engine::Session,
     override_status: Option<&ErrorOverride>,
 ) -> SessionInfo {
-    let (status, server_id) = match override_status {
-        Some(failure) => (&failure.status, Some(failure.server_id.clone())),
+    let (status, selection) = match override_status {
+        Some(failure) => (&failure.status, Some(failure.selection.clone())),
         None => {
             let status = session.status();
             return session_info_with_status(engine, profile, session, &status, None);
         }
     };
-    session_info_with_status(engine, profile, session, status, server_id)
+    session_info_with_status(engine, profile, session, status, selection)
 }
 
 fn session_info_with_status(
@@ -1032,7 +1265,7 @@ fn session_info_with_status(
     profile: &str,
     session: &oxidom_core::engine::Session,
     status: &Status,
-    override_server_id: Option<String>,
+    override_selection: Option<SessionSelection>,
 ) -> SessionInfo {
     let (state, error) = match status {
         Status::Disconnected => ("disconnected", None),
@@ -1040,7 +1273,11 @@ fn session_info_with_status(
         Status::Connected => ("connected", None),
         Status::Error(message) => ("error", Some(message.clone())),
     };
-    let server_id = override_server_id.or_else(|| session.server_id.clone());
+    let selection = override_selection.or_else(|| session.selection.clone());
+    let server_id = selection
+        .as_ref()
+        .and_then(SessionSelection::server_id)
+        .map(str::to_string);
     let server = server_id
         .as_deref()
         .and_then(|server_id| engine.all_servers().find(|server| server.id == server_id));
@@ -1064,7 +1301,107 @@ fn session_info_with_status(
             mark: interface.mark,
             up: interface.up,
         }),
+        selection: selection_info(engine, session, selection.as_ref()),
     }
+}
+
+fn selection_info(
+    engine: &Engine,
+    session: &oxidom_core::engine::Session,
+    selection: Option<&SessionSelection>,
+) -> SelectionInfo {
+    match selection {
+        Some(SessionSelection::Server(_)) => SelectionInfo {
+            kind: "server".to_string(),
+            ..SelectionInfo::default()
+        },
+        Some(SessionSelection::Pool {
+            members, strategy, ..
+        }) => {
+            let live = session.balancer_info.as_ref();
+            // `principleTarget` answers a different question per strategy, and
+            // reading it the same way both times is how a pool would report
+            // five healthy servers as dead. A rotating balancer returns every
+            // node it still considers eligible, so absence there is real news;
+            // a picking balancer returns only its winner, so absence there is
+            // no evidence at all.
+            let rotating = matches!(strategy.as_str(), "roundRobin" | "random");
+            let pool_members = members
+                .iter()
+                .map(|server_id| {
+                    let server = engine.find_server(server_id);
+                    let alias = server.as_ref().and_then(|server| server.alias.clone());
+                    let tag = format!("s-{}", alias.as_deref().unwrap_or(server_id.as_str()));
+                    let healthy = match live {
+                        Some(info) if rotating && info.override_target.is_none() => {
+                            Some(info.principle.iter().any(|live_tag| live_tag == &tag))
+                        }
+                        _ => None,
+                    };
+                    PoolMember {
+                        server_id: server_id.clone(),
+                        alias,
+                        name: server
+                            .as_ref()
+                            .map(|server| server.name.clone())
+                            .unwrap_or_else(|| server_id.clone()),
+                        tag,
+                        healthy,
+                    }
+                })
+                .collect::<Vec<_>>();
+            // A single current exit exists only when something picked one: an
+            // override, or a picking strategy. Naming one node "now" under
+            // roundRobin would describe a rotation that never stopped.
+            let current_tag = live.and_then(|info| match &info.override_target {
+                Some(target) => Some(target.as_str()),
+                None if rotating => None,
+                None => (info.principle.len() == 1).then(|| info.principle[0].as_str()),
+            });
+            let selecting = current_tag.and_then(|tag| {
+                pool_members
+                    .iter()
+                    .find(|member| member.tag == tag)
+                    .map(|member| {
+                        member
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| member.server_id.clone())
+                    })
+            });
+            SelectionInfo {
+                kind: "pool".to_string(),
+                strategy: strategy.clone(),
+                members: pool_members,
+                selecting,
+                stale: session.pool_stale,
+            }
+        }
+        None => SelectionInfo::default(),
+    }
+}
+
+fn pool_membership_stale(
+    query: Option<&oxidom_core::pool::PoolQuery>,
+    selection: Option<&SessionSelection>,
+    subscriptions: &[oxidom_core::model::Subscription],
+) -> bool {
+    let (Some(query), Some(SessionSelection::Pool { fingerprint, .. })) = (query, selection) else {
+        // A running session deliberately survives its profile file or a later
+        // switch to single-server selection.
+        return false;
+    };
+    oxidom_core::pool::resolve(query, subscriptions)
+        .map(|members| {
+            let ids = members
+                .iter()
+                .map(|server| server.id.clone())
+                .collect::<Vec<_>>();
+            pool_fingerprint(&ids) != *fingerprint
+        })
+        // An empty current result differs from the non-empty membership that
+        // was accepted at `up`, even though `resolve` reports it as an error.
+        .unwrap_or(true)
 }
 
 /// How each candidate for an ambiguous handle should be spelled back at the
@@ -1211,9 +1548,11 @@ impl Service {
             engine
                 .prepare_session("default", Ipv4Addr::LOCALHOST, socks_port, http_port)
                 .map_err(failed)?;
-            if let Err(error) =
-                engine.configure_interface("default", &default_profile.interface, &server)
-            {
+            if let Err(error) = engine.configure_interface(
+                "default",
+                &default_profile.interface,
+                std::slice::from_ref(&server),
+            ) {
                 if !existed {
                     engine.sessions.remove("default");
                 }
@@ -1258,6 +1597,7 @@ impl Service {
                     socks_port: profile.proxy.socks_port,
                     http_port: profile.proxy.http_port,
                     interface: profile.interface,
+                    pool: profile.select.pool,
                 }),
                 Err(error) => log::warn!("skipping profile {name:?}: {error:#}"),
             }
@@ -1289,7 +1629,7 @@ impl Service {
         // Only files written through `SaveProfile` were validated on the way
         // in; this one may have been edited by hand since.
         profile.validate(&name).map_err(failed)?;
-        if profile.select.server.is_empty() {
+        if profile.select.server.is_empty() && profile.select.pool.is_none() {
             return Err(failed(format!(
                 "profile {name:?} does not name a server yet; set select.server to an alias or id"
             )));
@@ -1297,7 +1637,7 @@ impl Service {
 
         // Resolve and apply everything that needs the engine, then drop the
         // guard: `start_connection` takes the same lock itself.
-        let (server, ignored_ports) = {
+        let (target, up_server, ignored_ports) = {
             let mut engine = oxidom_core::sync::lock(&self.shared.engine);
             if engine.sessions.get(&name).is_some() {
                 return Err(failed(format!(
@@ -1313,24 +1653,6 @@ impl Service {
                 ));
             }
 
-            let server = match handle::resolve(engine.all_servers(), &profile.select.server) {
-                HandleMatch::One(server) => server.clone(),
-                HandleMatch::None => {
-                    return Err(failed(format!(
-                        "profile {name:?} names no server this daemon knows: {:?}",
-                        profile.select.server
-                    )));
-                }
-                HandleMatch::Ambiguous(candidates) => {
-                    return Err(failed(format!(
-                        "{:?} matches {} servers ({}); use an alias or an id",
-                        profile.select.server,
-                        candidates.len(),
-                        candidate_list(&candidates)
-                    )));
-                }
-            };
-
             let wants_system_proxy = engine.registry.config.system_proxy;
             if wants_system_proxy
                 && let Some(owner) = engine.sessions.owner_of_system_proxy()
@@ -1343,6 +1665,78 @@ impl Service {
             let address = oxidom_core::bind::address_for(&name, &engine.sessions.taken_addresses())
                 .ok_or_else(|| failed("no free profile loopback addresses remain"))?;
 
+            let (target, servers, up_server) = if let Some(query) = &profile.select.pool {
+                let composites =
+                    oxidom_core::pool::excluded_composites(query, &engine.registry.subscriptions);
+                if !composites.is_empty() {
+                    log::warn!(
+                        "profile {name:?} pool omitted composite Xray profiles: {}",
+                        composites
+                            .iter()
+                            .map(|server| format!(
+                                "{} ({})",
+                                server.name,
+                                server.alias.as_deref().unwrap_or(&server.id)
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                let resolved = oxidom_core::pool::resolve(query, &engine.registry.subscriptions)
+                    .map_err(failed)?;
+                if resolved.len() > MAX_POOL_MEMBERS {
+                    return Err(failed(format!(
+                        "profile {name:?} pool resolves to {} nodes; set [select.pool] max to \
+                         {MAX_POOL_MEMBERS} or less",
+                        resolved.len()
+                    )));
+                }
+                let servers = resolved.into_iter().cloned().collect::<Vec<_>>();
+                let members = servers
+                    .iter()
+                    .map(|server| server.id.clone())
+                    .collect::<Vec<_>>();
+                let api_port = oxidom_core::engine::free_port(address, &[socks_port, http_port])
+                    .map_err(failed)?;
+                (
+                    ConnectionTarget::Pool {
+                        members,
+                        strategy: query.strategy.as_xray().to_string(),
+                        probe_interval: query.probe_interval_or_default().to_string(),
+                        api_port,
+                    },
+                    servers,
+                    UpServer::default(),
+                )
+            } else {
+                let server = match handle::resolve(engine.all_servers(), &profile.select.server) {
+                    HandleMatch::One(server) => server.clone(),
+                    HandleMatch::None => {
+                        return Err(failed(format!(
+                            "profile {name:?} names no server this daemon knows: {:?}",
+                            profile.select.server
+                        )));
+                    }
+                    HandleMatch::Ambiguous(candidates) => {
+                        return Err(failed(format!(
+                            "{:?} matches {} servers ({}); use an alias or an id",
+                            profile.select.server,
+                            candidates.len(),
+                            candidate_list(&candidates)
+                        )));
+                    }
+                };
+                (
+                    ConnectionTarget::Server(server.id.clone()),
+                    vec![server.clone()],
+                    UpServer {
+                        id: server.id,
+                        alias: server.alias,
+                        name: server.name,
+                    },
+                )
+            };
+
             if name == "default"
                 && (engine.registry.config.socks_port != socks_port
                     || engine.registry.config.http_port != http_port)
@@ -1354,21 +1748,24 @@ impl Service {
             engine
                 .prepare_session(&name, address, socks_port, http_port)
                 .map_err(failed)?;
-            if let Err(error) = engine.configure_interface(&name, &profile.interface, &server) {
+            if let Err(error) = engine.configure_interface(&name, &profile.interface, &servers) {
                 engine.sessions.remove(&name);
                 return Err(failed(error));
             }
             if wants_system_proxy {
                 engine.sessions.claim_system_proxy(&name).map_err(failed)?;
             }
-            (server, ignored_ports)
+            (target, up_server, ignored_ports)
         };
 
         self.shared.clear_override(&name);
         let generation = self.shared.next_connect_generation(&name);
-        let confirmation =
-            self.shared
-                .start_connection(&name, &server.id, generation, ConnectionOrigin::Explicit);
+        let confirmation = self.shared.start_connection_target(
+            &name,
+            &target,
+            generation,
+            ConnectionOrigin::Explicit,
+        );
         self.shared.clear_override(&name);
         let confirmation = confirmation.map_err(failed)?;
         if profile.interface.enable
@@ -1385,11 +1782,7 @@ impl Service {
         }
 
         json(&UpResult {
-            server: UpServer {
-                id: server.id,
-                alias: server.alias,
-                name: server.name,
-            },
+            server: up_server,
             ignored_ports,
             warnings: (profile.interface.routes == RouteMode::Default)
                 .then(|| {
@@ -1565,26 +1958,55 @@ impl Service {
         if ports_changed && engine.status() == Status::Connected {
             // Same treatment as a user-driven connect: the restarted core has
             // to prove the new inbound is up before this counts as connected.
-            if let Some(active) = engine
-                .sessions
-                .get("default")
-                .and_then(|session| session.server_id.clone())
-            {
+            let target = engine.sessions.get("default").and_then(|session| {
+                match session.selection.as_ref()? {
+                    SessionSelection::Server(server_id) => {
+                        Some(ConnectionTarget::Server(server_id.clone()))
+                    }
+                    SessionSelection::Pool {
+                        members, strategy, ..
+                    } => Some(ConnectionTarget::Pool {
+                        members: members.clone(),
+                        strategy: strategy.clone(),
+                        probe_interval: session.pool_probe_interval.clone(),
+                        api_port: session.api_port,
+                    }),
+                }
+            });
+            if let Some(target) = target {
                 let generation = self.shared.next_connect_generation("default");
-                match engine.connect_session("default", &active) {
-                    Ok(()) => confirmation = Some((active, generation)),
+                let reconnect = match &target {
+                    ConnectionTarget::Server(server_id) => {
+                        engine.connect_session("default", server_id)
+                    }
+                    ConnectionTarget::Pool {
+                        members,
+                        strategy,
+                        probe_interval,
+                        api_port,
+                    } => engine.connect_pool_session(
+                        "default",
+                        members,
+                        strategy,
+                        probe_interval,
+                        *api_port,
+                    ),
+                };
+                match reconnect {
+                    Ok(()) => confirmation = Some((target, generation)),
                     Err(error) => reconnect_error = Some(format!("{error:#}")),
                 }
             }
         }
         drop(engine);
-        if let Some((active, generation)) = confirmation {
+        if let Some((target, generation)) = confirmation {
+            let probe_label = target.probe_label("default");
             let probe_token = oxidom_core::sync::lock(&self.shared.probes)
-                .start_now("default", &active)
+                .start_now("default", &probe_label)
                 .token;
             self.shared.confirm_connection(
                 "default".to_string(),
-                active,
+                target,
                 generation,
                 ConnectionOrigin::Explicit,
                 probe_token,
@@ -1619,9 +2041,9 @@ fn spawn_core_supervisor(shared: Shared) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(CORE_WATCH_INTERVAL);
-            for (profile, server_id) in shared.note_core_deaths() {
+            for (profile, target) in shared.note_core_deaths() {
                 if let Some(generation) = shared.current_generation(&profile) {
-                    shared.begin_reconnect(profile, server_id, generation);
+                    shared.begin_reconnect(profile, target, generation);
                 }
             }
         }
@@ -1679,6 +2101,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
         options.system_bus,
     );
     shared.spawn_active_probe_loop();
+    shared.spawn_pool_status_loop();
     spawn_core_supervisor(shared.clone());
 
     let service = Service {
@@ -1799,7 +2222,26 @@ mod tests {
             .sessions
             .get_mut(profile)
             .context("test session is absent")?
-            .server_id = Some(server_id.to_string());
+            .selection = Some(SessionSelection::Server(server_id.to_string()));
+        Ok(())
+    }
+
+    fn mark_pool(engine: &mut Engine, profile: &str, members: &[&str]) -> Result<()> {
+        let address = bind::address_for(profile, &engine.sessions.taken_addresses())
+            .context("allocating test address")?;
+        let socks_port = engine.registry.config.socks_port;
+        let http_port = engine.registry.config.http_port;
+        engine.prepare_session(profile, address, socks_port, http_port)?;
+        let session = engine
+            .sessions
+            .get_mut(profile)
+            .context("test session is absent")?;
+        session.selection = Some(SessionSelection::pool(
+            members.iter().map(|member| (*member).to_string()).collect(),
+            "roundRobin".to_string(),
+        ));
+        session.api_port = 18082;
+        session.pool_probe_interval = "5m".to_string();
         Ok(())
     }
 
@@ -1809,6 +2251,24 @@ mod tests {
             .map(|attempt| reconnect_delay(attempt).as_secs())
             .collect();
         assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+    }
+
+    #[test]
+    fn pool_probe_reports_the_http_method_it_actually_uses() {
+        assert_eq!(
+            pool_probe_method(LatencyMethod::HttpHead),
+            ("HEAD", LatencyMethod::HttpHead)
+        );
+        for requested in [
+            LatencyMethod::HttpGet,
+            LatencyMethod::Tcp,
+            LatencyMethod::Icmp,
+        ] {
+            assert_eq!(
+                pool_probe_method(requested),
+                ("GET", LatencyMethod::HttpGet)
+            );
+        }
     }
 
     #[test]
@@ -1878,13 +2338,69 @@ mod tests {
 
         assert_eq!(
             service.shared.note_core_deaths(),
-            vec![("default".to_string(), "dead-server".to_string())]
+            vec![(
+                "default".to_string(),
+                ConnectionTarget::Server("dead-server".to_string())
+            )]
         );
         assert!(matches!(
             oxidom_core::sync::lock(&service.shared.engine).status(),
             Status::Error(message) if message == "Xray exited unexpectedly"
         ));
         assert!(service.shared.note_core_deaths().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_dead_pool_keeps_its_full_reconnect_target() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("dead-pool")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            mark_pool(&mut engine, "spread", &["one", "two"])?;
+            let session = engine.sessions.get("spread").context("pool session")?;
+            *oxidom_core::sync::lock(&session.core.status) = Status::Connected;
+        }
+
+        let deaths = service.shared.note_core_deaths();
+        assert!(matches!(
+            deaths.as_slice(),
+            [(
+                profile,
+                ConnectionTarget::Pool {
+                    members,
+                    strategy,
+                    probe_interval,
+                    api_port: 18082,
+                },
+            )] if profile == "spread"
+                && members == &["one".to_string(), "two".to_string()]
+                && strategy == "roundRobin"
+                && probe_interval == "5m"
+        ));
+        assert!(matches!(
+            oxidom_core::sync::lock(&service.shared.engine)
+                .sessions
+                .get("spread")
+                .map(|session| session.status()),
+            Some(Status::Error(message)) if message == CORE_EXITED_MESSAGE
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn an_adopted_session_starts_inside_a_reconnect_generation() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("adopted-generation")?;
+        let mut engine = Engine::load();
+        mark_pool(&mut engine, "spread", &["one", "two"])?;
+        let session = engine.sessions.get("spread").context("pool session")?;
+        *oxidom_core::sync::lock(&session.core.status) = Status::Connected;
+
+        let shared = Shared::new(engine, false, false, false);
+
+        assert!(shared.current_generation("spread").is_some());
         Ok(())
     }
 
@@ -1912,8 +2428,14 @@ mod tests {
         assert_eq!(
             service.shared.note_core_deaths(),
             vec![
-                ("home".to_string(), "same".to_string()),
-                ("work".to_string(), "same".to_string()),
+                (
+                    "home".to_string(),
+                    ConnectionTarget::Server("same".to_string())
+                ),
+                (
+                    "work".to_string(),
+                    ConnectionTarget::Server("same".to_string())
+                ),
             ]
         );
         let engine = oxidom_core::sync::lock(&service.shared.engine);
@@ -2176,6 +2698,163 @@ mod tests {
         assert_eq!(status.active_profile.as_deref(), Some("home"));
         assert_eq!(status.active_id.as_deref(), Some("home-server"));
         assert_eq!(status.sessions.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn pool_session_info_never_fills_the_legacy_server_fields() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("pool-session-info")?;
+        let service = for_test();
+        let mut subscription = oxidom_core::model::Subscription::new(
+            "https://subscription.example".to_string(),
+            Some("Test".to_string()),
+        );
+        subscription.servers = [
+            "trojan://one@one.example:443#One",
+            "vless://two@two.example:443#Two",
+        ]
+        .iter()
+        .map(|link| oxidom_core::link::parse_link(link).context("parsing test server"))
+        .collect::<Result<Vec<_>>>()?;
+        oxidom_core::alias::assign(std::slice::from_mut(&mut subscription));
+        let ids = subscription
+            .servers
+            .iter()
+            .map(|server| server.id.clone())
+            .collect::<Vec<_>>();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.subscriptions.push(subscription);
+            mark_pool(&mut engine, "spread", &[&ids[0], &ids[1]])?;
+            let first_tag = format!(
+                "s-{}",
+                engine
+                    .find_server(&ids[0])
+                    .and_then(|server| server.alias)
+                    .context("first alias")?
+            );
+            let session = engine.sessions.get_mut("spread").context("pool session")?;
+            session.balancer_info = Some(oxidom_core::xray::api::BalancerInfo {
+                tag: "pool".to_string(),
+                principle: vec![first_tag],
+                override_target: None,
+            });
+        }
+
+        let session: SessionInfo =
+            serde_json::from_str(&service.session_status("spread".to_string())?)?;
+        assert!(session.server_id.is_none());
+        assert!(session.server_alias.is_none());
+        assert!(session.server_name.is_none());
+        assert_eq!(session.selection.kind, "pool");
+        assert_eq!(session.selection.strategy, "roundRobin");
+        assert_eq!(session.selection.members.len(), 2);
+        // roundRobin keeps rotating, so there is no "now" node to name — but
+        // the member the core dropped from its eligible set is real news.
+        assert_eq!(session.selection.selecting, None);
+        assert_eq!(session.selection.members[0].healthy, Some(true));
+        assert_eq!(session.selection.members[1].healthy, Some(false));
+        Ok(())
+    }
+
+    /// A picking strategy answers with its winner, so the other members are not
+    /// unhealthy — they simply lost. Reporting them as dead was the bug this
+    /// test pins shut.
+    #[test]
+    fn a_least_ping_pool_names_its_pick_without_condemning_the_rest() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("pool-least-ping")?;
+        let service = for_test();
+        let mut subscription = oxidom_core::model::Subscription::new(
+            "https://subscription.example".to_string(),
+            Some("Test".to_string()),
+        );
+        subscription.servers = [
+            "trojan://one@one.example:443#One",
+            "vless://two@two.example:443#Two",
+        ]
+        .iter()
+        .map(|link| oxidom_core::link::parse_link(link).context("parsing test server"))
+        .collect::<Result<Vec<_>>>()?;
+        oxidom_core::alias::assign(std::slice::from_mut(&mut subscription));
+        let ids = subscription
+            .servers
+            .iter()
+            .map(|server| server.id.clone())
+            .collect::<Vec<_>>();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.subscriptions.push(subscription);
+            mark_pool(&mut engine, "spread", &[&ids[0], &ids[1]])?;
+            let second_tag = format!(
+                "s-{}",
+                engine
+                    .find_server(&ids[1])
+                    .and_then(|server| server.alias)
+                    .context("second alias")?
+            );
+            let session = engine.sessions.get_mut("spread").context("pool session")?;
+            if let Some(SessionSelection::Pool { strategy, .. }) = session.selection.as_mut() {
+                "leastPing".clone_into(strategy);
+            }
+            session.balancer_info = Some(oxidom_core::xray::api::BalancerInfo {
+                tag: "pool".to_string(),
+                principle: vec![second_tag],
+                override_target: None,
+            });
+        }
+
+        let session: SessionInfo =
+            serde_json::from_str(&service.session_status("spread".to_string())?)?;
+        assert_eq!(session.selection.strategy, "leastPing");
+        assert_eq!(
+            session.selection.selecting,
+            session.selection.members[1].alias
+        );
+        for member in &session.selection.members {
+            assert_eq!(member.healthy, None, "{}", member.tag);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stale_uses_the_resolved_order_and_ignores_a_missing_profile() -> Result<()> {
+        let mut subscription = oxidom_core::model::Subscription::new(
+            "https://subscription.example".to_string(),
+            Some("Test".to_string()),
+        );
+        subscription.servers = [
+            "trojan://one@one.example:443#One",
+            "vless://two@two.example:443#Two",
+        ]
+        .iter()
+        .map(|link| oxidom_core::link::parse_link(link).context("parsing test server"))
+        .collect::<Result<Vec<_>>>()?;
+        let ids = subscription
+            .servers
+            .iter()
+            .map(|server| server.id.clone())
+            .collect::<Vec<_>>();
+        let selection = SessionSelection::pool(ids.clone(), "roundRobin".to_string());
+        let groups = [subscription];
+        let query = oxidom_core::pool::PoolQuery::default();
+
+        assert!(!pool_membership_stale(
+            Some(&query),
+            Some(&selection),
+            &groups
+        ));
+        let changed = oxidom_core::pool::PoolQuery {
+            exclude: vec![ids[0].clone()],
+            ..query
+        };
+        assert!(pool_membership_stale(
+            Some(&changed),
+            Some(&selection),
+            &groups
+        ));
+        assert!(!pool_membership_stale(None, Some(&selection), &groups));
         Ok(())
     }
 

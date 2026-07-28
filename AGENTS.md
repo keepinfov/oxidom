@@ -167,9 +167,25 @@ inbound tagged `api-in` on the session's own address. Three details are binding:
 A single-server session emits none of this — its config is byte-identical to what it was before
 pools existed, and a test pins that.
 
-The daemon reads the live exit by running `xray api bi` against that inbound (no gRPC client, no
-new dependency) from its background loop, never from `Status`: the GUI polls `Status` twice a
-second and it must not block on a subprocess.
+The daemon reads balancer state by running `xray api bi --json` against that inbound (no gRPC
+client, no new dependency) from its background loop, never from `Status`: the GUI polls `Status`
+twice a second and it must not block on a subprocess.
+
+That command's help promises health, strategy and selecting; the wire schema of Xray 26.3.27
+carries none of them. What comes back is `override.target` and `principleTarget.tag`, and
+**`principleTarget` answers a different question per strategy** — verified live, not read from
+documentation:
+
+| Strategy | `principleTarget` holds | A missing tag means |
+|---|---|---|
+| `roundRobin`, `random` | every node still considered eligible | the observatory dropped it — this *is* the health signal |
+| `leastPing`, `leastLoad` | the one node it picked | nothing; the others merely lost |
+
+So `xray::api` reports the raw set and refuses to interpret it, and the daemon — which knows the
+strategy — decides. A rotating pool has no single current exit to name and reports how much of
+the rotation survives; a picking pool names its node and claims nothing about the rest. An
+override pins one target under any strategy. No per-node delay is reported anywhere, because
+none is available and an invented one would read as a measurement.
 
 Two Xray 26.x details that are easy to get wrong and are covered by tests — verify any change
 against a real core with `xray run -test -c <file>` rather than against documentation:

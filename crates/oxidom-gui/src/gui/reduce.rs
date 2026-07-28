@@ -1103,6 +1103,7 @@ mod tests {
             socks_port: 10808,
             http_port: 10809,
             interface: ProfileInterface::default(),
+            pool: None,
         }
     }
 

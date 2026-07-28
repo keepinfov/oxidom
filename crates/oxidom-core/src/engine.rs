@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -13,6 +14,7 @@ use crate::run::CgroupSlice;
 use crate::state::{self, InterfaceState, RouteRecord, SessionState, State, store};
 use crate::tun::core::Tun2socks;
 use crate::tun::plan::{Cidr, PlanInput, RoutePlan, Via, plan_routes};
+use crate::xray::api::BalancerInfo;
 use crate::xray::core::{Status, XrayCore};
 use crate::{alias, bind, link, probe, subscription};
 
@@ -107,6 +109,11 @@ impl Registry {
                 && let Some(new_id) = server_ids.get(active_id)
             {
                 active_id.clone_from(new_id);
+            }
+            for member in &mut session.pool_members {
+                if let Some(new_id) = server_ids.get(member) {
+                    member.clone_from(new_id);
+                }
             }
         }
         alias::assign(&mut self.subscriptions);
@@ -355,6 +362,41 @@ impl Interface {
 }
 
 /// One running profile and the Xray process that carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSelection {
+    Server(String),
+    Pool {
+        members: Vec<String>,
+        strategy: String,
+        fingerprint: u64,
+    },
+}
+
+impl SessionSelection {
+    pub fn pool(members: Vec<String>, strategy: String) -> Self {
+        let fingerprint = pool_fingerprint(&members);
+        Self::Pool {
+            members,
+            strategy,
+            fingerprint,
+        }
+    }
+
+    pub fn server_id(&self) -> Option<&str> {
+        match self {
+            Self::Server(server_id) => Some(server_id),
+            Self::Pool { .. } => None,
+        }
+    }
+}
+
+pub fn pool_fingerprint(members: &[String]) -> u64 {
+    // Server ids are fixed-width hexadecimal strings, so a NUL separator
+    // makes the ordered sequence unambiguous while reusing the project's one
+    // stable FNV-1a implementation.
+    crate::model::stable_hash(&members.join("\0"))
+}
+
 pub struct Session {
     /// Name of the profile that started this session. This is the runtime key.
     pub profile: String,
@@ -362,7 +404,12 @@ pub struct Session {
     pub address: Ipv4Addr,
     pub socks_port: u16,
     pub http_port: u16,
-    pub server_id: Option<String>,
+    pub selection: Option<SessionSelection>,
+    pub api_port: u16,
+    pub pool_probe_interval: String,
+    pub balancer_info: Option<BalancerInfo>,
+    pub balancer_polled_at: Option<Instant>,
+    pub pool_stale: bool,
     pub interface: Option<Interface>,
 }
 
@@ -380,20 +427,75 @@ impl Session {
             address,
             socks_port,
             http_port,
-            server_id: None,
+            selection: None,
+            api_port: 0,
+            pool_probe_interval: String::new(),
+            balancer_info: None,
+            balancer_polled_at: None,
+            pool_stale: false,
             interface: None,
         }
     }
 
     pub fn connect(&mut self, server: &Server) -> Result<()> {
+        self.selection = None;
+        self.api_port = 0;
+        self.balancer_info = None;
         self.core.connect(server, self.address, &self.profile)?;
-        self.server_id = Some(server.id.clone());
+        self.selection = Some(SessionSelection::Server(server.id.clone()));
+        self.api_port = 0;
+        self.pool_probe_interval.clear();
+        self.balancer_info = None;
+        self.balancer_polled_at = None;
+        self.pool_stale = false;
+        Ok(())
+    }
+
+    pub fn connect_pool(
+        &mut self,
+        members: &[Server],
+        strategy: &str,
+        probe_interval: &str,
+        api_port: u16,
+    ) -> Result<()> {
+        self.selection = None;
+        self.api_port = 0;
+        self.balancer_info = None;
+        let member_refs = members.iter().collect::<Vec<_>>();
+        self.core.connect_pool(
+            &member_refs,
+            strategy,
+            probe_interval,
+            self.address,
+            api_port,
+            &self.profile,
+        )?;
+        self.selection = Some(SessionSelection::pool(
+            members.iter().map(|server| server.id.clone()).collect(),
+            strategy.to_string(),
+        ));
+        self.api_port = api_port;
+        self.pool_probe_interval = probe_interval.to_string();
+        self.balancer_info = None;
+        self.balancer_polled_at = None;
+        self.pool_stale = false;
         Ok(())
     }
 
     pub fn disconnect(&mut self) {
         self.core.disconnect();
-        self.server_id = None;
+        self.selection = None;
+        self.api_port = 0;
+        self.pool_probe_interval.clear();
+        self.balancer_info = None;
+        self.balancer_polled_at = None;
+        self.pool_stale = false;
+    }
+
+    pub fn server_id(&self) -> Option<&str> {
+        self.selection
+            .as_ref()
+            .and_then(SessionSelection::server_id)
     }
 
     pub fn status(&self) -> Status {
@@ -432,14 +534,26 @@ impl Session {
     }
 
     fn state(&self) -> SessionState {
+        let (server_id, pool_members, pool_strategy) = match &self.selection {
+            Some(SessionSelection::Server(server_id)) => {
+                (Some(server_id.clone()), Vec::new(), String::new())
+            }
+            Some(SessionSelection::Pool {
+                members, strategy, ..
+            }) => (None, members.clone(), strategy.clone()),
+            None => (None, Vec::new(), String::new()),
+        };
         SessionState {
             profile: self.profile.clone(),
-            server_id: self.server_id.clone(),
+            server_id,
             address: self.address,
             socks_port: self.socks_port,
             http_port: self.http_port,
             xray_pid: self.child_pid(),
             interface: self.interface.as_ref().map(Interface::state),
+            pool_members,
+            pool_strategy,
+            api_port: self.api_port,
         }
     }
 }
@@ -543,7 +657,26 @@ impl Sessions {
                 saved.http_port,
                 config.xray_binary.clone(),
             );
-            session.server_id.clone_from(&saved.server_id);
+            session.selection = saved
+                .server_id
+                .clone()
+                .map(SessionSelection::Server)
+                .or_else(|| {
+                    (!saved.pool_members.is_empty()).then(|| {
+                        SessionSelection::pool(
+                            saved.pool_members.clone(),
+                            saved.pool_strategy.clone(),
+                        )
+                    })
+                });
+            session.api_port = saved.api_port;
+            if matches!(&session.selection, Some(SessionSelection::Pool { .. })) {
+                session.pool_probe_interval = crate::profile::load(&saved.profile)
+                    .ok()
+                    .and_then(|profile| profile.select.pool)
+                    .map(|query| query.probe_interval_or_default().to_string())
+                    .unwrap_or_else(|| "5m".to_string());
+            }
             sessions.insert(session);
         }
         sessions
@@ -579,8 +712,23 @@ impl Engine {
             return;
         }
         let mut cleaned_profiles = Vec::new();
+        let mut state_changed = false;
         for saved in &stale_sessions {
-            let core_clean = saved.xray_pid.is_none_or(|pid| {
+            let adopted_pool = saved.xray_pid.filter(|pid| {
+                !saved.pool_members.is_empty()
+                    && saved.api_port != 0
+                    && is_our_xray(*pid, &saved.profile)
+            });
+            if let Some(pid) = adopted_pool
+                && let Some(session) = self.sessions.get_mut(&saved.profile)
+            {
+                session.core.adopt(pid, &saved.profile);
+                log::info!(
+                    "adopted running pool Xray process {pid} for profile {:?}",
+                    saved.profile
+                );
+            }
+            let core_clean = adopted_pool.is_some() || saved.xray_pid.is_none_or(|pid| {
                 if kill_stale_xray(pid, &saved.profile) {
                     log::info!(
                         "stopped orphaned xray process {pid} for profile {:?} from a previous run",
@@ -609,6 +757,22 @@ impl Engine {
                     }
                 }
             });
+            if adopted_pool.is_some() {
+                // A recovered core can keep proxying, but the privileged TUN
+                // helper cannot be turned back into a `Child`. Clean its
+                // recorded kernel domain and retain the adopted proxy session.
+                if interface_clean
+                    && let Some(current) = self
+                        .state
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.profile == saved.profile)
+                    && current.interface.take().is_some()
+                {
+                    state_changed = true;
+                }
+                continue;
+            }
             if core_clean
                 && interface_clean
                 && (saved.xray_pid.is_some() || saved.interface.is_some())
@@ -616,7 +780,7 @@ impl Engine {
                 cleaned_profiles.push(saved.profile.clone());
             }
         }
-        if cleaned_profiles.is_empty() {
+        if cleaned_profiles.is_empty() && !state_changed {
             return;
         }
         // A session is a running profile, not a remembered connection. Once
@@ -630,7 +794,8 @@ impl Engine {
         self.state
             .sessions
             .retain(|session| !cleaned_profiles.contains(&session.profile));
-        if let Err(error) = self.state.save() {
+        state_changed |= !cleaned_profiles.is_empty();
+        if state_changed && let Err(error) = self.state.save() {
             log::warn!("could not persist recovered session state: {error:#}");
         }
     }
@@ -760,7 +925,7 @@ impl Engine {
         &mut self,
         profile: &str,
         requested: &ProfileInterface,
-        server: &Server,
+        servers: &[Server],
     ) -> Result<()> {
         if !requested.enable {
             if self
@@ -814,22 +979,25 @@ impl Engine {
             .as_ref()
             .map(|network| network.connected.as_slice())
             .unwrap_or_default();
-        let (server_address, default_gateway) = if requested.routes == RouteMode::Default {
-            let server_address = resolve_server_ipv4(server)?;
+        let (server_addresses, default_gateway) = if requested.routes == RouteMode::Default {
+            // A full-tunnel pool pays one DNS lookup per member during `up`.
+            // Caching it would make route lifetime and DNS lifetime diverge;
+            // phase 5 deliberately resolves the fixed membership once here.
+            let server_addresses = resolve_servers_ipv4(servers)?;
             let gateway = network
                 .as_ref()
                 .and_then(|network| network.gateway)
                 .context("routes = \"default\" requires the current default IPv4 gateway")?;
-            (Some(server_address), Some(gateway))
+            (server_addresses, Some(gateway))
         } else {
-            (None, None)
+            (Vec::new(), None)
         };
         let plan = plan_routes(&PlanInput {
             table: mark,
             mark,
             mode: requested.routes,
             list: &list,
-            server_address,
+            server_addresses,
             default_gateway,
             connected,
         })?;
@@ -1069,12 +1237,12 @@ impl Engine {
     }
 
     pub fn active_server_id(&self) -> Option<String> {
-        self.default_session()?.server_id.clone()
+        self.default_session()?.server_id().map(str::to_string)
     }
 
     pub fn active_profile(&self) -> Option<String> {
         let session = self.default_session()?;
-        session.server_id.as_ref().map(|_| session.profile.clone())
+        session.selection.as_ref().map(|_| session.profile.clone())
     }
 
     /// Disconnect when a refresh took the active server away with it — the
@@ -1113,7 +1281,7 @@ impl Engine {
             .sessions
             .iter()
             .filter_map(
-                |(profile, session)| match (&session.server_id, session.status()) {
+                |(profile, session)| match (session.server_id(), session.status()) {
                     (Some(id), Status::Connected | Status::Connecting | Status::Error(_))
                         if covers(id, &self.registry.subscriptions) =>
                     {
@@ -1157,6 +1325,40 @@ impl Engine {
         self.sync_session(profile);
         if let Err(error) = self.state.save() {
             log::warn!("could not persist the active Xray process: {error:#}");
+        }
+        Ok(())
+    }
+
+    pub fn connect_pool_session(
+        &mut self,
+        profile: &str,
+        member_ids: &[String],
+        strategy: &str,
+        probe_interval: &str,
+        api_port: u16,
+    ) -> Result<()> {
+        let members = member_ids
+            .iter()
+            .map(|id| {
+                self.find_server(id)
+                    .with_context(|| format!("pool member {id} is no longer in the daemon store"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if self
+            .sessions
+            .get(profile)
+            .and_then(|session| session.interface.as_ref())
+            .is_some_and(|interface| interface.up || interface.tun2socks.child_pid().is_some())
+        {
+            self.stop_interface(profile)?;
+        }
+        self.sessions
+            .get_mut(profile)
+            .ok_or_else(|| anyhow!("profile {profile:?} has no session"))?
+            .connect_pool(&members, strategy, probe_interval, api_port)?;
+        self.sync_session(profile);
+        if let Err(error) = self.state.save() {
+            log::warn!("could not persist the active Xray pool process: {error:#}");
         }
         Ok(())
     }
@@ -1273,6 +1475,39 @@ fn resolve_server_ipv4(server: &Server) -> Result<Ipv4Addr> {
             std::net::IpAddr::V6(_) => None,
         })
         .context("routes = \"default\" requires the server IPv4 address")
+}
+
+/// Ask the OS for a port on this session address, then release it for Xray.
+///
+/// There is necessarily a short bind-release-bind race, the same one used by
+/// probe cores. `ensure_ports_free` closes the diagnostic gap immediately
+/// before spawn, while binding permanently here would prevent Xray taking it.
+pub fn free_port(bind: Ipv4Addr, excluded: &[u16]) -> Result<u16> {
+    for _ in 0..16 {
+        let port = std::net::TcpListener::bind((bind, 0))
+            .and_then(|listener| listener.local_addr())
+            .map(|address| address.port())
+            .context("allocating a free port on the session address")?;
+        if !excluded.contains(&port) {
+            return Ok(port);
+        }
+    }
+    bail!("the OS repeatedly allocated a reserved session port")
+}
+
+fn resolve_servers_ipv4(servers: &[Server]) -> Result<Vec<Ipv4Addr>> {
+    servers
+        .iter()
+        .map(|server| {
+            resolve_server_ipv4(server).with_context(|| {
+                format!(
+                    "pool member {:?} ({}) needs a host route to avoid a full-tunnel loop",
+                    server.name,
+                    server.alias.as_deref().unwrap_or(&server.id)
+                )
+            })
+        })
+        .collect()
 }
 
 fn start_interface_steps(
@@ -1607,6 +1842,7 @@ mod tests {
             http_port: 10809,
             xray_pid: None,
             interface: None,
+            ..SessionState::default()
         }
     }
 
@@ -1682,6 +1918,19 @@ mod tests {
     }
 
     #[test]
+    fn pool_selection_has_no_server_id_and_hashes_member_order() {
+        let first = vec!["one".to_string(), "two".to_string()];
+        let reversed = vec!["two".to_string(), "one".to_string()];
+        let selection = super::SessionSelection::pool(first.clone(), "roundRobin".to_string());
+
+        assert!(selection.server_id().is_none());
+        assert_ne!(
+            super::pool_fingerprint(&first),
+            super::pool_fingerprint(&reversed)
+        );
+    }
+
+    #[test]
     fn recovery_reaps_every_recorded_session_and_clears_runtime_state() -> Result<()> {
         let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("recover-all-sessions")?;
@@ -1699,6 +1948,60 @@ mod tests {
         assert!(engine.sessions.is_empty());
         let persisted = State::load(&engine.registry.config);
         assert!(persisted.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_adopts_a_pool_core_and_keeps_its_api_port() -> Result<()> {
+        use std::process::{Command, Stdio};
+
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("recover-pool")?;
+        let config = crate::xray::core::XrayCore::config_path("spread")?;
+        std::fs::create_dir_all(config.parent().context("config parent")?)?;
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "while :; do sleep 1; done"])
+            .arg(&config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        wait_for_process_identity(&mut child, "spread")?;
+        let mut saved = saved_profile_session("spread", Some(child.id()));
+        saved.pool_members = vec!["one".to_string(), "two".to_string()];
+        saved.pool_strategy = "roundRobin".to_string();
+        saved.api_port = 18082;
+        crate::profile::save(
+            "spread",
+            &crate::profile::Profile {
+                select: crate::profile::ProfileSelect {
+                    server: String::new(),
+                    pool: Some(crate::pool::PoolQuery {
+                        probe_interval: "17s".to_string(),
+                        ..crate::pool::PoolQuery::default()
+                    }),
+                },
+                ..crate::profile::Profile::default()
+            },
+        )?;
+        State {
+            sessions: vec![saved],
+        }
+        .save()?;
+
+        let engine = Engine::load();
+        let session = engine.sessions.get("spread").context("adopted session")?;
+        assert_eq!(session.child_pid(), Some(child.id()));
+        assert_eq!(session.api_port, 18082);
+        assert_eq!(session.pool_probe_interval, "17s");
+        assert!(matches!(
+            &session.selection,
+            Some(super::SessionSelection::Pool { members, .. })
+                if members == &["one".to_string(), "two".to_string()]
+        ));
+        assert_eq!(session.status(), crate::xray::core::Status::Connected);
+
+        drop(engine);
+        child.wait()?;
         Ok(())
     }
 

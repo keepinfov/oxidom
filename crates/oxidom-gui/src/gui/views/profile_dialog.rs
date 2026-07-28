@@ -6,6 +6,7 @@ use adw::prelude::*;
 
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
+use oxidom_core::pool::PoolQuery;
 use oxidom_core::profile::{
     self, Profile, ProfileInterface, ProfileProxy, ProfileSelect, RouteMode,
 };
@@ -80,6 +81,8 @@ struct PickerEntry {
 struct DialogValues {
     description: String,
     server: String,
+    /// E2 has no pool editor, but Save must preserve a loaded pool verbatim.
+    pool: Option<PoolQuery>,
     socks_port: u16,
     http_port: u16,
     interface_enable: bool,
@@ -105,6 +108,7 @@ impl DialogValues {
                 .map(|entry| entry.description.clone())
                 .unwrap_or_default(),
             server: entry.map(|entry| entry.server.clone()).unwrap_or_default(),
+            pool: entry.and_then(|entry| entry.pool.clone()),
             socks_port: proxy.socks_port,
             http_port: proxy.http_port,
             interface_enable: interface.enable,
@@ -122,11 +126,7 @@ fn profile_from_dialog(values: DialogValues) -> Profile {
         description: values.description,
         select: ProfileSelect {
             server: values.server,
-            // The dialog has no pool editor yet, and `ProfileEntry` carries no
-            // pool to preserve. The moment it does, this must round-trip the
-            // loaded value like `interface_address` already does — otherwise
-            // opening a pool profile and pressing Save silently unselects it.
-            pool: None,
+            pool: values.pool,
         },
         proxy: ProfileProxy {
             socks_port: values.socks_port,
@@ -216,6 +216,13 @@ pub fn show_profile_dialog(
     // model, and a builder that happened to apply the two in the other order
     // would drop it.
     server.set_selected(selected);
+    let preserves_pool = initial.pool.is_some();
+    if preserves_pool {
+        // E3 owns the pool editor. Until then this row must not offer a
+        // server choice that would conflict with the pool being preserved.
+        server.set_sensitive(false);
+        server.set_subtitle("Pool selection is preserved; its editor arrives in the next phase");
+    }
     profile_group.add(&server);
 
     let socks = adw::SpinRow::with_range(1.0, 65535.0, 1.0);
@@ -343,6 +350,7 @@ pub fn show_profile_dialog(
             .collect::<Vec<_>>(),
     );
     let interface_address = initial.interface_address.clone();
+    let pool = initial.pool.clone();
     let collect_profile: Rc<dyn Fn() -> Option<(String, Profile)>> = Rc::new({
         let name_entry = name_entry.clone();
         let edit_name = edit_name.clone();
@@ -359,13 +367,18 @@ pub fn show_profile_dialog(
         move || {
             let name = dialog_name(name_entry.as_ref(), edit_name.as_deref());
             let selected = picker_entries.get(server.selected() as usize)?;
-            // No profile is ever written pointing at the placeholder.
-            if selected.placeholder {
+            // A pool legitimately has no single-server row selected. For a
+            // single selection the placeholder must never reach the profile.
+            if pool.is_none() && selected.placeholder {
                 return None;
             }
             let values = DialogValues {
                 description: description_entry.text().to_string(),
-                server: selected.handle.clone(),
+                server: pool
+                    .as_ref()
+                    .map(|_| String::new())
+                    .unwrap_or_else(|| selected.handle.clone()),
+                pool: pool.clone(),
                 socks_port: socks.value() as u16,
                 http_port: http.value() as u16,
                 interface_enable: interface_enable.is_active(),
@@ -402,7 +415,9 @@ pub fn show_profile_dialog(
                 .as_ref()
                 .and_then(|entry| profile_name_validation(entry.text().as_str(), &existing_names));
             let selected = picker_entries.get(server.selected() as usize);
-            server.set_subtitle(if selected.is_some_and(|entry| entry.missing) {
+            server.set_subtitle(if preserves_pool {
+                "Pool selection is preserved; its editor arrives in the next phase"
+            } else if selected.is_some_and(|entry| entry.missing) {
                 MISSING_SERVER_HINT
             } else {
                 ""
@@ -417,8 +432,7 @@ pub fn show_profile_dialog(
                     (socks.value() as u16 == http.value() as u16).then(|| PORTS_ERROR.to_string())
                 })
                 .or_else(|| {
-                    selected
-                        .is_none_or(|entry| entry.placeholder)
+                    (!preserves_pool && selected.is_none_or(|entry| entry.placeholder))
                         .then(|| SERVER_ERROR.to_string())
                 })
                 .or_else(|| {
@@ -816,7 +830,7 @@ mod tests {
         let entry = ProfileEntry {
             name: "work".to_string(),
             description: "Office tunnel".to_string(),
-            server: "ch-trojan".to_string(),
+            server: String::new(),
             socks_port: 12080,
             http_port: 12081,
             interface: ProfileInterface {
@@ -827,13 +841,16 @@ mod tests {
                 routes: RouteMode::List,
                 list: vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()],
             },
+            pool: Some(PoolQuery::default()),
         };
 
         let saved = profile_from_dialog(DialogValues::new(Some(&entry)));
         assert_eq!(saved.interface, entry.interface);
         assert_eq!(saved.description, entry.description);
         assert_eq!(saved.select.server, entry.server);
+        assert_eq!(saved.select.pool, entry.pool);
         assert_eq!(saved.proxy.socks_port, entry.socks_port);
         assert_eq!(saved.proxy.http_port, entry.http_port);
+        saved.validate(&entry.name).unwrap();
     }
 }

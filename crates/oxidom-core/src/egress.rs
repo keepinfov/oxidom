@@ -30,6 +30,34 @@ pub fn address(
         return Ok(ip);
     }
 
+    let ip = request_address(bind, socks_port)?;
+
+    caches.insert(
+        profile.to_string(),
+        EgressCache {
+            server_id: server_id.to_string(),
+            ip: ip.to_string(),
+            at_unix_ms: now,
+        },
+    );
+    match serde_json::to_vec(&caches) {
+        Ok(body) => {
+            if let Err(error) = fsutil::write_private_atomic(&path, &body) {
+                log::warn!("could not cache the egress address: {error:#}");
+            }
+        }
+        Err(error) => log::warn!("could not serialize the egress address cache: {error}"),
+    }
+    Ok(ip)
+}
+
+/// Observe a rotating pool once. Caching this value would claim one member's
+/// address still describes the next connection after round-robin advances.
+pub fn uncached_address(bind: Ipv4Addr, socks_port: u16) -> Result<IpAddr> {
+    request_address(bind, socks_port)
+}
+
+fn request_address(bind: Ipv4Addr, socks_port: u16) -> Result<IpAddr> {
     let url = std::env::var("OXIDOM_EGRESS_URL")
         .ok()
         .filter(|url| !url.is_empty())
@@ -50,30 +78,12 @@ pub fn address(
     let body = response
         .into_string()
         .context("reading the egress address response")?;
-    let ip: IpAddr = body.trim().parse().with_context(|| {
+    body.trim().parse().with_context(|| {
         format!(
             "the egress service returned no IP address: {:?}",
             body.trim()
         )
-    })?;
-
-    caches.insert(
-        profile.to_string(),
-        EgressCache {
-            server_id: server_id.to_string(),
-            ip: ip.to_string(),
-            at_unix_ms: now,
-        },
-    );
-    match serde_json::to_vec(&caches) {
-        Ok(body) => {
-            if let Err(error) = fsutil::write_private_atomic(&path, &body) {
-                log::warn!("could not cache the egress address: {error:#}");
-            }
-        }
-        Err(error) => log::warn!("could not serialize the egress address cache: {error}"),
-    }
-    Ok(ip)
+    })
 }
 
 fn cached_address(

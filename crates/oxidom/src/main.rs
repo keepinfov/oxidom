@@ -228,8 +228,21 @@ fn status(profile: Option<&str>, json: bool) -> CliResult {
     let Some(profile) = profile else {
         return print_sessions(&client, json);
     };
-    let (session, server) = connected_session(&client, profile)?;
+    let session = connected_session(&client, profile)?;
     let probes = client.probe_state().map_err(Failure::error)?;
+    if session.selection.kind == "pool" {
+        let latency_ms = current_pool_latency(&probes, &session.profile);
+        let output = StatusOutput::new(&session, None, latency_ms);
+        if json {
+            return print_json(&output);
+        }
+        return print_text(pool_status(&session, latency_ms));
+    }
+
+    let server = servers_for_session(&client, &session)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Failure::message("the active server is no longer in the daemon store"))?;
     let latency_ms = current_latency(&probes, &session.profile, &server.id);
     let output = StatusOutput::new(&session, Some(&server), latency_ms);
 
@@ -249,29 +262,46 @@ fn status(profile: Option<&str>, json: bool) -> CliResult {
 
 fn ip(profile: Option<&str>, egress: bool, fresh: bool) -> CliResult {
     let client = existing_client()?;
-    let (session, server) = connected_listed_session(&client, profile.unwrap_or("default"))?;
-    let address = if egress {
+    let session = connected_listed_session(&client, profile.unwrap_or("default"))?;
+    let servers = servers_for_session(&client, &session)?;
+    if egress {
         let bind = session
             .address
             .parse()
             .map_err(|error| Failure::message(format!("invalid session address: {error}")))?;
-        oxidom_core::egress::address(
-            &session.profile,
-            &server.id,
-            bind,
-            session.socks_port,
-            fresh,
-        )
-        .map_err(Failure::error)?
-    } else {
-        endpoint_ip(&server)?
-    };
-    print_line(address)
+        let address = if session.selection.kind == "pool" {
+            oxidom_core::egress::uncached_address(bind, session.socks_port)
+        } else {
+            let server = servers.first().ok_or_else(|| {
+                Failure::message("the active server is no longer in the daemon store")
+            })?;
+            oxidom_core::egress::address(
+                &session.profile,
+                &server.id,
+                bind,
+                session.socks_port,
+                fresh,
+            )
+        }
+        .map_err(Failure::error)?;
+        return print_line(address);
+    }
+
+    let addresses = servers
+        .iter()
+        .map(endpoint_ip)
+        .collect::<CliResult<Vec<_>>>()?;
+    let body = addresses
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    print_line(body)
 }
 
 fn env(profile: Option<&str>) -> CliResult {
     let client = existing_client()?;
-    let (session, _) = connected_listed_session(&client, profile.unwrap_or("default"))?;
+    let session = connected_listed_session(&client, profile.unwrap_or("default"))?;
     print_text(session_environment(&session))
 }
 
@@ -372,10 +402,13 @@ fn print_sessions(client: &DaemonClient, json: bool) -> CliResult {
         .map(|session| {
             let latency = (session.state == "connected")
                 .then(|| {
-                    session
-                        .server_id
-                        .as_deref()
-                        .and_then(|server_id| current_latency(&probes, &session.profile, server_id))
+                    if session.selection.kind == "pool" {
+                        current_pool_latency(&probes, &session.profile)
+                    } else {
+                        session.server_id.as_deref().and_then(|server_id| {
+                            current_latency(&probes, &session.profile, server_id)
+                        })
+                    }
                 })
                 .flatten();
             SessionOutput::new(session, latency)
@@ -410,6 +443,12 @@ fn session_table(sessions: &[SessionOutput]) -> String {
                 .server_alias
                 .clone()
                 .or_else(|| session.server_id.clone())
+                .or_else(|| {
+                    session
+                        .selection
+                        .as_ref()
+                        .map(|selection| format!("pool({})", selection.members.len()))
+                })
                 .unwrap_or_else(|| "—".to_string()),
             format!("{}:{}", session.address, session.socks_port),
         ];
@@ -711,43 +750,61 @@ impl Drop for TemporaryProfile {
     }
 }
 
-fn connected_session(client: &DaemonClient, profile: &str) -> CliResult<(SessionInfo, Server)> {
+fn connected_session(client: &DaemonClient, profile: &str) -> CliResult<SessionInfo> {
     let session = client.session_status(profile).map_err(Failure::error)?;
-    connected_server_for_session(client, session)
+    require_connected(session)
 }
 
-fn connected_listed_session(
-    client: &DaemonClient,
-    profile: &str,
-) -> CliResult<(SessionInfo, Server)> {
+fn connected_listed_session(client: &DaemonClient, profile: &str) -> CliResult<SessionInfo> {
     let session = client
         .list_sessions()
         .map_err(Failure::error)?
         .into_iter()
         .find(|session| session.profile == profile)
         .ok_or_else(Failure::not_connected)?;
-    connected_server_for_session(client, session)
+    require_connected(session)
 }
 
-fn connected_server_for_session(
-    client: &DaemonClient,
-    session: SessionInfo,
-) -> CliResult<(SessionInfo, Server)> {
+fn require_connected(session: SessionInfo) -> CliResult<SessionInfo> {
     if session.state != "connected" {
         return Err(Failure::not_connected());
     }
-    let active_id = session
-        .server_id
-        .as_deref()
-        .ok_or_else(|| Failure::message("daemon reports connected without an active server"))?;
+    if session.selection.kind != "pool" && session.server_id.is_none() {
+        return Err(Failure::message(
+            "daemon reports connected without an active selection",
+        ));
+    }
+    Ok(session)
+}
+
+fn servers_for_session(client: &DaemonClient, session: &SessionInfo) -> CliResult<Vec<Server>> {
     let subscriptions = client.subscriptions().map_err(Failure::error)?;
-    let server = subscriptions
+    let all = subscriptions
         .iter()
-        .flat_map(|subscription| &subscription.servers)
-        .find(|server| server.id == active_id)
-        .cloned()
-        .ok_or_else(|| Failure::message("the active server is no longer in the daemon store"))?;
-    Ok((session, server))
+        .flat_map(|subscription| subscription.servers.iter())
+        .collect::<Vec<_>>();
+    let ids = if session.selection.kind == "pool" {
+        session
+            .selection
+            .members
+            .iter()
+            .map(|member| member.server_id.as_str())
+            .collect::<Vec<_>>()
+    } else {
+        session.server_id.iter().map(String::as_str).collect()
+    };
+    ids.into_iter()
+        .map(|server_id| {
+            all.iter()
+                .find(|server| server.id == server_id)
+                .map(|server| (*server).clone())
+                .ok_or_else(|| {
+                    Failure::message(format!(
+                        "session member {server_id:?} is no longer in the daemon store"
+                    ))
+                })
+        })
+        .collect()
 }
 
 fn resolve_server<'a>(subscriptions: &'a [Subscription], needle: &str) -> CliResult<&'a Server> {
@@ -801,6 +858,70 @@ fn current_latency(probes: &ProbeState, profile: &str, server_id: &str) -> Optio
                 .then_some(reading.value)
                 .flatten()
         })
+}
+
+fn current_pool_latency(probes: &ProbeState, profile: &str) -> Option<u32> {
+    let label = format!("pool:{profile}");
+    if probes.version < PROBE_STATE_VERSION
+        || probes.running.iter().any(|id| id == &label)
+        || probes.queued.iter().any(|id| id == &label)
+    {
+        return None;
+    }
+    probes.proxied.get(profile).and_then(|reading| {
+        (reading.route == ProbeRoute::Proxied && reading.failure.is_none())
+            .then_some(reading.value)
+            .flatten()
+    })
+}
+
+fn pool_status(session: &SessionInfo, latency_ms: Option<u32>) -> String {
+    let selection = &session.selection;
+    // Under a rotating strategy every connection may leave by a different node,
+    // so "now → X" would be a lie; what is true and useful there is how many
+    // nodes the core still considers eligible.
+    let current = match selection.selecting.as_deref() {
+        Some(handle) => format!("now → {handle}"),
+        None => {
+            let known = selection
+                .members
+                .iter()
+                .filter(|member| member.healthy.is_some())
+                .count();
+            if known == 0 {
+                "no live reading".to_string()
+            } else {
+                let healthy = selection
+                    .members
+                    .iter()
+                    .filter(|member| member.healthy == Some(true))
+                    .count();
+                format!("{healthy}/{known} in rotation")
+            }
+        }
+    };
+    let stale = if selection.stale { ", stale" } else { "" };
+    let latency = latency_ms
+        .map(|value| format!("{value} ms"))
+        .unwrap_or_else(|| "—".to_string());
+    let mut output = format!(
+        "{}  socks {}:{}  {latency}\nselection: pool ({}, {} nodes, {current}{stale})\n",
+        session.state,
+        session.address,
+        session.socks_port,
+        selection.strategy,
+        selection.members.len(),
+    );
+    for member in &selection.members {
+        let health = match member.healthy {
+            Some(true) => "✓",
+            Some(false) => "✗",
+            None => "?",
+        };
+        let handle = member.alias.as_deref().unwrap_or(&member.server_id);
+        output.push_str(&format!("  {health} {handle}  {}\n", member.name));
+    }
+    output
 }
 
 fn endpoint_ip(server: &Server) -> CliResult<IpAddr> {
@@ -864,6 +985,7 @@ mod tests {
                 error: None,
                 owns_system_proxy: false,
                 interface: None,
+                selection: None,
             },
             SessionOutput {
                 profile: "work".to_string(),
@@ -878,6 +1000,7 @@ mod tests {
                 error: None,
                 owns_system_proxy: false,
                 interface: None,
+                selection: None,
             },
         ];
 
@@ -908,6 +1031,7 @@ mod tests {
                     device: "oxi-default".to_string(),
                     ..Default::default()
                 }),
+                selection: None,
             },
             SessionOutput {
                 profile: "work".to_string(),
@@ -922,6 +1046,7 @@ mod tests {
                 error: None,
                 owns_system_proxy: false,
                 interface: None,
+                selection: None,
             },
         ];
 
@@ -930,6 +1055,103 @@ mod tests {
             "PROFILE  STATE      SERVER  ADDRESS            DEVICE       LATENCY\n\
              default  connected  ch      127.0.0.1:10808    oxi-default  84ms\n\
              work     connected  nl      127.72.14.1:10808  —            —\n"
+        );
+    }
+
+    #[test]
+    fn pool_sessions_use_an_explicit_pool_label_and_member_status() {
+        let selection = oxidom_core::ipc::SelectionInfo {
+            kind: "pool".to_string(),
+            strategy: "roundRobin".to_string(),
+            members: vec![
+                oxidom_core::ipc::PoolMember {
+                    server_id: "id-one".to_string(),
+                    alias: Some("ch-one".to_string()),
+                    name: "Swiss".to_string(),
+                    tag: "s-ch-one".to_string(),
+                    healthy: Some(true),
+                },
+                oxidom_core::ipc::PoolMember {
+                    server_id: "id-two".to_string(),
+                    alias: None,
+                    name: "Dutch".to_string(),
+                    tag: "s-id-two".to_string(),
+                    healthy: Some(false),
+                },
+            ],
+            // roundRobin has no single current exit, so the daemon leaves this
+            // unset and the line reports the rotation instead.
+            selecting: None,
+            stale: true,
+        };
+        let session = SessionInfo {
+            profile: "spread".to_string(),
+            state: "connected".to_string(),
+            address: "127.72.14.1".to_string(),
+            socks_port: 10808,
+            selection: selection.clone(),
+            ..SessionInfo::default()
+        };
+        let output = SessionOutput::new(&session, Some(84));
+
+        assert_eq!(
+            session_table(&[output]),
+            "PROFILE  STATE      SERVER   ADDRESS            LATENCY\n\
+             spread   connected  pool(2)  127.72.14.1:10808  84ms\n"
+        );
+        assert_eq!(
+            pool_status(&session, Some(84)),
+            concat!(
+                "connected  socks 127.72.14.1:10808  84 ms\n",
+                "selection: pool (roundRobin, 2 nodes, 1/2 in rotation, stale)\n",
+                "  ✓ ch-one  Swiss\n",
+                "  ✗ id-two  Dutch\n",
+            )
+        );
+    }
+
+    /// A picking strategy does name a current exit, and says nothing about the
+    /// members it did not pick.
+    #[test]
+    fn a_least_ping_pool_prints_its_current_exit() {
+        let session = SessionInfo {
+            profile: "spread".to_string(),
+            state: "connected".to_string(),
+            address: "127.72.14.1".to_string(),
+            socks_port: 10808,
+            selection: oxidom_core::ipc::SelectionInfo {
+                kind: "pool".to_string(),
+                strategy: "leastPing".to_string(),
+                members: vec![
+                    oxidom_core::ipc::PoolMember {
+                        server_id: "id-one".to_string(),
+                        alias: Some("ch-one".to_string()),
+                        name: "Swiss".to_string(),
+                        tag: "s-ch-one".to_string(),
+                        healthy: None,
+                    },
+                    oxidom_core::ipc::PoolMember {
+                        server_id: "id-two".to_string(),
+                        alias: Some("nl-two".to_string()),
+                        name: "Dutch".to_string(),
+                        tag: "s-nl-two".to_string(),
+                        healthy: None,
+                    },
+                ],
+                selecting: Some("nl-two".to_string()),
+                stale: false,
+            },
+            ..SessionInfo::default()
+        };
+
+        assert_eq!(
+            pool_status(&session, None),
+            concat!(
+                "connected  socks 127.72.14.1:10808  —\n",
+                "selection: pool (leastPing, 2 nodes, now → nl-two)\n",
+                "  ? ch-one  Swiss\n",
+                "  ? nl-two  Dutch\n",
+            )
         );
     }
 
@@ -991,5 +1213,14 @@ mod tests {
             ..ProbeState::default()
         };
         assert_eq!(current_latency(&legacy, "work", "same"), Some(20));
+        assert_eq!(current_pool_latency(&probes, "work"), Some(20));
+
+        let pending = ProbeState {
+            version: PROBE_STATE_VERSION,
+            running: vec!["pool:work".to_string()],
+            proxied: probes.proxied,
+            ..ProbeState::default()
+        };
+        assert_eq!(current_pool_latency(&pending, "work"), None);
     }
 }

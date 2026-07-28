@@ -110,6 +110,36 @@ pub struct SessionInfo {
     /// Whether this session is the logical owner of the desktop system proxy.
     pub owns_system_proxy: bool,
     pub interface: Option<InterfaceInfo>,
+    /// Additive selection detail. Legacy server fields above keep their exact
+    /// meaning; a pool never fills them with an arbitrary member.
+    pub selection: SelectionInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SelectionInfo {
+    /// "server" | "pool"
+    pub kind: String,
+    pub strategy: String,
+    pub members: Vec<PoolMember>,
+    pub selecting: Option<String>,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PoolMember {
+    pub server_id: String,
+    pub alias: Option<String>,
+    pub name: String,
+    pub tag: String,
+    /// Whether the core still counts this node as eligible. Only a rotating
+    /// balancer answers that question — see `xray::api::BalancerInfo` — so a
+    /// picking strategy leaves this `None` rather than guessing.
+    ///
+    /// There is deliberately no per-node delay beside it: the wire schema
+    /// carries none, and a fabricated number would read like a measurement.
+    pub healthy: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -296,6 +326,8 @@ pub struct ProfileEntry {
     /// can put back what it did not show. Without it a GUI save silently
     /// downgrades a TUN profile to proxy-only.
     pub interface: crate::profile::ProfileInterface,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<crate::pool::PoolQuery>,
 }
 
 /// The selected server returned after bringing a profile up.
@@ -403,6 +435,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entry.interface, crate::profile::ProfileInterface::default());
+        assert!(entry.pool.is_none());
     }
 
     /// A daemon that predates the reading contract sends `latencies` and no
