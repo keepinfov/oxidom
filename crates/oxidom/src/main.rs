@@ -886,17 +886,17 @@ fn pool_status(session: &SessionInfo, latency_ms: Option<u32>) -> String {
             let known = selection
                 .members
                 .iter()
-                .filter(|member| member.healthy.is_some())
+                .filter(|member| member.in_rotation.is_some())
                 .count();
             if known == 0 {
                 "no live reading".to_string()
             } else {
-                let healthy = selection
+                let live = selection
                     .members
                     .iter()
-                    .filter(|member| member.healthy == Some(true))
+                    .filter(|member| member.in_rotation == Some(true))
                     .count();
-                format!("{healthy}/{known} in rotation")
+                format!("{live}/{known} in rotation")
             }
         }
     };
@@ -913,7 +913,7 @@ fn pool_status(session: &SessionInfo, latency_ms: Option<u32>) -> String {
         selection.members.len(),
     );
     for member in &selection.members {
-        let health = match member.healthy {
+        let health = match member.in_rotation {
             Some(true) => "✓",
             Some(false) => "✗",
             None => "?",
@@ -1069,14 +1069,14 @@ mod tests {
                     alias: Some("ch-one".to_string()),
                     name: "Swiss".to_string(),
                     tag: "s-ch-one".to_string(),
-                    healthy: Some(true),
+                    in_rotation: Some(true),
                 },
                 oxidom_core::ipc::PoolMember {
                     server_id: "id-two".to_string(),
                     alias: None,
                     name: "Dutch".to_string(),
                     tag: "s-id-two".to_string(),
-                    healthy: Some(false),
+                    in_rotation: Some(false),
                 },
             ],
             // roundRobin has no single current exit, so the daemon leaves this
@@ -1128,14 +1128,14 @@ mod tests {
                         alias: Some("ch-one".to_string()),
                         name: "Swiss".to_string(),
                         tag: "s-ch-one".to_string(),
-                        healthy: None,
+                        in_rotation: None,
                     },
                     oxidom_core::ipc::PoolMember {
                         server_id: "id-two".to_string(),
                         alias: Some("nl-two".to_string()),
                         name: "Dutch".to_string(),
                         tag: "s-nl-two".to_string(),
-                        healthy: None,
+                        in_rotation: None,
                     },
                 ],
                 selecting: Some("nl-two".to_string()),

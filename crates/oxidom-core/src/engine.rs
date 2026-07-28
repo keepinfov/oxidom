@@ -406,6 +406,7 @@ pub struct Session {
     pub http_port: u16,
     pub selection: Option<SessionSelection>,
     pub api_port: u16,
+    pub pool_expected: usize,
     pub pool_probe_interval: String,
     pub balancer_info: Option<BalancerInfo>,
     pub balancer_polled_at: Option<Instant>,
@@ -429,6 +430,7 @@ impl Session {
             http_port,
             selection: None,
             api_port: 0,
+            pool_expected: 0,
             pool_probe_interval: String::new(),
             balancer_info: None,
             balancer_polled_at: None,
@@ -444,6 +446,7 @@ impl Session {
         self.core.connect(server, self.address, &self.profile)?;
         self.selection = Some(SessionSelection::Server(server.id.clone()));
         self.api_port = 0;
+        self.pool_expected = 0;
         self.pool_probe_interval.clear();
         self.balancer_info = None;
         self.balancer_polled_at = None;
@@ -455,6 +458,7 @@ impl Session {
         &mut self,
         members: &[Server],
         strategy: &str,
+        expected: usize,
         probe_interval: &str,
         api_port: u16,
     ) -> Result<()> {
@@ -463,9 +467,12 @@ impl Session {
         self.balancer_info = None;
         let member_refs = members.iter().collect::<Vec<_>>();
         self.core.connect_pool(
-            &member_refs,
-            strategy,
-            probe_interval,
+            &crate::xray::config::PoolSpec {
+                members: &member_refs,
+                strategy,
+                expected,
+                probe_interval,
+            },
             self.address,
             api_port,
             &self.profile,
@@ -475,6 +482,7 @@ impl Session {
             strategy.to_string(),
         ));
         self.api_port = api_port;
+        self.pool_expected = expected;
         self.pool_probe_interval = probe_interval.to_string();
         self.balancer_info = None;
         self.balancer_polled_at = None;
@@ -486,6 +494,7 @@ impl Session {
         self.core.disconnect();
         self.selection = None;
         self.api_port = 0;
+        self.pool_expected = 0;
         self.pool_probe_interval.clear();
         self.balancer_info = None;
         self.balancer_polled_at = None;
@@ -1334,6 +1343,7 @@ impl Engine {
         profile: &str,
         member_ids: &[String],
         strategy: &str,
+        expected: usize,
         probe_interval: &str,
         api_port: u16,
     ) -> Result<()> {
@@ -1355,7 +1365,7 @@ impl Engine {
         self.sessions
             .get_mut(profile)
             .ok_or_else(|| anyhow!("profile {profile:?} has no session"))?
-            .connect_pool(&members, strategy, probe_interval, api_port)?;
+            .connect_pool(&members, strategy, expected, probe_interval, api_port)?;
         self.sync_session(profile);
         if let Err(error) = self.state.save() {
             log::warn!("could not persist the active Xray pool process: {error:#}");

@@ -909,13 +909,14 @@ fn pool_chip(selection: &SelectionInfo) -> SessionChip {
         let known = selection
             .members
             .iter()
-            .filter_map(|member| member.healthy)
+            .filter_map(|member| member.in_rotation)
             .collect::<Vec<_>>();
-        // A picking strategy deliberately leaves every value unknown. Never
-        // turn that absence of evidence into a count of dead nodes.
+        // "In rotation", never "healthy": under `roundRobin` a node in the
+        // rotation may well be unreachable, and under `leastLoad` a node out
+        // of it may be alive and merely unselected.
         if known.len() == count && !known.is_empty() {
-            let healthy = known.into_iter().filter(|healthy| *healthy).count();
-            text.push_str(&format!(" · {healthy}/{count} healthy"));
+            let live = known.into_iter().filter(|value| *value).count();
+            text.push_str(&format!(" · {live}/{count} in rotation"));
         }
     }
     SessionChip::new(text, SessionChipKind::Pool)
@@ -1727,14 +1728,14 @@ mod tests {
                         alias: Some("one".to_string()),
                         name: "One".to_string(),
                         tag: "s-one".to_string(),
-                        healthy: Some(true),
+                        in_rotation: Some(true),
                     },
                     PoolMember {
                         server_id: "two".to_string(),
                         alias: Some("two".to_string()),
                         name: "Two".to_string(),
                         tag: "s-two".to_string(),
-                        healthy: Some(false),
+                        in_rotation: Some(false),
                     },
                 ],
                 selecting: None,
@@ -1748,7 +1749,7 @@ mod tests {
         assert_eq!(rows[0].server, "pool (2)");
         assert_eq!(
             rows[0].chips[0],
-            SessionChip::new("pool · 2 nodes · 1/2 healthy", SessionChipKind::Pool)
+            SessionChip::new("pool · 2 nodes · 1/2 in rotation", SessionChipKind::Pool)
         );
         assert_eq!(
             rows[0].chips[1],
@@ -1759,7 +1760,7 @@ mod tests {
         state.sessions[0].selection.strategy = "leastPing".to_string();
         state.sessions[0].selection.selecting = Some("two".to_string());
         for member in &mut state.sessions[0].selection.members {
-            member.healthy = None;
+            member.in_rotation = None;
         }
         let rows = session_rows(&[work], &state, NOW_MS);
         assert_eq!(
@@ -1767,7 +1768,7 @@ mod tests {
             SessionChip::new("pool · 2 nodes · now two", SessionChipKind::Pool)
         );
         assert!(
-            !rows[0].chips[0].text.contains("healthy"),
+            !rows[0].chips[0].text.contains("in rotation"),
             "unknown health under a picking strategy must not become dead nodes"
         );
     }
@@ -2092,12 +2093,12 @@ mod tests {
                     members: vec![
                         PoolMember {
                             server_id: "one".to_string(),
-                            healthy: None,
+                            in_rotation: None,
                             ..PoolMember::default()
                         },
                         PoolMember {
                             server_id: "two".to_string(),
-                            healthy: None,
+                            in_rotation: None,
                             ..PoolMember::default()
                         },
                     ],

@@ -8,11 +8,21 @@ use crate::model::{OutboundSpec, Server, Subscription};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum Strategy {
+    /// Rotates across the nodes the observatory still reaches. The default
+    /// because it is the only strategy that both spreads traffic — the point
+    /// of a pool — and drops dead nodes.
     #[default]
-    RoundRobin,
-    Random,
-    LeastPing,
     LeastLoad,
+    /// Rotates across **every** member, reachable or not. Measured on Xray
+    /// 26.3.27: with one live and one unreachable node, half of twelve
+    /// requests went into the unreachable one. Kept because an even sweep is
+    /// sometimes what is wanted, but it is not a failover.
+    RoundRobin,
+    /// Same blindness as `roundRobin`, without the even sweep.
+    Random,
+    /// Concentrates everything on the single fastest node. The opposite of
+    /// spreading activity, and offered for "my server got slow, move me".
+    LeastPing,
 }
 
 impl Strategy {
@@ -23,6 +33,19 @@ impl Strategy {
             Strategy::LeastPing => "leastPing",
             Strategy::LeastLoad => "leastLoad",
         }
+    }
+
+    /// Whether the core keeps unreachable members in the rotation. The UI has
+    /// to say this out loud: a pool that quietly swallows a third of its
+    /// requests looks like an unreliable connection, not like a setting.
+    pub fn keeps_dead_nodes(&self) -> bool {
+        matches!(self, Strategy::RoundRobin | Strategy::Random)
+    }
+
+    /// Whether the balancer settles on one node, so naming a current exit is
+    /// meaningful rather than a snapshot of a rotation.
+    pub fn picks_one(&self) -> bool {
+        matches!(self, Strategy::LeastPing)
     }
 }
 
@@ -40,6 +63,12 @@ pub struct PoolQuery {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub max: usize,
+    /// How many members `leastLoad` keeps in rotation. Zero means the whole
+    /// pool, which the core reads as "rotate across everything still
+    /// reachable" — verified on 26.3.27, where an `expected` above the live
+    /// count returns exactly the live ones.
+    #[serde(default)]
+    pub expected: usize,
     #[serde(default)]
     pub probe_interval: String,
 }
@@ -50,6 +79,15 @@ impl PoolQuery {
             "5m"
         } else {
             &self.probe_interval
+        }
+    }
+
+    /// `expected` resolved against the pool that was actually built.
+    pub fn expected_or_all(&self, members: usize) -> usize {
+        if self.expected == 0 || self.expected > members {
+            members
+        } else {
+            self.expected
         }
     }
 }
@@ -221,17 +259,46 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_round_robin_with_a_five_minute_probe() {
+    fn defaults_rotate_across_live_nodes_with_a_five_minute_probe() {
         let query = PoolQuery::default();
-        assert_eq!(query.strategy, Strategy::RoundRobin);
-        assert_eq!(query.strategy.as_xray(), "roundRobin");
+        // Measured, not assumed: `roundRobin` keeps unreachable members in the
+        // rotation, so it cannot be the default for a feature whose purpose is
+        // to keep working while spreading traffic.
+        assert_eq!(query.strategy, Strategy::LeastLoad);
+        assert_eq!(query.strategy.as_xray(), "leastLoad");
+        assert!(!query.strategy.keeps_dead_nodes());
+        assert!(!query.strategy.picks_one());
         assert_eq!(query.probe_interval_or_default(), "5m");
+
+        assert!(Strategy::RoundRobin.keeps_dead_nodes());
+        assert!(Strategy::Random.keeps_dead_nodes());
+        assert!(Strategy::LeastPing.picks_one());
 
         let explicit = PoolQuery {
             probe_interval: "30s".to_string(),
             ..PoolQuery::default()
         };
         assert_eq!(explicit.probe_interval_or_default(), "30s");
+    }
+
+    #[test]
+    fn expected_falls_back_to_the_whole_pool() {
+        let unset = PoolQuery::default();
+        assert_eq!(unset.expected_or_all(6), 6);
+
+        let narrow = PoolQuery {
+            expected: 2,
+            ..PoolQuery::default()
+        };
+        assert_eq!(narrow.expected_or_all(6), 2);
+
+        // Asking for more than the pool holds is not an error: the core
+        // answers with whatever is live, which is exactly the intent.
+        let wide = PoolQuery {
+            expected: 40,
+            ..PoolQuery::default()
+        };
+        assert_eq!(wide.expected_or_all(6), 6);
     }
 
     #[test]

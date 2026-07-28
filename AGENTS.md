@@ -152,9 +152,26 @@ tcp/ws/grpc/xhttp; tlsSettings/realitySettings/xtls as needed).
 
 A **pool** session emits the same scaffold plus one outbound per member tagged `s-<alias|id>`, a
 `routing.balancers` entry `{ tag: "pool", selector: ["s-"], strategy: { type: <strategy> } }`, a
-`burstObservatory` with `subjectSelector: ["s-"]` (which is also the failover: it drops dead
-nodes by itself), and an `api` block with `RoutingService` reachable through a `dokodemo-door`
-inbound tagged `api-in` on the session's own address. Three details are binding:
+`burstObservatory` with `subjectSelector: ["s-"]`, and an `api` block with `RoutingService`
+reachable through a `dokodemo-door` inbound tagged `api-in` on the session's own address.
+
+**An observatory is not by itself a failover — the strategy decides.** Measured on Xray 26.3.27
+with one reachable and one unreachable outbound, twelve requests each:
+
+| Strategy | Sent to the dead node | Notes |
+|---|---:|---|
+| `roundRobin` | **6 of 12** | observatory logs the failed pings and the balancer ignores them |
+| `leastLoad`, `settings.expected: N` | **0** | rotates evenly across the reachable nodes it selected |
+| `leastPing` | 0 | settles on one node, which defeats spreading |
+
+`leastLoad` with `expected` is therefore the default: it is the only strategy that both spreads
+traffic across exit IPs — the entire point of a pool — and drops nodes that stopped answering.
+`expected` above the live count returns exactly the live ones, so "rotate across everything
+reachable" is `expected = <pool size>`, which is what `expected = 0` resolves to. The generator
+emits `settings` only for `leastLoad`; emitting it elsewhere would imply a filtering that the
+other strategies do not perform.
+
+Three further details are binding:
 
 - The `api-in → api` rule comes **first** in `routing.rules`, ahead of the `balancerTag` rule.
   Otherwise API traffic falls into the balancer and `xray api bi` hangs.

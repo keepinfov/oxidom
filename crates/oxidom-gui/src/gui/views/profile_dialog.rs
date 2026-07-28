@@ -22,6 +22,9 @@ const MISSING_SERVER_HINT: &str = "This handle matches no server the daemon know
 const NO_SERVER_LABEL: &str = "Choose a server…";
 const DNS_LEAK_WARNING: &str = "All traffic will use the tunnel, but DNS is not routed through \
     it in this release. The system resolver will continue outside the tunnel.";
+const HEALTH_BLIND_WARNING: &str = "This strategy keeps unreachable nodes in the rotation. \
+    Measured on Xray 26.3.27: with one live and one dead node, half of the requests went into \
+    the dead one. Use leastLoad to rotate only across nodes the core can still reach.";
 const LEAST_PING_WARNING: &str = "leastPing concentrates traffic on one node and works against \
     spreading activity across IPs.";
 const NEW_CONNECTIONS_HINT: &str = "Pool switching affects only new connections; existing \
@@ -250,7 +253,7 @@ pub fn show_profile_dialog(
         .title("Pool")
         .visible(initial.pool.is_some())
         .build();
-    let strategy_labels = gtk::StringList::new(&["roundRobin", "random", "leastPing", "leastLoad"]);
+    let strategy_labels = gtk::StringList::new(&["leastLoad", "roundRobin", "random", "leastPing"]);
     let strategy = adw::ComboRow::builder()
         .title("Strategy")
         .subtitle(strategy_hint(initial_pool.strategy))
@@ -284,6 +287,14 @@ pub fn show_profile_dialog(
     pool_max.set_subtitle("0 means no query limit; activation still caps a pool at 64 nodes");
     pool_max.set_value(initial_pool.max as f64);
     pool_group.add(&pool_max);
+    let pool_expected = adw::SpinRow::with_range(0.0, profile::MAX_POOL_MEMBERS as f64, 1.0);
+    pool_expected.set_title("Nodes in rotation");
+    pool_expected.set_subtitle(
+        "How many reachable nodes leastLoad rotates across; 0 means all of them. Ignored by the \
+         other strategies.",
+    );
+    pool_expected.set_value(initial_pool.expected as f64);
+    pool_group.add(&pool_expected);
     let pool_probe_interval = adw::EntryRow::builder()
         .title("Probe interval")
         .text(&initial_pool.probe_interval)
@@ -428,6 +439,7 @@ pub fn show_profile_dialog(
         let pool_protocols = pool_protocols.clone();
         let pool_exclude = pool_exclude.clone();
         let pool_max = pool_max.clone();
+        let pool_expected = pool_expected.clone();
         let pool_probe_interval = pool_probe_interval.clone();
         let socks = socks.clone();
         let http = http.clone();
@@ -453,6 +465,7 @@ pub fn show_profile_dialog(
                 protocols: parse_values(&pool_protocols.text()),
                 exclude: parse_values(&pool_exclude.text()),
                 max: pool_max.value() as usize,
+                expected: pool_expected.value() as usize,
                 probe_interval: pool_probe_interval.text().trim().to_string(),
             });
             let values = DialogValues {
@@ -566,6 +579,10 @@ pub fn show_profile_dialog(
         });
     }
     pool_max.connect_value_notify({
+        let update_validation = update_validation.clone();
+        move |_| update_validation()
+    });
+    pool_expected.connect_value_notify({
         let update_validation = update_validation.clone();
         move |_| update_validation()
     });
@@ -707,25 +724,30 @@ fn route_mode_index(mode: RouteMode) -> u32 {
 
 fn strategy_index(strategy: Strategy) -> u32 {
     match strategy {
-        Strategy::RoundRobin => 0,
-        Strategy::Random => 1,
-        Strategy::LeastPing => 2,
-        Strategy::LeastLoad => 3,
+        Strategy::LeastLoad => 0,
+        Strategy::RoundRobin => 1,
+        Strategy::Random => 2,
+        Strategy::LeastPing => 3,
     }
 }
 
 fn strategy_from_index(index: u32) -> Strategy {
     match index {
-        1 => Strategy::Random,
-        2 => Strategy::LeastPing,
-        3 => Strategy::LeastLoad,
-        _ => Strategy::RoundRobin,
+        1 => Strategy::RoundRobin,
+        2 => Strategy::Random,
+        3 => Strategy::LeastPing,
+        _ => Strategy::LeastLoad,
     }
 }
 
+/// Both hints describe measured behaviour, not preference. A user who picks a
+/// health-blind strategy has to learn it here rather than from a pool that
+/// quietly swallows part of its traffic.
 fn strategy_hint(strategy: Strategy) -> &'static str {
-    if strategy == Strategy::LeastPing {
+    if strategy.picks_one() {
         LEAST_PING_WARNING
+    } else if strategy.keeps_dead_nodes() {
+        HEALTH_BLIND_WARNING
     } else {
         ""
     }
@@ -993,6 +1015,7 @@ mod tests {
                 protocols: vec!["vless".to_string()],
                 exclude: vec!["slow".to_string()],
                 max: 8,
+                expected: 4,
                 probe_interval: "30s".to_string(),
             }),
         };
@@ -1010,10 +1033,21 @@ mod tests {
     #[test]
     fn strategy_help_states_the_ip_spreading_tradeoff() {
         assert_eq!(strategy_hint(Strategy::LeastPing), LEAST_PING_WARNING);
-        assert_eq!(strategy_hint(Strategy::RoundRobin), "");
-        assert_eq!(
-            strategy_from_index(strategy_index(Strategy::LeastLoad)),
-            Strategy::LeastLoad
-        );
+        // Both ways of failing the user's goal are called out, and the default
+        // — the one that both spreads and drops dead nodes — needs no warning.
+        assert_eq!(strategy_hint(Strategy::RoundRobin), HEALTH_BLIND_WARNING);
+        assert_eq!(strategy_hint(Strategy::Random), HEALTH_BLIND_WARNING);
+        assert_eq!(strategy_hint(Strategy::LeastLoad), "");
+
+        for strategy in [
+            Strategy::LeastLoad,
+            Strategy::RoundRobin,
+            Strategy::Random,
+            Strategy::LeastPing,
+        ] {
+            assert_eq!(strategy_from_index(strategy_index(strategy)), strategy);
+        }
+        // The picker opens on the default rather than on a health-blind sweep.
+        assert_eq!(strategy_index(Strategy::default()), 0);
     }
 }

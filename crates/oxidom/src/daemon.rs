@@ -179,6 +179,8 @@ enum ConnectionTarget {
     Pool {
         members: Vec<String>,
         strategy: String,
+        /// How many members `leastLoad` keeps rotating; 0 means all of them.
+        expected: usize,
         probe_interval: String,
         api_port: u16,
     },
@@ -370,6 +372,7 @@ impl Shared {
                 } => ConnectionTarget::Pool {
                     members,
                     strategy,
+                    expected: session.pool_expected,
                     probe_interval: session.pool_probe_interval.clone(),
                     api_port: session.api_port,
                 },
@@ -812,12 +815,14 @@ impl Shared {
                     ConnectionTarget::Pool {
                         members,
                         strategy,
+                        expected,
                         probe_interval,
                         api_port,
                     } => engine.connect_pool_session(
                         profile,
                         members,
                         strategy,
+                        *expected,
                         probe_interval,
                         *api_port,
                     ),
@@ -1319,23 +1324,26 @@ fn selection_info(
             members, strategy, ..
         }) => {
             let live = session.balancer_info.as_ref();
-            // `principleTarget` answers a different question per strategy, and
-            // reading it the same way both times is how a pool would report
-            // five healthy servers as dead. A rotating balancer returns every
-            // node it still considers eligible, so absence there is real news;
-            // a picking balancer returns only its winner, so absence there is
-            // no evidence at all.
-            let rotating = matches!(strategy.as_str(), "roundRobin" | "random");
+            // `principleTarget` is the set the balancer is rotating through
+            // right now, and that is all it is. Measured on Xray 26.3.27:
+            // `roundRobin` lists every member including unreachable ones,
+            // `leastLoad` lists the reachable ones it selected, `leastPing`
+            // lists its single winner. So this maps to "in rotation" for every
+            // strategy — and only a strategy that settles on one node may have
+            // that node called the current exit.
+            let picks_one = strategy == "leastPing";
             let pool_members = members
                 .iter()
                 .map(|server_id| {
                     let server = engine.find_server(server_id);
                     let alias = server.as_ref().and_then(|server| server.alias.clone());
                     let tag = format!("s-{}", alias.as_deref().unwrap_or(server_id.as_str()));
-                    let healthy = match live {
-                        Some(info) if rotating && info.override_target.is_none() => {
+                    let in_rotation = match live {
+                        Some(info) if info.override_target.is_none() => {
                             Some(info.principle.iter().any(|live_tag| live_tag == &tag))
                         }
+                        // An override pins one target and says nothing about
+                        // what the strategy would otherwise be rotating.
                         _ => None,
                     };
                     PoolMember {
@@ -1346,7 +1354,7 @@ fn selection_info(
                             .map(|server| server.name.clone())
                             .unwrap_or_else(|| server_id.clone()),
                         tag,
-                        healthy,
+                        in_rotation,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1355,7 +1363,7 @@ fn selection_info(
             // roundRobin would describe a rotation that never stopped.
             let current_tag = live.and_then(|info| match &info.override_target {
                 Some(target) => Some(target.as_str()),
-                None if rotating => None,
+                None if !picks_one => None,
                 None => (info.principle.len() == 1).then(|| info.principle[0].as_str()),
             });
             let selecting = current_tag.and_then(|tag| {
@@ -1698,10 +1706,12 @@ impl Service {
                     .collect::<Vec<_>>();
                 let api_port = oxidom_core::engine::free_port(address, &[socks_port, http_port])
                     .map_err(failed)?;
+                let expected = query.expected_or_all(members.len());
                 (
                     ConnectionTarget::Pool {
                         members,
                         strategy: query.strategy.as_xray().to_string(),
+                        expected,
                         probe_interval: query.probe_interval_or_default().to_string(),
                         api_port,
                     },
@@ -1968,6 +1978,7 @@ impl Service {
                     } => Some(ConnectionTarget::Pool {
                         members: members.clone(),
                         strategy: strategy.clone(),
+                        expected: session.pool_expected,
                         probe_interval: session.pool_probe_interval.clone(),
                         api_port: session.api_port,
                     }),
@@ -1982,12 +1993,14 @@ impl Service {
                     ConnectionTarget::Pool {
                         members,
                         strategy,
+                        expected,
                         probe_interval,
                         api_port,
                     } => engine.connect_pool_session(
                         "default",
                         members,
                         strategy,
+                        *expected,
                         probe_interval,
                         *api_port,
                     ),
@@ -2371,6 +2384,7 @@ mod tests {
                 ConnectionTarget::Pool {
                     members,
                     strategy,
+                    expected: _,
                     probe_interval,
                     api_port: 18082,
                 },
@@ -2750,17 +2764,18 @@ mod tests {
         assert_eq!(session.selection.kind, "pool");
         assert_eq!(session.selection.strategy, "roundRobin");
         assert_eq!(session.selection.members.len(), 2);
-        // roundRobin keeps rotating, so there is no "now" node to name — but
-        // the member the core dropped from its eligible set is real news.
+        // roundRobin keeps rotating, so there is no "now" node to name. The
+        // rotation membership is still reported — but note it says nothing
+        // about reachability under this strategy, which is why the field is
+        // called `in_rotation`.
         assert_eq!(session.selection.selecting, None);
-        assert_eq!(session.selection.members[0].healthy, Some(true));
-        assert_eq!(session.selection.members[1].healthy, Some(false));
+        assert_eq!(session.selection.members[0].in_rotation, Some(true));
+        assert_eq!(session.selection.members[1].in_rotation, Some(false));
         Ok(())
     }
 
-    /// A picking strategy answers with its winner, so the other members are not
-    /// unhealthy — they simply lost. Reporting them as dead was the bug this
-    /// test pins shut.
+    /// A picking strategy answers with its winner. Naming that winner is the
+    /// whole point; the others are simply out of rotation, not dead.
     #[test]
     fn a_least_ping_pool_names_its_pick_without_condemning_the_rest() -> Result<()> {
         let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
@@ -2812,9 +2827,8 @@ mod tests {
             session.selection.selecting,
             session.selection.members[1].alias
         );
-        for member in &session.selection.members {
-            assert_eq!(member.healthy, None, "{}", member.tag);
-        }
+        assert_eq!(session.selection.members[0].in_rotation, Some(false));
+        assert_eq!(session.selection.members[1].in_rotation, Some(true));
         Ok(())
     }
 

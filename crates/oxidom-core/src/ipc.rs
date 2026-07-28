@@ -133,13 +133,17 @@ pub struct PoolMember {
     pub alias: Option<String>,
     pub name: String,
     pub tag: String,
-    /// Whether the core still counts this node as eligible. Only a rotating
-    /// balancer answers that question — see `xray::api::BalancerInfo` — so a
-    /// picking strategy leaves this `None` rather than guessing.
+    /// Whether the balancer is currently rotating through this node.
+    ///
+    /// Deliberately not called `healthy`. `leastLoad` filters by reachability
+    /// *and* by cost, so a node missing here may be perfectly alive and merely
+    /// unselected; `roundRobin` keeps unreachable nodes in the rotation, so a
+    /// node present here may be dead. "In rotation" is the one thing the core
+    /// actually tells us, and it is true for every strategy.
     ///
     /// There is deliberately no per-node delay beside it: the wire schema
     /// carries none, and a fabricated number would read like a measurement.
-    pub healthy: Option<bool>,
+    pub in_rotation: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

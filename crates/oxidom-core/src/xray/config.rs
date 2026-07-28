@@ -40,15 +40,30 @@ pub fn generate(server: &Server, bind: Ipv4Addr, socks_port: u16, http_port: u16
     }
 }
 
+/// Everything about a pool that the generated config depends on. Grouped
+/// because these four always travel together from the profile down to the
+/// core, and passing them one by one made every hop an eight-argument call.
+pub struct PoolSpec<'a> {
+    pub members: &'a [&'a Server],
+    pub strategy: &'a str,
+    /// How many reachable nodes `leastLoad` keeps rotating; see `pool::Strategy`.
+    pub expected: usize,
+    pub probe_interval: &'a str,
+}
+
 pub fn generate_pool(
-    members: &[&Server],
-    strategy: &str,
-    probe_interval: &str,
+    spec: &PoolSpec<'_>,
     bind: Ipv4Addr,
     socks_port: u16,
     http_port: u16,
     api_port: u16,
 ) -> Result<Value> {
+    let PoolSpec {
+        members,
+        strategy,
+        expected,
+        probe_interval,
+    } = *spec;
     if members.is_empty() {
         bail!("cannot generate an Xray pool with no members");
     }
@@ -81,10 +96,18 @@ pub fn generate_pool(
             "protocol": "dokodemo-door",
             "settings": { "address": "127.0.0.1" }
         }));
+    // `leastLoad` is the only strategy that reads `expected`, and it is what
+    // makes a pool both spread and survive: the core keeps that many of the
+    // nodes it can still reach and rotates across them. Emitting it for the
+    // health-blind strategies would suggest they filter, which they do not.
+    let mut strategy_value = json!({ "type": strategy });
+    if strategy == "leastLoad" {
+        strategy_value["settings"] = json!({ "expected": expected.max(1) });
+    }
     config["routing"]["balancers"] = json!([{
         "tag": "pool",
         "selector": ["s-"],
-        "strategy": { "type": strategy }
+        "strategy": strategy_value
     }]);
     // This rule must precede the catch-all balancer rule or `xray api bi`
     // routes its own request into the pool and waits until it times out.
@@ -365,7 +388,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{generate, generate_pool};
+    use super::{PoolSpec, generate, generate_pool};
     use crate::model::{
         Hysteria2Obfs, Hysteria2Settings, OutboundSpec, PortRange, Protocol, Server, StreamSettings,
     };
@@ -503,9 +526,12 @@ mod tests {
         let bind = Ipv4Addr::new(127, 72, 14, 1);
 
         let config = generate_pool(
-            &[&socks, &vless],
-            "roundRobin",
-            "5m",
+            &PoolSpec {
+                members: &[&socks, &vless],
+                strategy: "leastLoad",
+                expected: 2,
+                probe_interval: "5m",
+            },
             bind,
             10808,
             10809,
@@ -524,7 +550,13 @@ mod tests {
         let routing = &config["routing"];
         assert_eq!(routing["balancers"][0]["tag"], "pool");
         assert_eq!(routing["balancers"][0]["selector"], json!(["s-"]));
-        assert_eq!(routing["balancers"][0]["strategy"]["type"], "roundRobin");
+        assert_eq!(routing["balancers"][0]["strategy"]["type"], "leastLoad");
+        // Without `expected` the core would settle on one node, which is the
+        // opposite of spreading traffic across exits.
+        assert_eq!(
+            routing["balancers"][0]["strategy"]["settings"]["expected"],
+            2
+        );
         assert_eq!(routing["rules"][0]["inboundTag"], json!(["api-in"]));
         assert_eq!(routing["rules"][0]["outboundTag"], "api");
         assert_eq!(routing["rules"][1]["outboundTag"], "direct");
@@ -542,9 +574,12 @@ mod tests {
         by_id.id = "collision".to_string();
 
         let error = generate_pool(
-            &[&by_alias, &by_id],
-            "roundRobin",
-            "5m",
+            &PoolSpec {
+                members: &[&by_alias, &by_id],
+                strategy: "leastLoad",
+                expected: 2,
+                probe_interval: "5m",
+            },
             Ipv4Addr::LOCALHOST,
             10808,
             10809,
@@ -823,9 +858,12 @@ mod tests {
         configs.push((
             "pool".to_string(),
             generate_pool(
-                &[&servers[0], &servers[2]],
-                "roundRobin",
-                "5m",
+                &PoolSpec {
+                    members: &[&servers[0], &servers[2]],
+                    strategy: "leastLoad",
+                    expected: 2,
+                    probe_interval: "5m",
+                },
                 Ipv4Addr::new(127, 72, 14, 1),
                 10808,
                 10809,

@@ -431,6 +431,7 @@ max = "eight"
                     protocols: vec!["vless".to_string(), "trojan".to_string()],
                     exclude: vec!["ch-trojan-3".to_string()],
                     max: 8,
+                    expected: 4,
                     probe_interval: "5m".to_string(),
                 }),
             },

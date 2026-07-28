@@ -153,9 +153,7 @@ impl XrayCore {
     /// Start (or restart) the core for a resolved pool.
     pub fn connect_pool(
         &mut self,
-        members: &[&Server],
-        strategy: &str,
-        probe_interval: &str,
+        spec: &config::PoolSpec<'_>,
         bind: Ipv4Addr,
         api_port: u16,
         profile: &str,
@@ -163,7 +161,7 @@ impl XrayCore {
         self.disconnect();
         self.set_status(Status::Connecting);
         crate::sync::lock(&self.logs).clear();
-        match self.try_connect_pool(members, strategy, probe_interval, bind, api_port, profile) {
+        match self.try_connect_pool(spec, bind, api_port, profile) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let message = format!("{error:#}");
@@ -226,27 +224,17 @@ impl XrayCore {
 
     fn try_connect_pool(
         &mut self,
-        members: &[&Server],
-        strategy: &str,
-        probe_interval: &str,
+        spec: &config::PoolSpec<'_>,
         bind: Ipv4Addr,
         api_port: u16,
         profile: &str,
     ) -> Result<()> {
         let xray = self.resolve_binary()?;
-        for member in members {
+        for member in spec.members {
             self.preflight_notes(member);
         }
         self.ensure_ports_free(bind, Some(api_port))?;
-        let cfg = config::generate_pool(
-            members,
-            strategy,
-            probe_interval,
-            bind,
-            self.socks_port,
-            self.http_port,
-            api_port,
-        )?;
+        let cfg = config::generate_pool(spec, bind, self.socks_port, self.http_port, api_port)?;
         self.spawn_config(&xray, &cfg, profile)?;
         self.active = None;
         Ok(())
