@@ -1663,7 +1663,14 @@ impl Controller {
             (
                 Profile {
                     description: entry.description.clone(),
-                    select: ProfileSelect { server: handle },
+                    // Retargeting at one server replaces whatever the profile
+                    // selected, a pool included: that is what clicking a card
+                    // means. The confirmation dialog below is what keeps it
+                    // from happening silently.
+                    select: ProfileSelect {
+                        server: handle,
+                        pool: None,
+                    },
                     proxy: ProfileProxy {
                         socks_port: entry.socks_port,
                         http_port: entry.http_port,

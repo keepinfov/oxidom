@@ -122,6 +122,11 @@ fn profile_from_dialog(values: DialogValues) -> Profile {
         description: values.description,
         select: ProfileSelect {
             server: values.server,
+            // The dialog has no pool editor yet, and `ProfileEntry` carries no
+            // pool to preserve. The moment it does, this must round-trip the
+            // loaded value like `interface_address` already does — otherwise
+            // opening a pool profile and pressing Save silently unselects it.
+            pool: None,
         },
         proxy: ProfileProxy {
             socks_port: values.socks_port,

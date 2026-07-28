@@ -2187,6 +2187,7 @@ mod tests {
         let profile = Profile {
             select: oxidom_core::profile::ProfileSelect {
                 server: "anything".to_string(),
+                pool: None,
             },
             ..Profile::default()
         };
@@ -2225,7 +2226,10 @@ mod tests {
         profile::save(
             "work",
             &Profile {
-                select: oxidom_core::profile::ProfileSelect { server: server_id },
+                select: oxidom_core::profile::ProfileSelect {
+                    server: server_id,
+                    pool: None,
+                },
                 ..Profile::default()
             },
         )?;
@@ -2313,6 +2317,7 @@ mod tests {
             description: "работа".to_string(),
             select: oxidom_core::profile::ProfileSelect {
                 server: "ch-trojan".to_string(),
+                pool: None,
             },
             proxy: oxidom_core::profile::ProfileProxy {
                 socks_port: 21080,

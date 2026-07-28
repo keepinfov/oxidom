@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::engine::Engine;
+use crate::pool::PoolQuery;
 use crate::{fsutil, paths};
 
 const MAX_NAME_LEN: usize = 32;
+const MAX_POOL_MEMBERS: usize = 64;
 
 /// Top-level CLI words cannot also be profile-first profile names: the
 /// normalizer deliberately gives a verb in the first position precedence.
@@ -53,6 +55,11 @@ pub struct Profile {
 #[serde(default)]
 pub struct ProfileSelect {
     pub server: String,
+    /// A malformed `[select.pool]` is deliberately a hard parse error rather
+    /// than a silently ignored key: swallowing it would downgrade a pool
+    /// profile to "selects nothing" and report it as an unset server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<PoolQuery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +107,20 @@ impl Default for ProfileProxy {
 
 impl Profile {
     pub fn validate(&self, name: &str) -> Result<()> {
+        if !self.select.server.is_empty() && self.select.pool.is_some() {
+            bail!("a profile selects either a server or a pool, not both");
+        }
+        if let Some(pool) = &self.select.pool {
+            if pool.max > MAX_POOL_MEMBERS {
+                bail!("[select.pool] max must be 0 (unlimited) or at most {MAX_POOL_MEMBERS}");
+            }
+            if !pool.probe_interval.is_empty() && !valid_xray_duration(&pool.probe_interval) {
+                bail!(
+                    "[select.pool] probe_interval must be empty or a duration such as \"30s\", \
+                     \"5m\", or \"1h\""
+                );
+            }
+        }
         if self.proxy.socks_port == 0 || self.proxy.http_port == 0 {
             bail!("profile ports must be between 1 and 65535");
         }
@@ -154,6 +175,17 @@ impl Profile {
     pub fn to_toml(&self) -> Result<String> {
         toml::to_string_pretty(self).context("serializing profile")
     }
+}
+
+fn valid_xray_duration(value: &str) -> bool {
+    let Some((unit_index, unit)) = value.char_indices().next_back() else {
+        return false;
+    };
+    matches!(unit, 's' | 'm' | 'h')
+        && unit_index > 0
+        && value[..unit_index]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
 }
 
 /// Parse an editor setting without involving a shell. Editor variables often
@@ -288,7 +320,7 @@ pub fn ensure_default(engine: &Engine) -> Result<()> {
         .and_then(|server| server.alias.clone())
         .unwrap_or_default();
     let profile = Profile {
-        select: ProfileSelect { server },
+        select: ProfileSelect { server, pool: None },
         proxy: ProfileProxy {
             socks_port: engine.registry.config.socks_port,
             http_port: engine.registry.config.http_port,
@@ -314,7 +346,8 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{Profile, RouteMode, is_reserved, list, valid_name};
+    use super::{Profile, ProfileProxy, ProfileSelect, RouteMode, is_reserved, list, valid_name};
+    use crate::pool::{PoolQuery, Strategy};
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -349,7 +382,7 @@ future_key = "ignored"
 
 [select]
 server = "ch-trojan"
-pool = "future"
+future_selection = "ignored"
 
 [proxy]
 socks_port = 12080
@@ -366,6 +399,139 @@ http_port = 12081
         let encoded = toml::to_string_pretty(&profile)?;
         assert_eq!(toml::from_str::<Profile>(&encoded)?, profile);
         Ok(())
+    }
+
+    #[test]
+    fn a_malformed_pool_is_a_parse_error_not_a_silently_dropped_selection() {
+        let input = r#"
+description = "spread"
+
+[select]
+server = ""
+
+[select.pool]
+max = "eight"
+"#;
+        // Tolerating this would turn a pool profile into one that selects
+        // nothing, and `up` would then blame an unset server.
+        let error = toml::from_str::<Profile>(input).unwrap_err().to_string();
+        assert!(error.contains("invalid type"), "{error}");
+    }
+
+    #[test]
+    fn a_pool_profile_round_trips_through_toml() -> Result<()> {
+        let profile = Profile {
+            description: "spread".to_string(),
+            select: ProfileSelect {
+                server: String::new(),
+                pool: Some(PoolQuery {
+                    strategy: Strategy::Random,
+                    subscriptions: vec!["main".to_string()],
+                    countries: vec!["ch".to_string(), "de".to_string()],
+                    protocols: vec!["vless".to_string(), "trojan".to_string()],
+                    exclude: vec!["ch-trojan-3".to_string()],
+                    max: 8,
+                    probe_interval: "5m".to_string(),
+                }),
+            },
+            proxy: ProfileProxy {
+                socks_port: 12080,
+                http_port: 12081,
+            },
+            ..Profile::default()
+        };
+
+        let encoded = profile.to_toml()?;
+        assert!(encoded.contains("[select.pool]"), "{encoded}");
+        assert!(encoded.contains("strategy = \"random\""), "{encoded}");
+        assert_eq!(Profile::from_toml(&encoded)?, profile);
+        Ok(())
+    }
+
+    #[test]
+    fn a_profile_without_a_pool_keeps_its_legacy_toml_bytes() -> Result<()> {
+        let profile = Profile {
+            description: "work".to_string(),
+            select: ProfileSelect {
+                server: "ch-trojan".to_string(),
+                pool: None,
+            },
+            proxy: ProfileProxy {
+                socks_port: 12080,
+                http_port: 12081,
+            },
+            ..Profile::default()
+        };
+        let legacy = r#"description = "work"
+
+[select]
+server = "ch-trojan"
+
+[proxy]
+socks_port = 12080
+http_port = 12081
+
+[interface]
+enable = false
+device = ""
+address = ""
+mtu = 0
+routes = "manual"
+list = []
+"#;
+
+        assert_eq!(profile.to_toml()?, legacy);
+        Ok(())
+    }
+
+    #[test]
+    fn a_profile_cannot_select_both_a_server_and_a_pool() {
+        let profile = Profile {
+            select: ProfileSelect {
+                server: "ch-trojan".to_string(),
+                pool: Some(PoolQuery::default()),
+            },
+            ..Profile::default()
+        };
+
+        assert_eq!(
+            profile.validate("work").unwrap_err().to_string(),
+            "a profile selects either a server or a pool, not both"
+        );
+    }
+
+    #[test]
+    fn pool_probe_interval_must_use_xray_duration_syntax() {
+        let profile = Profile {
+            select: ProfileSelect {
+                server: String::new(),
+                pool: Some(PoolQuery {
+                    probe_interval: "five minutes".to_string(),
+                    ..PoolQuery::default()
+                }),
+            },
+            ..Profile::default()
+        };
+
+        let error = profile.validate("work").unwrap_err().to_string();
+        assert!(error.contains("[select.pool] probe_interval"), "{error}");
+    }
+
+    #[test]
+    fn pool_size_has_a_reasonable_upper_bound() {
+        let profile = Profile {
+            select: ProfileSelect {
+                server: String::new(),
+                pool: Some(PoolQuery {
+                    max: 65,
+                    ..PoolQuery::default()
+                }),
+            },
+            ..Profile::default()
+        };
+
+        let error = profile.validate("work").unwrap_err().to_string();
+        assert!(error.contains("[select.pool] max"), "{error}");
     }
 
     #[test]

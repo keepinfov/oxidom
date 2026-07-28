@@ -12,6 +12,7 @@ pub mod link;
 pub mod model;
 pub mod nft;
 pub mod paths;
+pub mod pool;
 pub mod probe;
 pub mod proc;
 pub mod profile;

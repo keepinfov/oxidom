@@ -1,12 +1,123 @@
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::model::{Hysteria2Settings, OutboundSpec, Server, StreamSettings};
 
+// The pool generator has no Config parameter, and an observatory needs one
+// stable HTTP target regardless of the user's direct/active probe method.
+const POOL_PROBE_DESTINATION: &str = "https://connectivitycheck.gstatic.com/generate_204";
+
 /// Generate a full Xray config JSON for `server`, with local SOCKS + HTTP inbounds.
 pub fn generate(server: &Server, bind: Ipv4Addr, socks_port: u16, http_port: u16) -> Value {
-    let mut config = json!({
+    match &server.spec {
+        OutboundSpec::XrayProfile {
+            proxy_outbounds,
+            balancers,
+            burst_observatory,
+            balancer_tag,
+        } => {
+            let mut config = scaffold(bind, socks_port, http_port, proxy_outbounds.clone());
+            config["routing"]["rules"] = json!([
+                { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
+                { "type": "field", "network": "tcp,udp", "balancerTag": balancer_tag }
+            ]);
+            config["routing"]["balancers"] = Value::Array(balancers.clone());
+            if let Some(observatory) = burst_observatory {
+                config["burstObservatory"] = observatory.clone();
+            }
+            config
+        }
+        _ => {
+            let mut config = scaffold(bind, socks_port, http_port, vec![outbound(server)]);
+            config["routing"]["rules"] = json!([
+                { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" }
+            ]);
+            config
+        }
+    }
+}
+
+pub fn generate_pool(
+    members: &[&Server],
+    strategy: &str,
+    probe_interval: &str,
+    bind: Ipv4Addr,
+    socks_port: u16,
+    http_port: u16,
+    api_port: u16,
+) -> Result<Value> {
+    if members.is_empty() {
+        bail!("cannot generate an Xray pool with no members");
+    }
+
+    let mut seen_tags = HashSet::with_capacity(members.len());
+    let mut outbounds = Vec::with_capacity(members.len());
+    for server in members {
+        let handle = server.alias.as_deref().unwrap_or(&server.id);
+        let tag = format!("s-{handle}");
+        if !seen_tags.insert(tag.clone()) {
+            bail!("duplicate Xray pool outbound tag {tag:?}");
+        }
+        let outbound = outbound_tagged(server, &tag).with_context(|| {
+            format!(
+                "server {:?} is a composite Xray profile and cannot be a pool member",
+                server.name
+            )
+        })?;
+        outbounds.push(outbound);
+    }
+
+    let mut config = scaffold(bind, socks_port, http_port, outbounds);
+    config["inbounds"]
+        .as_array_mut()
+        .expect("the shared scaffold always has inbounds")
+        .push(json!({
+            "tag": "api-in",
+            "listen": bind.to_string(),
+            "port": api_port,
+            "protocol": "dokodemo-door",
+            "settings": { "address": "127.0.0.1" }
+        }));
+    config["routing"]["balancers"] = json!([{
+        "tag": "pool",
+        "selector": ["s-"],
+        "strategy": { "type": strategy }
+    }]);
+    // This rule must precede the catch-all balancer rule or `xray api bi`
+    // routes its own request into the pool and waits until it times out.
+    config["routing"]["rules"] = json!([
+        { "type": "field", "inboundTag": ["api-in"], "outboundTag": "api" },
+        { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
+        { "type": "field", "network": "tcp,udp", "balancerTag": "pool" }
+    ]);
+    config["burstObservatory"] = json!({
+        "subjectSelector": ["s-"],
+        "pingConfig": {
+            "destination": POOL_PROBE_DESTINATION,
+            "interval": probe_interval,
+            "timeout": "3s",
+            "sampling": 3
+        }
+    });
+    config["api"] = json!({
+        "tag": "api",
+        "services": ["RoutingService"]
+    });
+    Ok(config)
+}
+
+fn scaffold(
+    bind: Ipv4Addr,
+    socks_port: u16,
+    http_port: u16,
+    mut proxy_outbounds: Vec<Value>,
+) -> Value {
+    proxy_outbounds.push(json!({ "protocol": "freedom", "tag": "direct" }));
+    proxy_outbounds.push(json!({ "protocol": "blackhole", "tag": "block" }));
+    json!({
         "log": { "loglevel": "warning" },
         "inbounds": [
             {
@@ -25,59 +136,26 @@ pub fn generate(server: &Server, bind: Ipv4Addr, socks_port: u16, http_port: u16
                 "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
             }
         ],
-    });
-
-    match &server.spec {
-        OutboundSpec::XrayProfile {
-            proxy_outbounds,
-            balancers,
-            burst_observatory,
-            balancer_tag,
-        } => {
-            let mut outbounds = proxy_outbounds.clone();
-            outbounds.push(json!({ "protocol": "freedom", "tag": "direct" }));
-            outbounds.push(json!({ "protocol": "blackhole", "tag": "block" }));
-            config["outbounds"] = Value::Array(outbounds);
-            config["routing"] = json!({
-                "domainStrategy": "IPIfNonMatch",
-                "rules": [
-                    { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
-                    { "type": "field", "network": "tcp,udp", "balancerTag": balancer_tag }
-                ],
-                "balancers": balancers
-            });
-            if let Some(observatory) = burst_observatory {
-                config["burstObservatory"] = observatory.clone();
-            }
-        }
-        _ => {
-            config["outbounds"] = json!([
-                outbound(server),
-                { "protocol": "freedom", "tag": "direct" },
-                { "protocol": "blackhole", "tag": "block" }
-            ]);
-            config["routing"] = json!({
-                "domainStrategy": "IPIfNonMatch",
-                "rules": [
-                    { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" }
-                ]
-            });
-        }
-    }
-
-    config
+        "outbounds": proxy_outbounds,
+        "routing": { "domainStrategy": "IPIfNonMatch" }
+    })
 }
 
 fn outbound(server: &Server) -> Value {
+    outbound_tagged(server, "proxy")
+        .unwrap_or_else(|| unreachable!("composite profiles are generated by generate"))
+}
+
+fn outbound_tagged(server: &Server, tag: &str) -> Option<Value> {
     let addr = &server.address;
     let port = server.port;
-    match &server.spec {
+    Some(match &server.spec {
         OutboundSpec::Vless {
             uuid,
             encryption,
             stream,
         } => json!({
-            "tag": "proxy",
+            "tag": tag,
             "protocol": "vless",
             "settings": { "vnext": [ {
                 "address": addr,
@@ -96,7 +174,7 @@ fn outbound(server: &Server) -> Value {
             security,
             stream,
         } => json!({
-            "tag": "proxy",
+            "tag": tag,
             "protocol": "vmess",
             "settings": { "vnext": [ {
                 "address": addr,
@@ -106,7 +184,7 @@ fn outbound(server: &Server) -> Value {
             "streamSettings": stream_settings(stream)
         }),
         OutboundSpec::Trojan { password, stream } => json!({
-            "tag": "proxy",
+            "tag": tag,
             "protocol": "trojan",
             "settings": { "servers": [ trim_obj(json!({
                 "address": addr,
@@ -117,7 +195,7 @@ fn outbound(server: &Server) -> Value {
             "streamSettings": stream_settings(stream)
         }),
         OutboundSpec::Shadowsocks { method, password } => json!({
-            "tag": "proxy",
+            "tag": tag,
             "protocol": "shadowsocks",
             "settings": { "servers": [ {
                 "address": addr,
@@ -127,26 +205,24 @@ fn outbound(server: &Server) -> Value {
             } ] }
         }),
         OutboundSpec::Socks { username, password } => json!({
-            "tag": "proxy",
+            "tag": tag,
             "protocol": "socks",
             "settings": { "servers": [ socks_http_server(addr, port, username, password) ] }
         }),
         OutboundSpec::Http { username, password } => json!({
-            "tag": "proxy",
+            "tag": tag,
             "protocol": "http",
             "settings": { "servers": [ socks_http_server(addr, port, username, password) ] }
         }),
         OutboundSpec::Hysteria2 { auth, settings } => json!({
-            "tag": "proxy",
+            "tag": tag,
             // Xray names the protocol "hysteria" and selects v2 by version.
             "protocol": "hysteria",
             "settings": { "version": 2, "address": addr, "port": port },
             "streamSettings": hysteria2_stream(auth, settings, port)
         }),
-        OutboundSpec::XrayProfile { .. } => {
-            unreachable!("composite profiles are generated by generate")
-        }
-    }
+        OutboundSpec::XrayProfile { .. } => return None,
+    })
 }
 
 /// Stream settings for a hysteria2 outbound.
@@ -289,7 +365,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::generate;
+    use super::{generate, generate_pool};
     use crate::model::{
         Hysteria2Obfs, Hysteria2Settings, OutboundSpec, PortRange, Protocol, Server, StreamSettings,
     };
@@ -416,6 +492,67 @@ mod tests {
             serde_json::to_vec(&generated).unwrap(),
             serde_json::to_vec(&legacy).unwrap()
         );
+    }
+
+    #[test]
+    fn pool_config_has_member_tags_api_first_routing_and_observatory() {
+        let mut socks = socks_server();
+        socks.alias = Some("socks-node".to_string());
+        let mut vless = tls_vless(false, None);
+        vless.id = "vless-id".to_string();
+        let bind = Ipv4Addr::new(127, 72, 14, 1);
+
+        let config = generate_pool(
+            &[&socks, &vless],
+            "roundRobin",
+            "5m",
+            bind,
+            10808,
+            10809,
+            10810,
+        )
+        .unwrap();
+
+        assert_eq!(config["inbounds"][2]["tag"], "api-in");
+        assert_eq!(config["inbounds"][2]["listen"], "127.72.14.1");
+        assert_eq!(config["inbounds"][2]["port"], 10810);
+        assert_eq!(config["outbounds"][0]["tag"], "s-socks-node");
+        assert_eq!(config["outbounds"][1]["tag"], "s-vless-id");
+        assert_eq!(config["outbounds"][2]["tag"], "direct");
+        assert_eq!(config["outbounds"][3]["tag"], "block");
+
+        let routing = &config["routing"];
+        assert_eq!(routing["balancers"][0]["tag"], "pool");
+        assert_eq!(routing["balancers"][0]["selector"], json!(["s-"]));
+        assert_eq!(routing["balancers"][0]["strategy"]["type"], "roundRobin");
+        assert_eq!(routing["rules"][0]["inboundTag"], json!(["api-in"]));
+        assert_eq!(routing["rules"][0]["outboundTag"], "api");
+        assert_eq!(routing["rules"][1]["outboundTag"], "direct");
+        assert_eq!(routing["rules"][2]["balancerTag"], "pool");
+        assert_eq!(config["burstObservatory"]["subjectSelector"], json!(["s-"]));
+        assert_eq!(config["burstObservatory"]["pingConfig"]["interval"], "5m");
+        assert_eq!(config["api"]["services"], json!(["RoutingService"]));
+    }
+
+    #[test]
+    fn duplicate_pool_tags_are_rejected() {
+        let mut by_alias = socks_server();
+        by_alias.alias = Some("collision".to_string());
+        let mut by_id = tls_vless(false, None);
+        by_id.id = "collision".to_string();
+
+        let error = generate_pool(
+            &[&by_alias, &by_id],
+            "roundRobin",
+            "5m",
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            10810,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "duplicate Xray pool outbound tag \"s-collision\"");
     }
 
     #[test]
@@ -671,17 +808,36 @@ mod tests {
             ])
             .collect();
 
+        let mut configs = Vec::new();
         for (index, server) in servers.iter().enumerate() {
             let bind = if index == 0 {
                 Ipv4Addr::new(127, 72, 14, 1)
             } else {
                 Ipv4Addr::LOCALHOST
             };
-            let config = generate(server, bind, 10808, 10809);
+            configs.push((
+                server.protocol.as_str().to_string(),
+                generate(server, bind, 10808, 10809),
+            ));
+        }
+        configs.push((
+            "pool".to_string(),
+            generate_pool(
+                &[&servers[0], &servers[2]],
+                "roundRobin",
+                "5m",
+                Ipv4Addr::new(127, 72, 14, 1),
+                10808,
+                10809,
+                10810,
+            )
+            .expect("sample pool should generate"),
+        ));
+
+        for (index, (label, config)) in configs.into_iter().enumerate() {
             let path = std::env::temp_dir().join(format!(
-                "oxidom-cfg-{}-{}.json",
+                "oxidom-cfg-{}-{index}-{label}.json",
                 std::process::id(),
-                server.id
             ));
             std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
             let out = std::process::Command::new(&xray)
@@ -691,9 +847,14 @@ mod tests {
                 .expect("xray should be runnable");
             assert!(
                 out.status.success(),
-                "xray rejected the {} config:\n{}",
-                server.protocol.as_str(),
+                "xray rejected the {label} config:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
+            );
+            eprintln!(
+                "xray accepted {label}: stdout={:?}, stderr={:?}",
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim()
             );
             std::fs::remove_file(&path).ok();
         }

@@ -150,6 +150,27 @@ Emit Xray JSON to a temp file, then spawn the core. Structure:
 Generate the protocol-specific `outbounds[0]` from `OutboundSpec` (streamSettings for
 tcp/ws/grpc/xhttp; tlsSettings/realitySettings/xtls as needed).
 
+A **pool** session emits the same scaffold plus one outbound per member tagged `s-<alias|id>`, a
+`routing.balancers` entry `{ tag: "pool", selector: ["s-"], strategy: { type: <strategy> } }`, a
+`burstObservatory` with `subjectSelector: ["s-"]` (which is also the failover: it drops dead
+nodes by itself), and an `api` block with `RoutingService` reachable through a `dokodemo-door`
+inbound tagged `api-in` on the session's own address. Three details are binding:
+
+- The `api-in → api` rule comes **first** in `routing.rules`, ahead of the `balancerTag` rule.
+  Otherwise API traffic falls into the balancer and `xray api bi` hangs.
+- `selector: ["s-"]` is a prefix match, so no other outbound may start with `s-`. That is the
+  whole reason for the tag scheme.
+- The api port is allocated on the session address and persisted in `state.toml`; after a
+  `kill -9` the daemon re-adopts the running core and would otherwise lose the way to ask it
+  anything.
+
+A single-server session emits none of this — its config is byte-identical to what it was before
+pools existed, and a test pins that.
+
+The daemon reads the live exit by running `xray api bi` against that inbound (no gRPC client, no
+new dependency) from its background loop, never from `Status`: the GUI polls `Status` twice a
+second and it must not block on a subprocess.
+
 Two Xray 26.x details that are easy to get wrong and are covered by tests — verify any change
 against a real core with `xray run -test -c <file>` rather than against documentation:
 - `allowInsecure` was **removed** and makes the core refuse to start when true. Never emit it;
@@ -249,6 +270,9 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
 - `oxidom down [PROFILE]` (`disconnect`) stops the tunnel unconditionally unless a profile
   is named.
 - `oxidom connect <HANDLE>` connects one server without a profile.
+- With a pool, `status` prints the selection as `pool (roundRobin, 6 nodes, now → ch-trojan-2)`
+  plus per-member health, and `ip` prints one endpoint per line. `--egress` stays unambiguous —
+  one request through the session — and is never cached for a pool, because the exit rotates.
 - `oxidom status [PROFILE] [--json]`, `oxidom ip [PROFILE] [--egress] [--fresh]`,
   `oxidom env [PROFILE]`, `oxidom list [servers|profiles|subscriptions|sessions] [--json]`, and
   `oxidom ping <HANDLE>` are read commands and never spawn a session daemon.
@@ -306,9 +330,39 @@ routes = "manual"
 
 Names match `^[a-z0-9][a-z0-9_-]{0,31}$`; command names and aliases are reserved so profile-first
 argv is never ambiguous. Existing reserved-name files remain readable/listed with a warning, but
-new writes are refused. `UpProfile` resolves `select.server` as a handle and applies that
-profile's ports; unit-pinned ports constrain only `default`. Removing a profile deliberately
-leaves its running session intact so the unit can still stop what it started.
+new writes are refused. `UpProfile` resolves the profile's selection and applies that profile's
+ports; unit-pinned ports constrain only `default`. Removing a profile deliberately leaves its
+running session intact so the unit can still stop what it started.
+
+A profile selects **either** one server **or** a pool, never both:
+
+```toml
+[select.pool]
+strategy       = "roundRobin"     # roundRobin | random | leastPing | leastLoad
+subscriptions  = ["main"]         # empty = every group, including "My servers"
+countries      = ["ch", "de", "nl"]
+protocols      = ["vless", "trojan"]
+exclude        = ["ch-trojan-3"]
+max            = 8                # 0 = uncapped
+probe_interval = "5m"
+```
+
+The same `PoolQuery` drives the balancer and the GUI's server filter: a filter is a pool
+constructor, not a second search. `roundRobin` is the default because the point of a pool is to
+spread activity across exit IPs; `leastPing` concentrates every connection on one node and
+defeats that. `server = ""` with `[select.pool]` absent stays valid — that is a freshly created
+profile, and only `UpProfile` refuses it.
+
+`pool.resolve` is pure and its order is deterministic (subscription order, then server order
+within a group) because the resolved list becomes both the config's outbound tags and the
+session's stored membership. `subscriptions` match a group id exactly or a group name
+case-insensitively; `exclude` matches an alias or id **exactly** — substring matching there
+would silently drop half a pool. Servers whose spec is `OutboundSpec::XrayProfile` are never
+pool members: such a server is itself a balancer.
+
+Pool membership is resolved **once, at `up`**. A subscription refresh that changes what the
+query would match marks the session `stale` and invites a reconnect; it never rewrites the
+config under live connections.
 
 Every profile gets a stable `127.<a>.<b>.1` inbound address derived with the same FNV-1a 64 used
 for ids; collisions probe forward through the address space. `default` is permanently
@@ -318,10 +372,16 @@ profile reuse the same SOCKS/HTTP ports.
 ### Sessions (binding)
 
 Subscriptions and servers are global sources. A profile is persistent configuration; a session
-is the ephemeral running instance of one profile: its Xray process, selected server, loopback
+is the ephemeral running instance of one profile: its Xray process, selection, loopback
 address, ports, optional interface and status. “Connect one server” means the `default` session,
 not a separate global mode. Several profiles may run at once, including several profiles on the
 same server.
+
+A session's selection is a single server **or** a pool, and a pool session has no active server:
+`Session::server_id()` returns `None` for it, deliberately, so nothing can quietly pick the first
+member and call it the exit. Everything that means “the tunnel is carrying server X” — the
+connected highlight, the proxied reading, the egress cache — is therefore keyed by session, and
+a pool reports its live exit from the observatory instead.
 
 `Sessions` is a `BTreeMap` keyed by profile, so listings are stable. A profile already up cannot
 be brought up twice. `DownProfile` removes exactly that runtime; `Down("")` removes all sessions.
@@ -403,6 +463,7 @@ crates/
       config.rs                  # config.toml load/save
       state.rs                   # state.toml
       model.rs                   # Server/Subscription/OutboundSpec types
+      pool.rs                    # PoolQuery + pure membership resolution
       engine.rs                  # Registry + per-profile Session/Sessions facade
       proc.rs                    # shared child supervision and recovered PID inspection
       resolve.rs                 # shared config → env → PATH binary resolver
@@ -413,6 +474,7 @@ crates/
       link.rs                    # share-link parsers
       subscription.rs            # fetch + decode + userinfo headers + hwid
       xray/
+        api.rs                   # `xray api bi` — live balancer selection and health
         config.rs                # OutboundSpec -> Xray JSON
         core.rs                  # process supervisor + status
         resolve.rs               # Xray binary preflight
