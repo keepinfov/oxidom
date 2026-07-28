@@ -700,6 +700,7 @@ mod tests {
             server: "ch-trojan".to_string(),
             socks_port: 12080,
             http_port: 12081,
+            interface: Default::default(),
         };
         assert_eq!(row_subtitle(&entry), "Office tunnel");
         entry.description.clear();

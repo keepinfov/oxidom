@@ -1257,6 +1257,7 @@ impl Service {
                     server: profile.select.server,
                     socks_port: profile.proxy.socks_port,
                     http_port: profile.proxy.http_port,
+                    interface: profile.interface,
                 }),
                 Err(error) => log::warn!("skipping profile {name:?}: {error:#}"),
             }

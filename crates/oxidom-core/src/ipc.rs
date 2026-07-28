@@ -292,6 +292,10 @@ pub struct ProfileEntry {
     pub server: String,
     pub socks_port: u16,
     pub http_port: u16,
+    /// The profile's interface section, so an editor that rewrites the profile
+    /// can put back what it did not show. Without it a GUI save silently
+    /// downgrades a TUN profile to proxy-only.
+    pub interface: crate::profile::ProfileInterface,
 }
 
 /// The selected server returned after bringing a profile up.
@@ -390,6 +394,15 @@ mod tests {
 
         let empty: StatusInfo = serde_json::from_str("{}").unwrap();
         assert!(matches!(empty.to_status(), Status::Disconnected));
+    }
+
+    #[test]
+    fn an_old_profile_entry_defaults_the_interface_section() {
+        let entry: ProfileEntry = serde_json::from_str(
+            r#"{"name":"work","server":"ch","socks_port":10808,"http_port":10809}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.interface, crate::profile::ProfileInterface::default());
     }
 
     /// A daemon that predates the reading contract sends `latencies` and no

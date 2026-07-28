@@ -467,11 +467,11 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
     search_bar.set_child(Some(&compact_search));
     let sessions_banner = adw::Banner::builder()
         .title(
-            other_sessions_message(&initial_status)
+            other_sessions_message(&initial_status, "default")
                 .as_deref()
                 .unwrap_or_default(),
         )
-        .revealed(other_sessions_message(&initial_status).is_some())
+        .revealed(other_sessions_message(&initial_status, "default").is_some())
         .build();
     let search_toggle = gtk::ToggleButton::builder()
         .icon_name("edit-find-symbolic")
@@ -1481,7 +1481,12 @@ impl Controller {
             // Whatever failed before, this click supersedes it — including a
             // retry of the very server that failed.
             state.ui.failed_id = None;
-            state.ui.pin_status(Status::Connecting, Instant::now());
+            // `Connect` is the daemon's method for the default session and no
+            // other, so that is the profile this pin describes — regardless of
+            // which profile the header happens to be showing.
+            state
+                .ui
+                .pin_status("default", Status::Connecting, Instant::now());
         }
         self.bump_epoch();
         self.set_cards_connection(CardConnection {
@@ -1503,9 +1508,11 @@ impl Controller {
                     let message = format!("{error:#}");
                     {
                         let mut state = controller.state.borrow_mut();
-                        state
-                            .ui
-                            .pin_status(Status::Error(message.clone()), Instant::now());
+                        state.ui.pin_status(
+                            "default",
+                            Status::Error(message.clone()),
+                            Instant::now(),
+                        );
                         state.ui.connected_id = None;
                         // Named here rather than left to the daemon: a refused
                         // bus call, or a job rejected while another is running,
@@ -1533,7 +1540,11 @@ impl Controller {
     fn disconnect(self: &Rc<Self>) {
         {
             let mut state = self.state.borrow_mut();
-            state.ui.pin_status(Status::Disconnected, Instant::now());
+            // Symmetrically with `connect_server`: `Disconnect` stops the
+            // default session, so that is who the pin belongs to.
+            state
+                .ui
+                .pin_status("default", Status::Disconnected, Instant::now());
             state.ui.connected_id = None;
             state.ui.failed_id = None;
         }
@@ -1606,6 +1617,7 @@ impl Controller {
     fn up_profile(self: &Rc<Self>, name: String) {
         let work_name = name.clone();
         let message_name = name.clone();
+        let pinned_name = name.clone();
         self.client_job(
             UiOperation::for_profile(UiOperationKind::UpProfile, name),
             move |client| {
@@ -1630,7 +1642,12 @@ impl Controller {
                             state.selected_id = Some(server_id.clone());
                             state.ui.connected_id = Some(server_id.clone());
                             state.ui.failed_id = None;
-                            state.ui.pin_status(Status::Connecting, Instant::now());
+                            // The pin belongs to the profile that was brought
+                            // up, not to whichever one the header shows: a
+                            // switch away must not carry this transition along.
+                            state
+                                .ui
+                                .pin_status(&pinned_name, Status::Connecting, Instant::now());
                         }
                         controller.bump_epoch();
                         controller.set_cards_connection(CardConnection {
@@ -1671,6 +1688,7 @@ impl Controller {
     fn down_profile(self: &Rc<Self>, name: String) {
         let work_name = name.clone();
         let message_name = name.clone();
+        let pinned_name = name.clone();
         self.client_job(
             UiOperation::for_profile(UiOperationKind::DownProfile, name),
             move |client| Ok(refresh_profiles_after(client, client.down(&work_name))),
@@ -1692,7 +1710,9 @@ impl Controller {
                     Ok(true) => {
                         {
                             let mut state = controller.state.borrow_mut();
-                            state.ui.pin_status(Status::Disconnected, Instant::now());
+                            state
+                                .ui
+                                .pin_status(&pinned_name, Status::Disconnected, Instant::now());
                             state.ui.connected_id = None;
                             state.ui.failed_id = None;
                         }
@@ -1887,9 +1907,13 @@ impl Controller {
                             // was running for, and the card should say so.
                             let failed = {
                                 let mut state = controller.state.borrow_mut();
-                                state
-                                    .ui
-                                    .pin_status(Status::Error(error.clone()), Instant::now());
+                                // Only the default session is restarted after a
+                                // port change, so only it can have failed here.
+                                state.ui.pin_status(
+                                    "default",
+                                    Status::Error(error.clone()),
+                                    Instant::now(),
+                                );
                                 let failed = state.ui.connected_id.take();
                                 state.ui.failed_id = failed.clone();
                                 failed
@@ -2174,7 +2198,8 @@ impl Controller {
     }
 
     fn update_sessions_banner(&self, status: &ipc::StatusInfo) {
-        if let Some(message) = other_sessions_message(status) {
+        let selected_profile = self.state.borrow().ui.selected_profile.clone();
+        if let Some(message) = other_sessions_message(status, &selected_profile) {
             self.sessions_banner.set_title(&message);
             self.sessions_banner.set_revealed(true);
         } else {
