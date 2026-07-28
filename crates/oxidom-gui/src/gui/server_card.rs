@@ -171,6 +171,8 @@ fn method_text(method: LatencyMethod) -> &'static str {
 pub enum CardConnectionState {
     Disconnected,
     ConnectedHere,
+    /// The server is one candidate in a running pool, not "the connection".
+    InPool,
     ConnectedElsewhere,
     Connecting,
     /// This server's connection attempt failed. Distinct from `Disconnected`
@@ -650,6 +652,7 @@ impl ServerCard {
         self.connect_button.remove_css_class("suggested-action");
         self.connect_button.remove_css_class("destructive-action");
         self.status.remove_css_class("status-working");
+        self.status.remove_css_class("status-neutral");
         self.status.remove_css_class("status-error");
         self.root.remove_css_class("failed-server");
         self.connect_button.set_sensitive(true);
@@ -658,6 +661,7 @@ impl ServerCard {
                 "Disconnected"
             }
             CardConnectionState::ConnectedHere => "Connected",
+            CardConnectionState::InPool => "In a running pool",
             CardConnectionState::Connecting => "Connecting",
             CardConnectionState::Failed => "Connection failed",
         };
@@ -683,6 +687,15 @@ impl ServerCard {
                 self.connect_button.set_label("Disconnect");
                 self.connect_button.add_css_class("destructive-action");
                 self.root.add_css_class("active-server");
+            }
+            CardConnectionState::InPool => {
+                self.status.set_label("In pool");
+                self.status.add_css_class("status-neutral");
+                self.status.set_visible(true);
+                self.latency_display.set_visible(true);
+                self.connect_button.set_label("Use alone");
+                self.connect_button.add_css_class("suggested-action");
+                self.root.remove_css_class("active-server");
             }
             CardConnectionState::ConnectedElsewhere => {
                 self.status.set_visible(false);
@@ -1087,6 +1100,10 @@ mod tests {
         assert_ne!(
             CardConnectionState::ConnectedElsewhere,
             CardConnectionState::Connecting
+        );
+        assert_ne!(
+            CardConnectionState::InPool,
+            CardConnectionState::ConnectedHere
         );
         // The whole point of the state: a server that failed does not look
         // like one the user never touched.

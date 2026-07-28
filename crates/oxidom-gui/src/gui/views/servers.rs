@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -7,9 +7,14 @@ use adw::prelude::*;
 use gtk::glib;
 
 use oxidom_core::model::Subscription;
+use oxidom_core::pool::PoolQuery;
 
 use super::super::group::subscription_description;
 use super::super::prefs::GuiPrefs;
+use super::super::reduce::{
+    FilterOption, ServerProfiles, available_countries, available_protocols,
+    available_subscriptions, filtered_ids, filters_to_query,
+};
 use super::super::server_card::{
     CARD_MEASURE_WIDTH, COMPACT_CARD_HEIGHT, CardConnectionState, LatencyState, ServerCard,
 };
@@ -29,7 +34,7 @@ pub struct CardConnection {
     /// Compatibility server the header controls.
     pub active: Option<String>,
     /// Connected profiles grouped by the server they carry.
-    pub profiles: HashMap<String, Vec<String>>,
+    pub profiles: HashMap<String, ServerProfiles>,
     /// The server an attempt is being built for.
     pub connecting: Option<String>,
     /// The server whose attempt failed, until something replaces it.
@@ -46,6 +51,7 @@ pub struct CardCallbacks {
     pub recheck: Rc<dyn Fn(Vec<String>)>,
     pub refresh: Rc<dyn Fn(String)>,
     pub set_alias: Rc<dyn Fn(String, String)>,
+    pub create_pool: Rc<dyn Fn(PoolQuery)>,
 }
 
 /// One subscription block. Cards live in independent vertical column boxes
@@ -72,11 +78,17 @@ pub struct ServersView {
     content: gtk::Box,
     cards: Rc<RefCell<HashMap<String, ServerCard>>>,
     groups: Rc<RefCell<Vec<GroupUi>>>,
+    subscriptions: Rc<RefCell<Vec<Subscription>>>,
     /// Lowercased "name transport protocol address:port country" per server.
     /// The search matches this, never transient widget text like the
     /// "Connected" badge — otherwise connecting would change search results.
     search_texts: Rc<RefCell<HashMap<String, String>>>,
     query: Rc<RefCell<String>>,
+    filter_countries: Rc<RefCell<Vec<String>>>,
+    filter_protocols: Rc<RefCell<Vec<String>>>,
+    filter_subscriptions: Rc<RefCell<Vec<String>>>,
+    current_filter: Rc<RefCell<PoolQuery>>,
+    create_pool: Rc<RefCell<Option<gtk::Button>>>,
     /// Number of card columns; driven by the window width (1, 2, or 3).
     columns: Rc<Cell<usize>>,
     pending_columns: Rc<Cell<usize>>,
@@ -133,8 +145,14 @@ impl ServersView {
             on_browse_subscriptions: Rc::new(RefCell::new(None)),
             cards: Rc::new(RefCell::new(HashMap::new())),
             groups: Rc::new(RefCell::new(Vec::new())),
+            subscriptions: Rc::new(RefCell::new(subscriptions.to_vec())),
             search_texts: Rc::new(RefCell::new(HashMap::new())),
             query: Rc::new(RefCell::new(String::new())),
+            filter_countries: Rc::new(RefCell::new(Vec::new())),
+            filter_protocols: Rc::new(RefCell::new(Vec::new())),
+            filter_subscriptions: Rc::new(RefCell::new(Vec::new())),
+            current_filter: Rc::new(RefCell::new(PoolQuery::default())),
+            create_pool: Rc::new(RefCell::new(None)),
             columns: Rc::new(Cell::new(1)),
             pending_columns: Rc::new(Cell::new(1)),
             column_update_scheduled: Rc::new(Cell::new(false)),
@@ -199,7 +217,7 @@ impl ServersView {
         &self,
         subscriptions: &[Subscription],
         connected_id: Option<&str>,
-        connected_profiles: &HashMap<String, Vec<String>>,
+        connected_profiles: &HashMap<String, ServerProfiles>,
         selected_id: Option<&str>,
         latency_states: &HashMap<String, LatencyState>,
         callbacks: CardCallbacks,
@@ -209,7 +227,9 @@ impl ServersView {
         }
         self.cards.borrow_mut().clear();
         self.groups.borrow_mut().clear();
+        *self.subscriptions.borrow_mut() = subscriptions.to_vec();
         self.search_texts.borrow_mut().clear();
+        self.create_pool.borrow_mut().take();
         *self.latencies.borrow_mut() = latency_states
             .iter()
             .filter_map(|(id, state)| sort_value(*state).map(|value| (id.clone(), value)))
@@ -243,6 +263,9 @@ impl ServersView {
             self.content.append(&empty);
             return;
         }
+
+        self.content
+            .append(&self.filter_bar(subscriptions, callbacks.create_pool.clone()));
 
         for (index, subscription) in subscriptions.iter().enumerate() {
             let heading = gtk::Label::builder()
@@ -402,12 +425,17 @@ impl ServersView {
                     move |alias| cb(id.clone(), alias)
                 };
                 let connection_state = match (connected_profiles.get(&id), connected_id) {
-                    (Some(_), _) => CardConnectionState::ConnectedHere,
+                    (Some(profiles), _) if !profiles.connected.is_empty() => {
+                        CardConnectionState::ConnectedHere
+                    }
+                    (Some(profiles), _) if !profiles.in_pool.is_empty() => {
+                        CardConnectionState::InPool
+                    }
                     (None, Some(connected_id)) if connected_id == id => {
                         CardConnectionState::ConnectedHere
                     }
-                    (None, Some(_)) => CardConnectionState::ConnectedElsewhere,
-                    (None, None) => CardConnectionState::Disconnected,
+                    (_, Some(_)) => CardConnectionState::ConnectedElsewhere,
+                    _ => CardConnectionState::Disconnected,
                 };
                 let card = ServerCard::new(
                     server,
@@ -475,6 +503,86 @@ impl ServersView {
         self.schedule_expanded_remeasure();
     }
 
+    fn filter_bar(
+        &self,
+        subscriptions: &[Subscription],
+        create_pool: Rc<dyn Fn(PoolQuery)>,
+    ) -> gtk::Widget {
+        let countries = available_countries(subscriptions)
+            .into_iter()
+            .map(|value| FilterOption {
+                label: value.to_ascii_uppercase(),
+                value,
+            })
+            .collect::<Vec<_>>();
+        let protocols = available_protocols(subscriptions)
+            .into_iter()
+            .map(|value| FilterOption {
+                label: value.clone(),
+                value,
+            })
+            .collect::<Vec<_>>();
+        let subscriptions = available_subscriptions(subscriptions);
+
+        let flow = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .column_spacing(8)
+            .row_spacing(8)
+            .max_children_per_line(4)
+            .min_children_per_line(1)
+            .css_classes(["server-filter-bar"])
+            .build();
+        flow.insert(
+            &filter_menu(
+                "Country",
+                &countries,
+                self.filter_countries.clone(),
+                self.clone(),
+            ),
+            -1,
+        );
+        flow.insert(
+            &filter_menu(
+                "Protocol",
+                &protocols,
+                self.filter_protocols.clone(),
+                self.clone(),
+            ),
+            -1,
+        );
+        flow.insert(
+            &filter_menu(
+                "Subscription",
+                &subscriptions,
+                self.filter_subscriptions.clone(),
+                self.clone(),
+            ),
+            -1,
+        );
+
+        let button = gtk::Button::builder()
+            .label("Create pool from this filter")
+            // A pool is a stored query, not a stored list. Country, protocol
+            // and subscription keep matching after a refresh, so a server
+            // added later joins the pool; the text box has no equivalent and
+            // is frozen into exclusions instead. Saying so here is cheaper
+            // than a user discovering it from a stale badge.
+            .tooltip_text(
+                "Create a profile whose pool matches the visible servers. Country, protocol \
+                 and subscription keep matching later, so servers added by a future refresh \
+                 can join; the search text is frozen as exclusions and does not.",
+            )
+            .css_classes(["suggested-action", "pill"])
+            .build();
+        button.connect_clicked({
+            let current_filter = self.current_filter.clone();
+            move |_| create_pool(current_filter.borrow().clone())
+        });
+        flow.insert(&button, -1);
+        *self.create_pool.borrow_mut() = Some(button);
+        flow.upcast()
+    }
+
     pub fn set_query(&self, query: &str) {
         *self.query.borrow_mut() = query.trim().to_lowercase();
         self.apply_filter();
@@ -486,18 +594,25 @@ impl ServersView {
     }
 
     fn apply_filter(&self) {
-        let query = self.query.borrow().clone();
+        let query = filters_to_query(
+            &self.subscriptions.borrow(),
+            &self.filter_subscriptions.borrow(),
+            &self.filter_countries.borrow(),
+            &self.filter_protocols.borrow(),
+            &self.search_texts.borrow(),
+            &self.query.borrow(),
+        );
+        let filtered = filtered_ids(&query, &self.subscriptions.borrow())
+            .into_iter()
+            .collect::<HashSet<_>>();
+        *self.current_filter.borrow_mut() = query;
         let selected = self.selected.borrow().clone();
         let mut total_visible = 0usize;
         {
-            let search_texts = self.search_texts.borrow();
             for group in self.groups.borrow().iter() {
                 let mut visible = 0;
                 for (id, card) in &group.cards {
-                    let matches = query.is_empty()
-                        || search_texts
-                            .get(id)
-                            .is_some_and(|text| text.contains(&query));
+                    let matches = filtered.contains(id);
                     card.set_visible(matches);
                     if matches {
                         visible += 1;
@@ -508,8 +623,10 @@ impl ServersView {
             }
         }
         // A query that matches nothing used to leave a blank page.
-        self.no_matches
-            .set_visible(!query.is_empty() && total_visible == 0);
+        self.no_matches.set_visible(total_visible == 0);
+        if let Some(button) = self.create_pool.borrow().as_ref() {
+            button.set_sensitive(total_visible > 0);
+        }
         // Cards mid-collapse from a recent selection switch reflow anyway —
         // snap them closed before repacking.
         for (id, card) in self.cards.borrow().iter() {
@@ -566,15 +683,54 @@ impl ServersView {
                 // claim `default` while one is being built. Sessions belonging
                 // to other profiles remain real and stay highlighted.
                 (Some(connecting), _) if connecting == id => CardConnectionState::Connecting,
-                (Some(_), _) if connection.profiles.contains_key(id) => {
+                (Some(_), _)
+                    if connection
+                        .profiles
+                        .get(id)
+                        .is_some_and(|profiles| !profiles.connected.is_empty()) =>
+                {
                     CardConnectionState::ConnectedHere
+                }
+                (Some(_), _)
+                    if connection
+                        .profiles
+                        .get(id)
+                        .is_some_and(|profiles| !profiles.in_pool.is_empty()) =>
+                {
+                    CardConnectionState::InPool
                 }
                 (Some(_), _) => CardConnectionState::Disconnected,
-                (None, Some(_)) if connection.profiles.contains_key(id) => {
+                (None, Some(_))
+                    if connection
+                        .profiles
+                        .get(id)
+                        .is_some_and(|profiles| !profiles.connected.is_empty()) =>
+                {
                     CardConnectionState::ConnectedHere
                 }
+                (None, Some(_))
+                    if connection
+                        .profiles
+                        .get(id)
+                        .is_some_and(|profiles| !profiles.in_pool.is_empty()) =>
+                {
+                    CardConnectionState::InPool
+                }
                 (None, Some(failed)) if failed == id => CardConnectionState::Failed,
-                _ if connection.profiles.contains_key(id) => CardConnectionState::ConnectedHere,
+                _ if connection
+                    .profiles
+                    .get(id)
+                    .is_some_and(|profiles| !profiles.connected.is_empty()) =>
+                {
+                    CardConnectionState::ConnectedHere
+                }
+                _ if connection
+                    .profiles
+                    .get(id)
+                    .is_some_and(|profiles| !profiles.in_pool.is_empty()) =>
+                {
+                    CardConnectionState::InPool
+                }
                 _ if connection.active.as_deref() == Some(id) => CardConnectionState::ConnectedHere,
                 _ if !connection.profiles.is_empty() || connection.active.is_some() => {
                     CardConnectionState::ConnectedElsewhere
@@ -790,6 +946,64 @@ impl ServersView {
             }
         });
         animation.play();
+    }
+}
+
+fn filter_menu(
+    title: &str,
+    options: &[FilterOption],
+    selected: Rc<RefCell<Vec<String>>>,
+    view: ServersView,
+) -> gtk::MenuButton {
+    let button = gtk::MenuButton::builder()
+        .label(filter_label(title, options, &selected.borrow()))
+        .sensitive(!options.is_empty())
+        .css_classes(["flat", "filter-menu"])
+        .build();
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    list.set_margin_top(8);
+    list.set_margin_bottom(8);
+    list.set_margin_start(8);
+    list.set_margin_end(8);
+    for option in options {
+        let check = gtk::CheckButton::with_label(&option.label);
+        check.set_active(selected.borrow().contains(&option.value));
+        check.connect_toggled({
+            let selected = selected.clone();
+            let value = option.value.clone();
+            let options = options.to_vec();
+            let title = title.to_string();
+            let button = button.clone();
+            let view = view.clone();
+            move |check| {
+                let mut values = selected.borrow_mut();
+                if check.is_active() {
+                    if !values.contains(&value) {
+                        values.push(value.clone());
+                    }
+                } else {
+                    values.retain(|selected| selected != &value);
+                }
+                button.set_label(&filter_label(&title, &options, &values));
+                drop(values);
+                view.apply_filter();
+            }
+        });
+        list.append(&check);
+    }
+    let popover = gtk::Popover::builder().child(&list).build();
+    button.set_popover(Some(&popover));
+    button
+}
+
+fn filter_label(title: &str, options: &[FilterOption], selected: &[String]) -> String {
+    match selected {
+        [] => format!("{title}: All"),
+        [only] => options
+            .iter()
+            .find(|option| option.value == *only)
+            .map_or_else(|| format!("{title}: {only}"), |option| option.label.clone()),
+        many => format!("{title}: {}", many.len()),
     }
 }
 

@@ -13,8 +13,10 @@ use std::time::Instant;
 
 use oxidom_core::ipc::{
     LatencyReading, PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry,
-    SessionInfo, StatusInfo,
+    SelectionInfo, SessionInfo, StatusInfo,
 };
+use oxidom_core::model::{OutboundSpec, Subscription};
+use oxidom_core::pool::PoolQuery;
 use oxidom_core::profile::RouteMode;
 use oxidom_core::xray::core::Status;
 
@@ -54,8 +56,8 @@ pub(super) struct SnapshotState {
     /// Every runtime session. The compatibility fields above still drive the
     /// header; this list keeps cards and the system-proxy owner honest.
     pub sessions: Vec<SessionInfo>,
-    /// Connected profiles grouped by the server they carry.
-    pub connected_profiles: HashMap<String, Vec<String>>,
+    /// Connected profiles and pool memberships grouped by server.
+    pub connected_profiles: HashMap<String, ServerProfiles>,
     /// Direct server measurements as last seen.
     pub readings: HashMap<String, LatencyReading>,
     /// Connection measurements keyed by profile.
@@ -591,10 +593,20 @@ fn proxied_reading<'a>(
 /// Which profiles visibly use each server. Kept pure because this is the
 /// multi-session fact every card consumes; widgets must not independently
 /// reinterpret the compatibility `active_id`.
-pub(super) fn connected_profiles(status: &StatusInfo) -> HashMap<String, Vec<String>> {
-    let mut by_server = HashMap::<String, Vec<String>>::new();
+pub(super) fn connected_profiles(status: &StatusInfo) -> HashMap<String, ServerProfiles> {
+    let mut by_server = HashMap::<String, ServerProfiles>::new();
     for session in &status.sessions {
         if session.state != "connected" {
+            continue;
+        }
+        if session.selection.kind == "pool" {
+            for member in &session.selection.members {
+                by_server
+                    .entry(member.server_id.clone())
+                    .or_default()
+                    .in_pool
+                    .push(session.profile.clone());
+            }
             continue;
         }
         let Some(server_id) = &session.server_id else {
@@ -603,6 +615,7 @@ pub(super) fn connected_profiles(status: &StatusInfo) -> HashMap<String, Vec<Str
         by_server
             .entry(server_id.clone())
             .or_default()
+            .connected
             .push(session.profile.clone());
     }
     // An older daemon has no session list. Preserve the exact one-tunnel
@@ -611,17 +624,144 @@ pub(super) fn connected_profiles(status: &StatusInfo) -> HashMap<String, Vec<Str
         && matches!(status.to_status(), Status::Connected)
         && let Some(server_id) = &status.active_id
     {
-        by_server.insert(
-            server_id.clone(),
-            vec![
+        by_server
+            .entry(server_id.clone())
+            .or_default()
+            .connected
+            .push(
                 status
                     .active_profile
                     .clone()
                     .unwrap_or_else(|| "default".to_string()),
-            ],
-        );
+            );
     }
     by_server
+}
+
+/// The two visually distinct relationships a server card can have to running
+/// profiles. Pool membership is intentionally not folded into `connected`:
+/// a rotating pool has no single active server.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct ServerProfiles {
+    pub connected: Vec<String>,
+    pub in_pool: Vec<String>,
+}
+
+/// One subscription choice shown by the server filter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FilterOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// Countries that can contribute an actual pool outbound.
+pub(super) fn available_countries(groups: &[Subscription]) -> Vec<String> {
+    let mut values = pool_servers(groups)
+        .filter_map(|server| server.country.as_deref())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+/// Protocols that can contribute an actual pool outbound.
+pub(super) fn available_protocols(groups: &[Subscription]) -> Vec<String> {
+    let mut values = pool_servers(groups)
+        .map(|server| server.protocol.as_str().to_string())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+/// Subscription ids and labels that contain at least one pool-eligible node.
+pub(super) fn available_subscriptions(groups: &[Subscription]) -> Vec<FilterOption> {
+    groups
+        .iter()
+        .filter(|group| {
+            group
+                .servers
+                .iter()
+                .any(|server| !matches!(&server.spec, OutboundSpec::XrayProfile { .. }))
+        })
+        .map(|group| FilterOption {
+            value: group.id.clone(),
+            label: group.name.clone(),
+        })
+        .collect()
+}
+
+/// Turn what the filter widgets show into the exact query used for both the
+/// list and a newly created profile.
+///
+/// `PoolQuery` deliberately has no fuzzy text field. A text search is frozen
+/// into exact server-id exclusions, so clicking "Create pool" preserves the
+/// visible selection instead of silently broadening it.
+pub(super) fn filters_to_query(
+    groups: &[Subscription],
+    subscriptions: &[String],
+    countries: &[String],
+    protocols: &[String],
+    search_texts: &HashMap<String, String>,
+    text: &str,
+) -> PoolQuery {
+    let mut query = PoolQuery {
+        subscriptions: normalized(subscriptions, false),
+        countries: normalized(countries, true),
+        protocols: normalized(protocols, true),
+        ..PoolQuery::default()
+    };
+    let text = text.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return query;
+    }
+
+    query.exclude = oxidom_core::pool::resolve(&query, groups)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|server| {
+            !search_texts
+                .get(&server.id)
+                .is_some_and(|haystack| haystack.contains(&text))
+        })
+        .map(|server| server.id.clone())
+        .collect();
+    query
+}
+
+/// Stable ids selected by a pool query, in subscription/server order.
+pub(super) fn filtered_ids(query: &PoolQuery, groups: &[Subscription]) -> Vec<String> {
+    oxidom_core::pool::resolve(query, groups)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|server| server.id.clone())
+        .collect()
+}
+
+fn normalized(values: &[String], lowercase: bool) -> Vec<String> {
+    let mut normalized = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if lowercase {
+                value.to_ascii_lowercase()
+            } else {
+                value.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    normalized.sort_by_key(|value| value.to_ascii_lowercase());
+    normalized.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    normalized
+}
+
+fn pool_servers(groups: &[Subscription]) -> impl Iterator<Item = &oxidom_core::model::Server> {
+    groups
+        .iter()
+        .flat_map(|group| group.servers.iter())
+        .filter(|server| !matches!(&server.spec, OutboundSpec::XrayProfile { .. }))
 }
 
 /// The session of `profile`, when the daemon reports one.
@@ -676,6 +816,8 @@ pub(super) struct SessionRow {
     /// Server as the user reads it: the session's alias or name while it runs,
     /// the profile's stored handle when it does not.
     pub server: String,
+    /// A pool is a selection in its own right, never an active member.
+    pub pool: bool,
     pub description: String,
     pub chips: Vec<SessionChip>,
     /// Where the toggle sits before the user touches it.
@@ -697,10 +839,28 @@ pub(super) enum SessionRowState {
 pub(super) struct SessionChip {
     pub text: String,
     pub kind: SessionChipKind,
+    pub tooltip: Option<String>,
+}
+
+impl SessionChip {
+    fn new(text: impl Into<String>, kind: SessionChipKind) -> Self {
+        Self {
+            text: text.into(),
+            kind,
+            tooltip: None,
+        }
+    }
+
+    fn with_tooltip(mut self, tooltip: impl Into<String>) -> Self {
+        self.tooltip = Some(tooltip.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SessionChipKind {
+    Pool,
+    Stale,
     Interface,
     Inbound,
     Latency,
@@ -734,10 +894,31 @@ fn latency_chip(reading: Option<&LatencyReading>, now_unix_ms: u64) -> Option<Se
         LatencyAge::Stale(minutes) => format!("{ms} ms · {minutes} min ago"),
         _ => format!("{ms} ms"),
     };
-    Some(SessionChip {
-        text,
-        kind: SessionChipKind::Latency,
-    })
+    Some(SessionChip::new(text, SessionChipKind::Latency))
+}
+
+fn pool_chip(selection: &SelectionInfo) -> SessionChip {
+    let count = selection.members.len();
+    let nodes = if count == 1 { "node" } else { "nodes" };
+    let mut text = format!("pool · {count} {nodes}");
+
+    if let Some(selecting) = selection.selecting.as_deref() {
+        text.push_str(" · now ");
+        text.push_str(selecting);
+    } else {
+        let known = selection
+            .members
+            .iter()
+            .filter_map(|member| member.healthy)
+            .collect::<Vec<_>>();
+        // A picking strategy deliberately leaves every value unknown. Never
+        // turn that absence of evidence into a count of dead nodes.
+        if known.len() == count && !known.is_empty() {
+            let healthy = known.into_iter().filter(|healthy| *healthy).count();
+            text.push_str(&format!(" · {healthy}/{count} healthy"));
+        }
+    }
+    SessionChip::new(text, SessionChipKind::Pool)
 }
 
 /// The operation currently running for `profile`, if any.
@@ -767,6 +948,20 @@ pub(super) fn session_rows(
                 _ => session_row_state(session),
             };
             let mut chips = Vec::new();
+            let running_pool = session
+                .filter(|session| session.selection.kind == "pool")
+                .map(|session| &session.selection);
+            let is_pool = running_pool.is_some() || entry.pool.is_some();
+
+            if let Some(selection) = running_pool {
+                chips.push(pool_chip(selection));
+                if selection.stale {
+                    chips.push(
+                        SessionChip::new("stale", SessionChipKind::Stale)
+                            .with_tooltip("Reconnect to pick up new servers"),
+                    );
+                }
+            }
 
             if let Some(interface) = session.and_then(|session| session.interface.as_ref()) {
                 let mut text = format!(
@@ -776,10 +971,7 @@ pub(super) fn session_rows(
                 if !interface.up {
                     text.push_str(" · down");
                 }
-                chips.push(SessionChip {
-                    text,
-                    kind: SessionChipKind::Interface,
-                });
+                chips.push(SessionChip::new(text, SessionChipKind::Interface));
             } else if session.is_none() && entry.interface.enable {
                 let device = if entry.interface.device.is_empty() {
                     oxidom_core::bind::device_name(&entry.name).ok()
@@ -787,46 +979,49 @@ pub(super) fn session_rows(
                     Some(entry.interface.device.clone())
                 };
                 if let Some(device) = device {
-                    chips.push(SessionChip {
-                        text: format!("{device} · {}", route_mode_label(entry.interface.routes)),
-                        kind: SessionChipKind::Interface,
-                    });
+                    chips.push(SessionChip::new(
+                        format!("{device} · {}", route_mode_label(entry.interface.routes)),
+                        SessionChipKind::Interface,
+                    ));
                 }
             } else if !entry.interface.enable {
-                chips.push(SessionChip {
-                    text: "proxy only".to_string(),
-                    kind: SessionChipKind::ProxyOnly,
-                });
+                chips.push(SessionChip::new("proxy only", SessionChipKind::ProxyOnly));
             }
 
             if let Some(session) = session {
-                chips.push(SessionChip {
-                    text: format!("{}:{}", session.address, session.socks_port),
-                    kind: SessionChipKind::Inbound,
-                });
+                chips.push(SessionChip::new(
+                    format!("{}:{}", session.address, session.socks_port),
+                    SessionChipKind::Inbound,
+                ));
             }
             if let Some(chip) = latency_chip(state.proxied.get(&entry.name), now_unix_ms) {
                 chips.push(chip);
             }
             if session.is_some_and(|session| session.owns_system_proxy) {
-                chips.push(SessionChip {
-                    text: "system proxy".to_string(),
-                    kind: SessionChipKind::SystemProxy,
-                });
+                chips.push(SessionChip::new(
+                    "system proxy",
+                    SessionChipKind::SystemProxy,
+                ));
             }
 
             SessionRow {
                 profile: entry.name.clone(),
                 state: row_state,
-                server: session
-                    .and_then(|session| {
+                server: running_pool
+                    .map(|selection| format!("pool ({})", selection.members.len()))
+                    .or_else(|| is_pool.then(|| "pool".to_string()))
+                    .unwrap_or_else(|| {
                         session
-                            .server_alias
-                            .as_ref()
-                            .or(session.server_name.as_ref())
-                    })
-                    .cloned()
-                    .unwrap_or_else(|| entry.server.clone()),
+                            .and_then(|session| {
+                                session
+                                    .server_alias
+                                    .as_ref()
+                                    .or(session.server_name.as_ref())
+                            })
+                            .cloned()
+                            .unwrap_or_else(|| entry.server.clone())
+                    }),
+                pool: is_pool,
                 description: entry.description.clone(),
                 chips,
                 toggle_on: matches!(
@@ -884,6 +1079,7 @@ pub(super) enum CardAction {
     RepointAndUp {
         profile: String,
         server_id: String,
+        replaces_pool: bool,
     },
 }
 
@@ -902,7 +1098,12 @@ pub(super) fn card_action(
     state: &SnapshotState,
     server_id: &str,
 ) -> CardAction {
-    if state.selected_profile == "default" {
+    let selected = state.selected_profile.clone();
+    let selected_entry = profiles.iter().find(|entry| entry.name == selected);
+    let replaces_pool = selected_entry.is_some_and(|entry| entry.pool.is_some())
+        || session_for(state, &selected).is_some_and(|session| session.selection.kind == "pool");
+
+    if selected == "default" && !replaces_pool {
         // This is a literal move of the pre-sessions branch from
         // `Controller::activate_server`: default must keep the same path, not a
         // newly equivalent interpretation of the session list.
@@ -916,7 +1117,6 @@ pub(super) fn card_action(
         return CardAction::Connect(server_id.to_string());
     }
 
-    let selected = state.selected_profile.clone();
     if session_for(state, &selected).and_then(|session| session.server_id.as_deref())
         == Some(server_id)
     {
@@ -932,6 +1132,7 @@ pub(super) fn card_action(
     CardAction::RepointAndUp {
         profile: selected,
         server_id: server_id.to_string(),
+        replaces_pool,
     }
 }
 
@@ -1037,6 +1238,17 @@ pub(super) fn latency_states(
 /// fallback (no probe has confirmed a fresh reading for this connection yet)
 /// rather than a live reading.
 pub(super) fn active_latency_for(state: &SnapshotState) -> (Option<u32>, bool) {
+    if session_for(state, &state.selected_profile)
+        .is_some_and(|session| session.selection.kind == "pool")
+    {
+        return state
+            .proxied
+            .get(&state.selected_profile)
+            .filter(|reading| reading.route == ProbeRoute::Proxied)
+            .and_then(|reading| reading.value)
+            .map_or((None, false), |ms| (Some(ms), false));
+    }
+
     let (display_target, allow_legacy_reading) = if state.selected_profile == "default" {
         let Some(id) = state.connected_id.as_deref() else {
             return (None, false);
@@ -1088,7 +1300,9 @@ pub(super) fn active_latency_for(state: &SnapshotState) -> (Option<u32>, bool) {
 mod tests {
     use super::*;
     use oxidom_core::config::LatencyMethod;
-    use oxidom_core::ipc::{InterfaceInfo, ProbeFailure, ProbeRoute};
+    use oxidom_core::ipc::{InterfaceInfo, PoolMember, ProbeFailure, ProbeRoute};
+    use oxidom_core::link::parse_link;
+    use oxidom_core::model::Subscription;
     use oxidom_core::profile::ProfileInterface;
 
     fn state() -> SnapshotState {
@@ -1117,6 +1331,22 @@ mod tests {
             http_port: 10809,
             ..SessionInfo::default()
         }
+    }
+
+    fn filter_group(id: &str, name: &str, links: &[(&str, &str, Option<&str>)]) -> Subscription {
+        let mut group =
+            Subscription::new(format!("https://{id}.example/sub"), Some(name.to_string()));
+        group.id = id.to_string();
+        group.servers = links
+            .iter()
+            .map(|(server_id, link, country)| {
+                let mut server = parse_link(link).expect("valid filter fixture");
+                server.id = (*server_id).to_string();
+                server.country = country.map(str::to_string);
+                server
+            })
+            .collect();
+        group
     }
 
     fn snapshot(status: StatusInfo, probe: ProbeState) -> PolledSnapshot {
@@ -1242,6 +1472,88 @@ mod tests {
     }
 
     #[test]
+    fn filter_query_and_visible_ids_are_the_same_pool_selection() {
+        let groups = vec![
+            filter_group(
+                "main",
+                "Main",
+                &[
+                    (
+                        "alpine",
+                        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.example:443#Alpine",
+                        Some("CH"),
+                    ),
+                    (
+                        "zurich",
+                        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@z.example:443#Zurich",
+                        Some("ch"),
+                    ),
+                    (
+                        "berlin",
+                        "trojan://secret@de.example:443#Berlin",
+                        Some("de"),
+                    ),
+                ],
+            ),
+            filter_group(
+                "backup",
+                "Backup",
+                &[("other", "trojan://secret@nl.example:443#Other", Some("nl"))],
+            ),
+        ];
+        let search_texts = HashMap::from([
+            (
+                "alpine".to_string(),
+                "alpine vless a.example:443 ch".to_string(),
+            ),
+            (
+                "zurich".to_string(),
+                "zurich vless z.example:443 ch".to_string(),
+            ),
+            (
+                "berlin".to_string(),
+                "berlin trojan de.example:443 de".to_string(),
+            ),
+            (
+                "other".to_string(),
+                "other trojan nl.example:443 nl".to_string(),
+            ),
+        ]);
+        let query = filters_to_query(
+            &groups,
+            &["main".to_string()],
+            &["CH".to_string()],
+            &["VLESS".to_string()],
+            &search_texts,
+            "alp",
+        );
+
+        assert_eq!(query.subscriptions, ["main"]);
+        assert_eq!(query.countries, ["ch"]);
+        assert_eq!(query.protocols, ["vless"]);
+        assert_eq!(query.exclude, ["zurich"]);
+        assert_eq!(filtered_ids(&query, &groups), ["alpine"]);
+        assert_eq!(available_countries(&groups), ["ch", "de", "nl"]);
+        assert_eq!(
+            available_protocols(&groups),
+            ["trojan".to_string(), "vless".to_string()]
+        );
+        assert_eq!(
+            available_subscriptions(&groups),
+            vec![
+                FilterOption {
+                    value: "main".to_string(),
+                    label: "Main".to_string(),
+                },
+                FilterOption {
+                    value: "backup".to_string(),
+                    label: "Backup".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn selected_latency_is_scoped_by_profile_on_the_same_server() {
         let mut state = state();
         state.selected_profile = "work".to_string();
@@ -1257,6 +1569,31 @@ mod tests {
             .insert("work".to_string(), proxied(83, NOW_MS));
 
         assert_eq!(active_latency_for(&state), (Some(83), false));
+    }
+
+    #[test]
+    fn pool_latency_is_profile_scoped_without_pretending_one_member_is_active() {
+        let mut state = state();
+        state.selected_profile = "work".to_string();
+        state.sessions = vec![SessionInfo {
+            profile: "work".to_string(),
+            state: "connected".to_string(),
+            selection: SelectionInfo {
+                kind: "pool".to_string(),
+                members: vec![PoolMember {
+                    server_id: "one".to_string(),
+                    ..PoolMember::default()
+                }],
+                ..SelectionInfo::default()
+            },
+            ..SessionInfo::default()
+        }];
+        state
+            .proxied
+            .insert("work".to_string(), proxied(57, NOW_MS));
+
+        assert_eq!(active_latency_for(&state), (Some(57), false));
+        assert!(state.sessions[0].server_id.is_none());
     }
 
     #[test]
@@ -1350,22 +1687,10 @@ mod tests {
         assert_eq!(
             rows[0].chips,
             vec![
-                SessionChip {
-                    text: "oxi-work · 198.18.7.1 · manual".to_string(),
-                    kind: SessionChipKind::Interface,
-                },
-                SessionChip {
-                    text: "127.91.37.1:10808".to_string(),
-                    kind: SessionChipKind::Inbound,
-                },
-                SessionChip {
-                    text: "71 ms · 3 min ago".to_string(),
-                    kind: SessionChipKind::Latency,
-                },
-                SessionChip {
-                    text: "system proxy".to_string(),
-                    kind: SessionChipKind::SystemProxy,
-                },
+                SessionChip::new("oxi-work · 198.18.7.1 · manual", SessionChipKind::Interface),
+                SessionChip::new("127.91.37.1:10808", SessionChipKind::Inbound),
+                SessionChip::new("71 ms · 3 min ago", SessionChipKind::Latency),
+                SessionChip::new("system proxy", SessionChipKind::SystemProxy),
             ]
         );
         assert_eq!(rows[1].state, SessionRowState::Connecting);
@@ -1376,19 +1701,74 @@ mod tests {
         assert_eq!(
             rows[1].chips,
             vec![
-                SessionChip {
-                    text: "proxy only".to_string(),
-                    kind: SessionChipKind::ProxyOnly,
-                },
-                SessionChip {
-                    text: "127.92.38.1:10808".to_string(),
-                    kind: SessionChipKind::Inbound,
-                },
-                SessionChip {
-                    text: "83 ms".to_string(),
-                    kind: SessionChipKind::Latency,
-                },
+                SessionChip::new("proxy only", SessionChipKind::ProxyOnly),
+                SessionChip::new("127.92.38.1:10808", SessionChipKind::Inbound),
+                SessionChip::new("83 ms", SessionChipKind::Latency),
             ]
+        );
+    }
+
+    #[test]
+    fn pool_rows_report_only_health_the_strategy_actually_supplies() {
+        let mut work = profile("work", "");
+        work.pool = Some(PoolQuery::default());
+        let mut state = state();
+        state.sessions = vec![SessionInfo {
+            profile: "work".to_string(),
+            state: "connected".to_string(),
+            address: "127.91.37.1".to_string(),
+            socks_port: 10808,
+            selection: SelectionInfo {
+                kind: "pool".to_string(),
+                strategy: "roundRobin".to_string(),
+                members: vec![
+                    PoolMember {
+                        server_id: "one".to_string(),
+                        alias: Some("one".to_string()),
+                        name: "One".to_string(),
+                        tag: "s-one".to_string(),
+                        healthy: Some(true),
+                    },
+                    PoolMember {
+                        server_id: "two".to_string(),
+                        alias: Some("two".to_string()),
+                        name: "Two".to_string(),
+                        tag: "s-two".to_string(),
+                        healthy: Some(false),
+                    },
+                ],
+                selecting: None,
+                stale: true,
+            },
+            ..SessionInfo::default()
+        }];
+
+        let rows = session_rows(&[work.clone()], &state, NOW_MS);
+        assert!(rows[0].pool);
+        assert_eq!(rows[0].server, "pool (2)");
+        assert_eq!(
+            rows[0].chips[0],
+            SessionChip::new("pool · 2 nodes · 1/2 healthy", SessionChipKind::Pool)
+        );
+        assert_eq!(
+            rows[0].chips[1],
+            SessionChip::new("stale", SessionChipKind::Stale)
+                .with_tooltip("Reconnect to pick up new servers")
+        );
+
+        state.sessions[0].selection.strategy = "leastPing".to_string();
+        state.sessions[0].selection.selecting = Some("two".to_string());
+        for member in &mut state.sessions[0].selection.members {
+            member.healthy = None;
+        }
+        let rows = session_rows(&[work], &state, NOW_MS);
+        assert_eq!(
+            rows[0].chips[0],
+            SessionChip::new("pool · 2 nodes · now two", SessionChipKind::Pool)
+        );
+        assert!(
+            !rows[0].chips[0].text.contains("healthy"),
+            "unknown health under a picking strategy must not become dead nodes"
         );
     }
 
@@ -1403,10 +1783,10 @@ mod tests {
         assert!(!rows[0].toggle_on);
         assert_eq!(
             rows[0].chips,
-            vec![SessionChip {
-                text: "oxi-work · list".to_string(),
-                kind: SessionChipKind::Interface,
-            }]
+            vec![SessionChip::new(
+                "oxi-work · list",
+                SessionChipKind::Interface
+            )]
         );
     }
 
@@ -1495,8 +1875,41 @@ mod tests {
             CardAction::RepointAndUp {
                 profile: "work".to_string(),
                 server_id: "same".to_string(),
+                replaces_pool: false,
             }
         );
+    }
+
+    #[test]
+    fn clicking_a_member_replaces_a_pool_only_after_confirmation() {
+        for selected in ["default", "work"] {
+            let mut state = state();
+            state.selected_profile = selected.to_string();
+            state.sessions = vec![SessionInfo {
+                profile: selected.to_string(),
+                state: "connected".to_string(),
+                selection: SelectionInfo {
+                    kind: "pool".to_string(),
+                    members: vec![PoolMember {
+                        server_id: "member".to_string(),
+                        ..PoolMember::default()
+                    }],
+                    ..SelectionInfo::default()
+                },
+                ..SessionInfo::default()
+            }];
+            let mut entry = profile(selected, "");
+            entry.pool = Some(PoolQuery::default());
+
+            assert_eq!(
+                card_action(&[entry], &state, "member"),
+                CardAction::RepointAndUp {
+                    profile: selected.to_string(),
+                    server_id: "member".to_string(),
+                    replaces_pool: true,
+                }
+            );
+        }
     }
 
     /// The optimistic "Connecting…" has to survive the daemon still reporting
@@ -1656,12 +2069,56 @@ mod tests {
 
         assert_eq!(
             connected_profiles(&status).get("same"),
-            Some(&vec!["home".to_string(), "work".to_string()])
+            Some(&ServerProfiles {
+                connected: vec!["home".to_string(), "work".to_string()],
+                in_pool: Vec::new(),
+            })
         );
         assert_eq!(
             other_sessions_message(&status.sessions, "home").as_deref(),
             Some("2 more sessions are running")
         );
+    }
+
+    #[test]
+    fn pool_members_are_marked_in_pool_not_connected_or_dead() {
+        let status = StatusInfo {
+            sessions: vec![SessionInfo {
+                profile: "spread".to_string(),
+                state: "connected".to_string(),
+                selection: SelectionInfo {
+                    kind: "pool".to_string(),
+                    strategy: "leastPing".to_string(),
+                    members: vec![
+                        PoolMember {
+                            server_id: "one".to_string(),
+                            healthy: None,
+                            ..PoolMember::default()
+                        },
+                        PoolMember {
+                            server_id: "two".to_string(),
+                            healthy: None,
+                            ..PoolMember::default()
+                        },
+                    ],
+                    selecting: Some("one".to_string()),
+                    ..SelectionInfo::default()
+                },
+                ..SessionInfo::default()
+            }],
+            ..StatusInfo::default()
+        };
+
+        let profiles = connected_profiles(&status);
+        for id in ["one", "two"] {
+            assert_eq!(
+                profiles.get(id),
+                Some(&ServerProfiles {
+                    connected: Vec::new(),
+                    in_pool: vec!["spread".to_string()],
+                })
+            );
+        }
     }
 
     #[test]

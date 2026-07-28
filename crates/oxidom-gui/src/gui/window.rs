@@ -13,6 +13,7 @@ use oxidom_core::config::Config;
 use oxidom_core::ipc;
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
+use oxidom_core::pool::PoolQuery;
 use oxidom_core::profile::{Profile, ProfileProxy, ProfileSelect};
 use oxidom_core::xray::core::Status;
 use oxidom_core::{paths, sysproxy};
@@ -1317,7 +1318,7 @@ impl Controller {
                 let weak = Rc::downgrade(self);
                 Rc::new(move || {
                     if let Some(controller) = weak.upgrade() {
-                        controller.open_profile_dialog(None);
+                        controller.open_profile_dialog(None, None);
                     }
                 })
             },
@@ -1332,11 +1333,13 @@ impl Controller {
     /// copy would quietly revert anything the CLI wrote since this page was
     /// last entered.
     fn edit_profile(self: &Rc<Self>, name: String) {
-        self.with_fresh_profiles(move |controller| controller.open_profile_dialog(Some(name)));
+        self.with_fresh_profiles(move |controller| {
+            controller.open_profile_dialog(Some(name), None)
+        });
     }
 
     /// `None` opens the editor for a profile that does not exist yet.
-    fn open_profile_dialog(self: &Rc<Self>, name: Option<String>) {
+    fn open_profile_dialog(self: &Rc<Self>, name: Option<String>, pool: Option<PoolQuery>) {
         let (profiles, choices) = {
             let state = self.state.borrow();
             (state.profiles.clone(), server_choices(&state.subscriptions))
@@ -1360,7 +1363,7 @@ impl Controller {
             },
         };
         let mode = match name.as_deref() {
-            None => ProfileDialog::New,
+            None => ProfileDialog::New { pool },
             Some(name) => {
                 let Some(entry) = profiles.iter().find(|entry| entry.name == name) else {
                     // Removed through the CLI between the click and the reread.
@@ -1532,6 +1535,14 @@ impl Controller {
                     }
                 })
             },
+            create_pool: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |query| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.open_profile_dialog(None, Some(query));
+                    }
+                })
+            },
         };
         self.servers.rebuild(
             &subscriptions,
@@ -1628,13 +1639,20 @@ impl Controller {
             CardAction::Disconnect => self.disconnect(),
             CardAction::UpProfile(name) => self.up_profile(name),
             CardAction::DownProfile(name) => self.down_profile(name),
-            CardAction::RepointAndUp { profile, server_id } => {
-                self.confirm_repoint_and_up(profile, server_id)
-            }
+            CardAction::RepointAndUp {
+                profile,
+                server_id,
+                replaces_pool,
+            } => self.confirm_repoint_and_up(profile, server_id, replaces_pool),
         }
     }
 
-    fn confirm_repoint_and_up(self: &Rc<Self>, profile_name: String, server_id: String) {
+    fn confirm_repoint_and_up(
+        self: &Rc<Self>,
+        profile_name: String,
+        server_id: String,
+        replaces_pool: bool,
+    ) {
         let (profile, server_name) = {
             let state = self.state.borrow();
             let Some(entry) = state
@@ -1681,14 +1699,36 @@ impl Controller {
             )
         };
 
+        let title = if replaces_pool {
+            format!("Replace «{profile_name}» pool with {server_name}?")
+        } else {
+            format!("Point «{profile_name}» at {server_name}?")
+        };
+        let body = if replaces_pool {
+            "This replaces the saved pool with one server. The running pool will reconnect and \
+             existing connections will close."
+                .to_string()
+        } else {
+            format!(
+                "This will rewrite the saved server selection for «{profile_name}» and connect it."
+            )
+        };
         let dialog = adw::MessageDialog::new(
             Some(&self.window),
-            Some(&format!("Point «{profile_name}» at {server_name}?")),
-            Some(&format!(
-                "This will rewrite the saved server selection for «{profile_name}» and connect it."
-            )),
+            Some(title.as_str()),
+            Some(body.as_str()),
         );
-        dialog.add_responses(&[("cancel", "Cancel"), ("repoint", "Repoint and Connect")]);
+        dialog.add_responses(&[
+            ("cancel", "Cancel"),
+            (
+                "repoint",
+                if replaces_pool {
+                    "Replace Pool and Connect"
+                } else {
+                    "Repoint and Connect"
+                },
+            ),
+        ]);
         dialog.set_response_appearance("repoint", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -2011,6 +2051,10 @@ impl Controller {
             move |client| {
                 let operation = client
                     .save_profile(&work_name, &profile)
+                    // A running profile cannot be brought up twice. The user
+                    // explicitly confirmed replacing its selection, so close
+                    // that routing domain before starting the saved one.
+                    .and_then(|()| client.down(&work_name).map(|_| ()))
                     .and_then(|()| client.up_profile(&work_name));
                 Ok(refresh_profiles_after(client, operation))
             },
@@ -2034,11 +2078,25 @@ impl Controller {
         };
         match operation {
             Ok(result) => {
-                let server_id = result.server.id;
+                let is_pool = self
+                    .state
+                    .borrow()
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.name == name)
+                    .is_some_and(|profile| profile.pool.is_some());
+                let server_id = (!is_pool).then_some(result.server.id);
                 {
                     let mut state = self.state.borrow_mut();
-                    state.selected_id = Some(server_id.clone());
-                    state.ui.connected_id = Some(server_id.clone());
+                    if let Some(server_id) = &server_id {
+                        state.selected_id = Some(server_id.clone());
+                        state.ui.connected_id = Some(server_id.clone());
+                    } else if name == "default" {
+                        // A pool has no active member. Keeping the previous
+                        // default server here would light up its card and put
+                        // its name back into the header until the next poll.
+                        state.ui.connected_id = None;
+                    }
                     state.ui.failed_id = None;
                     // The pin belongs to the profile that was brought up, not
                     // to whichever one the header shows: a switch away must
@@ -2048,13 +2106,17 @@ impl Controller {
                         .pin_status(&name, Status::Connecting, Instant::now());
                 }
                 self.bump_epoch();
-                self.set_cards_connection(CardConnection {
-                    active: Some(server_id.clone()),
-                    profiles: self.state.borrow().ui.connected_profiles.clone(),
-                    connecting: Some(server_id.clone()),
-                    failed: None,
-                });
-                self.servers.set_selected(Some(&server_id));
+                if let Some(server_id) = server_id {
+                    self.set_cards_connection(CardConnection {
+                        active: Some(server_id.clone()),
+                        profiles: self.state.borrow().ui.connected_profiles.clone(),
+                        connecting: Some(server_id.clone()),
+                        failed: None,
+                    });
+                    self.servers.set_selected(Some(&server_id));
+                } else {
+                    self.sync_connection_cards();
+                }
                 self.rebuild_sessions();
                 if !result.ignored_ports.is_empty() {
                     self.show_message(&format!(
@@ -2778,7 +2840,9 @@ impl Controller {
                 Status::Disconnected => "Disconnected".to_string(),
                 Status::Connecting => "Connecting…".to_string(),
                 Status::Connected => {
-                    let name = self.active_server_name(&state);
+                    let name = self
+                        .active_pool_name(&state)
+                        .or_else(|| self.active_server_name(&state));
                     match name {
                         Some(name) => format!("Connected · {name}"),
                         None => "Connected".to_string(),
@@ -2811,6 +2875,19 @@ impl Controller {
 
     fn active_server_name(&self, state: &AppState) -> Option<String> {
         self.active_server_display(state).map(|(name, _)| name)
+    }
+
+    /// The pool label comes from the same reduced row as the Sessions page and
+    /// tray menu, so no surface can accidentally name one member as active.
+    fn active_pool_name(&self, state: &AppState) -> Option<String> {
+        let session = session_for(&state.ui, &state.ui.selected_profile)?;
+        if session.selection.kind != "pool" {
+            return None;
+        }
+        session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
+            .into_iter()
+            .find(|row| row.profile == state.ui.selected_profile && row.pool)
+            .map(|row| row.server)
     }
 
     /// Display name and country of the connected server.
@@ -2857,7 +2934,10 @@ impl Controller {
             .set_visible(self.compact.get() && !matches!(status, Status::Disconnected));
         self.header_status.set_sensitive(false);
 
-        let display = self.active_server_display(&self.state.borrow());
+        let state = self.state.borrow();
+        let pool_name = self.active_pool_name(&state);
+        let display = self.active_server_display(&state);
+        drop(state);
         let name = display.as_ref().map(|(name, _)| name.clone());
         let country = display.and_then(|(_, country)| country);
         match status {
@@ -2866,7 +2946,7 @@ impl Controller {
                 set_status_tone(&self.header_status, StatusTone::Working);
                 self.header_status_spinner.set_visible(true);
                 self.header_status_spinner.set_spinning(true);
-                let tooltip = name.as_deref().map_or_else(
+                let tooltip = pool_name.as_deref().or(name.as_deref()).map_or_else(
                     || "Connecting…".to_string(),
                     |name| format!("Connecting · {name}"),
                 );
@@ -2876,9 +2956,15 @@ impl Controller {
             }
             Status::Connected => {
                 set_status_tone(&self.header_status, StatusTone::Connected);
-                self.header_status_flag
-                    .append(&super::server_card::flag_widget(country.as_deref(), 16, 14));
-                self.header_status_flag.set_visible(true);
+                if pool_name.is_some() {
+                    self.header_status_icon
+                        .set_icon_name(Some("network-vpn-symbolic"));
+                    self.header_status_icon.set_visible(true);
+                } else {
+                    self.header_status_flag
+                        .append(&super::server_card::flag_widget(country.as_deref(), 16, 14));
+                    self.header_status_flag.set_visible(true);
+                }
                 if let Some(ms) = active_latency {
                     self.header_status_label.set_label(&format!("{ms} ms"));
                     self.header_status_label.set_visible(true);
@@ -2888,7 +2974,10 @@ impl Controller {
                 }
                 let tooltip = format!(
                     "{} — click to disconnect",
-                    name.as_deref().unwrap_or("Connected")
+                    pool_name
+                        .as_deref()
+                        .or(name.as_deref())
+                        .unwrap_or("Connected")
                 );
                 self.header_status.set_tooltip_text(Some(&tooltip));
                 self.header_status.set_sensitive(true);
@@ -2932,7 +3021,8 @@ impl Controller {
                 self.sidebar_status_icon
                     .set_icon_name(Some("network-vpn-symbolic"));
                 let name = self
-                    .active_server_name(state)
+                    .active_pool_name(state)
+                    .or_else(|| self.active_server_name(state))
                     .unwrap_or_else(|| "Connected".to_string());
                 let label = active_latency
                     .map(|ms| format!("{name} · {ms} ms"))
@@ -3236,6 +3326,9 @@ fn install_css() {
         button.flat { min-height: 24px; font-weight: normal; }
         button.pill { font-weight: 500; }
         button.slim-pill { min-height: 24px; padding: 2px 16px; }
+        .server-filter-bar { padding: 0 0 2px; }
+        .server-filter-bar > flowboxchild { padding: 0; }
+        menubutton.filter-menu > button { min-height: 30px; padding: 3px 12px; border-radius: 999px; }
         .compact-search { min-height: 28px; }
         .compact-search text { padding-top: 1px; padding-bottom: 1px; }
         .compact-connect { min-height: 24px; padding: 2px 14px; font-weight: 500; }
@@ -3295,6 +3388,8 @@ fn install_css() {
         .status-badge.status-connected { color: @success_color; background: alpha(@success_color, 0.14); }
         .status-badge.status-error { color: @error_color; background: alpha(@error_color, 0.13); }
         .session-chip { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; background: alpha(@window_fg_color, 0.07); }
+        .session-chip-pool { color: @accent_color; background: alpha(@accent_color, 0.12); }
+        .session-chip-stale { color: @warning_color; background: alpha(@warning_color, 0.13); }
         .session-chip-interface { color: @accent_color; background: alpha(@accent_color, 0.12); }
         .session-chip-inbound { color: alpha(@window_fg_color, 0.78); }
         .session-chip-latency { color: @success_color; background: alpha(@success_color, 0.14); }

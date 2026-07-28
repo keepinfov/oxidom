@@ -344,6 +344,7 @@ fn set_chips(container: &gtk::FlowBox, chips: &[SessionChip]) {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["session-chip", chip_class(chip.kind)])
             .build();
+        label.set_tooltip_text(chip.tooltip.as_deref());
         container.insert(&label, -1);
     }
     container.set_visible(!chips.is_empty());
@@ -351,6 +352,8 @@ fn set_chips(container: &gtk::FlowBox, chips: &[SessionChip]) {
 
 fn chip_class(kind: SessionChipKind) -> &'static str {
     match kind {
+        SessionChipKind::Pool => "session-chip-pool",
+        SessionChipKind::Stale => "session-chip-stale",
         SessionChipKind::Interface => "session-chip-interface",
         SessionChipKind::Inbound => "session-chip-inbound",
         SessionChipKind::Latency => "session-chip-latency",
@@ -368,6 +371,7 @@ mod tests {
             profile: "work".to_string(),
             state,
             server: "ch-trojan".to_string(),
+            pool: false,
             description: "Office tunnel".to_string(),
             chips: Vec::new(),
             toggle_on: false,

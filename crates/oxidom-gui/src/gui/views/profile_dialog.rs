@@ -6,7 +6,7 @@ use adw::prelude::*;
 
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
-use oxidom_core::pool::PoolQuery;
+use oxidom_core::pool::{PoolQuery, Strategy};
 use oxidom_core::profile::{
     self, Profile, ProfileInterface, ProfileProxy, ProfileSelect, RouteMode,
 };
@@ -22,6 +22,10 @@ const MISSING_SERVER_HINT: &str = "This handle matches no server the daemon know
 const NO_SERVER_LABEL: &str = "Choose a server…";
 const DNS_LEAK_WARNING: &str = "All traffic will use the tunnel, but DNS is not routed through \
     it in this release. The system resolver will continue outside the tunnel.";
+const LEAST_PING_WARNING: &str = "leastPing concentrates traffic on one node and works against \
+    spreading activity across IPs.";
+const NEW_CONNECTIONS_HINT: &str = "Pool switching affects only new connections; existing \
+    connections do not migrate.";
 
 /// One server the profile's picker can point at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,7 +65,9 @@ pub enum ProfileDialog<'a> {
         name: &'a str,
         entry: &'a ProfileEntry,
     },
-    New,
+    New {
+        pool: Option<PoolQuery>,
+    },
 }
 
 #[derive(Clone)]
@@ -81,7 +87,6 @@ struct PickerEntry {
 struct DialogValues {
     description: String,
     server: String,
-    /// E2 has no pool editor, but Save must preserve a loaded pool verbatim.
     pool: Option<PoolQuery>,
     socks_port: u16,
     http_port: u16,
@@ -156,7 +161,11 @@ pub fn show_profile_dialog(
             Some(name.to_string()),
             DialogValues::new(Some(entry)),
         ),
-        ProfileDialog::New => ("New Profile".to_string(), None, DialogValues::new(None)),
+        ProfileDialog::New { pool } => {
+            let mut initial = DialogValues::new(None);
+            initial.pool = pool;
+            ("New Profile".to_string(), None, initial)
+        }
     };
 
     let window = adw::Window::builder()
@@ -191,6 +200,14 @@ pub fn show_profile_dialog(
         .build();
     profile_group.add(&description_entry);
 
+    let selection_labels = gtk::StringList::new(&["Single server", "Pool"]);
+    let selection_mode = adw::ComboRow::builder()
+        .title("Selection")
+        .model(&selection_labels)
+        .selected(u32::from(initial.pool.is_some()))
+        .build();
+    profile_group.add(&selection_mode);
+
     let (picker_entries, selected) = picker_entries(choices, &initial.server);
     let picker_entries = Rc::new(picker_entries);
     let labels: Vec<&str> = picker_entries
@@ -216,13 +233,7 @@ pub fn show_profile_dialog(
     // model, and a builder that happened to apply the two in the other order
     // would drop it.
     server.set_selected(selected);
-    let preserves_pool = initial.pool.is_some();
-    if preserves_pool {
-        // E3 owns the pool editor. Until then this row must not offer a
-        // server choice that would conflict with the pool being preserved.
-        server.set_sensitive(false);
-        server.set_subtitle("Pool selection is preserved; its editor arrives in the next phase");
-    }
+    server.set_visible(initial.pool.is_none());
     profile_group.add(&server);
 
     let socks = adw::SpinRow::with_range(1.0, 65535.0, 1.0);
@@ -233,6 +244,59 @@ pub fn show_profile_dialog(
     http.set_title("HTTP port");
     http.set_value(f64::from(initial.http_port));
     profile_group.add(&http);
+
+    let initial_pool = initial.pool.clone().unwrap_or_default();
+    let pool_group = adw::PreferencesGroup::builder()
+        .title("Pool")
+        .visible(initial.pool.is_some())
+        .build();
+    let strategy_labels = gtk::StringList::new(&["roundRobin", "random", "leastPing", "leastLoad"]);
+    let strategy = adw::ComboRow::builder()
+        .title("Strategy")
+        .subtitle(strategy_hint(initial_pool.strategy))
+        .model(&strategy_labels)
+        .selected(strategy_index(initial_pool.strategy))
+        .build();
+    pool_group.add(&strategy);
+
+    let pool_subscriptions = adw::EntryRow::builder()
+        .title("Subscriptions")
+        .text(join_values(&initial_pool.subscriptions))
+        .build();
+    pool_group.add(&pool_subscriptions);
+    let pool_countries = adw::EntryRow::builder()
+        .title("Countries")
+        .text(join_values(&initial_pool.countries))
+        .build();
+    pool_group.add(&pool_countries);
+    let pool_protocols = adw::EntryRow::builder()
+        .title("Protocols")
+        .text(join_values(&initial_pool.protocols))
+        .build();
+    pool_group.add(&pool_protocols);
+    let pool_exclude = adw::EntryRow::builder()
+        .title("Exclude")
+        .text(join_values(&initial_pool.exclude))
+        .build();
+    pool_group.add(&pool_exclude);
+    let pool_max = adw::SpinRow::with_range(0.0, profile::MAX_POOL_MEMBERS as f64, 1.0);
+    pool_max.set_title("Maximum nodes");
+    pool_max.set_subtitle("0 means no query limit; activation still caps a pool at 64 nodes");
+    pool_max.set_value(initial_pool.max as f64);
+    pool_group.add(&pool_max);
+    let pool_probe_interval = adw::EntryRow::builder()
+        .title("Probe interval")
+        .text(&initial_pool.probe_interval)
+        .build();
+    pool_group.add(&pool_probe_interval);
+    let switching_hint = adw::ActionRow::builder()
+        .title("Existing connections stay on their current exit")
+        .subtitle(NEW_CONNECTIONS_HINT)
+        .subtitle_lines(2)
+        .activatable(false)
+        .build();
+    switching_hint.add_prefix(&gtk::Image::from_icon_name("dialog-information-symbolic"));
+    pool_group.add(&switching_hint);
 
     let interface_group = adw::PreferencesGroup::builder().title("Interface").build();
     let interface_enable = adw::SwitchRow::builder()
@@ -295,6 +359,7 @@ pub fn show_profile_dialog(
 
     let groups = gtk::Box::new(gtk::Orientation::Vertical, 24);
     groups.append(&profile_group);
+    groups.append(&pool_group);
     groups.append(&interface_group);
     if let Some(name) = edit_name.as_deref() {
         let remove_group = adw::PreferencesGroup::builder().title("Remove").build();
@@ -350,13 +415,20 @@ pub fn show_profile_dialog(
             .collect::<Vec<_>>(),
     );
     let interface_address = initial.interface_address.clone();
-    let pool = initial.pool.clone();
     let collect_profile: Rc<dyn Fn() -> Option<(String, Profile)>> = Rc::new({
         let name_entry = name_entry.clone();
         let edit_name = edit_name.clone();
         let description_entry = description_entry.clone();
+        let selection_mode = selection_mode.clone();
         let server = server.clone();
         let picker_entries = picker_entries.clone();
+        let strategy = strategy.clone();
+        let pool_subscriptions = pool_subscriptions.clone();
+        let pool_countries = pool_countries.clone();
+        let pool_protocols = pool_protocols.clone();
+        let pool_exclude = pool_exclude.clone();
+        let pool_max = pool_max.clone();
+        let pool_probe_interval = pool_probe_interval.clone();
         let socks = socks.clone();
         let http = http.clone();
         let interface_enable = interface_enable.clone();
@@ -366,19 +438,29 @@ pub fn show_profile_dialog(
         let routed_subnets = routed_subnets.clone();
         move || {
             let name = dialog_name(name_entry.as_ref(), edit_name.as_deref());
-            let selected = picker_entries.get(server.selected() as usize)?;
-            // A pool legitimately has no single-server row selected. For a
-            // single selection the placeholder must never reach the profile.
-            if pool.is_none() && selected.placeholder {
+            let pool_mode = selection_mode.selected() == 1;
+            let selected = (!pool_mode)
+                .then(|| picker_entries.get(server.selected() as usize))
+                .flatten();
+            if selected.is_some_and(|entry| entry.placeholder) || (!pool_mode && selected.is_none())
+            {
                 return None;
             }
+            let pool = pool_mode.then(|| PoolQuery {
+                strategy: strategy_from_index(strategy.selected()),
+                subscriptions: parse_values(&pool_subscriptions.text()),
+                countries: parse_values(&pool_countries.text()),
+                protocols: parse_values(&pool_protocols.text()),
+                exclude: parse_values(&pool_exclude.text()),
+                max: pool_max.value() as usize,
+                probe_interval: pool_probe_interval.text().trim().to_string(),
+            });
             let values = DialogValues {
                 description: description_entry.text().to_string(),
-                server: pool
-                    .as_ref()
-                    .map(|_| String::new())
-                    .unwrap_or_else(|| selected.handle.clone()),
-                pool: pool.clone(),
+                server: selected
+                    .map(|entry| entry.handle.clone())
+                    .unwrap_or_default(),
+                pool,
                 socks_port: socks.value() as u16,
                 http_port: http.value() as u16,
                 interface_enable: interface_enable.is_active(),
@@ -396,8 +478,11 @@ pub fn show_profile_dialog(
         let name_entry = name_entry.clone();
         let edit_name = edit_name.clone();
         let existing_names = existing_names.clone();
+        let selection_mode = selection_mode.clone();
         let server = server.clone();
         let picker_entries = picker_entries.clone();
+        let pool_group = pool_group.clone();
+        let strategy = strategy.clone();
         let socks = socks.clone();
         let http = http.clone();
         let routes = routes.clone();
@@ -414,10 +499,12 @@ pub fn show_profile_dialog(
             let name_issue = name_entry
                 .as_ref()
                 .and_then(|entry| profile_name_validation(entry.text().as_str(), &existing_names));
+            let pool_mode = selection_mode.selected() == 1;
             let selected = picker_entries.get(server.selected() as usize);
-            server.set_subtitle(if preserves_pool {
-                "Pool selection is preserved; its editor arrives in the next phase"
-            } else if selected.is_some_and(|entry| entry.missing) {
+            server.set_visible(!pool_mode);
+            pool_group.set_visible(pool_mode);
+            strategy.set_subtitle(strategy_hint(strategy_from_index(strategy.selected())));
+            server.set_subtitle(if selected.is_some_and(|entry| entry.missing) {
                 MISSING_SERVER_HINT
             } else {
                 ""
@@ -432,7 +519,7 @@ pub fn show_profile_dialog(
                     (socks.value() as u16 == http.value() as u16).then(|| PORTS_ERROR.to_string())
                 })
                 .or_else(|| {
-                    (!preserves_pool && selected.is_none_or(|entry| entry.placeholder))
+                    (!pool_mode && selected.is_none_or(|entry| entry.placeholder))
                         .then(|| SERVER_ERROR.to_string())
                 })
                 .or_else(|| {
@@ -454,7 +541,31 @@ pub fn show_profile_dialog(
         let update_validation = update_validation.clone();
         move |_| update_validation()
     });
+    selection_mode.connect_selected_notify({
+        let update_validation = update_validation.clone();
+        move |_| update_validation()
+    });
     server.connect_selected_notify({
+        let update_validation = update_validation.clone();
+        move |_| update_validation()
+    });
+    strategy.connect_selected_notify({
+        let update_validation = update_validation.clone();
+        move |_| update_validation()
+    });
+    for entry in [
+        &pool_subscriptions,
+        &pool_countries,
+        &pool_protocols,
+        &pool_exclude,
+        &pool_probe_interval,
+    ] {
+        entry.connect_changed({
+            let update_validation = update_validation.clone();
+            move |_| update_validation()
+        });
+    }
+    pool_max.connect_value_notify({
         let update_validation = update_validation.clone();
         move |_| update_validation()
     });
@@ -594,6 +705,44 @@ fn route_mode_index(mode: RouteMode) -> u32 {
     }
 }
 
+fn strategy_index(strategy: Strategy) -> u32 {
+    match strategy {
+        Strategy::RoundRobin => 0,
+        Strategy::Random => 1,
+        Strategy::LeastPing => 2,
+        Strategy::LeastLoad => 3,
+    }
+}
+
+fn strategy_from_index(index: u32) -> Strategy {
+    match index {
+        1 => Strategy::Random,
+        2 => Strategy::LeastPing,
+        3 => Strategy::LeastLoad,
+        _ => Strategy::RoundRobin,
+    }
+}
+
+fn strategy_hint(strategy: Strategy) -> &'static str {
+    if strategy == Strategy::LeastPing {
+        LEAST_PING_WARNING
+    } else {
+        ""
+    }
+}
+
+fn join_values(values: &[String]) -> String {
+    values.join(", ")
+}
+
+fn parse_values(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn route_mode(index: u32) -> RouteMode {
     match index {
         1 => RouteMode::List,
@@ -603,11 +752,7 @@ fn route_mode(index: u32) -> RouteMode {
 }
 
 fn parse_subnets(text: &str) -> Vec<String> {
-    text.split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
+    parse_values(text)
 }
 
 fn picker_entries(choices: &[ServerChoice], stored: &str) -> (Vec<PickerEntry>, u32) {
@@ -841,7 +986,15 @@ mod tests {
                 routes: RouteMode::List,
                 list: vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()],
             },
-            pool: Some(PoolQuery::default()),
+            pool: Some(PoolQuery {
+                strategy: Strategy::LeastPing,
+                subscriptions: vec!["main".to_string()],
+                countries: vec!["ch".to_string(), "de".to_string()],
+                protocols: vec!["vless".to_string()],
+                exclude: vec!["slow".to_string()],
+                max: 8,
+                probe_interval: "30s".to_string(),
+            }),
         };
 
         let saved = profile_from_dialog(DialogValues::new(Some(&entry)));
@@ -852,5 +1005,15 @@ mod tests {
         assert_eq!(saved.proxy.socks_port, entry.socks_port);
         assert_eq!(saved.proxy.http_port, entry.http_port);
         saved.validate(&entry.name).unwrap();
+    }
+
+    #[test]
+    fn strategy_help_states_the_ip_spreading_tradeoff() {
+        assert_eq!(strategy_hint(Strategy::LeastPing), LEAST_PING_WARNING);
+        assert_eq!(strategy_hint(Strategy::RoundRobin), "");
+        assert_eq!(
+            strategy_from_index(strategy_index(Strategy::LeastLoad)),
+            Strategy::LeastLoad
+        );
     }
 }
