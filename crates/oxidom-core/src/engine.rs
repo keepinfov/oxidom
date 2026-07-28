@@ -1378,12 +1378,25 @@ fn cleanup_live_interface(interface: &mut Interface, delete_device: bool) -> Res
         Ok(()) => {}
         Err(error) => errors.push(format!("{error:#}")),
     }
-    if delete_device
-        && device_exists
-        && interface.created
-        && let Err(error) = crate::tun::device::delete(&interface.device)
-    {
-        errors.push(format!("{error:#}"));
+    if delete_device && device_exists {
+        // `created` only knows about this session. A persistent device outlives
+        // its session by design, and `down` drops the record that remembered
+        // making it, so after the first reconnect the kernel's own notion of
+        // ownership is the only one left. Refusing is still a real outcome and
+        // is reported rather than passed off as a removal.
+        let ours = interface.created
+            || crate::tun::device::owned_by(
+                &interface.device,
+                nix::unistd::Uid::effective().as_raw(),
+            );
+        if !ours {
+            errors.push(format!(
+                "refusing to delete network interface {:?}: oxidom did not create it",
+                interface.device
+            ));
+        } else if let Err(error) = crate::tun::device::delete(&interface.device) {
+            errors.push(format!("{error:#}"));
+        }
     }
     interface.fresh = false;
     if errors.is_empty() {

@@ -102,6 +102,24 @@ pub fn exists(name: &str) -> bool {
         && std::path::Path::new("/sys/class/net").join(name).exists()
 }
 
+/// Does this device look like one oxidom created?
+///
+/// A persistent TUN deliberately outlives its session, and `down` drops the
+/// session record that remembered making it — so the in-memory `created` flag
+/// cannot answer this after the first reconnect, and `oxidom tun --down` was
+/// left unable to remove its own device. The kernel remembers instead:
+/// `TUNSETOWNER` is readable back through sysfs, and only tun/tap devices
+/// expose the file at all, so an ordinary interface can never match.
+pub fn owned_by(name: &str, uid: u32) -> bool {
+    if crate::bind::validate_device_name(name).is_err() {
+        return false;
+    }
+    std::fs::read_to_string(format!("/sys/class/net/{name}/owner"))
+        .ok()
+        .and_then(|owner| owner.trim().parse::<i64>().ok())
+        .is_some_and(|owner| owner >= 0 && owner as u64 == u64::from(uid))
+}
+
 fn open_tun() -> Result<std::fs::File> {
     OpenOptions::new()
         .read(true)
@@ -146,6 +164,33 @@ mod tests {
         assert!(!super::exists(name));
         let error = super::delete(name).unwrap_err().to_string();
         assert!(error.contains("does not exist"), "{error}");
+    }
+
+    /// `owner` is a tun/tap-only attribute, so an ordinary interface cannot be
+    /// mistaken for one of ours however the uid compares. An unowned tun reads
+    /// back as -1, which must not match uid 0 or wrap into a large uid.
+    #[test]
+    fn ownership_is_only_ever_claimed_for_a_tun_we_own() {
+        assert!(!super::owned_by("lo", 0), "lo has no owner attribute");
+        assert!(!super::owned_by("oxi-no-such-42", 0));
+        assert!(!super::owned_by("../etc/passwd", 0));
+        for name in std::fs::read_dir("/sys/class/net")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        {
+            let Ok(owner) = std::fs::read_to_string(format!("/sys/class/net/{name}/owner")) else {
+                continue;
+            };
+            let claimed = owner.trim() != "-1";
+            assert_eq!(
+                super::owned_by(&name, owner.trim().parse::<u32>().unwrap_or(u32::MAX)),
+                claimed && crate::bind::validate_device_name(&name).is_ok(),
+                "{name} reports owner {}",
+                owner.trim()
+            );
+        }
     }
 
     #[test]
