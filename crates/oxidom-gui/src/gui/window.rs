@@ -13,14 +13,15 @@ use oxidom_core::config::Config;
 use oxidom_core::ipc;
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
-use oxidom_core::profile::Profile;
+use oxidom_core::profile::{Profile, ProfileProxy, ProfileSelect};
 use oxidom_core::xray::core::Status;
 use oxidom_core::{paths, sysproxy};
 
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
-    Effect, PolledSnapshot, ProbeWait, SnapshotState, active_latency_for, latency_states,
-    other_sessions_message, reduce, session_rows,
+    CardAction, Effect, PolledSnapshot, ProbeWait, SessionRowState, SnapshotState, SwitcherItem,
+    active_latency_for, card_action, latency_states, other_sessions_message, reduce,
+    selected_status, session_for, session_rows, switcher_items, switcher_visible,
 };
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
@@ -149,6 +150,12 @@ struct Controller {
     header_status_flag: gtk::Box,
     header_status_label: gtk::Label,
     header_status_spinner: gtk::Spinner,
+    profile_switcher: gtk::MenuButton,
+    profile_switcher_popover: gtk::Popover,
+    profile_switcher_list: gtk::ListBox,
+    /// Items the popover's rows were built from, so a poll that changed
+    /// nothing does not tear the list down and put it back.
+    profile_switcher_shown: RefCell<Vec<SwitcherItem>>,
     profile_actions: gtk::Box,
     subscription_actions: gtk::Box,
     settings_actions: gtk::Box,
@@ -171,8 +178,8 @@ struct Controller {
     quit_after_close: Cell<bool>,
     tray: RefCell<Option<ksni::blocking::Handle<OxidomTray>>>,
     tray_commands: mpsc::Receiver<TrayCommand>,
-    /// Last (connected, text) pushed to the tray, to skip no-op updates.
-    tray_pushed: RefCell<(bool, String)>,
+    /// Last (text, sessions) pushed to the tray, to skip no-op updates.
+    tray_pushed: RefCell<(String, Vec<(String, bool)>)>,
     /// True while this GUI holds the GNOME system proxy applied.
     proxy_applied: Cell<bool>,
     /// Endpoint the applied GNOME proxy points at. `None` with
@@ -468,12 +475,13 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
     search_bar.set_child(Some(&compact_search));
     let sessions_banner = adw::Banner::builder()
         .title(
-            other_sessions_message(&initial_status, "default")
+            other_sessions_message(&initial_status.sessions, "default")
                 .as_deref()
                 .unwrap_or_default(),
         )
-        .revealed(other_sessions_message(&initial_status, "default").is_some())
+        .revealed(other_sessions_message(&initial_status.sessions, "default").is_some())
         .build();
+    sessions_banner.set_button_label(Some("Sessions"));
     let search_toggle = gtk::ToggleButton::builder()
         .icon_name("edit-find-symbolic")
         .tooltip_text("Search servers")
@@ -517,10 +525,30 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         .build();
     header_status.update_property(&[gtk::accessible::Property::Label("Connection status")]);
 
+    let profile_switcher_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .activate_on_single_click(true)
+        .css_classes(["profile-switcher-list"])
+        .build();
+    let profile_switcher_popover = gtk::Popover::builder()
+        .child(&profile_switcher_list)
+        .build();
+    let profile_switcher = gtk::MenuButton::builder()
+        .label("default")
+        .tooltip_text("Choose profile")
+        .visible(false)
+        .css_classes(["profile-switcher"])
+        .build();
+    profile_switcher.set_popover(Some(&profile_switcher_popover));
+    profile_switcher.update_property(&[gtk::accessible::Property::Label(
+        "Choose connection profile",
+    )]);
+
     let header = adw::HeaderBar::new();
     header.pack_start(&sidebar_toggle);
     header.pack_start(&search_toggle);
     header.pack_start(&header_status);
+    header.pack_start(&profile_switcher);
     header.pack_start(&search);
     header.pack_end(&profile_actions);
     header.pack_end(&subscription_actions);
@@ -554,7 +582,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
     let tray_handle = {
         use ksni::blocking::TrayMethods;
         let tray = OxidomTray {
-            connected: false,
+            sessions: Vec::new(),
             status_text: "Disconnected".to_string(),
             commands: tray_sender,
         };
@@ -596,6 +624,10 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         header_status_flag,
         header_status_label,
         header_status_spinner,
+        profile_switcher,
+        profile_switcher_popover,
+        profile_switcher_list,
+        profile_switcher_shown: RefCell::new(Vec::new()),
         profile_actions,
         subscription_actions,
         settings_actions,
@@ -616,7 +648,7 @@ fn build(app: &adw::Application, background: bool, client: DaemonClient) -> adw:
         quit_after_close: Cell::new(false),
         tray: RefCell::new(tray_handle),
         tray_commands,
-        tray_pushed: RefCell::new((false, String::new())),
+        tray_pushed: RefCell::new((String::new(), Vec::new())),
         proxy_applied: Cell::new(gui_proxy_marker_exists()),
         applied_proxy_endpoint: Cell::new(None),
         applied_connection: RefCell::new(CardConnection::default()),
@@ -867,6 +899,14 @@ impl Controller {
             move |_| {
                 if let Some(controller) = weak.upgrade() {
                     controller.handle_status_clicked();
+                }
+            }
+        });
+        self.sessions_banner.connect_button_clicked({
+            let weak = Rc::downgrade(self);
+            move |_| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.navigate_to(Page::Sessions);
                 }
             }
         });
@@ -1208,6 +1248,7 @@ impl Controller {
         };
         self.sessions.rebuild(&profiles, &choices, &rows, callbacks);
         self.sessions.set_operation(operation);
+        self.sync_profile_switcher();
     }
 
     fn sync_session_rows(self: &Rc<Self>) {
@@ -1220,6 +1261,95 @@ impl Controller {
         if !self.sessions.set_rows(&rows) {
             self.rebuild_sessions();
         }
+    }
+
+    fn sync_profile_switcher(self: &Rc<Self>) {
+        let (visible, selected_profile, items) = {
+            let state = self.state.borrow();
+            (
+                switcher_visible(&state.profiles),
+                state.ui.selected_profile.clone(),
+                switcher_items(&state.profiles, &state.ui),
+            )
+        };
+        self.profile_switcher.set_visible(visible);
+        self.profile_switcher.set_label(&selected_profile);
+
+        // The poll calls this twice a second. Rebuilding the popover's rows
+        // while the user has it open destroys the row they are reaching for,
+        // so an open menu keeps the list it was opened with until it closes.
+        if *self.profile_switcher_shown.borrow() == items {
+            return;
+        }
+        if self.profile_switcher_popover.is_visible() {
+            return;
+        }
+        self.profile_switcher_shown.replace(items.clone());
+
+        while let Some(child) = self.profile_switcher_list.first_child() {
+            self.profile_switcher_list.remove(&child);
+        }
+        for item in items {
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            content.set_margin_top(6);
+            content.set_margin_bottom(6);
+            content.set_margin_start(10);
+            content.set_margin_end(10);
+
+            let dot = gtk::Label::builder()
+                .label("●")
+                .css_classes(["profile-switcher-dot"])
+                .build();
+            set_status_tone(&dot, session_row_tone(item.state));
+            let name = gtk::Label::builder()
+                .label(&item.profile)
+                .hexpand(true)
+                .xalign(0.0)
+                .build();
+            content.append(&dot);
+            content.append(&name);
+
+            let row = gtk::ListBoxRow::builder()
+                .child(&content)
+                .activatable(true)
+                .selectable(true)
+                .tooltip_text(session_row_state_label(item.state))
+                .build();
+            let selected = item.selected;
+            row.connect_activate({
+                let weak = Rc::downgrade(self);
+                let profile = item.profile;
+                move |_| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.select_profile(profile.clone());
+                    }
+                }
+            });
+            self.profile_switcher_list.append(&row);
+            if selected {
+                self.profile_switcher_list.select_row(Some(&row));
+            }
+        }
+    }
+
+    fn select_profile(self: &Rc<Self>, profile: String) {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.ui.selected_profile == profile {
+                self.profile_switcher_popover.popdown();
+                return;
+            }
+            state.ui.selected_profile = profile.clone();
+        }
+        self.profile_switcher.set_label(&profile);
+        self.profile_switcher_popover.popdown();
+        self.bump_epoch();
+        self.refresh_status();
+        self.sync_connection_cards();
+        // The banner counts sessions *other than* the selected one, so it has
+        // to be recounted here rather than waiting for the next poll.
+        let sessions = self.state.borrow().ui.sessions.clone();
+        self.update_sessions_banner(&sessions);
     }
 
     fn rebuild_views(self: &Rc<Self>) {
@@ -1377,26 +1507,101 @@ impl Controller {
     }
 
     fn activate_server(self: &Rc<Self>, server_id: String) {
-        let (status, connected) = {
+        let action = {
             let state = self.state.borrow();
-            (state.ui.current_status(), state.ui.connected_id.clone())
+            card_action(&state.profiles, &state.ui, &server_id)
         };
-        if matches!(status, Status::Connected | Status::Connecting)
-            && connected.as_deref() == Some(&server_id)
-        {
-            self.disconnect();
-        } else {
-            self.connect_server(server_id);
+        match action {
+            CardAction::Connect(id) => self.connect_server(id),
+            CardAction::Disconnect => self.disconnect(),
+            CardAction::UpProfile(name) => self.up_profile(name),
+            CardAction::DownProfile(name) => self.down_profile(name),
+            CardAction::RepointAndUp { profile, server_id } => {
+                self.confirm_repoint_and_up(profile, server_id)
+            }
         }
     }
 
-    fn disconnect_if_active(self: &Rc<Self>) {
-        let status = {
+    fn confirm_repoint_and_up(self: &Rc<Self>, profile_name: String, server_id: String) {
+        let (profile, server_name) = {
             let state = self.state.borrow();
-            state.ui.current_status()
+            let Some(entry) = state
+                .profiles
+                .iter()
+                .find(|entry| entry.name == profile_name)
+            else {
+                drop(state);
+                self.show_message(&format!("Profile «{profile_name}» no longer exists"));
+                return;
+            };
+            let server = state
+                .subscriptions
+                .iter()
+                .flat_map(|subscription| subscription.servers.iter())
+                .find(|server| server.id == server_id);
+            let server_name = server
+                .map(|server| oxidom_core::model::name_without_flag(&server.name).to_string())
+                .unwrap_or_else(|| server_id.clone());
+            // The alias when there is one, exactly as `server_choices` builds
+            // the dialog's handles. Storing the raw id of an aliased server
+            // would make the picker report it as a server that does not exist.
+            let handle = server
+                .and_then(|server| server.alias.clone())
+                .unwrap_or_else(|| server_id.clone());
+            (
+                Profile {
+                    description: entry.description.clone(),
+                    select: ProfileSelect { server: handle },
+                    proxy: ProfileProxy {
+                        socks_port: entry.socks_port,
+                        http_port: entry.http_port,
+                    },
+                    interface: entry.interface.clone(),
+                },
+                server_name,
+            )
+        };
+
+        let dialog = adw::MessageDialog::new(
+            Some(&self.window),
+            Some(&format!("Point «{profile_name}» at {server_name}?")),
+            Some(&format!(
+                "This will rewrite the saved server selection for «{profile_name}» and connect it."
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("repoint", "Repoint and Connect")]);
+        dialog.set_response_appearance("repoint", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, {
+            let weak = Rc::downgrade(self);
+            move |dialog, response| {
+                dialog.close();
+                if response != "repoint" {
+                    return;
+                }
+                if let Some(controller) = weak.upgrade() {
+                    controller.repoint_and_up(profile_name.clone(), profile.clone());
+                }
+            }
+        });
+        dialog.present();
+    }
+
+    fn disconnect_if_active(self: &Rc<Self>) {
+        let (profile, status) = {
+            let state = self.state.borrow();
+            (
+                state.ui.selected_profile.clone(),
+                selected_status(&state.ui),
+            )
         };
         if matches!(status, Status::Connecting | Status::Connected) {
-            self.disconnect();
+            if profile == "default" {
+                self.disconnect();
+            } else {
+                self.down_profile(profile);
+            }
         }
     }
 
@@ -1664,8 +1869,7 @@ impl Controller {
 
     fn up_profile(self: &Rc<Self>, name: String) {
         let work_name = name.clone();
-        let message_name = name.clone();
-        let pinned_name = name.clone();
+        let finish_name = name.clone();
         self.client_job(
             UiOperation::for_profile(UiOperationKind::UpProfile, name),
             move |client| {
@@ -1675,62 +1879,85 @@ impl Controller {
                 ))
             },
             move |controller, result| {
-                let operation = match result {
-                    Ok((operation, profiles)) => {
-                        controller.state.borrow_mut().profiles = profiles;
-                        operation
-                    }
-                    Err(error) => Err(error),
-                };
-                match operation {
-                    Ok(result) => {
-                        let server_id = result.server.id;
-                        {
-                            let mut state = controller.state.borrow_mut();
-                            state.selected_id = Some(server_id.clone());
-                            state.ui.connected_id = Some(server_id.clone());
-                            state.ui.failed_id = None;
-                            // The pin belongs to the profile that was brought
-                            // up, not to whichever one the header shows: a
-                            // switch away must not carry this transition along.
-                            state
-                                .ui
-                                .pin_status(&pinned_name, Status::Connecting, Instant::now());
-                        }
-                        controller.bump_epoch();
-                        controller.set_cards_connection(CardConnection {
-                            active: Some(server_id.clone()),
-                            profiles: controller.state.borrow().ui.connected_profiles.clone(),
-                            connecting: Some(server_id.clone()),
-                            failed: None,
-                        });
-                        controller.servers.set_selected(Some(&server_id));
-                        controller.rebuild_sessions();
-                        if !result.ignored_ports.is_empty() {
-                            controller.show_message(&format!(
-                                "{} left unchanged — fixed by the system service unit",
-                                result.ignored_ports.join(" and ")
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        // Deliberately neither pinned nor cleared. `UpProfile`
-                        // refuses before it touches the tunnel whenever the
-                        // profile is unreadable or its handle resolves to
-                        // nothing or to several servers, and calling that
-                        // "disconnected" would blank a connection that is still
-                        // carrying traffic. The status this worker read after
-                        // the call lands immediately after this handler and
-                        // paints whichever of the two it actually is.
-                        controller.mark_error_notified(&format!("{error:#}"));
-                        controller
-                            .show_message(&format!("Could not bring up «{message_name}»: {error}"));
-                    }
-                }
-                controller.reconcile_system_proxy();
-                controller.refresh_status();
+                controller.finish_up_profile(finish_name, result);
             },
         );
+    }
+
+    fn repoint_and_up(self: &Rc<Self>, name: String, profile: Profile) {
+        let work_name = name.clone();
+        let finish_name = name.clone();
+        self.client_job(
+            UiOperation::for_profile(UiOperationKind::UpProfile, name),
+            move |client| {
+                let operation = client
+                    .save_profile(&work_name, &profile)
+                    .and_then(|()| client.up_profile(&work_name));
+                Ok(refresh_profiles_after(client, operation))
+            },
+            move |controller, result| {
+                controller.finish_up_profile(finish_name, result);
+            },
+        );
+    }
+
+    fn finish_up_profile(
+        self: &Rc<Self>,
+        name: String,
+        result: Result<(Result<ipc::UpResult>, Vec<ProfileEntry>)>,
+    ) {
+        let operation = match result {
+            Ok((operation, profiles)) => {
+                self.state.borrow_mut().profiles = profiles;
+                operation
+            }
+            Err(error) => Err(error),
+        };
+        match operation {
+            Ok(result) => {
+                let server_id = result.server.id;
+                {
+                    let mut state = self.state.borrow_mut();
+                    state.selected_id = Some(server_id.clone());
+                    state.ui.connected_id = Some(server_id.clone());
+                    state.ui.failed_id = None;
+                    // The pin belongs to the profile that was brought up, not
+                    // to whichever one the header shows: a switch away must
+                    // not carry this transition along.
+                    state
+                        .ui
+                        .pin_status(&name, Status::Connecting, Instant::now());
+                }
+                self.bump_epoch();
+                self.set_cards_connection(CardConnection {
+                    active: Some(server_id.clone()),
+                    profiles: self.state.borrow().ui.connected_profiles.clone(),
+                    connecting: Some(server_id.clone()),
+                    failed: None,
+                });
+                self.servers.set_selected(Some(&server_id));
+                self.rebuild_sessions();
+                if !result.ignored_ports.is_empty() {
+                    self.show_message(&format!(
+                        "{} left unchanged — fixed by the system service unit",
+                        result.ignored_ports.join(" and ")
+                    ));
+                }
+            }
+            Err(error) => {
+                // Deliberately neither pinned nor cleared. `UpProfile` refuses
+                // before it touches the tunnel whenever the profile is
+                // unreadable or its handle resolves to nothing or to several
+                // servers, and calling that "disconnected" would blank a
+                // connection that is still carrying traffic. The status this
+                // worker read after the call lands immediately after this
+                // handler and paints whichever of the two it actually is.
+                self.mark_error_notified(&format!("{error:#}"));
+                self.show_message(&format!("Could not bring up «{name}»: {error}"));
+            }
+        }
+        self.reconcile_system_proxy();
+        self.refresh_status();
     }
 
     fn down_profile(self: &Rc<Self>, name: String) {
@@ -2200,7 +2427,7 @@ impl Controller {
         let Some(effects) = effects else {
             return;
         };
-        self.update_sessions_banner(&snapshot.status);
+        self.update_sessions_banner(&snapshot.status.sessions);
         // Collected rather than issued inline: `probe_one` borrows the state the
         // effects were just produced from.
         let mut reprobe = Vec::new();
@@ -2229,14 +2456,15 @@ impl Controller {
         }
         self.logs.set_logs(&snapshot.logs);
         self.sync_session_rows();
+        self.sync_profile_switcher();
         self.sync_connection_cards();
         self.reconcile_system_proxy();
         self.refresh_status();
     }
 
-    fn update_sessions_banner(&self, status: &ipc::StatusInfo) {
+    fn update_sessions_banner(&self, sessions: &[ipc::SessionInfo]) {
         let selected_profile = self.state.borrow().ui.selected_profile.clone();
-        if let Some(message) = other_sessions_message(status, &selected_profile) {
+        if let Some(message) = other_sessions_message(sessions, &selected_profile) {
             self.sessions_banner.set_title(&message);
             self.sessions_banner.set_revealed(true);
         } else {
@@ -2360,7 +2588,19 @@ impl Controller {
         while let Ok(command) = self.tray_commands.try_recv() {
             match command {
                 TrayCommand::ShowWindow => self.window.present(),
-                TrayCommand::Disconnect => self.disconnect_if_active(),
+                TrayCommand::Toggle(profile) => {
+                    // The same rule the page's switch follows, so a checkmark
+                    // and a switch for one profile can never disagree.
+                    let running = self
+                        .tray_sessions()
+                        .into_iter()
+                        .any(|(name, running)| name == profile && running);
+                    if running {
+                        self.down_profile(profile);
+                    } else {
+                        self.up_profile(profile);
+                    }
+                }
                 // Quitting from the tray must respect the same unsaved-settings
                 // guard as closing the window, or a draft is silently lost.
                 TrayCommand::Quit => self.request_quit(),
@@ -2397,37 +2637,51 @@ impl Controller {
         }
     }
 
+    /// One `(profile, running)` pair per profile, taken from the very rows the
+    /// Sessions page draws so the tray cannot describe a session differently
+    /// from the window.
+    fn tray_sessions(&self) -> Vec<(String, bool)> {
+        let state = self.state.borrow();
+        session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
+            .into_iter()
+            .map(|row| (row.profile, row.toggle_on))
+            .collect()
+    }
+
     /// Mirror the connection into the tray tooltip/menu, skipping no-ops.
     fn update_tray(&self, status: &Status) {
         let Some(handle) = self.tray.borrow().clone() else {
             return;
         };
-        let connected = matches!(status, Status::Connected | Status::Connecting);
-        let text = match status {
-            Status::Disconnected => "Disconnected".to_string(),
-            Status::Connecting => "Connecting…".to_string(),
-            Status::Connected => {
-                let name = self.active_server_name(&self.state.borrow());
-                match name {
-                    Some(name) => format!("Connected · {name}"),
-                    None => "Connected".to_string(),
+        let text = {
+            let state = self.state.borrow();
+            match status {
+                Status::Disconnected => "Disconnected".to_string(),
+                Status::Connecting => "Connecting…".to_string(),
+                Status::Connected => {
+                    let name = self.active_server_name(&state);
+                    match name {
+                        Some(name) => format!("Connected · {name}"),
+                        None => "Connected".to_string(),
+                    }
                 }
+                Status::Error(error) => format!("Error: {error}"),
             }
-            Status::Error(error) => format!("Error: {error}"),
         };
-        if *self.tray_pushed.borrow() == (connected, text.clone()) {
+        let sessions = self.tray_sessions();
+        if *self.tray_pushed.borrow() == (text.clone(), sessions.clone()) {
             return;
         }
-        *self.tray_pushed.borrow_mut() = (connected, text.clone());
+        *self.tray_pushed.borrow_mut() = (text.clone(), sessions.clone());
         handle.update(move |tray| {
-            tray.connected = connected;
             tray.status_text = text.clone();
+            tray.sessions.clone_from(&sessions);
         });
     }
 
     fn refresh_status(&self) {
         let state = self.state.borrow();
-        let status = state.ui.current_status();
+        let status = selected_status(&state.ui);
         let (active_latency, latency_stale) = active_latency_for(&state.ui);
         drop(state);
 
@@ -2442,7 +2696,12 @@ impl Controller {
 
     /// Display name and country of the connected server.
     fn active_server_display(&self, state: &AppState) -> Option<(String, Option<String>)> {
-        let active = state.ui.connected_id.as_deref()?;
+        let active = if state.ui.selected_profile == "default" {
+            state.ui.connected_id.as_deref()
+        } else {
+            session_for(&state.ui, &state.ui.selected_profile)
+                .and_then(|session| session.server_id.as_deref())
+        }?;
         state
             .subscriptions
             .iter()
@@ -2530,7 +2789,7 @@ impl Controller {
     }
 
     fn update_sidebar_connection_status(&self, state: &AppState) {
-        let status = state.ui.current_status();
+        let status = selected_status(&state.ui);
         let (active_latency, latency_stale) = active_latency_for(&state.ui);
         self.sidebar_status.set_sensitive(false);
         self.sidebar_status_label.remove_css_class("latency-stale");
@@ -2610,7 +2869,7 @@ impl Controller {
     fn handle_status_clicked(self: &Rc<Self>) {
         let status = {
             let state = self.state.borrow();
-            state.ui.current_status()
+            selected_status(&state.ui)
         };
         match status {
             Status::Error(error) => self.show_error_details("Connection error", &error),
@@ -2754,6 +3013,24 @@ fn summarize_error(title: &str, detail: &str) -> String {
     format!("{title}: {cut}…")
 }
 
+fn session_row_tone(state: SessionRowState) -> StatusTone {
+    match state {
+        SessionRowState::Stopped => StatusTone::Neutral,
+        SessionRowState::Connecting => StatusTone::Working,
+        SessionRowState::Connected => StatusTone::Connected,
+        SessionRowState::Error => StatusTone::Error,
+    }
+}
+
+fn session_row_state_label(state: SessionRowState) -> &'static str {
+    match state {
+        SessionRowState::Stopped => "Stopped",
+        SessionRowState::Connecting => "Connecting",
+        SessionRowState::Connected => "Connected",
+        SessionRowState::Error => "Error",
+    }
+}
+
 fn set_status_tone<W: IsA<gtk::Widget>>(widget: &W, tone: StatusTone) {
     let widget = widget.as_ref();
     for class in [
@@ -2817,6 +3094,21 @@ fn install_css() {
         headerbar button.header-status label { padding: 0; margin: 0; }
         headerbar button.header-status label.latency-stale,
         .sidebar-status label.latency-stale { opacity: 0.6; }
+        headerbar menubutton.profile-switcher > button {
+            min-width: 0;
+            min-height: 24px;
+            padding: 2px 8px;
+            border-radius: 8px;
+            box-shadow: none;
+            font-weight: 500;
+            font-size: 0.85em;
+        }
+        .profile-switcher-list { margin: 6px; min-width: 150px; }
+        .profile-switcher-dot { font-size: 0.72em; }
+        .profile-switcher-dot.status-neutral { color: alpha(@window_fg_color, 0.46); }
+        .profile-switcher-dot.status-working { color: @accent_color; }
+        .profile-switcher-dot.status-connected { color: @success_color; }
+        .profile-switcher-dot.status-error { color: @error_color; }
         button.flat { min-height: 24px; font-weight: normal; }
         button.pill { font-weight: 500; }
         button.slim-pill { min-height: 24px; padding: 2px 16px; }

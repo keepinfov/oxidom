@@ -658,7 +658,6 @@ fn reported_status_for(state: &SnapshotState, profile: &str) -> Status {
 /// that drove the header before sessions existed — instead of being recomputed
 /// from the session list: the single-profile experience must not merely look
 /// equivalent, it must be the same path.
-#[allow(dead_code)]
 pub(super) fn selected_status(state: &SnapshotState) -> Status {
     if state.selected_profile == "default" {
         return state.current_status();
@@ -853,12 +852,10 @@ pub(super) struct SwitcherItem {
 /// One profile means the switcher does not exist — not that it exists with a
 /// single entry. A user who never made a profile must see the header they saw
 /// before this phase.
-#[allow(dead_code)]
 pub(super) fn switcher_visible(profiles: &[ProfileEntry]) -> bool {
     profiles.len() > 1
 }
 
-#[allow(dead_code)]
 pub(super) fn switcher_items(
     profiles: &[ProfileEntry],
     state: &SnapshotState,
@@ -900,7 +897,6 @@ fn profile_points_to_server(entry: &ProfileEntry, state: &SnapshotState, server_
 
 /// Decide what activating a server card means before the widget layer performs
 /// any daemon or filesystem operation.
-#[allow(dead_code)]
 pub(super) fn card_action(
     profiles: &[ProfileEntry],
     state: &SnapshotState,
@@ -940,11 +936,10 @@ pub(super) fn card_action(
 }
 
 pub(super) fn other_sessions_message(
-    status: &StatusInfo,
+    sessions: &[SessionInfo],
     selected_profile: &str,
 ) -> Option<String> {
-    let count = status
-        .sessions
+    let count = sessions
         .iter()
         .filter(|session| session.profile != selected_profile)
         .count();
@@ -1663,7 +1658,7 @@ mod tests {
             Some(&vec!["home".to_string(), "work".to_string()])
         );
         assert_eq!(
-            other_sessions_message(&status, "home").as_deref(),
+            other_sessions_message(&status.sessions, "home").as_deref(),
             Some("2 more sessions are running")
         );
     }

@@ -3,17 +3,17 @@
 
 use std::sync::mpsc::Sender;
 
-use ksni::menu::{MenuItem, StandardItem};
+use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayCommand {
     ShowWindow,
-    Disconnect,
+    Toggle(String),
     Quit,
 }
 
 pub struct OxidomTray {
-    pub connected: bool,
+    pub sessions: Vec<(String, bool)>,
     pub status_text: String,
     pub commands: Sender<TrayCommand>,
 }
@@ -44,7 +44,27 @@ impl ksni::Tray for OxidomTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        vec![
+        let mut menu = self
+            .sessions
+            .iter()
+            .map(|(profile, running)| {
+                let profile = profile.clone();
+                CheckmarkItem {
+                    label: profile.clone(),
+                    checked: *running,
+                    activate: Box::new(move |tray: &mut Self| {
+                        let _ = tray.commands.send(TrayCommand::Toggle(profile.clone()));
+                    }),
+                    ..Default::default()
+                }
+                .into()
+            })
+            .collect::<Vec<_>>();
+        // Nothing above it to separate from when no profile exists yet.
+        if !menu.is_empty() {
+            menu.push(MenuItem::Separator);
+        }
+        menu.extend([
             StandardItem {
                 label: "Show oxidom".to_string(),
                 activate: Box::new(|tray: &mut Self| {
@@ -54,16 +74,6 @@ impl ksni::Tray for OxidomTray {
             }
             .into(),
             StandardItem {
-                label: "Disconnect".to_string(),
-                enabled: self.connected,
-                activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.commands.send(TrayCommand::Disconnect);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
-            StandardItem {
                 label: "Quit".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.commands.send(TrayCommand::Quit);
@@ -71,6 +81,7 @@ impl ksni::Tray for OxidomTray {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        menu
     }
 }
