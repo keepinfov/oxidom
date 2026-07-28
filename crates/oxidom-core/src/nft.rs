@@ -75,6 +75,13 @@ fn chain_name(profile: &str) -> Result<String> {
     Ok(format!("profile_{profile}"))
 }
 
+fn restore_chain_name(profile: &str) -> Result<String> {
+    if !crate::profile::valid_name(profile) {
+        bail!("invalid profile name {profile:?}");
+    }
+    Ok(format!("restore_{profile}"))
+}
+
 /// nft reads a quoted string literally: it has no escape sequences to undo.
 /// Doubling a backslash therefore does not protect the value, it corrupts it —
 /// a cgroup path containing systemd's `\x2d` became `\\x2d` and no longer named
@@ -89,18 +96,36 @@ fn quote(value: &str) -> Result<String> {
 }
 
 /// `add` is idempotent for an existing table/chain. Flushing only our
-/// deterministic chain before re-adding its one rule makes retries and daemon
+/// deterministic chains before re-adding their rules makes retries and daemon
 /// recovery safe while leaving every foreign nftables object untouched.
+///
+/// Two chains, because marking the way out is only half of it. The kernel picks
+/// a source address when the socket connects, before any mark exists, so a
+/// marked packet leaves through the tunnel still carrying the address of the
+/// ordinary uplink. The reply then arrives on the tunnel from an address whose
+/// route, in the *system* table, points somewhere else — and a strict reverse
+/// path filter has no choice but to drop it. Under `routes = "manual"` the
+/// system table is deliberately ignorant of the tunnel, so the answer cannot be
+/// a route: the mark is saved on the conntrack entry and restored in prerouting
+/// before the reverse path is checked, which sends that check through the
+/// profile's own table, where the tunnel is the way out.
+///
+/// Restoration is keyed on this profile's exact mark, so no foreign mark — the
+/// user's own routing classes, tailscale — is ever touched.
 pub fn install_ruleset(profile: &str, slice: &CgroupSlice, mark: u32) -> Result<String> {
     let chain = chain_name(profile)?;
+    let restore = restore_chain_name(profile)?;
+    let comment = quote(&format!("oxidom profile {profile}"))?;
     Ok(format!(
         "add table inet oxidom\n\
          add chain inet oxidom {chain} {{ type route hook output priority mangle; policy accept; }}\n\
          flush chain inet oxidom {chain}\n\
-         add rule inet oxidom {chain} socket cgroupv2 level {} {} meta mark set {mark:#x} comment {}\n",
+         add rule inet oxidom {chain} socket cgroupv2 level {} {} counter meta mark set {mark:#x} ct mark set {mark:#x} comment {comment}\n\
+         add chain inet oxidom {restore} {{ type filter hook prerouting priority mangle; policy accept; }}\n\
+         flush chain inet oxidom {restore}\n\
+         add rule inet oxidom {restore} ct mark {mark:#x} counter meta mark set {mark:#x} comment {comment}\n",
         slice.level,
         quote(&slice.path)?,
-        quote(&format!("oxidom profile {profile}"))?
     ))
 }
 
@@ -109,11 +134,15 @@ pub fn install_ruleset(profile: &str, slice: &CgroupSlice, mark: u32) -> Result<
 /// retained as oxidom's private container for other live profile chains.
 pub fn remove_ruleset(profile: &str) -> Result<String> {
     let chain = chain_name(profile)?;
+    let restore = restore_chain_name(profile)?;
     Ok(format!(
         "add table inet oxidom\n\
          add chain inet oxidom {chain} {{ type route hook output priority mangle; policy accept; }}\n\
          flush chain inet oxidom {chain}\n\
-         destroy chain inet oxidom {chain}\n"
+         destroy chain inet oxidom {chain}\n\
+         add chain inet oxidom {restore} {{ type filter hook prerouting priority mangle; policy accept; }}\n\
+         flush chain inet oxidom {restore}\n\
+         destroy chain inet oxidom {restore}\n"
     ))
 }
 
@@ -122,7 +151,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn install_is_one_atomic_profile_rule_in_a_route_chain() {
+    fn install_marks_on_the_way_out_and_restores_on_the_way_back() {
         let slice = crate::run::user_slice("work", 1000).unwrap();
         let ruleset = install_ruleset("work", &slice, 0x6f21).unwrap();
         assert_eq!(
@@ -131,10 +160,34 @@ mod tests {
              add chain inet oxidom profile_work { type route hook output priority mangle; policy accept; }\n\
              flush chain inet oxidom profile_work\n\
              add rule inet oxidom profile_work socket cgroupv2 level 4 \
-             \"user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice\" meta mark set \
-             0x6f21 comment \"oxidom profile work\"\n"
+             \"user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice\" counter meta mark \
+             set 0x6f21 ct mark set 0x6f21 comment \"oxidom profile work\"\n\
+             add chain inet oxidom restore_work { type filter hook prerouting priority mangle; policy accept; }\n\
+             flush chain inet oxidom restore_work\n\
+             add rule inet oxidom restore_work ct mark 0x6f21 counter meta mark set 0x6f21 comment \
+             \"oxidom profile work\"\n"
         );
         assert_eq!(ruleset.matches("socket cgroupv2").count(), 1);
+    }
+
+    /// Restoration has to reach the packet before the reverse path is checked,
+    /// and it must never widen beyond this profile: a bare `meta mark set ct
+    /// mark` would rewrite the mark of every foreign flow on the box.
+    #[test]
+    fn restoration_runs_before_rpfilter_and_only_for_this_profiles_mark() {
+        let slice = crate::run::user_slice("work", 1000).unwrap();
+        let ruleset = install_ruleset("work", &slice, 0x6f21).unwrap();
+        // NixOS puts its reverse path check at `mangle + 10`; ours must be earlier,
+        // and later than conntrack at -200 or `ct mark` would not be readable yet.
+        assert!(
+            ruleset.contains("hook prerouting priority mangle;"),
+            "{ruleset}"
+        );
+        assert!(
+            ruleset.contains("restore_work ct mark 0x6f21 counter meta mark set 0x6f21"),
+            "{ruleset}"
+        );
+        assert!(!ruleset.contains("meta mark set ct mark"), "{ruleset}");
     }
 
     /// The cgroup path systemd creates carries `\x2d`, and nft resolves the
@@ -155,11 +208,15 @@ mod tests {
         assert!(quote("a\nb").is_err());
     }
 
+    /// Both chains go, or a restored mark outlives the tunnel it belonged to.
     #[test]
-    fn removal_only_destroys_the_profiles_own_chain() {
+    fn removal_destroys_both_of_the_profiles_chains_and_nothing_else() {
         let ruleset = remove_ruleset("work").unwrap();
         assert!(ruleset.contains("destroy chain inet oxidom profile_work"));
+        assert!(ruleset.contains("destroy chain inet oxidom restore_work"));
         assert!(!ruleset.contains("profile_home"));
+        assert!(!ruleset.contains("flush ruleset"));
+        assert!(!ruleset.contains("destroy table"));
     }
 
     /// A chain name is an nft identifier, and identifiers are bare words —
