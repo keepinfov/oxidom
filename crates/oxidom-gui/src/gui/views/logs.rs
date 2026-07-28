@@ -9,8 +9,13 @@ type ClearCallback = Rc<dyn Fn()>;
 #[derive(Clone)]
 pub struct LogsView {
     pub root: gtk::Box,
-    scrolled: gtk::ScrolledWindow,
+    text: gtk::TextView,
     buffer: gtk::TextBuffer,
+    /// Right-gravity mark kept at the end of the buffer. Scrolling to a mark
+    /// lets GtkTextView defer the scroll until it has laid the new text out;
+    /// driving the adjustment directly means guessing at a height it has not
+    /// computed yet.
+    bottom: gtk::TextMark,
     copy: gtk::Button,
     clear: gtk::Button,
     follow: gtk::Button,
@@ -131,10 +136,13 @@ impl LogsView {
             }
         });
 
+        let bottom = buffer.create_mark(Some("bottom"), &buffer.end_iter(), false);
+
         Self {
             root,
-            scrolled,
+            text,
             buffer,
+            bottom,
             copy,
             clear,
             follow,
@@ -160,31 +168,40 @@ impl LogsView {
             visible_after_clear(logs, &mut cleared_prefix)
         };
         let value = visible.join("\n");
-        if *self.visible_text.borrow() == value {
+        let previous = std::mem::replace(&mut *self.visible_text.borrow_mut(), value.clone());
+        if previous == value {
             return;
         }
-        *self.visible_text.borrow_mut() = value.clone();
         self.copy.set_sensitive(!value.is_empty());
         self.clear.set_sensitive(!value.is_empty());
 
-        let rendered = if value.is_empty() {
-            "No Xray output yet."
-        } else {
-            &value
-        };
         let should_follow = self.following.get();
-        self.updating_scroll.set(should_follow);
-        self.buffer.set_text(rendered);
-        if should_follow {
-            let adjustment = self.scrolled.vadjustment();
-            let updating_scroll = self.updating_scroll.clone();
-            let follow = self.follow.clone();
-            glib::idle_add_local_once(move || {
-                scroll_to_bottom(&adjustment);
-                updating_scroll.set(false);
-                follow.set_visible(false);
-            });
+        self.updating_scroll.set(true);
+
+        // Append when the log only grew, which is what a ring buffer polled
+        // twice a second almost always does. `set_text` drops the entire
+        // buffer: the view's height collapses, the scroll position is clamped
+        // to the top, and the follow-up scroll drags it back down a frame
+        // later. That round trip is the flick to the beginning on every new
+        // line — avoided here rather than papered over.
+        match value.strip_prefix(&previous) {
+            Some(suffix) if !previous.is_empty() && !value.is_empty() => {
+                self.buffer.insert(&mut self.buffer.end_iter(), suffix);
+            }
+            _ => self.buffer.set_text(if value.is_empty() {
+                "No Xray output yet."
+            } else {
+                &value
+            }),
         }
+
+        if should_follow {
+            self.buffer.move_mark(&self.bottom, &self.buffer.end_iter());
+            self.text.scroll_to_mark(&self.bottom, 0.0, true, 0.0, 1.0);
+            self.follow.set_visible(false);
+        }
+        let updating_scroll = self.updating_scroll.clone();
+        glib::idle_add_local_once(move || updating_scroll.set(false));
     }
 }
 
