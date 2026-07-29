@@ -861,6 +861,58 @@ impl ServersView {
                 view.save_as_group_dialog(None);
             }
         });
+        // Managing the selected group belongs here rather than behind a
+        // right-click on its chip: this popover is already where the scope is
+        // worked on, and a group that can be created but never renamed or
+        // deleted is a trap.
+        if let Some(group) = self.active_group_value() {
+            let manage = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            manage.append(&section_title(&format!("Group “{}”", group.name)));
+            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            spacer.set_hexpand(true);
+            manage.append(&spacer);
+
+            let update = gtk::Button::builder()
+                .label("Update")
+                .tooltip_text("Replace this group with what is shown")
+                .css_classes(["flat"])
+                .build();
+            update.connect_clicked({
+                let view = self.clone();
+                let group = group.clone();
+                move |_| {
+                    view.filter_popover.popdown();
+                    view.save_as_group_dialog(Some(group.clone()));
+                }
+            });
+            manage.append(&update);
+
+            let delete = gtk::Button::builder()
+                .label("Delete")
+                // Favourites is where the star puts things, so removing it
+                // would leave the star with nowhere to go. Emptying it is
+                // always possible, and is what "delete" would have meant.
+                .sensitive(group.id != FAVOURITES_ID)
+                .tooltip_text(if group.id == FAVOURITES_ID {
+                    "Favourites is built in. Unstar its servers to empty it."
+                } else {
+                    "Delete this group. The servers in it are not touched."
+                })
+                .css_classes(["flat", "destructive-action"])
+                .build();
+            delete.connect_clicked({
+                let view = self.clone();
+                let group = group.clone();
+                move |_| {
+                    view.filter_popover.popdown();
+                    view.delete_group_dialog(group.clone());
+                }
+            });
+            manage.append(&delete);
+            content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            content.append(&manage);
+        }
+
         actions.append(&reset);
         actions.append(&create_pool);
         actions.append(&save);
@@ -1062,6 +1114,50 @@ impl ServersView {
                 (count > 0).then(|| (group.name.clone(), count))
             })
             .collect()
+    }
+
+    fn active_group_value(&self) -> Option<ServerGroup> {
+        let id = self.active_group.borrow().clone()?;
+        self.saved_groups
+            .borrow()
+            .iter()
+            .find(|group| group.id == id)
+            .cloned()
+    }
+
+    fn delete_group_dialog(&self, group: ServerGroup) {
+        let parent = self.root.root().and_downcast::<gtk::Window>();
+        let dialog = adw::MessageDialog::new(
+            parent.as_ref(),
+            Some("Delete group?"),
+            Some(&format!(
+                "“{}” will be removed. The servers in it stay where they are.",
+                group.name
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, {
+            let view = self.clone();
+            move |dialog, response| {
+                dialog.close();
+                if response != "delete" {
+                    return;
+                }
+                {
+                    let mut prefs = view.prefs.borrow_mut();
+                    prefs.groups.retain(|saved| saved.id != group.id);
+                    if let Err(error) = prefs.save() {
+                        log::warn!("could not save gui prefs: {error:#}");
+                    }
+                }
+                *view.saved_groups.borrow_mut() = view.prefs.borrow().groups.clone();
+                view.select_group(None);
+            }
+        });
+        dialog.present();
     }
 
     /// Star or unstar one server. Handled here rather than routed through the
