@@ -2188,42 +2188,6 @@ fn exclude_menu(
     list.set_margin_bottom(8);
     list.set_margin_start(8);
     list.set_margin_end(8);
-    // Rows are kept so the search can hide them. A provider with two hundred
-    // nodes turns this list into a scroll hunt otherwise, and the user asked
-    // for exclusions of *specific* servers — which means finding one.
-    let mut rows: Vec<(String, gtk::Widget)> = Vec::new();
-    for (subscription, servers) in &grouped {
-        let heading = section_title(subscription);
-        heading.set_margin_top(6);
-        list.append(&heading);
-        rows.push((subscription.to_lowercase(), heading.upcast::<gtk::Widget>()));
-        for server in servers {
-            let check = gtk::CheckButton::with_label(&server.label);
-            check.set_active(selected.borrow().contains(&server.value));
-            check.connect_toggled({
-                let selected = selected.clone();
-                let value = server.value.clone();
-                let button = button.clone();
-                let view = view.clone();
-                move |check| {
-                    let mut values = selected.borrow_mut();
-                    if check.is_active() {
-                        if !values.contains(&value) {
-                            values.push(value.clone());
-                        }
-                    } else {
-                        values.retain(|selected| selected != &value);
-                    }
-                    button.set_label(&exclude_label(&values));
-                    drop(values);
-                    view.apply_filter();
-                }
-            });
-            list.append(&check);
-            rows.push((server.label.to_lowercase(), check.upcast::<gtk::Widget>()));
-        }
-    }
-
     let scroll = gtk::ScrolledWindow::builder()
         .child(&list)
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -2233,32 +2197,6 @@ fn exclude_menu(
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Find a server")
         .build();
-    search.connect_search_changed(move |entry| {
-        let text = entry.text().trim().to_lowercase();
-        // A subscription heading is shown when it or any of its servers match,
-        // which is why the headings are marked and re-scanned rather than
-        // filtered independently.
-        let mut heading: Option<(gtk::Widget, bool)> = None;
-        for (haystack, row) in &rows {
-            let is_heading = row.is::<gtk::Label>();
-            let matches = text.is_empty() || haystack.contains(&text);
-            if is_heading {
-                if let Some((widget, any)) = heading.take() {
-                    widget.set_visible(any);
-                }
-                heading = Some((row.clone(), matches));
-                continue;
-            }
-            row.set_visible(matches);
-            if matches && let Some((_, any)) = heading.as_mut() {
-                *any = true;
-            }
-        }
-        if let Some((widget, any)) = heading {
-            widget.set_visible(any);
-        }
-    });
-
     let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
     content.set_margin_top(6);
     content.set_margin_bottom(6);
@@ -2266,7 +2204,83 @@ fn exclude_menu(
     content.set_margin_end(6);
     content.append(&search);
     content.append(&scroll);
-    button.set_popover(Some(&gtk::Popover::builder().child(&content).build()));
+    let popover = gtk::Popover::builder().child(&content).build();
+
+    // Filled when the menu is first opened, not when it is built. The other
+    // three filters offer a handful of choices; this one offers a checkbox per
+    // server, and the popover is rebuilt every time a chip or a quick filter
+    // writes into the rows around it. Building two hundred widgets each of
+    // those times, for a menu most sessions never open, is pure waste.
+    let filled = Rc::new(Cell::new(false));
+    popover.connect_show({
+        let button = button.clone();
+        move |_| {
+            if filled.replace(true) {
+                return;
+            }
+            // Rows are kept so the search can hide them. A provider with two
+            // hundred nodes turns this list into a scroll hunt otherwise, and the
+            // user asked to exclude *specific* servers — which means finding one.
+            let mut rows: Vec<(String, gtk::Widget)> = Vec::new();
+            for (subscription, servers) in &grouped {
+                let heading = section_title(subscription);
+                heading.set_margin_top(6);
+                list.append(&heading);
+                rows.push((subscription.to_lowercase(), heading.upcast::<gtk::Widget>()));
+                for server in servers {
+                    let check = gtk::CheckButton::with_label(&server.label);
+                    check.set_active(selected.borrow().contains(&server.value));
+                    check.connect_toggled({
+                        let selected = selected.clone();
+                        let value = server.value.clone();
+                        let button = button.clone();
+                        let view = view.clone();
+                        move |check| {
+                            let mut values = selected.borrow_mut();
+                            if check.is_active() {
+                                if !values.contains(&value) {
+                                    values.push(value.clone());
+                                }
+                            } else {
+                                values.retain(|selected| selected != &value);
+                            }
+                            button.set_label(&exclude_label(&values));
+                            drop(values);
+                            view.apply_filter();
+                        }
+                    });
+                    list.append(&check);
+                    rows.push((server.label.to_lowercase(), check.upcast::<gtk::Widget>()));
+                }
+            }
+            search.connect_search_changed(move |entry| {
+                let text = entry.text().trim().to_lowercase();
+                // A subscription heading is shown when it or any of its servers
+                // match, which is why the headings are marked and re-scanned
+                // rather than filtered independently.
+                let mut heading: Option<(gtk::Widget, bool)> = None;
+                for (haystack, row) in &rows {
+                    let is_heading = row.is::<gtk::Label>();
+                    let matches = text.is_empty() || haystack.contains(&text);
+                    if is_heading {
+                        if let Some((widget, any)) = heading.take() {
+                            widget.set_visible(any);
+                        }
+                        heading = Some((row.clone(), matches));
+                        continue;
+                    }
+                    row.set_visible(matches);
+                    if matches && let Some((_, any)) = heading.as_mut() {
+                        *any = true;
+                    }
+                }
+                if let Some((widget, any)) = heading {
+                    widget.set_visible(any);
+                }
+            });
+        }
+    });
+    button.set_popover(Some(&popover));
     button
 }
 
