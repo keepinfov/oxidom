@@ -692,6 +692,54 @@ pub(super) fn available_subscriptions(groups: &[Subscription]) -> Vec<FilterOpti
         .collect()
 }
 
+/// Apply a saved display order to the daemon's subscription list.
+///
+/// The saved order is advisory, not authoritative: ids it does not mention keep
+/// their natural position *after* the ones it does, and ids it mentions that no
+/// longer exist are dropped. A subscription added since the order was saved
+/// therefore appears at the end rather than vanishing.
+pub(super) fn ordered_subscriptions(
+    groups: &[Subscription],
+    order: &[String],
+) -> Vec<Subscription> {
+    let mut remaining: Vec<Option<Subscription>> = groups.iter().cloned().map(Some).collect();
+    let mut ordered = Vec::with_capacity(groups.len());
+    for id in order {
+        if let Some(slot) = remaining
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|group| &group.id == id))
+            && let Some(group) = slot.take()
+        {
+            ordered.push(group);
+        }
+    }
+    ordered.extend(remaining.into_iter().flatten());
+    ordered
+}
+
+/// The order after moving `id` by `delta` positions within `visible`.
+///
+/// Takes the currently displayed order rather than the stored one so the result
+/// is always a complete, self-consistent order — storing a partial one is how a
+/// later move against a stale list would reshuffle groups the user never
+/// touched. Out-of-range moves are a no-op, so the callers can wire the buttons
+/// unconditionally and let the ends of the list clamp themselves.
+pub(super) fn moved_subscription(visible: &[String], id: &str, delta: isize) -> Vec<String> {
+    let mut order = visible.to_vec();
+    let Some(from) = order.iter().position(|value| value == id) else {
+        return order;
+    };
+    let Some(to) = from
+        .checked_add_signed(delta)
+        .filter(|to| *to < order.len())
+    else {
+        return order;
+    };
+    let group = order.remove(from);
+    order.insert(to, group);
+    order
+}
+
 /// Turn what the filter widgets show into the exact query used for both the
 /// list and a newly created profile.
 ///
@@ -1552,6 +1600,52 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn saved_order_leads_and_unknown_subscriptions_keep_their_natural_place() {
+        let groups = vec![
+            filter_group("main", "Main", &[]),
+            filter_group("backup", "Backup", &[]),
+            filter_group("fresh", "Fresh", &[]),
+        ];
+        let ids = |groups: &[Subscription]| {
+            groups
+                .iter()
+                .map(|group| group.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A saved order that predates "fresh" still ranks the two it knows, and
+        // leaves the newcomer at the end instead of dropping it.
+        assert_eq!(
+            ids(&ordered_subscriptions(
+                &groups,
+                &["backup".to_string(), "main".to_string()]
+            )),
+            ["backup", "main", "fresh"]
+        );
+        // An id for a subscription that has since been removed is ignored.
+        assert_eq!(
+            ids(&ordered_subscriptions(
+                &groups,
+                &["gone".to_string(), "fresh".to_string()]
+            )),
+            ["fresh", "main", "backup"]
+        );
+        assert_eq!(ids(&ordered_subscriptions(&groups, &[])), ids(&groups));
+    }
+
+    #[test]
+    fn moving_a_subscription_clamps_at_both_ends() {
+        let visible = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        assert_eq!(moved_subscription(&visible, "c", -1), ["a", "c", "b"]);
+        assert_eq!(moved_subscription(&visible, "a", 1), ["b", "a", "c"]);
+        // Already first/last, and an id that is not in the list at all.
+        assert_eq!(moved_subscription(&visible, "a", -1), ["a", "b", "c"]);
+        assert_eq!(moved_subscription(&visible, "c", 1), ["a", "b", "c"]);
+        assert_eq!(moved_subscription(&visible, "d", -1), ["a", "b", "c"]);
     }
 
     #[test]

@@ -13,7 +13,8 @@ use super::super::group::subscription_description;
 use super::super::prefs::GuiPrefs;
 use super::super::reduce::{
     FilterOption, ServerProfiles, available_countries, available_protocols,
-    available_subscriptions, filtered_ids, filters_to_query,
+    available_subscriptions, filtered_ids, filters_to_query, moved_subscription,
+    ordered_subscriptions,
 };
 use super::super::server_card::{
     CARD_MEASURE_WIDTH, COMPACT_CARD_HEIGHT, CardConnectionState, LatencyState, ServerCard,
@@ -61,6 +62,9 @@ pub struct CardCallbacks {
 /// filter, sort, column-count change), never on selection.
 #[derive(Clone)]
 struct GroupUi {
+    /// Subscription id. The group's own actions address it by id rather than by
+    /// position, because reordering moves the position out from under them.
+    id: String,
     root: gtk::Widget,
     columns_box: gtk::Box,
     column_boxes: Rc<RefCell<Vec<gtk::Box>>>,
@@ -222,6 +226,12 @@ impl ServersView {
         latency_states: &HashMap<String, LatencyState>,
         callbacks: CardCallbacks,
     ) {
+        // The daemon's order is the subscriptions' creation order; the user's
+        // arrangement is a display preference layered on top of it, so every
+        // rebuild re-applies it rather than the widget order being the only
+        // record of it.
+        let ordered = ordered_subscriptions(subscriptions, &self.prefs.borrow().subscription_order);
+        let subscriptions = &ordered[..];
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
@@ -267,7 +277,7 @@ impl ServersView {
         self.content
             .append(&self.filter_bar(subscriptions, callbacks.create_pool.clone()));
 
-        for (index, subscription) in subscriptions.iter().enumerate() {
+        for subscription in subscriptions {
             let heading = gtk::Label::builder()
                 .label(&subscription.name)
                 .xalign(0.0)
@@ -320,8 +330,17 @@ impl ServersView {
             sort.update_property(&[gtk::accessible::Property::Label("Sort by latency")]);
             sort.connect_clicked({
                 let view = self.clone();
-                move |_| view.sort_group(index)
+                let subscription_id = subscription.id.clone();
+                move |_| view.sort_group(&subscription_id)
             });
+            let reorder = gtk::MenuButton::builder()
+                .icon_name("view-more-symbolic")
+                .tooltip_text("Move this group")
+                .valign(gtk::Align::Center)
+                .css_classes(["flat", "circular", "server-action"])
+                .build();
+            reorder.update_property(&[gtk::accessible::Property::Label("Move this group")]);
+            reorder.set_popover(Some(&self.reorder_popover(&subscription.id)));
             let collapsed = Rc::new(Cell::new(
                 self.prefs
                     .borrow()
@@ -337,13 +356,6 @@ impl ServersView {
             collapse_toggle.update_property(&[gtk::accessible::Property::Label(collapse_tooltip(
                 collapsed.get(),
             ))]);
-            let name_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            name_row.set_hexpand(true);
-            name_row.append(&heading);
-            name_row.append(&update);
-            name_row.append(&speed);
-            name_row.append(&sort);
-            name_row.append(&collapse_toggle);
 
             let description = gtk::Label::builder()
                 .label(subscription_description(subscription))
@@ -355,12 +367,30 @@ impl ServersView {
                 .build();
             let title_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
             title_box.set_hexpand(true);
-            title_box.append(&name_row);
+            title_box.append(&heading);
             title_box.append(&description);
+            // The name and the quota line are the group's whole width minus four
+            // icon buttons, and hitting a 24px chevron to fold a group away was
+            // the only way to do it. They become the expander instead; the
+            // chevron stays because it is what says the group folds at all.
+            let title_toggle = gtk::Button::builder()
+                .child(&title_box)
+                .hexpand(true)
+                .css_classes(["flat", "subscription-toggle"])
+                .build();
+
+            let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            actions.set_valign(gtk::Align::Center);
+            actions.append(&update);
+            actions.append(&speed);
+            actions.append(&sort);
+            actions.append(&reorder);
+            actions.append(&collapse_toggle);
 
             let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             header.set_hexpand(true);
-            header.append(&title_box);
+            header.append(&title_toggle);
+            header.append(&actions);
 
             let columns_box = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
@@ -369,20 +399,26 @@ impl ServersView {
                 .hexpand(true)
                 .visible(!collapsed.get())
                 .build();
-            collapse_toggle.connect_clicked({
+            // One toggle behind two widgets, so the chevron and the title can
+            // never disagree about whether the group is folded.
+            let toggle: Rc<dyn Fn()> = {
                 let collapsed = collapsed.clone();
                 let columns_box = columns_box.clone();
+                let collapse_toggle = collapse_toggle.clone();
+                let title_toggle = title_toggle.clone();
                 let prefs = self.prefs.clone();
                 let subscription_id = subscription.id.clone();
-                move |button| {
+                Rc::new(move || {
                     let now_collapsed = !collapsed.get();
                     collapsed.set(now_collapsed);
                     columns_box.set_visible(!now_collapsed);
-                    button.set_icon_name(collapse_icon(now_collapsed));
-                    button.set_tooltip_text(Some(collapse_tooltip(now_collapsed)));
-                    button.update_property(&[gtk::accessible::Property::Label(collapse_tooltip(
-                        now_collapsed,
-                    ))]);
+                    collapse_toggle.set_icon_name(collapse_icon(now_collapsed));
+                    collapse_toggle.set_tooltip_text(Some(collapse_tooltip(now_collapsed)));
+                    collapse_toggle.update_property(&[gtk::accessible::Property::Label(
+                        collapse_tooltip(now_collapsed),
+                    )]);
+                    title_toggle
+                        .update_state(&[gtk::accessible::State::Expanded(Some(!now_collapsed))]);
                     let mut prefs = prefs.borrow_mut();
                     if now_collapsed {
                         prefs
@@ -394,8 +430,14 @@ impl ServersView {
                     if let Err(error) = prefs.save() {
                         log::warn!("could not save gui prefs: {error:#}");
                     }
-                }
+                })
+            };
+            title_toggle.update_state(&[gtk::accessible::State::Expanded(Some(!collapsed.get()))]);
+            title_toggle.connect_clicked({
+                let toggle = toggle.clone();
+                move |_| toggle()
             });
+            collapse_toggle.connect_clicked(move |_| toggle());
 
             let mut group_cards: Vec<(String, gtk::Widget)> = Vec::new();
             for server in &subscription.servers {
@@ -481,6 +523,7 @@ impl ServersView {
             group.append(&columns_box);
             self.content.append(&group);
             let group_ui = GroupUi {
+                id: subscription.id.clone(),
                 root: group.upcast::<gtk::Widget>(),
                 columns_box,
                 column_boxes: Rc::new(RefCell::new(Vec::new())),
@@ -888,10 +931,91 @@ impl ServersView {
         });
     }
 
+    /// Move a subscription group one slot up (`-1`) or down (`1`).
+    ///
+    /// Reorders the widgets in place instead of rebuilding: a rebuild would
+    /// throw away every card's expansion, latency badge and running animation
+    /// to express a change that is three `reorder_child_after` calls.
+    fn move_group(&self, subscription_id: &str, delta: isize) {
+        let visible: Vec<String> = self
+            .groups
+            .borrow()
+            .iter()
+            .map(|group| group.id.clone())
+            .collect();
+        let order = moved_subscription(&visible, subscription_id, delta);
+        if order == visible {
+            return;
+        }
+
+        {
+            let mut groups = self.groups.borrow_mut();
+            groups.sort_by_key(|group| {
+                order
+                    .iter()
+                    .position(|id| id == &group.id)
+                    .unwrap_or(usize::MAX)
+            });
+            // `content` also holds the filter bar (first) and the "no matches"
+            // page (last); re-seating the groups after the filter bar in order
+            // leaves both where they belong.
+            let mut previous = self.content.first_child();
+            for group in groups.iter() {
+                self.content
+                    .reorder_child_after(&group.root, previous.as_ref());
+                previous = Some(group.root.clone());
+            }
+        }
+
+        let mut prefs = self.prefs.borrow_mut();
+        prefs.subscription_order = order;
+        if let Err(error) = prefs.save() {
+            log::warn!("could not save gui prefs: {error:#}");
+        }
+    }
+
+    fn reorder_popover(&self, subscription_id: &str) -> gtk::Popover {
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        list.set_margin_top(6);
+        list.set_margin_bottom(6);
+        list.set_margin_start(6);
+        list.set_margin_end(6);
+        let popover = gtk::Popover::builder().child(&list).build();
+        for (label, icon, delta) in [
+            ("Move up", "go-up-symbolic", -1_isize),
+            ("Move down", "go-down-symbolic", 1),
+        ] {
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            content.append(&gtk::Image::from_icon_name(icon));
+            content.append(&gtk::Label::new(Some(label)));
+            let button = gtk::Button::builder()
+                .child(&content)
+                .css_classes(["flat"])
+                .build();
+            button.connect_clicked({
+                let view = self.clone();
+                let subscription_id = subscription_id.to_string();
+                let popover = popover.clone();
+                move |_| {
+                    popover.popdown();
+                    view.move_group(&subscription_id, delta);
+                }
+            });
+            list.append(&button);
+        }
+        popover
+    }
+
     /// Manually capture and apply a latency order. Later measurements update only
     /// their badges until the user presses sort again.
-    pub fn sort_group(&self, index: usize) {
-        let Some(group) = self.groups.borrow().get(index).cloned() else {
+    pub fn sort_group(&self, subscription_id: &str) {
+        let Some(group) = self
+            .groups
+            .borrow()
+            .iter()
+            .find(|group| group.id == subscription_id)
+            .cloned()
+        else {
             return;
         };
         let sorted = sorted_by_latency(&group.display_order.borrow(), &self.latencies.borrow());

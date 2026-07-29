@@ -208,6 +208,11 @@ pub struct ServerCard {
     /// every card every 15 s, so without this the whole grid would re-fade on
     /// each pass for the handful of badges that actually changed.
     last_latency: Rc<Cell<LatencyState>>,
+    last_connection: Rc<Cell<CardConnectionState>>,
+    /// Whether the badge is hidden because the number predates a failed connect
+    /// attempt. Cleared by the next measurement, not by time — see
+    /// [`ServerCard::set_latency_state`].
+    latency_predates_failure: Rc<Cell<bool>>,
     latency_generation: Rc<Cell<u64>>,
     height_generation: Rc<Cell<u64>>,
 }
@@ -514,6 +519,8 @@ impl ServerCard {
             connect_button,
             expanded,
             last_latency: Rc::new(Cell::new(latency_state)),
+            last_connection: Rc::new(Cell::new(CardConnectionState::Disconnected)),
+            latency_predates_failure: Rc::new(Cell::new(false)),
             latency_generation: Rc::new(Cell::new(0)),
             height_generation: Rc::new(Cell::new(0)),
         };
@@ -523,6 +530,16 @@ impl ServerCard {
     }
 
     pub fn set_latency_state(&self, state: LatencyState) {
+        // A card left over from a failed attempt hides its badge, because the
+        // only number it had was taken before the attempt. Anything arriving
+        // now was taken after it, so the reason to hide it is gone — and
+        // re-checking a failed server is the one way to find out it recovered.
+        if self.last_connection.get() == CardConnectionState::Failed
+            && !matches!(state, LatencyState::Unmeasured | LatencyState::Superseded)
+        {
+            self.latency_predates_failure.set(false);
+            self.latency_display.set_visible(true);
+        }
         let previous = self.last_latency.replace(state);
         if previous == state {
             return;
@@ -649,6 +666,16 @@ impl ServerCard {
     }
 
     pub fn set_connection_state(&self, state: CardConnectionState) {
+        // Entering the failed state is what makes the current number stale, not
+        // being in it: a re-check while the card still says "Failed" clears
+        // this again, and the poll re-asserting the same state must not undo
+        // that.
+        let previous = self.last_connection.replace(state);
+        if state != CardConnectionState::Failed {
+            self.latency_predates_failure.set(false);
+        } else if previous != CardConnectionState::Failed {
+            self.latency_predates_failure.set(true);
+        }
         self.connect_button.remove_css_class("suggested-action");
         self.connect_button.remove_css_class("destructive-action");
         self.status.remove_css_class("status-working");
@@ -717,11 +744,13 @@ impl ServerCard {
                 self.status.set_label("Failed");
                 self.status.add_css_class("status-error");
                 self.status.set_visible(true);
-                // The badge stays hidden here even though it does for no other
-                // state: the only number this card can have is a direct one
-                // taken before the attempt, and offering it beside "Failed"
-                // reads as "the tunnel is fine, 84 ms" — the exact lie.
-                self.latency_display.set_visible(false);
+                // A number taken *before* the attempt reads beside "Failed" as
+                // "the tunnel is fine, 84 ms" — the exact lie — so it stays
+                // hidden. A number taken after it is the opposite: it is how
+                // the user finds out the server came back, so re-checking
+                // brings the badge straight back.
+                self.latency_display
+                    .set_visible(!self.latency_predates_failure.get());
                 self.connect_button.set_label("Reconnect");
                 self.connect_button.add_css_class("suggested-action");
                 self.root.remove_css_class("active-server");

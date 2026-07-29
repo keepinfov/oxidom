@@ -15,6 +15,10 @@ pub struct GuiPrefs {
     /// Subscription ids whose server-card grid is collapsed on the Servers
     /// page.
     pub collapsed_subscriptions: HashSet<String>,
+    /// Subscription ids in the order the user arranged them. Advisory: ids the
+    /// daemon no longer knows are ignored, and subscriptions added since are
+    /// appended. See `reduce::ordered_subscriptions`.
+    pub subscription_order: Vec<String>,
 }
 
 impl GuiPrefs {
@@ -37,11 +41,14 @@ impl GuiPrefs {
             .iter()
             .map(|subscription| subscription.id.as_str())
             .collect();
-        let before = prefs.collapsed_subscriptions.len();
+        let before = prefs.collapsed_subscriptions.len() + prefs.subscription_order.len();
         prefs
             .collapsed_subscriptions
             .retain(|subscription_id| current.contains(subscription_id.as_str()));
-        if prefs.collapsed_subscriptions.len() != before
+        prefs
+            .subscription_order
+            .retain(|subscription_id| current.contains(subscription_id.as_str()));
+        if prefs.collapsed_subscriptions.len() + prefs.subscription_order.len() != before
             && let Err(error) = prefs.save()
         {
             log::warn!("could not discard stale gui prefs: {error:#}");

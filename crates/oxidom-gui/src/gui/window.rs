@@ -154,6 +154,7 @@ struct Controller {
     header_status_label: gtk::Label,
     header_status_spinner: gtk::Spinner,
     profile_switcher: gtk::MenuButton,
+    profile_switcher_label: gtk::Label,
     profile_switcher_popover: gtk::Popover,
     profile_switcher_list: gtk::ListBox,
     /// Items the popover's rows were built from, so a poll that changed
@@ -562,12 +563,26 @@ fn build(
     let profile_switcher_popover = gtk::Popover::builder()
         .child(&profile_switcher_list)
         .build();
-    let profile_switcher = gtk::MenuButton::builder()
+    // A `MenuButton` label is a plain non-ellipsizing GtkLabel, so a profile
+    // named anything long became the window's minimum width and the header
+    // simply refused to shrink past it. An explicit child gives the name an
+    // ellipsis and a ceiling, and the chevron the button would have drawn
+    // itself is drawn here instead.
+    let profile_switcher_label = gtk::Label::builder()
         .label("default")
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(12)
+        .xalign(0.0)
+        .build();
+    let profile_switcher_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    profile_switcher_content.append(&profile_switcher_label);
+    profile_switcher_content.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+    let profile_switcher = gtk::MenuButton::builder()
         .tooltip_text("Choose profile")
         .visible(false)
         .css_classes(["profile-switcher"])
         .build();
+    profile_switcher.set_child(Some(&profile_switcher_content));
     profile_switcher.set_popover(Some(&profile_switcher_popover));
     profile_switcher.update_property(&[gtk::accessible::Property::Label(
         "Choose connection profile",
@@ -635,6 +650,7 @@ fn build(
         .content(&toasts)
         .build();
     set_window_icon(&window);
+    drop_focus_on_outside_click(&window);
 
     let controller = Rc::new(Controller {
         window: window.clone(),
@@ -654,6 +670,7 @@ fn build(
         header_status_label,
         header_status_spinner,
         profile_switcher,
+        profile_switcher_label,
         profile_switcher_popover,
         profile_switcher_list,
         profile_switcher_shown: RefCell::new(Vec::new()),
@@ -746,6 +763,51 @@ fn build(
     controller.reconcile_system_proxy();
     controller.sync_connection_cards();
     window
+}
+
+/// Let a click anywhere outside a text field give up that field's focus.
+///
+/// GTK keeps an entry focused until something else takes focus, and most of
+/// this window is buttons and cards, which take none. So a search box or an
+/// alias field stayed lit and kept swallowing the keyboard long after the user
+/// had moved on, with no way back other than Escape or Tab.
+///
+/// Runs in the capture phase and never claims the sequence, so the widget that
+/// was actually clicked still gets the same click it always did. Only text
+/// widgets are dropped — anything else keeps its focus, or keyboard navigation
+/// would be unusable.
+fn drop_focus_on_outside_click(window: &adw::ApplicationWindow) {
+    let click = gtk::GestureClick::new();
+    click.set_button(0);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.connect_pressed({
+        let window = window.downgrade();
+        move |_, _, x, y| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let Some(focused) = gtk::prelude::GtkWindowExt::focus(&window) else {
+                return;
+            };
+            // `GtkEditable` covers the whole family in one test — GtkText, the
+            // entries that delegate to it, and libadwaita's `AdwEntryRow`.
+            if !focused.is::<gtk::Editable>() && !focused.is::<gtk::TextView>() {
+                return;
+            }
+            // A click on the entry itself arrives as its inner `GtkText`, and a
+            // click on the frame around it as the `GtkEntry` that owns it —
+            // hence both directions of the ancestry test.
+            let inside = window
+                .pick(x, y, gtk::PickFlags::DEFAULT)
+                .is_some_and(|hit| {
+                    hit == focused || hit.is_ancestor(&focused) || focused.is_ancestor(&hit)
+                });
+            if !inside {
+                gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+            }
+        }
+    });
+    window.add_controller(click);
 }
 
 fn set_window_icon(window: &adw::ApplicationWindow) {
@@ -1398,7 +1460,11 @@ impl Controller {
             )
         };
         self.profile_switcher.set_visible(visible);
-        self.profile_switcher.set_label(&selected_profile);
+        self.profile_switcher_label.set_label(&selected_profile);
+        // The name can be elided down to an ellipsis, so the full one has to be
+        // reachable somewhere.
+        self.profile_switcher
+            .set_tooltip_text(Some(&format!("Profile: {selected_profile}")));
 
         // The poll calls this twice a second. Rebuilding the popover's rows
         // while the user has it open destroys the row they are reaching for,
@@ -3326,6 +3392,10 @@ fn install_css() {
         button.flat { min-height: 24px; font-weight: normal; }
         button.pill { font-weight: 500; }
         button.slim-pill { min-height: 24px; padding: 2px 16px; }
+        /* The group title doubles as the expander, so it needs a button's hover
+           feedback without a button's indent: the negative margin puts the text
+           back on the same vertical line as the cards underneath it. */
+        button.subscription-toggle { padding: 2px 8px; margin-left: -8px; border-radius: 10px; min-height: 0; }
         .server-filter-bar { padding: 0 0 2px; }
         .server-filter-bar > flowboxchild { padding: 0; }
         menubutton.filter-menu > button { min-height: 30px; padding: 3px 12px; border-radius: 999px; }
