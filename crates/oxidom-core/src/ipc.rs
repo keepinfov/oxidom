@@ -120,6 +120,9 @@ pub struct SessionInfo {
 pub struct SelectionInfo {
     /// "server" | "pool"
     pub kind: String,
+    /// What the user calls this pool, empty when it has no name or the
+    /// selection is a single server. Cosmetic: it never selects anything.
+    pub name: String,
     pub strategy: String,
     pub members: Vec<PoolMember>,
     pub selecting: Option<String>,

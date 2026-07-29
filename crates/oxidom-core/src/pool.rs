@@ -49,10 +49,41 @@ impl Strategy {
     }
 }
 
+/// What a pool is made of: either an explicit list of servers, or a rule that
+/// keeps matching as subscriptions change.
+///
+/// The distinction is the user's, not an implementation detail. A rule cannot
+/// be looked at — to know what is in "Europe" you have to run it in your head
+/// against every subscription — and it *grows*: a server added by tomorrow's
+/// refresh joins on its own. A list can be counted, and it never gains a member
+/// without being edited. Losing one is fine and expected; that is just a server
+/// going away.
+///
+/// Freezing a list as "every filter off, plus every other server excluded"
+/// looks equivalent and is not: a server that did not exist when the list was
+/// frozen is in nobody's exclusions, so it would silently join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolKind {
+    List,
+    Rule,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PoolQuery {
+    /// What the user calls this pool. Carried so `oxidom status` can say
+    /// `pool "Europe"` instead of six anonymous nodes; it names the pool and
+    /// never selects anything, so renaming one does not make a running session
+    /// stale (see `engine::pool_fingerprint`, which hashes resolved members).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     #[serde(default)]
     pub strategy: Strategy,
+    /// Exact handles — server id or alias — making up a frozen list. Non-empty
+    /// means this pool *is* these servers: the filters below are not consulted,
+    /// and [`Profile::validate`](crate::profile::Profile::validate) rejects a
+    /// pool that sets both rather than quietly ignoring half of it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
     #[serde(default)]
     pub subscriptions: Vec<String>,
     #[serde(default)]
@@ -74,6 +105,23 @@ pub struct PoolQuery {
 }
 
 impl PoolQuery {
+    pub fn kind(&self) -> PoolKind {
+        if self.members.is_empty() {
+            PoolKind::Rule
+        } else {
+            PoolKind::List
+        }
+    }
+
+    /// Whether any filter is set. Only meaningful together with [`Self::kind`]:
+    /// a list that also carries filters is a contradiction, not a refinement.
+    pub fn has_filters(&self) -> bool {
+        !self.subscriptions.is_empty()
+            || !self.countries.is_empty()
+            || !self.protocols.is_empty()
+            || !self.exclude.is_empty()
+    }
+
     pub fn probe_interval_or_default(&self) -> &str {
         if self.probe_interval.is_empty() {
             "5m"
@@ -92,27 +140,50 @@ impl PoolQuery {
     }
 }
 
-/// Resolve a pool without I/O while preserving group and server order.
+/// Resolve a pool without I/O.
+///
+/// A rule preserves group and server order; a list preserves the order the user
+/// arranged it in, which is why `max` truncating it is still meaningful.
 pub fn resolve<'a>(query: &PoolQuery, groups: &'a [Subscription]) -> Result<Vec<&'a Server>> {
-    let mut matches = Vec::new();
+    let mut matches: Vec<&Server> = Vec::new();
 
-    for group in groups {
-        if !group_matches(query, group) {
-            continue;
-        }
-
-        for server in &group.servers {
-            if !server_matches(query, server) {
+    if query.kind() == PoolKind::List {
+        for handle in &query.members {
+            let Some(server) = find_member(handle, groups) else {
+                // Silent for the same reason as below. `missing_members` is the
+                // companion that says it once, where a user can act on it.
                 continue;
-            }
-            // Silent on purpose: this runs on every GUI filter keystroke and on
-            // every daemon poll, so a `warn!` here would be a log flood. The one
-            // place a user can act on it — bringing a pool profile up — says so
-            // once, by comparing the resolved list against the group contents.
+            };
             if matches!(&server.spec, OutboundSpec::XrayProfile { .. }) {
                 continue;
             }
+            // A handle can be listed twice — an alias and the id behind it are
+            // two spellings of one server, and two outbounds would collide on
+            // the `s-<handle>` tag.
+            if matches.iter().any(|kept| kept.id == server.id) {
+                continue;
+            }
             matches.push(server);
+        }
+    } else {
+        for group in groups {
+            if !group_matches(query, group) {
+                continue;
+            }
+
+            for server in &group.servers {
+                if !server_matches(query, server) {
+                    continue;
+                }
+                // Silent on purpose: this runs on every GUI filter keystroke and on
+                // every daemon poll, so a `warn!` here would be a log flood. The one
+                // place a user can act on it — bringing a pool profile up — says so
+                // once, by comparing the resolved list against the group contents.
+                if matches!(&server.spec, OutboundSpec::XrayProfile { .. }) {
+                    continue;
+                }
+                matches.push(server);
+            }
         }
     }
 
@@ -125,11 +196,19 @@ pub fn resolve<'a>(query: &PoolQuery, groups: &'a [Subscription]) -> Result<Vec<
     Ok(matches)
 }
 
-/// Composite profiles that match the query but cannot become pool outbounds.
+/// Composite profiles that the pool names but cannot turn into outbounds.
 ///
 /// `resolve` stays silent because the GUI calls it continuously. Activation
 /// uses this companion once to make the omission visible in the daemon log.
 pub fn excluded_composites<'a>(query: &PoolQuery, groups: &'a [Subscription]) -> Vec<&'a Server> {
+    if query.kind() == PoolKind::List {
+        return query
+            .members
+            .iter()
+            .filter_map(|handle| find_member(handle, groups))
+            .filter(|server| matches!(&server.spec, OutboundSpec::XrayProfile { .. }))
+            .collect();
+    }
     groups
         .iter()
         .filter(|group| group_matches(query, group))
@@ -139,6 +218,32 @@ pub fn excluded_composites<'a>(query: &PoolQuery, groups: &'a [Subscription]) ->
                 && matches!(&server.spec, OutboundSpec::XrayProfile { .. })
         })
         .collect()
+}
+
+/// Handles a frozen list names that no subscription holds any more.
+///
+/// A list is expected to shrink — that is a server going away, not a broken
+/// profile — so this is reported once at activation rather than failing the
+/// pool. Empty for a rule, which has no handles to lose.
+pub fn missing_members<'a>(query: &'a PoolQuery, groups: &[Subscription]) -> Vec<&'a str> {
+    if query.kind() == PoolKind::Rule {
+        return Vec::new();
+    }
+    query
+        .members
+        .iter()
+        .filter(|handle| find_member(handle, groups).is_none())
+        .map(String::as_str)
+        .collect()
+}
+
+/// Exact id or alias, never a substring: a list is what the user picked, and a
+/// prefix match could quietly enrol a server they never chose.
+fn find_member<'a>(handle: &str, groups: &'a [Subscription]) -> Option<&'a Server> {
+    groups
+        .iter()
+        .flat_map(|group| group.servers.iter())
+        .find(|server| server.id == handle || server.alias.as_deref() == Some(handle))
 }
 
 fn group_matches(query: &PoolQuery, group: &Subscription) -> bool {
@@ -177,6 +282,12 @@ fn server_matches(query: &PoolQuery, server: &Server) -> bool {
 }
 
 fn empty_pool_message(query: &PoolQuery) -> String {
+    if query.kind() == PoolKind::List {
+        return format!(
+            "no server is left of the pool's list ({})",
+            query.members.join(", ")
+        );
+    }
     let mut filters = Vec::new();
     if !query.subscriptions.is_empty() {
         filters.push(format!("subscriptions: {}", query.subscriptions.join(", ")));
@@ -200,7 +311,7 @@ fn empty_pool_message(query: &PoolQuery) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{PoolQuery, Strategy, resolve};
+    use super::{PoolKind, PoolQuery, Strategy, excluded_composites, missing_members, resolve};
     use crate::model::{OutboundSpec, Protocol, Server, Subscription};
 
     fn server(id: &str, protocol: Protocol, country: Option<&str>, alias: Option<&str>) -> Server {
@@ -466,6 +577,135 @@ mod tests {
         assert_eq!(
             ids(resolve(&PoolQuery::default(), &groups).unwrap()),
             ["plain"]
+        );
+    }
+
+    #[test]
+    fn a_listed_pool_is_exactly_its_members_in_the_order_they_were_listed() {
+        let groups = vec![
+            group(
+                "main",
+                "Main",
+                vec![
+                    server("id-a", Protocol::Vless, Some("de"), Some("berlin")),
+                    server("id-b", Protocol::Trojan, Some("ch"), None),
+                ],
+            ),
+            group(
+                "backup",
+                "Backup",
+                vec![server("id-c", Protocol::Socks, Some("nl"), None)],
+            ),
+        ];
+        // Handles are ids or aliases, and the pool follows the user's order
+        // rather than the subscriptions' — a list is a list.
+        let query = PoolQuery {
+            members: vec![
+                "id-c".to_string(),
+                "berlin".to_string(),
+                // The same server spelled twice: one outbound, not two, or the
+                // `s-<handle>` tags would collide.
+                "id-a".to_string(),
+                // Gone from every subscription: dropped, not fatal.
+                "id-vanished".to_string(),
+            ],
+            ..PoolQuery::default()
+        };
+
+        assert_eq!(query.kind(), PoolKind::List);
+        assert_eq!(ids(resolve(&query, &groups).unwrap()), ["id-c", "id-a"]);
+        assert_eq!(missing_members(&query, &groups), ["id-vanished"]);
+        // A rule has no handles to lose.
+        assert!(missing_members(&PoolQuery::default(), &groups).is_empty());
+    }
+
+    #[test]
+    fn a_list_ignores_the_filters_and_a_rule_ignores_nothing() {
+        let groups = vec![group(
+            "main",
+            "Main",
+            vec![
+                server("de", Protocol::Vless, Some("de"), None),
+                server("ch", Protocol::Vless, Some("ch"), None),
+            ],
+        )];
+        // `Profile::validate` rejects this combination outright; `resolve` is
+        // the pure function underneath and simply lets the list win, so a
+        // config that slipped through cannot half-apply.
+        let contradictory = PoolQuery {
+            members: vec!["de".to_string()],
+            countries: vec!["ch".to_string()],
+            ..PoolQuery::default()
+        };
+        assert!(contradictory.has_filters());
+        assert_eq!(ids(resolve(&contradictory, &groups).unwrap()), ["de"]);
+
+        let rule = PoolQuery {
+            countries: vec!["ch".to_string()],
+            ..PoolQuery::default()
+        };
+        assert_eq!(rule.kind(), PoolKind::Rule);
+        assert!(!PoolQuery::default().has_filters());
+        assert_eq!(ids(resolve(&rule, &groups).unwrap()), ["ch"]);
+    }
+
+    #[test]
+    fn a_listed_composite_is_skipped_like_a_matched_one() {
+        let groups = vec![group(
+            "all",
+            "All",
+            vec![
+                composite("composite"),
+                server("plain", Protocol::Vless, Some("ch"), None),
+            ],
+        )];
+        let query = PoolQuery {
+            members: vec!["composite".to_string(), "plain".to_string()],
+            ..PoolQuery::default()
+        };
+
+        assert_eq!(ids(resolve(&query, &groups).unwrap()), ["plain"]);
+        assert_eq!(ids(excluded_composites(&query, &groups)), ["composite"]);
+        // Named explicitly and still present, so it is not "missing" — it is
+        // omitted, which is a different sentence in the log.
+        assert!(missing_members(&query, &groups).is_empty());
+    }
+
+    #[test]
+    fn an_empty_list_names_the_handles_that_are_gone() {
+        let groups = vec![group(
+            "all",
+            "All",
+            vec![server("still-here", Protocol::Socks, None, None)],
+        )];
+        let query = PoolQuery {
+            members: vec!["gone-one".to_string(), "gone-two".to_string()],
+            ..PoolQuery::default()
+        };
+
+        assert_eq!(
+            resolve(&query, &groups).unwrap_err().to_string(),
+            "no server is left of the pool's list (gone-one, gone-two)"
+        );
+    }
+
+    #[test]
+    fn a_name_is_a_label_and_never_selects_anything() {
+        let groups = vec![group(
+            "all",
+            "All",
+            vec![server("one", Protocol::Socks, Some("ch"), None)],
+        )];
+        let named = PoolQuery {
+            name: "Europe".to_string(),
+            ..PoolQuery::default()
+        };
+
+        assert_eq!(named.kind(), PoolKind::Rule);
+        assert!(!named.has_filters());
+        assert_eq!(
+            ids(resolve(&named, &groups).unwrap()),
+            ids(resolve(&PoolQuery::default(), &groups).unwrap())
         );
     }
 

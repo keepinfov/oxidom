@@ -6,7 +6,7 @@ use adw::prelude::*;
 
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
-use oxidom_core::pool::{PoolQuery, Strategy};
+use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
 use oxidom_core::profile::{
     self, Profile, ProfileInterface, ProfileProxy, ProfileSelect, RouteMode,
 };
@@ -262,6 +262,25 @@ pub fn show_profile_dialog(
         .build();
     pool_group.add(&strategy);
 
+    // A pool built from an explicit list has no filters to show, and the two
+    // cannot coexist — `Profile::validate` rejects that combination rather than
+    // letting the file claim one thing and the tunnel do another. So the filter
+    // rows are shown for what they are: not this pool's business. The list
+    // itself is carried through the dialog untouched.
+    let is_list = initial_pool.kind() == PoolKind::List;
+    if is_list {
+        let members = adw::ActionRow::builder()
+            .title(match initial_pool.members.len() {
+                1 => "1 server, chosen by hand".to_string(),
+                count => format!("{count} servers, chosen by hand"),
+            })
+            .subtitle("This pool is a fixed list. Editing which servers are in it happens where the servers are.")
+            .subtitle_lines(2)
+            .activatable(false)
+            .build();
+        pool_group.add(&members);
+    }
+
     let pool_subscriptions = adw::EntryRow::builder()
         .title("Subscriptions")
         .text(join_values(&initial_pool.subscriptions))
@@ -282,6 +301,14 @@ pub fn show_profile_dialog(
         .text(join_values(&initial_pool.exclude))
         .build();
     pool_group.add(&pool_exclude);
+    for row in [
+        &pool_subscriptions,
+        &pool_countries,
+        &pool_protocols,
+        &pool_exclude,
+    ] {
+        row.set_visible(!is_list);
+    }
     let pool_max = adw::SpinRow::with_range(0.0, profile::MAX_POOL_MEMBERS as f64, 1.0);
     pool_max.set_title("Maximum nodes");
     pool_max.set_subtitle("0 means no query limit; activation still caps a pool at 64 nodes");
@@ -434,6 +461,8 @@ pub fn show_profile_dialog(
         let server = server.clone();
         let picker_entries = picker_entries.clone();
         let strategy = strategy.clone();
+        let carried_name = initial_pool.name.clone();
+        let carried_members = initial_pool.members.clone();
         let pool_subscriptions = pool_subscriptions.clone();
         let pool_countries = pool_countries.clone();
         let pool_protocols = pool_protocols.clone();
@@ -458,7 +487,12 @@ pub fn show_profile_dialog(
             {
                 return None;
             }
+            // The name and the member list are carried, not rebuilt: this
+            // dialog never showed either, and saving is not allowed to erase
+            // what it did not show.
             let pool = pool_mode.then(|| PoolQuery {
+                name: carried_name.clone(),
+                members: carried_members.clone(),
                 strategy: strategy_from_index(strategy.selected()),
                 subscriptions: parse_values(&pool_subscriptions.text()),
                 countries: parse_values(&pool_countries.text()),
@@ -1009,6 +1043,10 @@ mod tests {
                 list: vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()],
             },
             pool: Some(PoolQuery {
+                // Neither of these has a widget in the dialog, which is
+                // exactly why they belong in this test.
+                name: "Europe".to_string(),
+                members: Vec::new(),
                 strategy: Strategy::LeastPing,
                 subscriptions: vec!["main".to_string()],
                 countries: vec!["ch".to_string(), "de".to_string()],

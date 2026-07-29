@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::engine::Engine;
-use crate::pool::PoolQuery;
+use crate::pool::{PoolKind, PoolQuery};
 use crate::{fsutil, paths};
 
 const MAX_NAME_LEN: usize = 32;
@@ -111,6 +111,18 @@ impl Profile {
             bail!("a profile selects either a server or a pool, not both");
         }
         if let Some(pool) = &self.select.pool {
+            // Silently ignoring the filters would let the file say one thing
+            // and the tunnel do another — and which half wins is exactly the
+            // question a user reading the file is trying to answer.
+            if pool.kind() == PoolKind::List && pool.has_filters() {
+                bail!(
+                    "[select.pool] lists members, so it cannot also filter by subscription, \
+                     country, protocol or exclusion — remove the member from the list instead"
+                );
+            }
+            if pool.members.len() > MAX_POOL_MEMBERS {
+                bail!("[select.pool] members must name at most {MAX_POOL_MEMBERS} servers");
+            }
             if pool.max > MAX_POOL_MEMBERS {
                 bail!("[select.pool] max must be 0 (unlimited) or at most {MAX_POOL_MEMBERS}");
             }
@@ -425,6 +437,7 @@ max = "eight"
             select: ProfileSelect {
                 server: String::new(),
                 pool: Some(PoolQuery {
+                    name: "Europe".to_string(),
                     strategy: Strategy::Random,
                     subscriptions: vec!["main".to_string()],
                     countries: vec!["ch".to_string(), "de".to_string()],
@@ -433,6 +446,7 @@ max = "eight"
                     max: 8,
                     expected: 4,
                     probe_interval: "5m".to_string(),
+                    ..PoolQuery::default()
                 }),
             },
             proxy: ProfileProxy {
@@ -446,6 +460,66 @@ max = "eight"
         assert!(encoded.contains("[select.pool]"), "{encoded}");
         assert!(encoded.contains("strategy = \"random\""), "{encoded}");
         assert_eq!(Profile::from_toml(&encoded)?, profile);
+        Ok(())
+    }
+
+    #[test]
+    fn a_rule_pool_keeps_its_pre_list_toml_bytes() -> Result<()> {
+        // `name` and `members` are skipped when empty, so every pool profile
+        // written before lists existed still round-trips to the same bytes —
+        // and still parses, since both fields default.
+        let profile = Profile {
+            select: ProfileSelect {
+                server: String::new(),
+                pool: Some(PoolQuery {
+                    countries: vec!["ch".to_string()],
+                    ..PoolQuery::default()
+                }),
+            },
+            ..Profile::default()
+        };
+
+        let encoded = profile.to_toml()?;
+        assert!(!encoded.contains("name"), "{encoded}");
+        assert!(!encoded.contains("members"), "{encoded}");
+        assert_eq!(Profile::from_toml(&encoded)?, profile);
+        Ok(())
+    }
+
+    #[test]
+    fn a_listed_pool_round_trips_and_refuses_to_also_filter() -> Result<()> {
+        let listed = Profile {
+            select: ProfileSelect {
+                server: String::new(),
+                pool: Some(PoolQuery {
+                    name: "Favourites".to_string(),
+                    members: vec!["ch-one".to_string(), "de-two".to_string()],
+                    ..PoolQuery::default()
+                }),
+            },
+            ..Profile::default()
+        };
+        let encoded = listed.to_toml()?;
+        assert!(encoded.contains("name = \"Favourites\""), "{encoded}");
+        assert!(encoded.contains("\"ch-one\""), "{encoded}");
+        assert!(encoded.contains("\"de-two\""), "{encoded}");
+        assert_eq!(Profile::from_toml(&encoded)?, listed);
+        listed.validate("favourites")?;
+
+        // Both halves set is a file that says one thing and would do another.
+        let contradictory = Profile {
+            select: ProfileSelect {
+                server: String::new(),
+                pool: Some(PoolQuery {
+                    members: vec!["ch-one".to_string()],
+                    countries: vec!["de".to_string()],
+                    ..PoolQuery::default()
+                }),
+            },
+            ..Profile::default()
+        };
+        let error = contradictory.validate("mixed").unwrap_err().to_string();
+        assert!(error.contains("lists members"), "{error}");
         Ok(())
     }
 

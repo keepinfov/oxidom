@@ -303,8 +303,9 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
 - `oxidom down [PROFILE]` (`disconnect`) stops the tunnel unconditionally unless a profile
   is named.
 - `oxidom connect <HANDLE>` connects one server without a profile.
-- With a pool, `status` prints the selection as `pool (roundRobin, 6 nodes, now → ch-trojan-2)`
-  plus per-member health, and `ip` prints one endpoint per line. `--egress` stays unambiguous —
+- With a pool, `status` prints the selection as `pool "Europe" (leastPing, 6 nodes, now →
+  ch-trojan-2)` — the name is dropped when the pool has none — plus per-member health, and `ip`
+  prints one endpoint per line. `--egress` stays unambiguous —
   one request through the session — and is never cached for a pool, because the exit rotates.
 - `oxidom status [PROFILE] [--json]`, `oxidom ip [PROFILE] [--egress] [--fresh]`,
   `oxidom env [PROFILE]`, `oxidom list [servers|profiles|subscriptions|sessions] [--json]`, and
@@ -371,7 +372,9 @@ A profile selects **either** one server **or** a pool, never both:
 
 ```toml
 [select.pool]
-strategy       = "roundRobin"     # roundRobin | random | leastPing | leastLoad
+name           = "Europe"         # label only; never selects anything
+strategy       = "leastLoad"      # leastLoad | roundRobin | random | leastPing
+members        = ["ch-one", "de-two"]   # a *list*; mutually exclusive with the filters below
 subscriptions  = ["main"]         # empty = every group, including "My servers"
 countries      = ["ch", "de", "nl"]
 protocols      = ["vless", "trojan"]
@@ -380,18 +383,41 @@ max            = 8                # 0 = uncapped
 probe_interval = "5m"
 ```
 
-The same `PoolQuery` drives the balancer and the GUI's server filter: a filter is a pool
-constructor, not a second search. `roundRobin` is the default because the point of a pool is to
-spread activity across exit IPs; `leastPing` concentrates every connection on one node and
-defeats that. `server = ""` with `[select.pool]` absent stays valid — that is a freshly created
-profile, and only `UpProfile` refuses it.
+A pool is made either of a **list** (`members` non-empty, `PoolKind::List`) or of a **rule**
+(the filters, `PoolKind::Rule`). The distinction is the user's, not an implementation detail: a
+rule cannot be looked at and it *grows* — a server added by tomorrow's refresh joins on its own —
+while a list can be counted and never gains a member without being edited. Losing one is
+expected and is just a server going away. Freezing a list as "no filters plus everything else
+excluded" looks equivalent and is not: a server that did not exist when the list was frozen is
+in nobody's exclusions, so it would silently join. `Profile::validate` **rejects** a pool that
+sets both, rather than letting the file claim one thing and the tunnel do another; `resolve`, the
+pure function underneath, lets the list win so a config that slipped through cannot half-apply.
 
-`pool.resolve` is pure and its order is deterministic (subscription order, then server order
-within a group) because the resolved list becomes both the config's outbound tags and the
-session's stored membership. `subscriptions` match a group id exactly or a group name
-case-insensitively; `exclude` matches an alias or id **exactly** — substring matching there
-would silently drop half a pool. Servers whose spec is `OutboundSpec::XrayProfile` are never
-pool members: such a server is itself a balancer.
+`name` is carried into `SelectionInfo` and printed by `oxidom status` (`pool "Europe" (…)`). It
+takes no part in selection, and `engine::pool_fingerprint` hashes resolved members, so renaming a
+pool never makes a running session stale. Both `name` and `members` are `skip_serializing_if`
+empty, so every pool profile written before lists existed still round-trips to the same bytes.
+
+The same `PoolQuery` drives the balancer and the GUI's server filter: a filter is a pool
+constructor, not a second search. `leastLoad` is the default because the point of a pool is to
+spread activity across exit IPs *and keep working*; `roundRobin` was measured on Xray 26.3.27 to
+keep unreachable nodes in the rotation, and `leastPing` concentrates every connection on one node.
+`server = ""` with `[select.pool]` absent stays valid — that is a freshly created profile, and
+only `UpProfile` refuses it.
+
+`pool.resolve` is pure and its order is deterministic because the resolved list becomes both the
+config's outbound tags and the session's stored membership: a rule follows subscription order then
+server order within a group; a list follows the order the user arranged, which is why `max`
+truncating it is still meaningful. `subscriptions` match a group id exactly or a group name
+case-insensitively; `members` and `exclude` match an alias or id **exactly** — substring matching
+there would silently drop half a pool or enrol a server nobody chose. A handle listed twice
+(alias and id) yields one outbound, or the `s-<handle>` tags would collide. Servers whose spec is
+`OutboundSpec::XrayProfile` are never pool members: such a server is itself a balancer.
+
+`resolve` stays silent about what it dropped because the GUI calls it on every keystroke. Two
+companions report it once, at `up`, where a user can act: `excluded_composites` for balancer
+servers that cannot become outbounds, and `missing_members` for handles a list names that no
+subscription holds any more. Neither is fatal — only an empty result is.
 
 Pool membership is resolved **once, at `up`**. A subscription refresh that changes what the
 query would match marks the session `stale` and invites a reconnect; it never rewrites the
@@ -502,7 +528,7 @@ crates/
       config.rs                  # config.toml load/save
       state.rs                   # state.toml
       model.rs                   # Server/Subscription/OutboundSpec types
-      pool.rs                    # PoolQuery + pure membership resolution
+      pool.rs                    # PoolQuery (list or rule) + pure membership resolution
       engine.rs                  # Registry + per-profile Session/Sessions facade
       proc.rs                    # shared child supervision and recovered PID inspection
       resolve.rs                 # shared config → env → PATH binary resolver

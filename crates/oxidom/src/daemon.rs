@@ -14,7 +14,7 @@ use zbus::fdo;
 
 use oxidom_core::alias;
 use oxidom_core::config::{Config, LatencyMethod};
-use oxidom_core::engine::{Engine, SessionSelection, pool_fingerprint};
+use oxidom_core::engine::{Engine, PoolSession, SessionSelection, pool_fingerprint};
 use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
     ApplySettingsResult, BUS_NAME, InterfaceInfo, LatencyReading, OBJECT_PATH, PROBE_STATE_VERSION,
@@ -178,6 +178,8 @@ enum ConnectionTarget {
     Server(String),
     Pool {
         members: Vec<String>,
+        /// The pool's label, carried so a reconnect does not lose it.
+        name: String,
         strategy: String,
         /// How many members `leastLoad` keeps rotating; 0 means all of them.
         expected: usize,
@@ -371,6 +373,7 @@ impl Shared {
                     members, strategy, ..
                 } => ConnectionTarget::Pool {
                     members,
+                    name: session.pool_name.clone(),
                     strategy,
                     expected: session.pool_expected,
                     probe_interval: session.pool_probe_interval.clone(),
@@ -814,6 +817,7 @@ impl Shared {
                     }
                     ConnectionTarget::Pool {
                         members,
+                        name,
                         strategy,
                         expected,
                         probe_interval,
@@ -821,10 +825,13 @@ impl Shared {
                     } => engine.connect_pool_session(
                         profile,
                         members,
-                        strategy,
-                        *expected,
-                        probe_interval,
-                        *api_port,
+                        &PoolSession {
+                            name,
+                            strategy,
+                            expected: *expected,
+                            probe_interval,
+                            api_port: *api_port,
+                        },
                     ),
                 })
             }
@@ -1379,6 +1386,7 @@ fn selection_info(
             });
             SelectionInfo {
                 kind: "pool".to_string(),
+                name: session.pool_name.clone(),
                 strategy: strategy.clone(),
                 members: pool_members,
                 selecting,
@@ -1690,6 +1698,19 @@ impl Service {
                             .join(", ")
                     );
                 }
+                // A frozen list is expected to shrink as servers go away, so a
+                // handle nobody holds any more is a note, not a failure. Said
+                // once here, where a user can act on it, rather than by
+                // `resolve`, which the GUI calls on every keystroke.
+                let missing =
+                    oxidom_core::pool::missing_members(query, &engine.registry.subscriptions);
+                if !missing.is_empty() {
+                    log::warn!(
+                        "profile {name:?} pool lists {} server(s) no subscription holds any more: {}",
+                        missing.len(),
+                        missing.join(", ")
+                    );
+                }
                 let resolved = oxidom_core::pool::resolve(query, &engine.registry.subscriptions)
                     .map_err(failed)?;
                 if resolved.len() > MAX_POOL_MEMBERS {
@@ -1710,6 +1731,7 @@ impl Service {
                 (
                     ConnectionTarget::Pool {
                         members,
+                        name: query.name.clone(),
                         strategy: query.strategy.as_xray().to_string(),
                         expected,
                         probe_interval: query.probe_interval_or_default().to_string(),
@@ -1977,6 +1999,7 @@ impl Service {
                         members, strategy, ..
                     } => Some(ConnectionTarget::Pool {
                         members: members.clone(),
+                        name: session.pool_name.clone(),
                         strategy: strategy.clone(),
                         expected: session.pool_expected,
                         probe_interval: session.pool_probe_interval.clone(),
@@ -1992,6 +2015,7 @@ impl Service {
                     }
                     ConnectionTarget::Pool {
                         members,
+                        name,
                         strategy,
                         expected,
                         probe_interval,
@@ -1999,10 +2023,13 @@ impl Service {
                     } => engine.connect_pool_session(
                         "default",
                         members,
-                        strategy,
-                        *expected,
-                        probe_interval,
-                        *api_port,
+                        &PoolSession {
+                            name,
+                            strategy,
+                            expected: *expected,
+                            probe_interval,
+                            api_port: *api_port,
+                        },
                     ),
                 };
                 match reconnect {
@@ -2383,6 +2410,7 @@ mod tests {
                 profile,
                 ConnectionTarget::Pool {
                     members,
+                    name: _,
                     strategy,
                     expected: _,
                     probe_interval,

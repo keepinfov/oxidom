@@ -1815,6 +1815,7 @@ mod tests {
             socks_port: 10808,
             selection: SelectionInfo {
                 kind: "pool".to_string(),
+                name: String::new(),
                 strategy: "roundRobin".to_string(),
                 members: vec![
                     PoolMember {

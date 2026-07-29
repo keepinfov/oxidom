@@ -904,8 +904,15 @@ fn pool_status(session: &SessionInfo, latency_ms: Option<u32>) -> String {
     let latency = latency_ms
         .map(|value| format!("{value} ms"))
         .unwrap_or_else(|| "—".to_string());
+    // An unnamed pool still reads fine; a named one saves the reader from
+    // matching six hostnames against the group they had in mind.
+    let label = if selection.name.is_empty() {
+        "pool".to_string()
+    } else {
+        format!("pool {:?}", selection.name)
+    };
     let mut output = format!(
-        "{}  socks {}:{}  {latency}\nselection: pool ({}, {} nodes, {current}{stale})\n",
+        "{}  socks {}:{}  {latency}\nselection: {label} ({}, {} nodes, {current}{stale})\n",
         session.state,
         session.address,
         session.socks_port,
@@ -1062,6 +1069,7 @@ mod tests {
     fn pool_sessions_use_an_explicit_pool_label_and_member_status() {
         let selection = oxidom_core::ipc::SelectionInfo {
             kind: "pool".to_string(),
+            name: String::new(),
             strategy: "roundRobin".to_string(),
             members: vec![
                 oxidom_core::ipc::PoolMember {
@@ -1121,6 +1129,7 @@ mod tests {
             socks_port: 10808,
             selection: oxidom_core::ipc::SelectionInfo {
                 kind: "pool".to_string(),
+                name: "Europe".to_string(),
                 strategy: "leastPing".to_string(),
                 members: vec![
                     oxidom_core::ipc::PoolMember {
@@ -1148,7 +1157,9 @@ mod tests {
             pool_status(&session, None),
             concat!(
                 "connected  socks 127.72.14.1:10808  —\n",
-                "selection: pool (leastPing, 2 nodes, now → nl-two)\n",
+                // Named here, unnamed in the roundRobin case above: both forms
+                // are output the parsers downstream have to survive.
+                "selection: pool \"Europe\" (leastPing, 2 nodes, now → nl-two)\n",
                 "  ? ch-one  Swiss\n",
                 "  ? nl-two  Dutch\n",
             )

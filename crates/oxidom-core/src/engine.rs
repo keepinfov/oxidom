@@ -390,6 +390,23 @@ impl SessionSelection {
     }
 }
 
+/// Everything a pool session runs with besides its members.
+///
+/// One struct rather than five positional arguments threaded through two
+/// layers: `name` was the fifth, and adding it flat would have pushed both
+/// `Session::connect_pool` and `Engine::connect_pool_session` past the point
+/// where the reader has to count commas to know which `u16` is the api port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolSession<'a> {
+    /// What the user calls this pool. Purely a label — it names the pool in
+    /// `oxidom status` and never takes part in selecting anything.
+    pub name: &'a str,
+    pub strategy: &'a str,
+    pub expected: usize,
+    pub probe_interval: &'a str,
+    pub api_port: u16,
+}
+
 pub fn pool_fingerprint(members: &[String]) -> u64 {
     // Server ids are fixed-width hexadecimal strings, so a NUL separator
     // makes the ordered sequence unambiguous while reusing the project's one
@@ -406,6 +423,10 @@ pub struct Session {
     pub http_port: u16,
     pub selection: Option<SessionSelection>,
     pub api_port: u16,
+    /// The pool's label, empty for a single-server session. Snapshotted at `up`
+    /// like the member list, so a session keeps saying what it was brought up
+    /// as even after the profile file is edited.
+    pub pool_name: String,
     pub pool_expected: usize,
     pub pool_probe_interval: String,
     pub balancer_info: Option<BalancerInfo>,
@@ -430,6 +451,7 @@ impl Session {
             http_port,
             selection: None,
             api_port: 0,
+            pool_name: String::new(),
             pool_expected: 0,
             pool_probe_interval: String::new(),
             balancer_info: None,
@@ -446,6 +468,7 @@ impl Session {
         self.core.connect(server, self.address, &self.profile)?;
         self.selection = Some(SessionSelection::Server(server.id.clone()));
         self.api_port = 0;
+        self.pool_name.clear();
         self.pool_expected = 0;
         self.pool_probe_interval.clear();
         self.balancer_info = None;
@@ -454,14 +477,7 @@ impl Session {
         Ok(())
     }
 
-    pub fn connect_pool(
-        &mut self,
-        members: &[Server],
-        strategy: &str,
-        expected: usize,
-        probe_interval: &str,
-        api_port: u16,
-    ) -> Result<()> {
+    pub fn connect_pool(&mut self, members: &[Server], pool: &PoolSession<'_>) -> Result<()> {
         self.selection = None;
         self.api_port = 0;
         self.balancer_info = None;
@@ -469,21 +485,22 @@ impl Session {
         self.core.connect_pool(
             &crate::xray::config::PoolSpec {
                 members: &member_refs,
-                strategy,
-                expected,
-                probe_interval,
+                strategy: pool.strategy,
+                expected: pool.expected,
+                probe_interval: pool.probe_interval,
             },
             self.address,
-            api_port,
+            pool.api_port,
             &self.profile,
         )?;
         self.selection = Some(SessionSelection::pool(
             members.iter().map(|server| server.id.clone()).collect(),
-            strategy.to_string(),
+            pool.strategy.to_string(),
         ));
-        self.api_port = api_port;
-        self.pool_expected = expected;
-        self.pool_probe_interval = probe_interval.to_string();
+        self.api_port = pool.api_port;
+        self.pool_name = pool.name.to_string();
+        self.pool_expected = pool.expected;
+        self.pool_probe_interval = pool.probe_interval.to_string();
         self.balancer_info = None;
         self.balancer_polled_at = None;
         self.pool_stale = false;
@@ -494,6 +511,7 @@ impl Session {
         self.core.disconnect();
         self.selection = None;
         self.api_port = 0;
+        self.pool_name.clear();
         self.pool_expected = 0;
         self.pool_probe_interval.clear();
         self.balancer_info = None;
@@ -680,11 +698,16 @@ impl Sessions {
                 });
             session.api_port = saved.api_port;
             if matches!(&session.selection, Some(SessionSelection::Pool { .. })) {
-                session.pool_probe_interval = crate::profile::load(&saved.profile)
+                let query = crate::profile::load(&saved.profile)
                     .ok()
-                    .and_then(|profile| profile.select.pool)
+                    .and_then(|profile| profile.select.pool);
+                session.pool_probe_interval = query
+                    .as_ref()
                     .map(|query| query.probe_interval_or_default().to_string())
                     .unwrap_or_else(|| "5m".to_string());
+                // The label is not persisted in `state.toml` — it is cosmetic,
+                // and the profile that owns it is right there on disk.
+                session.pool_name = query.map(|query| query.name).unwrap_or_default();
             }
             sessions.insert(session);
         }
@@ -1354,10 +1377,7 @@ impl Engine {
         &mut self,
         profile: &str,
         member_ids: &[String],
-        strategy: &str,
-        expected: usize,
-        probe_interval: &str,
-        api_port: u16,
+        pool: &PoolSession<'_>,
     ) -> Result<()> {
         let members = member_ids
             .iter()
@@ -1377,7 +1397,7 @@ impl Engine {
         self.sessions
             .get_mut(profile)
             .ok_or_else(|| anyhow!("profile {profile:?} has no session"))?
-            .connect_pool(&members, strategy, expected, probe_interval, api_port)?;
+            .connect_pool(&members, pool)?;
         self.sync_session(profile);
         if let Err(error) = self.state.save() {
             log::warn!("could not persist the active Xray pool process: {error:#}");
