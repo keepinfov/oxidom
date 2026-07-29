@@ -10,14 +10,16 @@ use oxidom_core::model::Subscription;
 use oxidom_core::pool::PoolQuery;
 
 use super::super::group::subscription_description;
-use super::super::prefs::GuiPrefs;
+use super::super::prefs::{FAVOURITES_ID, GroupKind, GuiPrefs, ServerGroup};
 use super::super::reduce::{
-    FilterOption, ServerProfiles, available_countries, available_protocols,
-    available_subscriptions, filtered_ids, filters_to_query, moved_subscription,
-    ordered_subscriptions,
+    FilterOption, Quick, ServerProfiles, available_countries, available_protocols,
+    available_subscriptions, filtered_ids, filters_to_query, group_member_ids, groups_holding,
+    moved_subscription, ordered_subscriptions, query_equals_group, quick_filters, toggled_member,
+    upsert_group,
 };
 use super::super::server_card::{
-    CARD_MEASURE_WIDTH, COMPACT_CARD_HEIGHT, CardConnectionState, LatencyState, ServerCard,
+    CARD_MEASURE_WIDTH, COMPACT_CARD_HEIGHT, CardConnectionState, CardHandlers, LatencyState,
+    ServerCard,
 };
 
 const CARD_COLUMN_SPACING: i32 = 12;
@@ -75,6 +77,8 @@ struct GroupUi {
 }
 
 type BrowseCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+/// Set on every rebuild, read long afterwards by the filter popover.
+type PoolCallback = Rc<RefCell<Option<Rc<dyn Fn(PoolQuery)>>>>;
 
 #[derive(Clone)]
 pub struct ServersView {
@@ -91,8 +95,35 @@ pub struct ServersView {
     filter_countries: Rc<RefCell<Vec<String>>>,
     filter_protocols: Rc<RefCell<Vec<String>>>,
     filter_subscriptions: Rc<RefCell<Vec<String>>>,
+    /// Members of the selected group when that group is a frozen list. Not a
+    /// widget's contents — a list has no filter row to live in — so it is
+    /// carried here and folded into `current_filter` by `apply_filter`.
+    scope_members: Rc<RefCell<Vec<String>>>,
+    /// What the visible selection would be saved as: a list of exactly the
+    /// visible servers, or the rule that matched them.
     current_filter: Rc<RefCell<PoolQuery>>,
-    create_pool: Rc<RefCell<Option<gtk::Button>>>,
+    /// Id of the chip that is selected, `None` for "All".
+    active_group: Rc<RefCell<Option<String>>>,
+    /// Mirror of `prefs.groups`, so the chip row and the popover read one list.
+    saved_groups: Rc<RefCell<Vec<ServerGroup>>>,
+    /// The selected chip's widget, so the "modified" mark can be updated on a
+    /// keystroke without rebuilding the row under the pointer.
+    active_chip: Rc<RefCell<Option<gtk::ToggleButton>>>,
+    /// Set on every rebuild; the popover's "Create pool" needs it long after
+    /// the callbacks that carried it went out of scope.
+    on_create_pool: PoolCallback,
+    /// The row of saved scopes, above the subscription groups.
+    chip_bar: gtk::Box,
+    chip_scroll: gtk::ScrolledWindow,
+    /// Lives in the window header next to the search entry, so the filter
+    /// costs no vertical space until it is opened.
+    filter_button: gtk::MenuButton,
+    filter_popover: gtk::Popover,
+    /// Rows the popover disables while a fixed list is selected: a list has no
+    /// filters, and the two are mutually exclusive.
+    filter_rows: Rc<RefCell<Vec<gtk::Widget>>>,
+    match_label: gtk::Label,
+    advanced_expanded: Rc<Cell<bool>>,
     /// Number of card columns; driven by the window width (1, 2, or 3).
     columns: Rc<Cell<usize>>,
     pending_columns: Rc<Cell<usize>>,
@@ -142,10 +173,51 @@ impl ServersView {
             .visible(false)
             .build();
 
+        let chip_bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .css_classes(["group-chip-bar"])
+            .build();
+        // Horizontal scroll rather than wrapping: the row must not grow taller
+        // as groups accumulate, and it must not become the page's minimum
+        // width in a narrow window.
+        let chip_scroll = gtk::ScrolledWindow::builder()
+            .child(&chip_bar)
+            .hscrollbar_policy(gtk::PolicyType::External)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .build();
+
+        let filter_popover = gtk::Popover::builder().width_request(320).build();
+        let filter_button = gtk::MenuButton::builder()
+            .icon_name("funnel-symbolic")
+            .tooltip_text("Filter servers")
+            .visible(false)
+            .css_classes(["flat", "header-icon-button"])
+            .build();
+        filter_button.update_property(&[gtk::accessible::Property::Label("Filter servers")]);
+        filter_button.set_popover(Some(&filter_popover));
+        let match_label = gtk::Label::builder()
+            .xalign(0.0)
+            .css_classes(["dim-label", "caption"])
+            .build();
+
         Self {
             root,
             content,
             no_matches,
+            chip_bar,
+            chip_scroll,
+            filter_button,
+            filter_popover,
+            match_label,
+            advanced_expanded: Rc::new(Cell::new(false)),
+            filter_rows: Rc::new(RefCell::new(Vec::new())),
+            scope_members: Rc::new(RefCell::new(Vec::new())),
+            active_group: Rc::new(RefCell::new(None)),
+            saved_groups: Rc::new(RefCell::new(Vec::new())),
+            active_chip: Rc::new(RefCell::new(None)),
+            on_create_pool: Rc::new(RefCell::new(None)),
             on_browse_subscriptions: Rc::new(RefCell::new(None)),
             cards: Rc::new(RefCell::new(HashMap::new())),
             groups: Rc::new(RefCell::new(Vec::new())),
@@ -156,7 +228,6 @@ impl ServersView {
             filter_protocols: Rc::new(RefCell::new(Vec::new())),
             filter_subscriptions: Rc::new(RefCell::new(Vec::new())),
             current_filter: Rc::new(RefCell::new(PoolQuery::default())),
-            create_pool: Rc::new(RefCell::new(None)),
             columns: Rc::new(Cell::new(1)),
             pending_columns: Rc::new(Cell::new(1)),
             column_update_scheduled: Rc::new(Cell::new(false)),
@@ -239,7 +310,7 @@ impl ServersView {
         self.groups.borrow_mut().clear();
         *self.subscriptions.borrow_mut() = subscriptions.to_vec();
         self.search_texts.borrow_mut().clear();
-        self.create_pool.borrow_mut().take();
+        *self.on_create_pool.borrow_mut() = Some(callbacks.create_pool.clone());
         *self.latencies.borrow_mut() = latency_states
             .iter()
             .filter_map(|(id, state)| sort_value(*state).map(|value| (id.clone(), value)))
@@ -274,8 +345,17 @@ impl ServersView {
             return;
         }
 
-        self.content
-            .append(&self.filter_bar(subscriptions, callbacks.create_pool.clone()));
+        self.content.append(&self.chip_scroll);
+        self.build_chip_bar();
+        self.build_filter_popover(subscriptions);
+        let favourites: HashSet<String> = self
+            .prefs
+            .borrow()
+            .groups
+            .iter()
+            .find(|group| group.id == FAVOURITES_ID)
+            .map(|group| group.query.members.iter().cloned().collect())
+            .unwrap_or_default();
 
         for subscription in subscriptions {
             let heading = gtk::Label::builder()
@@ -483,10 +563,18 @@ impl ServersView {
                     server,
                     connection_state,
                     latency_state,
-                    on_select,
-                    on_activate,
-                    on_ping,
-                    on_set_alias,
+                    favourites.contains(&id),
+                    CardHandlers {
+                        select: Rc::new(on_select),
+                        activate: Rc::new(on_activate),
+                        ping: Rc::new(on_ping),
+                        set_alias: Rc::new(on_set_alias),
+                        toggle_favourite: {
+                            let view = self.clone();
+                            let id = id.clone();
+                            Rc::new(move || view.toggle_favourite(&id))
+                        },
+                    },
                 );
                 let mut tooltip = format!(
                     "{} · {}:{} · {}",
@@ -546,11 +634,122 @@ impl ServersView {
         self.schedule_expanded_remeasure();
     }
 
-    fn filter_bar(
-        &self,
-        subscriptions: &[Subscription],
-        create_pool: Rc<dyn Fn(PoolQuery)>,
-    ) -> gtk::Widget {
+    /// The filter control the window packs into its header, beside the search
+    /// entry. Handed out rather than owned by the window so every decision
+    /// about filtering stays in one file.
+    pub fn header_filter(&self) -> gtk::MenuButton {
+        self.filter_button.clone()
+    }
+
+    /// The row of saved scopes: All, then one chip per group, then "+".
+    ///
+    /// A group is a *scope*, not a place servers live. Rendering it as another
+    /// block of cards would show the same server two or three times over and
+    /// leave no way to tell which card was the real one; narrowing the single
+    /// list keeps every server in exactly one place — its subscription.
+    fn build_chip_bar(&self) {
+        while let Some(child) = self.chip_bar.first_child() {
+            self.chip_bar.remove(&child);
+        }
+        let active = self.active_group.borrow().clone();
+        let saved = self.prefs.borrow().groups.clone();
+        *self.saved_groups.borrow_mut() = saved.clone();
+        self.active_chip.borrow_mut().take();
+
+        let all = gtk::ToggleButton::builder()
+            .label("All")
+            .active(active.is_none())
+            .css_classes(["pill", "group-chip"])
+            .build();
+        all.connect_clicked({
+            let view = self.clone();
+            move |button| {
+                if button.is_active() {
+                    view.select_group(None);
+                } else {
+                    // A chip is a radio, not a checkbox: clicking the active
+                    // one must not leave the row with nothing selected.
+                    button.set_active(true);
+                }
+            }
+        });
+        self.chip_bar.append(&all);
+
+        for group in &saved {
+            let count = group_member_ids(group, &self.subscriptions.borrow()).len();
+            let chip = gtk::ToggleButton::builder()
+                .label(group.label())
+                .active(active.as_deref() == Some(group.id.as_str()))
+                .tooltip_text(group_chip_tooltip(group, count))
+                .css_classes(["pill", "group-chip"])
+                .build();
+            chip.connect_clicked({
+                let view = self.clone();
+                let id = group.id.clone();
+                move |button| {
+                    if button.is_active() {
+                        view.select_group(Some(&id));
+                    } else {
+                        button.set_active(true);
+                    }
+                }
+            });
+            if chip.is_active() {
+                *self.active_chip.borrow_mut() = Some(chip.clone());
+            }
+            self.chip_bar.append(&chip);
+        }
+        self.sync_chip_modified();
+
+        let add = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Save what is shown as a new group")
+            .css_classes(["flat", "circular", "group-chip-add"])
+            .build();
+        add.update_property(&[gtk::accessible::Property::Label(
+            "Save what is shown as a new group",
+        )]);
+        add.connect_clicked({
+            let view = self.clone();
+            move |_| view.save_as_group_dialog(None)
+        });
+        self.chip_bar.append(&add);
+    }
+
+    /// One popover holding both the quick row and the detailed controls.
+    ///
+    /// Quick and advanced are two presentations of *one* state, never two
+    /// filters: a quick chip writes the same values the advanced list shows, so
+    /// opening it right afterwards explains what the click did.
+    fn build_filter_popover(&self, subscriptions: &[Subscription]) {
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        content.set_margin_top(10);
+        content.set_margin_bottom(10);
+        content.set_margin_start(10);
+        content.set_margin_end(10);
+
+        let quick = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .column_spacing(6)
+            .row_spacing(6)
+            .max_children_per_line(4)
+            .min_children_per_line(2)
+            .build();
+        for item in quick_filters(subscriptions, 4) {
+            let button = gtk::Button::builder()
+                .label(&item.label)
+                .css_classes(["pill", "quick-filter"])
+                .build();
+            button.connect_clicked({
+                let view = self.clone();
+                let quick = item.quick.clone();
+                move |_| view.apply_quick(&quick)
+            });
+            quick.insert(&button, -1);
+        }
+        content.append(&section_title("Quick"));
+        content.append(&quick);
+
         let countries = available_countries(subscriptions)
             .into_iter()
             .map(|value| FilterOption {
@@ -565,65 +764,420 @@ impl ServersView {
                 value,
             })
             .collect::<Vec<_>>();
-        let subscriptions = available_subscriptions(subscriptions);
+        let groups = available_subscriptions(subscriptions);
 
-        let flow = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .column_spacing(8)
-            .row_spacing(8)
-            .max_children_per_line(4)
-            .min_children_per_line(1)
-            .css_classes(["server-filter-bar"])
-            .build();
-        flow.insert(
-            &filter_menu(
+        let advanced_rows = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        advanced_rows.set_margin_top(6);
+        advanced_rows.set_margin_start(6);
+        let rows = [
+            filter_menu(
                 "Country",
                 &countries,
                 self.filter_countries.clone(),
                 self.clone(),
             ),
-            -1,
-        );
-        flow.insert(
-            &filter_menu(
+            filter_menu(
                 "Protocol",
                 &protocols,
                 self.filter_protocols.clone(),
                 self.clone(),
             ),
-            -1,
-        );
-        flow.insert(
-            &filter_menu(
+            filter_menu(
                 "Subscription",
-                &subscriptions,
+                &groups,
                 self.filter_subscriptions.clone(),
                 self.clone(),
             ),
-            -1,
-        );
+        ];
+        self.filter_rows.borrow_mut().clear();
+        for row in &rows {
+            advanced_rows.append(row);
+            self.filter_rows
+                .borrow_mut()
+                .push(row.clone().upcast::<gtk::Widget>());
+        }
+        // Whether Advanced is open survives a rebuild: a quick chip writes into
+        // these very rows, and collapsing the section at that moment hides the
+        // one thing the click was supposed to explain.
+        let advanced = gtk::Expander::builder()
+            .label("Advanced")
+            .child(&advanced_rows)
+            .expanded(self.advanced_expanded.get())
+            .build();
+        advanced.connect_expanded_notify({
+            let expanded = self.advanced_expanded.clone();
+            move |expander| expanded.set(expander.is_expanded())
+        });
+        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        content.append(&advanced);
 
-        let button = gtk::Button::builder()
-            .label("Create pool from this filter")
-            // A pool is a stored query, not a stored list. Country, protocol
-            // and subscription keep matching after a refresh, so a server
-            // added later joins the pool; the text box has no equivalent and
-            // is frozen into exclusions instead. Saying so here is cheaper
-            // than a user discovering it from a stale badge.
+        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        // The match count is one long-lived widget so `apply_filter` can update
+        // it on a keystroke without touching the popover. Rebuilding the
+        // popover therefore has to take it off the box it was in — GTK refuses
+        // to give a widget a second parent, and the old box is not finalised
+        // before this line runs.
+        self.match_label.unparent();
+        content.append(&self.match_label);
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let reset = gtk::Button::builder()
+            .label("Reset")
+            .css_classes(["flat"])
+            .build();
+        reset.connect_clicked({
+            let view = self.clone();
+            move |_| view.apply_quick(&Quick::All)
+        });
+        let create_pool = gtk::Button::builder()
+            .label("Create pool…")
             .tooltip_text(
-                "Create a profile whose pool matches the visible servers. Country, protocol \
-                 and subscription keep matching later, so servers added by a future refresh \
-                 can join; the search text is frozen as exclusions and does not.",
+                "Create a profile whose pool is the visible selection. Saving it as a list \
+                 freezes those servers; saving it as a rule lets servers added by a future \
+                 refresh join.",
             )
+            .css_classes(["flat"])
+            .build();
+        create_pool.connect_clicked({
+            let view = self.clone();
+            move |_| {
+                view.filter_popover.popdown();
+                let query = view.current_filter.borrow().clone();
+                if let Some(callback) = view.on_create_pool.borrow().as_ref() {
+                    callback(query);
+                }
+            }
+        });
+        let save = gtk::Button::builder()
+            .label("Save as group…")
+            .hexpand(true)
+            .halign(gtk::Align::End)
             .css_classes(["suggested-action", "pill"])
             .build();
-        button.connect_clicked({
-            let current_filter = self.current_filter.clone();
-            move |_| create_pool(current_filter.borrow().clone())
+        save.connect_clicked({
+            let view = self.clone();
+            move |_| {
+                view.filter_popover.popdown();
+                view.save_as_group_dialog(None);
+            }
         });
-        flow.insert(&button, -1);
-        *self.create_pool.borrow_mut() = Some(button);
-        flow.upcast()
+        actions.append(&reset);
+        actions.append(&create_pool);
+        actions.append(&save);
+        content.append(&actions);
+
+        self.filter_popover.set_child(Some(&content));
+        self.sync_filter_sensitivity();
+    }
+
+    /// Load a saved scope, or clear back to "All".
+    fn select_group(&self, id: Option<&str>) {
+        let group = id.and_then(|id| {
+            self.saved_groups
+                .borrow()
+                .iter()
+                .find(|group| group.id == id)
+                .cloned()
+        });
+        *self.active_group.borrow_mut() = group.as_ref().map(|group| group.id.clone());
+        match group {
+            // A list has no filter rows to load, so the filters are cleared and
+            // the members are carried separately.
+            Some(group) if group.kind == GroupKind::List => {
+                *self.scope_members.borrow_mut() = group.query.members.clone();
+                self.set_filter_values(&PoolQuery::default());
+            }
+            Some(group) => {
+                self.scope_members.borrow_mut().clear();
+                self.set_filter_values(&group.query);
+            }
+            None => {
+                self.scope_members.borrow_mut().clear();
+                self.set_filter_values(&PoolQuery::default());
+            }
+        }
+        self.build_chip_bar();
+        self.apply_filter();
+    }
+
+    /// Write a query into the filter widgets' backing state. The popover is
+    /// rebuilt from that state, so the two cannot drift.
+    fn set_filter_values(&self, query: &PoolQuery) {
+        self.filter_countries
+            .borrow_mut()
+            .clone_from(&query.countries);
+        self.filter_protocols
+            .borrow_mut()
+            .clone_from(&query.protocols);
+        self.filter_subscriptions
+            .borrow_mut()
+            .clone_from(&query.subscriptions);
+        self.build_filter_popover(&self.subscriptions.borrow().clone());
+    }
+
+    fn apply_quick(&self, quick: &Quick) {
+        // A quick pick replaces rather than adds: "Germany" means Germany, and
+        // a chip that silently intersected with whatever was left over from
+        // last time would show an empty page for no visible reason.
+        let mut query = PoolQuery::default();
+        match quick {
+            Quick::All => {}
+            Quick::Country(country) => query.countries = vec![country.clone()],
+            Quick::Protocol(protocol) => query.protocols = vec![protocol.clone()],
+        }
+        self.scope_members.borrow_mut().clear();
+        *self.active_group.borrow_mut() = None;
+        self.set_filter_values(&query);
+        self.build_chip_bar();
+        self.apply_filter();
+    }
+
+    /// Ask for a name and whether the group should be a list or a rule.
+    ///
+    /// The choice is the whole point and cannot be inferred: the same visible
+    /// forty-two servers are either "these forty-two, frozen" or "whatever is
+    /// German and VLESS, forever". Only the user knows which they meant.
+    fn save_as_group_dialog(&self, editing: Option<ServerGroup>) {
+        let current = self.current_filter.borrow().clone();
+        let visible = filtered_ids(&current, &self.subscriptions.borrow()).len();
+        let rule = PoolQuery {
+            countries: self.filter_countries.borrow().clone(),
+            protocols: self.filter_protocols.borrow().clone(),
+            subscriptions: self.filter_subscriptions.borrow().clone(),
+            ..PoolQuery::default()
+        };
+        // A frozen list is the only honest option for a selection that came
+        // from a search box: the text has no equivalent in a rule, so a rule
+        // saved here would quietly be wider than what is on screen.
+        let rule_available =
+            self.scope_members.borrow().is_empty() && self.query.borrow().is_empty();
+
+        let name_row = adw::EntryRow::builder().title("Name").build();
+        name_row.set_text(
+            &editing
+                .as_ref()
+                .map(|group| group.name.clone())
+                .unwrap_or_else(|| suggested_group_name(&rule)),
+        );
+        let list_choice = gtk::CheckButton::with_label(&format!(
+            "List — {visible} server{}, frozen",
+            if visible == 1 { "" } else { "s" }
+        ));
+        list_choice.set_tooltip_text(Some(
+            "New servers will not join on their own. A server that goes away leaves.",
+        ));
+        let rule_choice = gtk::CheckButton::with_label(&format!("Rule — {}", describe_rule(&rule)));
+        rule_choice.set_group(Some(&list_choice));
+        rule_choice.set_sensitive(rule_available);
+        rule_choice.set_tooltip_text(Some(if rule_available {
+            "Servers added by a future subscription refresh will join on their own."
+        } else {
+            "The search text has no equivalent in a rule, so this selection can only be frozen."
+        }));
+        let saved_kind = editing.as_ref().map(|group| group.kind);
+        if saved_kind == Some(GroupKind::Rule) && rule_available {
+            rule_choice.set_active(true);
+        } else {
+            list_choice.set_active(true);
+        }
+
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let rows = adw::PreferencesGroup::new();
+        rows.add(&name_row);
+        body.append(&rows);
+        body.append(&list_choice);
+        body.append(&rule_choice);
+
+        let parent = self.root.root().and_downcast::<gtk::Window>();
+        let dialog = adw::MessageDialog::new(
+            parent.as_ref(),
+            Some(if editing.is_some() {
+                "Edit group"
+            } else {
+                "Save as group"
+            }),
+            Some("A group narrows the list. Connecting to one makes it a pool."),
+        );
+        dialog.set_extra_child(Some(&body));
+        dialog.add_responses(&[("cancel", "Cancel"), ("save", "Save")]);
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, {
+            let view = self.clone();
+            move |dialog, response| {
+                if response != "save" {
+                    return;
+                }
+                let name = name_row.text().trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                let kind = if rule_choice.is_active() {
+                    GroupKind::Rule
+                } else {
+                    GroupKind::List
+                };
+                view.save_group(editing.clone(), name, kind);
+                dialog.close();
+            }
+        });
+        dialog.present();
+    }
+
+    /// Names of the groups that currently hold `server_id`. The subscriptions
+    /// page asks before it deletes anything; groups live here, so the answer
+    /// does too.
+    pub fn groups_holding(&self, server_id: &str) -> Vec<String> {
+        groups_holding(
+            &self.prefs.borrow().groups,
+            &self.subscriptions.borrow(),
+            server_id,
+        )
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// `(group name, how many of this subscription's servers it holds)`.
+    pub fn groups_holding_any(&self, subscription_id: &str) -> Vec<(String, usize)> {
+        let subscriptions = self.subscriptions.borrow();
+        let Some(subscription) = subscriptions
+            .iter()
+            .find(|group| group.id == subscription_id)
+        else {
+            return Vec::new();
+        };
+        self.prefs
+            .borrow()
+            .groups
+            .iter()
+            .filter_map(|group| {
+                let held = group_member_ids(group, &subscriptions);
+                let count = subscription
+                    .servers
+                    .iter()
+                    .filter(|server| held.contains(&server.id))
+                    .count();
+                (count > 0).then(|| (group.name.clone(), count))
+            })
+            .collect()
+    }
+
+    /// Star or unstar one server. Handled here rather than routed through the
+    /// window because Favourites is a display preference this view already
+    /// owns; the daemon has no opinion about it.
+    fn toggle_favourite(&self, server_id: &str) {
+        {
+            let mut prefs = self.prefs.borrow_mut();
+            let favourites = prefs
+                .groups
+                .iter()
+                .find(|group| group.id == FAVOURITES_ID)
+                .cloned()
+                .unwrap_or_else(ServerGroup::favourites);
+            prefs.groups = upsert_group(&prefs.groups, toggled_member(&favourites, server_id));
+            if let Err(error) = prefs.save() {
+                log::warn!("could not save gui prefs: {error:#}");
+            }
+        }
+        // The chip's count changed, and if Favourites is the active scope the
+        // card the user just starred has to appear or leave right now.
+        self.build_chip_bar();
+        if self.active_group.borrow().as_deref() == Some(FAVOURITES_ID) {
+            self.select_group(Some(FAVOURITES_ID));
+        }
+    }
+
+    fn save_group(&self, editing: Option<ServerGroup>, name: String, kind: GroupKind) {
+        let query = match kind {
+            // Freeze exactly what is on screen, in the order it is shown.
+            GroupKind::List => PoolQuery {
+                name: name.clone(),
+                members: filtered_ids(&self.current_filter.borrow(), &self.subscriptions.borrow()),
+                ..PoolQuery::default()
+            },
+            GroupKind::Rule => PoolQuery {
+                name: name.clone(),
+                countries: self.filter_countries.borrow().clone(),
+                protocols: self.filter_protocols.borrow().clone(),
+                subscriptions: self.filter_subscriptions.borrow().clone(),
+                ..PoolQuery::default()
+            },
+        };
+        let group = ServerGroup {
+            id: editing
+                .map(|group| group.id)
+                .unwrap_or_else(|| free_group_id(&name, &self.prefs.borrow().groups)),
+            name,
+            icon: String::new(),
+            kind,
+            query,
+        };
+        let id = group.id.clone();
+        {
+            let mut prefs = self.prefs.borrow_mut();
+            prefs.groups = upsert_group(&prefs.groups, group);
+            if let Err(error) = prefs.save() {
+                log::warn!("could not save gui prefs: {error:#}");
+            }
+        }
+        *self.saved_groups.borrow_mut() = self.prefs.borrow().groups.clone();
+        self.select_group(Some(&id));
+    }
+
+    /// Mark the selected chip when the filter no longer shows what that group
+    /// holds — so a narrowed view is never mistaken for the group itself, and
+    /// "Save as group…" is understood as saving the change rather than the
+    /// group as it was.
+    fn sync_chip_modified(&self) {
+        let Some(chip) = self.active_chip.borrow().clone() else {
+            return;
+        };
+        let Some(id) = self.active_group.borrow().clone() else {
+            return;
+        };
+        let saved = self.saved_groups.borrow();
+        let Some(group) = saved.iter().find(|group| group.id == id) else {
+            return;
+        };
+        // A list is compared against what it currently resolves to, not against
+        // the handles it stores: a member whose server went away is not an edit
+        // the user made, and marking the chip for it would be blaming them for
+        // a subscription refresh.
+        let mut basis = group.clone();
+        if basis.kind == GroupKind::List {
+            basis.query.members = group_member_ids(group, &self.subscriptions.borrow());
+        }
+        let modified = !query_equals_group(&self.current_filter.borrow(), &basis);
+        chip.set_label(&if modified {
+            format!("{} ·", group.label())
+        } else {
+            group.label()
+        });
+        if modified {
+            chip.add_css_class("group-chip-modified");
+            chip.set_tooltip_text(Some(&format!(
+                "Showing a narrowed view of “{}”. Save it to keep the change.",
+                group.name
+            )));
+        } else {
+            chip.remove_css_class("group-chip-modified");
+        }
+    }
+
+    fn sync_filter_sensitivity(&self) {
+        let is_list = !self.scope_members.borrow().is_empty();
+        for row in self.filter_rows.borrow().iter() {
+            row.set_sensitive(!is_list);
+            if is_list {
+                row.set_tooltip_text(Some(
+                    "This group is a fixed list of servers, so it has no filters.",
+                ));
+            } else {
+                row.set_tooltip_text(None);
+            }
+        }
     }
 
     pub fn set_query(&self, query: &str) {
@@ -637,18 +1191,54 @@ impl ServersView {
     }
 
     fn apply_filter(&self) {
-        let query = filters_to_query(
-            &self.subscriptions.borrow(),
-            &self.filter_subscriptions.borrow(),
-            &self.filter_countries.borrow(),
-            &self.filter_protocols.borrow(),
-            &self.search_texts.borrow(),
-            &self.query.borrow(),
-        );
-        let filtered = filtered_ids(&query, &self.subscriptions.borrow())
+        // Whatever is on screen is exactly what "save" and "create pool" would
+        // store, so both are derived here from one computation rather than
+        // rebuilt separately and left to drift.
+        let subscriptions = self.subscriptions.borrow().clone();
+        let members = self.scope_members.borrow().clone();
+        let query = if members.is_empty() {
+            filters_to_query(
+                &subscriptions,
+                &self.filter_subscriptions.borrow(),
+                &self.filter_countries.borrow(),
+                &self.filter_protocols.borrow(),
+                &self.search_texts.borrow(),
+                &self.query.borrow(),
+            )
+        } else {
+            // A frozen list narrowed by the search box is still a list: there
+            // is no filter to intersect with, only members to drop. Building it
+            // through `filtered_ids` keeps the resolved order and silently
+            // loses handles whose server is gone, which is what a list is for.
+            let text = self.query.borrow().clone();
+            let texts = self.search_texts.borrow();
+            let listed = PoolQuery {
+                members,
+                ..PoolQuery::default()
+            };
+            PoolQuery {
+                members: filtered_ids(&listed, &subscriptions)
+                    .into_iter()
+                    .filter(|id| {
+                        text.is_empty()
+                            || texts
+                                .get(id)
+                                .is_some_and(|haystack| haystack.contains(&text))
+                    })
+                    .collect(),
+                ..PoolQuery::default()
+            }
+        };
+        let filtered = filtered_ids(&query, &subscriptions)
             .into_iter()
             .collect::<HashSet<_>>();
+        self.match_label.set_label(&match filtered.len() {
+            1 => "1 server matches".to_string(),
+            count => format!("{count} servers match"),
+        });
         *self.current_filter.borrow_mut() = query;
+        self.sync_filter_sensitivity();
+        self.sync_chip_modified();
         let selected = self.selected.borrow().clone();
         let mut total_visible = 0usize;
         {
@@ -665,11 +1255,25 @@ impl ServersView {
                 total_visible += visible;
             }
         }
-        // A query that matches nothing used to leave a blank page.
-        self.no_matches.set_visible(total_visible == 0);
-        if let Some(button) = self.create_pool.borrow().as_ref() {
-            button.set_sensitive(total_visible > 0);
+        // A query that matches nothing used to leave a blank page. An empty
+        // Favourites is the ordinary version of that, so it says the thing to
+        // do about it rather than blaming the search.
+        let empty_list = self.active_group.borrow().is_some()
+            && self.scope_members.borrow().is_empty()
+            && self.saved_groups.borrow().iter().any(|group| {
+                Some(group.id.as_str()) == self.active_group.borrow().as_deref()
+                    && group.kind == GroupKind::List
+            });
+        if total_visible == 0 && empty_list {
+            self.no_matches.set_title("This group is empty");
+            self.no_matches
+                .set_description(Some("Star a server to put it here."));
+        } else {
+            self.no_matches.set_title("No matching servers");
+            self.no_matches
+                .set_description(Some("Try a different name, country, or protocol."));
         }
+        self.no_matches.set_visible(total_visible == 0);
         // Cards mid-collapse from a recent selection switch reflow anyway —
         // snap them closed before repacking.
         for (id, card) in self.cards.borrow().iter() {
@@ -1070,6 +1674,91 @@ impl ServersView {
             }
         });
         animation.play();
+    }
+}
+
+/// A stable id for a new group: a slug of its name, suffixed until free.
+///
+/// The id outlives renames, so it cannot simply *be* the name; and it is only
+/// ever compared against this machine's own list, so it does not need to be a
+/// hash of anything.
+fn free_group_id(name: &str, existing: &[ServerGroup]) -> String {
+    let slug = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let slug = slug.trim_matches('-').to_string();
+    let base = if slug.is_empty() {
+        "group".to_string()
+    } else {
+        slug
+    };
+    let taken = |candidate: &str| existing.iter().any(|group| group.id == candidate);
+    if !taken(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken(candidate))
+        .unwrap_or(base)
+}
+
+fn section_title(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .css_classes(["dim-label", "caption-heading"])
+        .build()
+}
+
+fn group_chip_tooltip(group: &ServerGroup, matched: usize) -> String {
+    match group.kind {
+        GroupKind::List => format!(
+            "{}: {matched} server{}, frozen. New servers do not join on their own.",
+            group.name,
+            if matched == 1 { "" } else { "s" }
+        ),
+        GroupKind::Rule => format!(
+            "{}: {}. Matches {matched} right now, and servers added later can join.",
+            group.name,
+            describe_rule(&group.query)
+        ),
+    }
+}
+
+/// The rule in the words the filter uses, for a tooltip or a radio label.
+fn describe_rule(query: &PoolQuery) -> String {
+    let mut parts = Vec::new();
+    if !query.countries.is_empty() {
+        parts.push(query.countries.join(", ").to_uppercase());
+    }
+    if !query.protocols.is_empty() {
+        parts.push(query.protocols.join(", "));
+    }
+    if !query.subscriptions.is_empty() {
+        parts.push(format!("{} subscription(s)", query.subscriptions.len()));
+    }
+    if parts.is_empty() {
+        "every server".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// A name the user will probably keep, so saving a scope is one click and a
+/// confirmation rather than a blank field to invent something for.
+fn suggested_group_name(rule: &PoolQuery) -> String {
+    match (rule.countries.as_slice(), rule.protocols.as_slice()) {
+        ([country], []) => country.to_uppercase(),
+        ([], [protocol]) => protocol.clone(),
+        ([country], [protocol]) => format!("{} {protocol}", country.to_uppercase()),
+        _ => String::new(),
     }
 }
 

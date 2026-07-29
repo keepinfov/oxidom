@@ -594,6 +594,10 @@ fn build(
     header.pack_start(&header_status);
     header.pack_start(&profile_switcher);
     header.pack_start(&search);
+    // The filter belongs next to the search because it is the same act — find
+    // the servers I mean — and putting it in the header keeps it from taking a
+    // strip of the page for controls that are usually left alone.
+    header.pack_start(&servers.header_filter());
     header.pack_end(&profile_actions);
     header.pack_end(&subscription_actions);
     header.pack_end(&settings_actions);
@@ -1242,6 +1246,8 @@ impl Controller {
         self.profile_actions.set_visible(profiles);
         self.subscription_actions.set_visible(subscriptions);
         self.settings_actions.set_visible(settings);
+        // Filtering only means anything where the cards are.
+        self.servers.header_filter().set_visible(general);
         if self.compact.get() {
             self.sync_search_entry(&self.compact_search);
             self.search.set_visible(false);
@@ -1675,6 +1681,22 @@ impl Controller {
                     if let Some(controller) = weak.upgrade() {
                         controller.set_hwid(id, enabled);
                     }
+                })
+            },
+            groups_holding: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id: String| {
+                    weak.upgrade()
+                        .map(|controller| controller.servers.groups_holding(&id))
+                        .unwrap_or_default()
+                })
+            },
+            groups_holding_any: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id: String| {
+                    weak.upgrade()
+                        .map(|controller| controller.servers.groups_holding_any(&id))
+                        .unwrap_or_default()
                 })
             },
         };
@@ -3396,8 +3418,13 @@ fn install_css() {
            feedback without a button's indent: the negative margin puts the text
            back on the same vertical line as the cards underneath it. */
         button.subscription-toggle { padding: 2px 8px; margin-left: -8px; border-radius: 10px; min-height: 0; }
-        .server-filter-bar { padding: 0 0 2px; }
-        .server-filter-bar > flowboxchild { padding: 0; }
+        .group-chip-bar { padding: 0 2px 2px; }
+        .group-chip { min-height: 28px; padding: 2px 14px; font-weight: 500; }
+        /* The dot in the label already says "modified"; the accent makes it
+           visible without reading, and both survive a theme that ignores one. */
+        .group-chip-modified { color: @accent_color; }
+        .group-chip-add { min-height: 28px; min-width: 28px; padding: 0; }
+        .quick-filter { min-height: 26px; padding: 2px 12px; font-weight: normal; }
         menubutton.filter-menu > button { min-height: 30px; padding: 3px 12px; border-radius: 999px; }
         .compact-search { min-height: 28px; }
         .compact-search text { padding-top: 1px; padding-bottom: 1px; }

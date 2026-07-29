@@ -22,6 +22,43 @@ pub struct SubscriptionCallbacks {
     pub remove: Rc<dyn Fn(String)>,
     pub remove_server: Rc<dyn Fn(String)>,
     pub hwid: Rc<dyn Fn(String, bool)>,
+    /// Names of the groups that would lose a server if it were deleted.
+    /// A group is the only thing in this app that holds a server by id, so a
+    /// deletion is the one moment a user can be told before it is too late.
+    pub groups_holding: Rc<dyn Fn(String) -> Vec<String>>,
+    /// The same, for every server of a subscription: `(group name, count)`.
+    pub groups_holding_any: Rc<dyn Fn(String) -> Vec<(String, usize)>>,
+}
+
+/// "It is also in Favourites and Germany." — appended to a deletion prompt.
+fn also_in_groups(groups: &[String]) -> String {
+    match groups {
+        [] => String::new(),
+        [one] => format!(" It will also leave the group “{one}”."),
+        many => format!(" It will also leave the groups {}.", quoted_list(many)),
+    }
+}
+
+/// "8 of them are in “Europe”, 1 in “Favourites”." — the same warning for a
+/// whole subscription, where naming every server would be useless.
+fn groups_losing_servers(affected: &[(String, usize)]) -> String {
+    if affected.is_empty() {
+        return String::new();
+    }
+    let parts = affected
+        .iter()
+        .map(|(name, count)| format!("{count} in “{name}”"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" Servers in your groups will go with them: {parts}.")
+}
+
+fn quoted_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("“{value}”"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Clone)]
@@ -641,13 +678,16 @@ fn show_subscription_details(
     let remove_id = subscription.id.clone();
     let remove_name = subscription.name.clone();
     let remove = callbacks.remove.clone();
+    let holding_any = callbacks.groups_holding_any.clone();
     let details_window = window.clone();
     delete.connect_clicked(move |_| {
+        let affected = holding_any(remove_id.clone());
         let dialog = adw::MessageDialog::new(
             Some(&details_window),
             Some("Delete subscription?"),
             Some(&format!(
-                "“{remove_name}” and all of its servers will be removed."
+                "“{remove_name}” and all of its servers will be removed.{}",
+                groups_losing_servers(&affected)
             )),
         );
         dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
@@ -713,6 +753,7 @@ fn show_local_servers(
         let server_id = server.id;
         let server_name = server.name.clone();
         let callback = callbacks.remove_server.clone();
+        let holding = callbacks.groups_holding.clone();
         let window_for_remove = window.clone();
         remove.connect_clicked(move |_| {
             // Deleting is irreversible (there is no undo), so mirror the
@@ -720,7 +761,10 @@ fn show_local_servers(
             let dialog = adw::MessageDialog::new(
                 Some(&window_for_remove),
                 Some("Remove server?"),
-                Some(&format!("“{server_name}” will be removed permanently.")),
+                Some(&format!(
+                    "“{server_name}” will be removed permanently.{}",
+                    also_in_groups(&holding(server_id.clone()))
+                )),
             );
             dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
             dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
@@ -818,4 +862,33 @@ fn format_timestamp(timestamp: i64) -> String {
         .and_then(|value| value.format("%c"))
         .map(|value| value.to_string())
         .unwrap_or_else(|_| timestamp.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{also_in_groups, groups_losing_servers};
+
+    #[test]
+    fn a_deletion_says_which_groups_would_lose_the_server() {
+        // Nothing to say is said as nothing, not as an empty clause dangling
+        // off the end of the sentence.
+        assert_eq!(also_in_groups(&[]), "");
+        assert_eq!(
+            also_in_groups(&["Favourites".to_string()]),
+            " It will also leave the group “Favourites”."
+        );
+        assert_eq!(
+            also_in_groups(&["Favourites".to_string(), "Germany".to_string()]),
+            " It will also leave the groups “Favourites”, “Germany”."
+        );
+    }
+
+    #[test]
+    fn deleting_a_subscription_counts_instead_of_naming_every_server() {
+        assert_eq!(groups_losing_servers(&[]), "");
+        assert_eq!(
+            groups_losing_servers(&[("Europe".to_string(), 8), ("Favourites".to_string(), 1)]),
+            " Servers in your groups will go with them: 8 in “Europe”, 1 in “Favourites”."
+        );
+    }
 }

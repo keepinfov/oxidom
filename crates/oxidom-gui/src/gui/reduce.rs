@@ -21,6 +21,7 @@ use oxidom_core::profile::RouteMode;
 use oxidom_core::xray::core::Status;
 
 use super::operation::{UiOperation, UiOperationKind};
+use super::prefs::{GroupKind, ServerGroup};
 use super::server_card::{LatencyAge, LatencyState};
 
 /// One round of daemon polling, produced off the main thread.
@@ -689,6 +690,140 @@ pub(super) fn available_subscriptions(groups: &[Subscription]) -> Vec<FilterOpti
             value: group.id.clone(),
             label: group.name.clone(),
         })
+        .collect()
+}
+
+/// A one-click filter offered above the detailed controls.
+///
+/// Quick and advanced are two presentations of *one* state, never two filters:
+/// picking "Germany" here sets the same `countries` the advanced list shows, so
+/// opening it immediately afterwards explains what the click did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Quick {
+    /// Clear every filter.
+    All,
+    Country(String),
+    Protocol(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct QuickFilter {
+    pub label: String,
+    pub quick: Quick,
+}
+
+/// The quick row: everything, then the countries carrying the most servers,
+/// then each protocol present. Derived from the data rather than hardcoded —
+/// a fixed "Germany" chip is noise for someone whose provider has none.
+pub(super) fn quick_filters(groups: &[Subscription], countries_shown: usize) -> Vec<QuickFilter> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for server in pool_servers(groups) {
+        let Some(country) = server.country.as_deref() else {
+            continue;
+        };
+        let country = country.to_ascii_lowercase();
+        match counts.iter_mut().find(|(value, _)| *value == country) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((country, 1)),
+        }
+    }
+    // Count descending, then alphabetically, so the row does not reshuffle
+    // between two equally sized countries on every rebuild.
+    counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    counts.truncate(countries_shown);
+
+    let mut quick = vec![QuickFilter {
+        label: "All".to_string(),
+        quick: Quick::All,
+    }];
+    quick.extend(counts.into_iter().map(|(country, count)| QuickFilter {
+        label: format!("{} {count}", country.to_ascii_uppercase()),
+        quick: Quick::Country(country),
+    }));
+    quick.extend(
+        available_protocols(groups)
+            .into_iter()
+            .map(|protocol| QuickFilter {
+                label: protocol.clone(),
+                quick: Quick::Protocol(protocol),
+            }),
+    );
+    quick
+}
+
+/// Whether the filter widgets currently hold exactly what a saved group holds.
+///
+/// The group's own name is not part of the comparison: renaming a group does
+/// not make the view "modified", because nothing about which servers are shown
+/// has changed.
+pub(super) fn query_equals_group(current: &PoolQuery, group: &ServerGroup) -> bool {
+    let mut saved = group.query.clone();
+    saved.name = current.name.clone();
+    &saved == current
+}
+
+/// Add or replace a group by id, keeping chip order stable.
+///
+/// Replacing in place rather than removing and pushing: saving over "Europe"
+/// must not send its chip to the end of the row.
+pub(super) fn upsert_group(groups: &[ServerGroup], group: ServerGroup) -> Vec<ServerGroup> {
+    let mut groups = groups.to_vec();
+    match groups.iter_mut().find(|saved| saved.id == group.id) {
+        Some(saved) => *saved = group,
+        None => groups.push(group),
+    }
+    groups
+}
+
+/// The group after starring or unstarring one server.
+///
+/// Membership is by server id, never by alias: an alias is a display name the
+/// user can change, and a favourite that fell out of the list because it was
+/// renamed would look like data loss.
+pub(super) fn toggled_member(group: &ServerGroup, server_id: &str) -> ServerGroup {
+    let mut group = group.clone();
+    match group
+        .query
+        .members
+        .iter()
+        .position(|member| member == server_id)
+    {
+        Some(index) => {
+            group.query.members.remove(index);
+        }
+        None => group.query.members.push(server_id.to_string()),
+    }
+    group
+}
+
+/// The servers a group currently stands for.
+///
+/// An empty *list* selects nothing, which is why the kind is stored rather than
+/// inferred: `PoolQuery` with no members and no filters is an unfiltered rule,
+/// i.e. every server, and a Favourites nobody has starred yet must not mean
+/// that.
+pub(super) fn group_member_ids(group: &ServerGroup, groups: &[Subscription]) -> Vec<String> {
+    if group.kind == GroupKind::List && group.query.members.is_empty() {
+        return Vec::new();
+    }
+    filtered_ids(&group.query, groups)
+}
+
+/// Groups a server belongs to right now, by name — for the sentence a deletion
+/// confirmation adds so nobody loses a favourite without being told.
+pub(super) fn groups_holding<'a>(
+    saved: &'a [ServerGroup],
+    groups: &[Subscription],
+    server_id: &str,
+) -> Vec<&'a str> {
+    saved
+        .iter()
+        .filter(|group| {
+            group_member_ids(group, groups)
+                .iter()
+                .any(|id| id == server_id)
+        })
+        .map(|group| group.name.as_str())
         .collect()
 }
 
@@ -1600,6 +1735,168 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn group(id: &str, kind: GroupKind, query: PoolQuery) -> ServerGroup {
+        ServerGroup {
+            id: id.to_string(),
+            name: id.to_string(),
+            icon: String::new(),
+            kind,
+            query,
+        }
+    }
+
+    #[test]
+    fn quick_filters_are_derived_from_the_servers_that_exist() {
+        let groups = vec![filter_group(
+            "main",
+            "Main",
+            &[
+                (
+                    "a",
+                    "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.example:443#A",
+                    Some("de"),
+                ),
+                (
+                    "b",
+                    "vless://b831381d-6324-4d53-ad4f-8cda48b30811@b.example:443#B",
+                    Some("DE"),
+                ),
+                ("c", "trojan://secret@c.example:443#C", Some("ch")),
+                ("d", "trojan://secret@d.example:443#D", None),
+            ],
+        )];
+
+        let quick = quick_filters(&groups, 2);
+        assert_eq!(
+            quick
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["All", "DE 2", "CH 1", "trojan", "vless"]
+        );
+        // Case folds into one country, and a server without one contributes
+        // to no country chip at all.
+        assert_eq!(quick[1].quick, Quick::Country("de".to_string()));
+        assert_eq!(quick[3].quick, Quick::Protocol("trojan".to_string()));
+        // Fewer countries than asked for is not an error.
+        assert_eq!(quick_filters(&groups, 99).len(), 5);
+    }
+
+    #[test]
+    fn a_group_matches_the_filter_regardless_of_what_the_pool_is_called() {
+        let saved = group(
+            "eu",
+            GroupKind::Rule,
+            PoolQuery {
+                name: "Europe".to_string(),
+                countries: vec!["de".to_string()],
+                ..PoolQuery::default()
+            },
+        );
+        let same = PoolQuery {
+            name: "something else entirely".to_string(),
+            countries: vec!["de".to_string()],
+            ..PoolQuery::default()
+        };
+        let different = PoolQuery {
+            name: "Europe".to_string(),
+            countries: vec!["ch".to_string()],
+            ..PoolQuery::default()
+        };
+
+        assert!(query_equals_group(&same, &saved));
+        assert!(!query_equals_group(&different, &saved));
+    }
+
+    #[test]
+    fn saving_over_a_group_keeps_its_place_in_the_row() {
+        let groups = vec![
+            group("favourites", GroupKind::List, PoolQuery::default()),
+            group("eu", GroupKind::Rule, PoolQuery::default()),
+            group("asia", GroupKind::Rule, PoolQuery::default()),
+        ];
+        let mut replacement = group("eu", GroupKind::Rule, PoolQuery::default());
+        replacement.name = "Europe (wider)".to_string();
+
+        let saved = upsert_group(&groups, replacement);
+        assert_eq!(
+            saved.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(),
+            ["favourites", "eu", "asia"]
+        );
+        assert_eq!(saved[1].name, "Europe (wider)");
+
+        let added = upsert_group(&groups, group("new", GroupKind::Rule, PoolQuery::default()));
+        assert_eq!(
+            added.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(),
+            ["favourites", "eu", "asia", "new"]
+        );
+    }
+
+    #[test]
+    fn starring_a_server_toggles_it_in_and_out_of_the_list() {
+        let empty = group("favourites", GroupKind::List, PoolQuery::default());
+
+        let starred = toggled_member(&empty, "id-a");
+        assert_eq!(starred.query.members, ["id-a"]);
+        let both = toggled_member(&starred, "id-b");
+        assert_eq!(both.query.members, ["id-a", "id-b"]);
+        // Toggling the first one back leaves the second where it was.
+        assert_eq!(toggled_member(&both, "id-a").query.members, ["id-b"]);
+    }
+
+    #[test]
+    fn a_deletion_can_name_every_group_that_would_lose_the_server() {
+        let groups = vec![filter_group(
+            "main",
+            "Main",
+            &[
+                (
+                    "berlin",
+                    "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.example:443#Berlin",
+                    Some("de"),
+                ),
+                ("zurich", "trojan://secret@z.example:443#Zurich", Some("ch")),
+            ],
+        )];
+        let mut favourites = group(
+            "favourites",
+            GroupKind::List,
+            PoolQuery {
+                members: vec!["berlin".to_string()],
+                ..PoolQuery::default()
+            },
+        );
+        favourites.name = "Favourites".to_string();
+        let mut germany = group(
+            "de",
+            GroupKind::Rule,
+            PoolQuery {
+                countries: vec!["de".to_string()],
+                ..PoolQuery::default()
+            },
+        );
+        germany.name = "Germany".to_string();
+        let saved = vec![favourites, germany];
+
+        // A rule counts too: deleting Berlin empties Germany just as surely as
+        // it empties a list that names it.
+        assert_eq!(
+            groups_holding(&saved, &groups, "berlin"),
+            ["Favourites", "Germany"]
+        );
+        assert!(groups_holding(&saved, &groups, "zurich").is_empty());
+
+        // An empty list stands for nothing. Inferred from `PoolQuery` alone it
+        // would be an unfiltered rule, i.e. every server on the machine, and a
+        // Favourites nobody has starred yet would claim all of them.
+        let untouched = vec![group("favourites", GroupKind::List, PoolQuery::default())];
+        assert!(group_member_ids(&untouched[0], &groups).is_empty());
+        assert!(groups_holding(&untouched, &groups, "berlin").is_empty());
+        // An empty *rule* is still "everything", which is what "All" means.
+        let all = group("all", GroupKind::Rule, PoolQuery::default());
+        assert_eq!(group_member_ids(&all, &groups).len(), 2);
     }
 
     #[test]

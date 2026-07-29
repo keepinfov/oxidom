@@ -182,6 +182,35 @@ pub enum CardConnectionState {
     Failed,
 }
 
+/// What a card can ask the page to do. One struct rather than five closure
+/// parameters: `ServerCard::new` was already at seven arguments, and the sixth
+/// and seventh would have been two more `impl Fn()` that read identically at
+/// the call site.
+#[derive(Clone)]
+pub struct CardHandlers {
+    pub select: Rc<dyn Fn()>,
+    pub activate: Rc<dyn Fn()>,
+    pub ping: Rc<dyn Fn()>,
+    pub set_alias: Rc<dyn Fn(String)>,
+    pub toggle_favourite: Rc<dyn Fn()>,
+}
+
+fn favourite_icon(favourite: bool) -> &'static str {
+    if favourite {
+        "starred-symbolic"
+    } else {
+        "non-starred-symbolic"
+    }
+}
+
+fn favourite_tooltip(favourite: bool) -> &'static str {
+    if favourite {
+        "Remove from Favourites"
+    } else {
+        "Add to Favourites"
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClickPlan {
     Ignore,
@@ -222,11 +251,16 @@ impl ServerCard {
         server: &Server,
         connection_state: CardConnectionState,
         latency_state: LatencyState,
-        on_select: impl Fn() + 'static,
-        on_activate: impl Fn() + 'static,
-        on_ping: impl Fn() + 'static,
-        on_set_alias: impl Fn(String) + 'static,
+        favourite: bool,
+        handlers: CardHandlers,
     ) -> Self {
+        let CardHandlers {
+            select: on_select,
+            activate: on_activate,
+            ping: on_ping,
+            set_alias: on_set_alias,
+            toggle_favourite,
+        } = handlers;
         let flag = flag_widget(server.country.as_deref(), 26, 20);
 
         let name = gtk::Label::builder()
@@ -318,8 +352,6 @@ impl ServerCard {
 
         // A single click inspects (toggles details); connecting stays an
         // explicit action — the Connect button, or a double-click shortcut.
-        let on_select: Rc<dyn Fn()> = Rc::new(on_select);
-        let on_activate: Rc<dyn Fn()> = Rc::new(on_activate);
         let expanded = Rc::new(Cell::new(false));
         let primary_click = gtk::GestureClick::new();
         primary_click.set_button(gtk::gdk::BUTTON_PRIMARY);
@@ -429,7 +461,6 @@ impl ServerCard {
         let edit_alias = icon_button("document-edit-symbolic", "Set alias");
         edit_alias.add_css_class("server-action");
         let current_alias = server.alias.clone();
-        let on_set_alias: Rc<dyn Fn(String)> = Rc::new(on_set_alias);
         edit_alias.connect_clicked(move |button| {
             show_alias_dialog(button, current_alias.as_deref(), on_set_alias.clone());
         });
@@ -456,9 +487,30 @@ impl ServerCard {
             .build();
         ping_button.update_property(&[gtk::accessible::Property::Label("Re-check latency")]);
         ping_button.connect_clicked(move |_| on_ping());
+        // Starring is the one way into the Favourites group, and Favourites is
+        // the answer to "the four servers I actually use are somewhere in six
+        // hundred".
+        let favourite_button = gtk::ToggleButton::builder()
+            .icon_name(favourite_icon(favourite))
+            .tooltip_text(favourite_tooltip(favourite))
+            .active(favourite)
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "server-action"])
+            .build();
+        favourite_button.update_property(&[gtk::accessible::Property::Label(favourite_tooltip(
+            favourite,
+        ))]);
+        favourite_button.connect_clicked(move |button| {
+            let now = button.is_active();
+            button.set_icon_name(favourite_icon(now));
+            button.set_tooltip_text(Some(favourite_tooltip(now)));
+            button.update_property(&[gtk::accessible::Property::Label(favourite_tooltip(now))]);
+            toggle_favourite();
+        });
 
         let action_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         action_row.set_hexpand(true);
+        action_row.append(&favourite_button);
         action_row.append(&edit_alias);
         action_row.append(&copy_button);
         action_row.append(&ping_button);
