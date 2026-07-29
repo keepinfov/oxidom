@@ -399,7 +399,13 @@ pool never makes a running session stale. Both `name` and `members` are `skip_se
 empty, so every pool profile written before lists existed still round-trips to the same bytes.
 
 The same `PoolQuery` drives the balancer and the GUI's server filter: a filter is a pool
-constructor, not a second search. `leastLoad` is the default because the point of a pool is to
+constructor, not a second search. A **group** in the GUI is a saved `PoolQuery` under a name, so
+connecting one writes it straight into `select.pool` — the daemon never learns a new noun. Group
+membership is therefore edited only where the servers are (the chip row and the funnel popover on
+the Servers page); the profile editor reports the pool and edits only `strategy`, `max`,
+`expected` and `probe_interval`, carrying everything about *which* servers through untouched.
+Two blind editors for one thing is how a saved profile comes to disagree with the group it was
+made from. `leastLoad` is the default because the point of a pool is to
 spread activity across exit IPs *and keep working*; `roundRobin` was measured on Xray 26.3.27 to
 keep unreachable nodes in the rotation, and `leastPing` concentrates every connection on one node.
 `server = ""` with `[select.pool]` absent stays valid — that is a freshly created profile, and
@@ -500,6 +506,14 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   (`transport_label`, e.g. "vless + xhttp + reality"), optional **latency badge** (green when
   low). Whole card is a click target → selects that server. Every server carried by a connected
   profile is visually marked; the one-profile case is unchanged.
+- **Scopes (groups):** a chip row above the grid — `All`, one chip per saved group, `+`. A group
+  is a **scope over the one list**, never a second block of cards: rendering it as its own block
+  shows the same server two or three times and leaves no way to tell which card is real, and
+  "show it only in its highest-priority group" makes a starred server vanish from its
+  subscription. Cards stay in their subscription; the chip narrows what is shown. Selecting a
+  chip reveals a Connect bar that points the **selected profile** at that group — the same rule a
+  card click follows. Favourites is a built-in list; the card's star is what fills it, and it
+  cannot be deleted because the star would have nowhere to put things.
 - **Server grid:** a top group of "loose"/favorite servers, then per-**subscription groups**:
   each group shows its **title** + **description** (name + quota/expiry from userinfo) followed by
   that subscription's server cards. Multi-column grid in wide mode, single column in narrow

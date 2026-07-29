@@ -16,7 +16,7 @@ use oxidom_core::ipc::{
     SelectionInfo, SessionInfo, StatusInfo,
 };
 use oxidom_core::model::{OutboundSpec, Subscription};
-use oxidom_core::pool::PoolQuery;
+use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
 use oxidom_core::profile::RouteMode;
 use oxidom_core::xray::core::Status;
 
@@ -676,6 +676,32 @@ pub(super) fn available_protocols(groups: &[Subscription]) -> Vec<String> {
     values
 }
 
+/// Every pool-eligible server, grouped under the subscription it belongs to.
+///
+/// The user asked to exclude "specific servers of a specific subscription", and
+/// a flat list of two hundred names does not answer that: two providers reusing
+/// the same city name are indistinguishable until the subscription is shown
+/// above them. The value written is the server id rather than its alias — an
+/// alias is a display name the user can change, and an exclusion that quietly
+/// stopped applying after a rename would be worse than no exclusion.
+pub(super) fn excludable_servers(groups: &[Subscription]) -> Vec<(String, Vec<FilterOption>)> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let servers: Vec<FilterOption> = group
+                .servers
+                .iter()
+                .filter(|server| !matches!(&server.spec, OutboundSpec::XrayProfile { .. }))
+                .map(|server| FilterOption {
+                    value: server.id.clone(),
+                    label: oxidom_core::model::name_without_flag(&server.name).to_string(),
+                })
+                .collect();
+            (!servers.is_empty()).then(|| (group.name.clone(), servers))
+        })
+        .collect()
+}
+
 /// Subscription ids and labels that contain at least one pool-eligible node.
 pub(super) fn available_subscriptions(groups: &[Subscription]) -> Vec<FilterOption> {
     groups
@@ -749,6 +775,44 @@ pub(super) fn quick_filters(groups: &[Subscription], countries_shown: usize) -> 
             }),
     );
     quick
+}
+
+/// The rule in the words the filter uses, for a tooltip or a radio label.
+pub(super) fn describe_rule(query: &PoolQuery) -> String {
+    let mut parts = Vec::new();
+    if !query.countries.is_empty() {
+        parts.push(query.countries.join(", ").to_uppercase());
+    }
+    if !query.protocols.is_empty() {
+        parts.push(query.protocols.join(", "));
+    }
+    if !query.subscriptions.is_empty() {
+        parts.push(format!("{} subscription(s)", query.subscriptions.len()));
+    }
+    if !query.exclude.is_empty() {
+        parts.push(format!("except {}", query.exclude.len()));
+    }
+    if parts.is_empty() {
+        "every server".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// A pool of either kind in one line, for somewhere that only reports.
+///
+/// Shared with the profile editor so the two cannot describe the same pool
+/// differently — which is exactly what happens when a dialog grows its own
+/// wording for something the main UI already names.
+pub(super) fn describe_pool(query: &PoolQuery) -> String {
+    match query.kind() {
+        PoolKind::List => format!(
+            "{} server{}, chosen by hand",
+            query.members.len(),
+            if query.members.len() == 1 { "" } else { "s" }
+        ),
+        PoolKind::Rule => describe_rule(query),
+    }
 }
 
 /// Whether the filter widgets currently hold exactly what a saved group holds.
@@ -856,10 +920,14 @@ pub(super) fn ordered_subscriptions(
 ///
 /// Takes the currently displayed order rather than the stored one so the result
 /// is always a complete, self-consistent order — storing a partial one is how a
-/// later move against a stale list would reshuffle groups the user never
+/// later move against a stale list would reshuffle entries the user never
 /// touched. Out-of-range moves are a no-op, so the callers can wire the buttons
 /// unconditionally and let the ends of the list clamp themselves.
-pub(super) fn moved_subscription(visible: &[String], id: &str, delta: isize) -> Vec<String> {
+///
+/// Shared by the subscription blocks and the group chips: both are a row of
+/// named things the user arranges, and one of them having its own copy of this
+/// is how the two would come to disagree about what "move up" means.
+pub(super) fn moved_in_order(visible: &[String], id: &str, delta: isize) -> Vec<String> {
     let mut order = visible.to_vec();
     let Some(from) = order.iter().position(|value| value == id) else {
         return order;
@@ -881,11 +949,17 @@ pub(super) fn moved_subscription(visible: &[String], id: &str, delta: isize) -> 
 /// `PoolQuery` deliberately has no fuzzy text field. A text search is frozen
 /// into exact server-id exclusions, so clicking "Create pool" preserves the
 /// visible selection instead of silently broadening it.
+///
+/// `exclude` are the servers the user struck out by hand. They and the frozen
+/// search share one field because `resolve` has one notion of exclusion; the two
+/// are unioned rather than one replacing the other, so typing in the search box
+/// cannot resurrect a server that was explicitly struck out.
 pub(super) fn filters_to_query(
     groups: &[Subscription],
     subscriptions: &[String],
     countries: &[String],
     protocols: &[String],
+    exclude: &[String],
     search_texts: &HashMap<String, String>,
     text: &str,
 ) -> PoolQuery {
@@ -893,6 +967,7 @@ pub(super) fn filters_to_query(
         subscriptions: normalized(subscriptions, false),
         countries: normalized(countries, true),
         protocols: normalized(protocols, true),
+        exclude: normalized(exclude, false),
         ..PoolQuery::default()
     };
     let text = text.trim().to_ascii_lowercase();
@@ -900,7 +975,7 @@ pub(super) fn filters_to_query(
         return query;
     }
 
-    query.exclude = oxidom_core::pool::resolve(&query, groups)
+    let by_text: Vec<String> = oxidom_core::pool::resolve(&query, groups)
         .unwrap_or_default()
         .into_iter()
         .filter(|server| {
@@ -910,6 +985,8 @@ pub(super) fn filters_to_query(
         })
         .map(|server| server.id.clone())
         .collect();
+    query.exclude.extend(by_text);
+    query.exclude = normalized(&query.exclude, false);
     query
 }
 
@@ -1320,6 +1397,130 @@ pub(super) fn card_action(
     }
 }
 
+/// One entry of the Connect button's menu.
+///
+/// The wording leads with what the user gets and follows with the cost, because
+/// every one of these has a cost: the two health-blind strategies keep dead
+/// nodes in the rotation, and the fast one defeats the whole reason pools exist
+/// here — spreading activity over several exit addresses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ConnectChoice {
+    pub label: &'static str,
+    pub detail: &'static str,
+    pub strategy: Strategy,
+}
+
+/// The strategies offered where a group is connected. `random` is deliberately
+/// absent: it is `roundRobin` with a worse guarantee, and the profile editor
+/// still reaches it for anyone who wants it.
+pub(super) fn connect_choices() -> Vec<ConnectChoice> {
+    vec![
+        ConnectChoice {
+            label: "Spread across nodes",
+            detail: "Rotates over the nodes the core can still reach.",
+            strategy: Strategy::LeastLoad,
+        },
+        ConnectChoice {
+            label: "Every node in turn",
+            detail: "Strict rotation, including nodes that stopped answering.",
+            strategy: Strategy::RoundRobin,
+        },
+        ConnectChoice {
+            label: "Fastest node",
+            detail: "One node carries everything, so activity stops spreading.",
+            strategy: Strategy::LeastPing,
+        },
+    ]
+}
+
+/// What pressing Connect on a group's bar means for the selected profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PoolAction {
+    /// The profile already carries exactly this pool and is running it.
+    DownProfile(String),
+    /// It carries exactly this pool but nothing is up.
+    UpProfile(String),
+    /// It selects something else. Like [`CardAction::RepointAndUp`] this
+    /// rewrites `profiles/<name>.toml`, so the widget layer has to ask first.
+    RepointAndUp {
+        profile: String,
+        /// The server the profile points at today, if it points at one. Named
+        /// in the confirmation so nobody replaces a working selection without
+        /// being told what it was.
+        replaces_server: Option<String>,
+        replaces_pool: bool,
+    },
+    /// The selected profile has no file to write. `default` is normally seeded
+    /// on the daemon's first start, so this is the deleted-everything case.
+    NoProfile(String),
+}
+
+/// Whether two pools select the same thing under the same strategy.
+///
+/// `max`, `expected` and `probe_interval` are excluded on purpose: the Connect
+/// bar has no widget for any of them, only the profile editor does, and a
+/// comparison that counted them would report "different pool" for a profile the
+/// user merely tuned — then offer to overwrite the tuning as the fix.
+fn same_pool(saved: &PoolQuery, wanted: &PoolQuery) -> bool {
+    saved.name == wanted.name
+        && saved.strategy == wanted.strategy
+        && saved.members == wanted.members
+        && saved.subscriptions == wanted.subscriptions
+        && saved.countries == wanted.countries
+        && saved.protocols == wanted.protocols
+        && saved.exclude == wanted.exclude
+}
+
+/// The pool to write when a group is connected: what the bar chose, over the
+/// runtime knobs the profile already carried.
+pub(super) fn pool_for_profile(entry: Option<&ProfileEntry>, wanted: PoolQuery) -> PoolQuery {
+    let Some(saved) = entry.and_then(|entry| entry.pool.as_ref()) else {
+        return wanted;
+    };
+    PoolQuery {
+        max: saved.max,
+        expected: saved.expected,
+        probe_interval: saved.probe_interval.clone(),
+        ..wanted
+    }
+}
+
+/// Decide what connecting a group does, before any file is written.
+///
+/// The profile acted on is the selected one — the same rule a card click
+/// follows. A group is not a second kind of connection; it is what the profile
+/// selects, so connecting one has to land in the same place a server does.
+pub(super) fn pool_action(
+    profiles: &[ProfileEntry],
+    state: &SnapshotState,
+    query: &PoolQuery,
+) -> PoolAction {
+    let selected = state.selected_profile.clone();
+    let Some(entry) = profiles.iter().find(|entry| entry.name == selected) else {
+        return PoolAction::NoProfile(selected);
+    };
+    // Compared against the profile as stored, not against the members a live
+    // session resolved: a session that went `stale` because a subscription
+    // refreshed still belongs to this group, and calling that "a different
+    // pool" would ask the user to confirm replacing a pool with itself.
+    if entry
+        .pool
+        .as_ref()
+        .is_some_and(|pool| same_pool(pool, query))
+    {
+        return if session_for(state, &selected).is_some() {
+            PoolAction::DownProfile(selected)
+        } else {
+            PoolAction::UpProfile(selected)
+        };
+    }
+    PoolAction::RepointAndUp {
+        profile: selected,
+        replaces_server: (!entry.server.is_empty()).then(|| entry.server.clone()),
+        replaces_pool: entry.pool.is_some(),
+    }
+}
+
 pub(super) fn other_sessions_message(
     sessions: &[SessionInfo],
     selected_profile: &str,
@@ -1708,6 +1909,7 @@ mod tests {
             &["main".to_string()],
             &["CH".to_string()],
             &["VLESS".to_string()],
+            &[],
             &search_texts,
             "alp",
         );
@@ -1717,6 +1919,43 @@ mod tests {
         assert_eq!(query.protocols, ["vless"]);
         assert_eq!(query.exclude, ["zurich"]);
         assert_eq!(filtered_ids(&query, &groups), ["alpine"]);
+
+        // A server struck out by hand stays struck out while the search box is
+        // narrowing to it: the two exclusions are one field, and the later one
+        // must not overwrite the earlier.
+        let by_hand = filters_to_query(
+            &groups,
+            &["main".to_string()],
+            &["CH".to_string()],
+            &["VLESS".to_string()],
+            &["alpine".to_string()],
+            &search_texts,
+            "alp",
+        );
+        assert_eq!(by_hand.exclude, ["alpine", "zurich"]);
+        assert!(filtered_ids(&by_hand, &groups).is_empty());
+
+        // And it applies on its own, with no search text at all.
+        let struck = filters_to_query(
+            &groups,
+            &[],
+            &[],
+            &[],
+            &["zurich".to_string()],
+            &[].into(),
+            "",
+        );
+        assert_eq!(
+            filtered_ids(&struck, &groups),
+            ["alpine", "berlin", "other"]
+        );
+        assert_eq!(
+            excludable_servers(&groups)
+                .iter()
+                .map(|(name, servers)| (name.as_str(), servers.len()))
+                .collect::<Vec<_>>(),
+            [("Main", 3), ("Backup", 1)]
+        );
         assert_eq!(available_countries(&groups), ["ch", "de", "nl"]);
         assert_eq!(
             available_protocols(&groups),
@@ -1934,15 +2173,94 @@ mod tests {
     }
 
     #[test]
-    fn moving_a_subscription_clamps_at_both_ends() {
+    fn connecting_a_group_acts_on_the_selected_profile_and_says_what_it_replaces() {
+        let europe = PoolQuery {
+            name: "Europe".to_string(),
+            countries: vec!["de".to_string()],
+            ..PoolQuery::default()
+        };
+        let mut state = state();
+        state.selected_profile = "work".to_string();
+
+        // Nothing to write to: every profile file is gone.
+        assert_eq!(
+            pool_action(&[], &state, &europe),
+            PoolAction::NoProfile("work".to_string())
+        );
+
+        // Points at a server, so connecting the group repoints it — and the
+        // server it is losing is named rather than merely implied.
+        let profiles = vec![profile("work", "berlin"), profile("default", "")];
+        assert_eq!(
+            pool_action(&profiles, &state, &europe),
+            PoolAction::RepointAndUp {
+                profile: "work".to_string(),
+                replaces_server: Some("berlin".to_string()),
+                replaces_pool: false,
+            }
+        );
+
+        // Already carries this exact pool: nothing to rewrite, only to start.
+        let mut carrying = profiles.clone();
+        carrying[0].server = String::new();
+        carrying[0].pool = Some(europe.clone());
+        assert_eq!(
+            pool_action(&carrying, &state, &europe),
+            PoolAction::UpProfile("work".to_string())
+        );
+
+        // …and once it is up, the same button takes it down.
+        state.sessions = vec![session("work", "connected", "berlin")];
+        assert_eq!(
+            pool_action(&carrying, &state, &europe),
+            PoolAction::DownProfile("work".to_string())
+        );
+
+        // A different strategy over the same servers is a different pool: the
+        // file has to change, so the user has to be asked.
+        let faster = PoolQuery {
+            strategy: Strategy::LeastPing,
+            ..europe.clone()
+        };
+        assert_eq!(
+            pool_action(&carrying, &state, &faster),
+            PoolAction::RepointAndUp {
+                profile: "work".to_string(),
+                replaces_server: None,
+                replaces_pool: true,
+            }
+        );
+
+        // Tuning the profile is not repointing it. The bar has no widget for
+        // any of these three, so a comparison that counted them would call a
+        // tuned profile "a different pool" and offer to erase the tuning.
+        let tuned = PoolQuery {
+            max: 8,
+            expected: 4,
+            probe_interval: "30s".to_string(),
+            ..europe.clone()
+        };
+        carrying[0].pool = Some(tuned.clone());
+        state.sessions.clear();
+        assert_eq!(
+            pool_action(&carrying, &state, &europe),
+            PoolAction::UpProfile("work".to_string())
+        );
+        assert_eq!(pool_for_profile(carrying.first(), europe.clone()), tuned);
+        // With nothing saved to carry, what the bar chose is what gets written.
+        assert_eq!(pool_for_profile(None, europe.clone()), europe);
+    }
+
+    #[test]
+    fn moving_an_entry_clamps_at_both_ends() {
         let visible = vec!["a".to_string(), "b".to_string(), "c".to_string()];
 
-        assert_eq!(moved_subscription(&visible, "c", -1), ["a", "c", "b"]);
-        assert_eq!(moved_subscription(&visible, "a", 1), ["b", "a", "c"]);
+        assert_eq!(moved_in_order(&visible, "c", -1), ["a", "c", "b"]);
+        assert_eq!(moved_in_order(&visible, "a", 1), ["b", "a", "c"]);
         // Already first/last, and an id that is not in the list at all.
-        assert_eq!(moved_subscription(&visible, "a", -1), ["a", "b", "c"]);
-        assert_eq!(moved_subscription(&visible, "c", 1), ["a", "b", "c"]);
-        assert_eq!(moved_subscription(&visible, "d", -1), ["a", "b", "c"]);
+        assert_eq!(moved_in_order(&visible, "a", -1), ["a", "b", "c"]);
+        assert_eq!(moved_in_order(&visible, "c", 1), ["a", "b", "c"]);
+        assert_eq!(moved_in_order(&visible, "d", -1), ["a", "b", "c"]);
     }
 
     #[test]

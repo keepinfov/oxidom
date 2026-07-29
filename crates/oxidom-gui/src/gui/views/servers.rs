@@ -13,9 +13,9 @@ use super::super::group::subscription_description;
 use super::super::prefs::{FAVOURITES_ID, GroupKind, GuiPrefs, ServerGroup};
 use super::super::reduce::{
     FilterOption, Quick, ServerProfiles, available_countries, available_protocols,
-    available_subscriptions, filtered_ids, filters_to_query, group_member_ids, groups_holding,
-    moved_subscription, ordered_subscriptions, query_equals_group, quick_filters, toggled_member,
-    upsert_group,
+    available_subscriptions, connect_choices, describe_rule, excludable_servers, filtered_ids,
+    filters_to_query, group_member_ids, groups_holding, moved_in_order, ordered_subscriptions,
+    query_equals_group, quick_filters, toggled_member, upsert_group,
 };
 use super::super::server_card::{
     CARD_MEASURE_WIDTH, COMPACT_CARD_HEIGHT, CardConnectionState, CardHandlers, LatencyState,
@@ -55,6 +55,10 @@ pub struct CardCallbacks {
     pub refresh: Rc<dyn Fn(String)>,
     pub set_alias: Rc<dyn Fn(String, String)>,
     pub create_pool: Rc<dyn Fn(PoolQuery)>,
+    /// Connect the selected profile to the group on screen. Unlike
+    /// `create_pool` this makes no new profile: a group is what a profile
+    /// selects, so connecting one lands where connecting a server lands.
+    pub connect_pool: Rc<dyn Fn(PoolQuery)>,
 }
 
 /// One subscription block. Cards live in independent vertical column boxes
@@ -95,6 +99,10 @@ pub struct ServersView {
     filter_countries: Rc<RefCell<Vec<String>>>,
     filter_protocols: Rc<RefCell<Vec<String>>>,
     filter_subscriptions: Rc<RefCell<Vec<String>>>,
+    /// Servers struck out by hand, by id. Part of the rule like the three above
+    /// it — `PoolQuery.exclude` is where a rule says "everything German except
+    /// this one", which no combination of the other three can express.
+    filter_exclude: Rc<RefCell<Vec<String>>>,
     /// Members of the selected group when that group is a frozen list. Not a
     /// widget's contents — a list has no filter row to live in — so it is
     /// carried here and folded into `current_filter` by `apply_filter`.
@@ -112,9 +120,19 @@ pub struct ServersView {
     /// Set on every rebuild; the popover's "Create pool" needs it long after
     /// the callbacks that carried it went out of scope.
     on_create_pool: PoolCallback,
+    on_connect_pool: PoolCallback,
     /// The row of saved scopes, above the subscription groups.
     chip_bar: gtk::Box,
     chip_scroll: gtk::ScrolledWindow,
+    /// Shown only while a chip is selected, so an unfiltered list costs no
+    /// vertical space for a button that would have nothing to connect.
+    connect_bar: gtk::Box,
+    connect_title: gtk::Label,
+    connect_button: adw::SplitButton,
+    /// Strategy the split button's primary half uses, last chosen from its
+    /// menu. Not persisted: it describes this session's intent, and a pool the
+    /// user actually kept is written into the profile anyway.
+    connect_strategy: Rc<Cell<usize>>,
     /// Lives in the window header next to the search entry, so the filter
     /// costs no vertical space until it is opened.
     filter_button: gtk::MenuButton,
@@ -188,6 +206,25 @@ impl ServersView {
             .propagate_natural_height(true)
             .build();
 
+        let connect_title = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
+            .build();
+        let connect_button = adw::SplitButton::builder()
+            .label("Connect")
+            .css_classes(["suggested-action"])
+            .build();
+        let connect_bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .visible(false)
+            .css_classes(["group-connect-bar"])
+            .build();
+        connect_bar.append(&connect_title);
+        connect_bar.append(&connect_button);
+
         let filter_popover = gtk::Popover::builder().width_request(320).build();
         let filter_button = gtk::MenuButton::builder()
             .icon_name("funnel-symbolic")
@@ -202,12 +239,16 @@ impl ServersView {
             .css_classes(["dim-label", "caption"])
             .build();
 
-        Self {
+        let view = Self {
             root,
             content,
             no_matches,
             chip_bar,
             chip_scroll,
+            connect_bar,
+            connect_title,
+            connect_button,
+            connect_strategy: Rc::new(Cell::new(0)),
             filter_button,
             filter_popover,
             match_label,
@@ -218,6 +259,7 @@ impl ServersView {
             saved_groups: Rc::new(RefCell::new(Vec::new())),
             active_chip: Rc::new(RefCell::new(None)),
             on_create_pool: Rc::new(RefCell::new(None)),
+            on_connect_pool: Rc::new(RefCell::new(None)),
             on_browse_subscriptions: Rc::new(RefCell::new(None)),
             cards: Rc::new(RefCell::new(HashMap::new())),
             groups: Rc::new(RefCell::new(Vec::new())),
@@ -227,6 +269,7 @@ impl ServersView {
             filter_countries: Rc::new(RefCell::new(Vec::new())),
             filter_protocols: Rc::new(RefCell::new(Vec::new())),
             filter_subscriptions: Rc::new(RefCell::new(Vec::new())),
+            filter_exclude: Rc::new(RefCell::new(Vec::new())),
             current_filter: Rc::new(RefCell::new(PoolQuery::default())),
             columns: Rc::new(Cell::new(1)),
             pending_columns: Rc::new(Cell::new(1)),
@@ -236,7 +279,12 @@ impl ServersView {
             selected: Rc::new(RefCell::new(None)),
             requested_selected: Rc::new(RefCell::new(None)),
             prefs: Rc::new(RefCell::new(GuiPrefs::load(subscriptions))),
-        }
+        };
+        // Once, not per rebuild: the split button outlives every rebuild, and
+        // re-connecting its handlers would make the Nth click perform N
+        // connections.
+        view.build_connect_button();
+        view
     }
 
     /// Pick the column count from the width the window gives this view.
@@ -311,6 +359,7 @@ impl ServersView {
         *self.subscriptions.borrow_mut() = subscriptions.to_vec();
         self.search_texts.borrow_mut().clear();
         *self.on_create_pool.borrow_mut() = Some(callbacks.create_pool.clone());
+        *self.on_connect_pool.borrow_mut() = Some(callbacks.connect_pool.clone());
         *self.latencies.borrow_mut() = latency_states
             .iter()
             .filter_map(|(id, state)| sort_value(*state).map(|value| (id.clone(), value)))
@@ -346,6 +395,7 @@ impl ServersView {
         }
 
         self.content.append(&self.chip_scroll);
+        self.content.append(&self.connect_bar);
         self.build_chip_bar();
         self.build_filter_popover(subscriptions);
         let favourites: HashSet<String> = self
@@ -716,6 +766,125 @@ impl ServersView {
         self.chip_bar.append(&add);
     }
 
+    /// Wire the split button: a click connects with the strategy last chosen,
+    /// the arrow offers the others.
+    ///
+    /// This is the bar the whole redesign exists for. Before it, the only way
+    /// to run a pool was to open the profile editor, switch Selection to Pool
+    /// and fill in eight fields — an expert path for a request that is simply
+    /// "don't make me pick a server".
+    fn build_connect_button(&self) {
+        self.connect_button.connect_clicked({
+            let view = self.clone();
+            move |_| view.connect_active_group()
+        });
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        list.set_margin_top(6);
+        list.set_margin_bottom(6);
+        list.set_margin_start(6);
+        list.set_margin_end(6);
+        let popover = gtk::Popover::builder().child(&list).build();
+        for (index, choice) in connect_choices().into_iter().enumerate() {
+            let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            text.append(
+                &gtk::Label::builder()
+                    .label(choice.label)
+                    .xalign(0.0)
+                    .build(),
+            );
+            text.append(
+                &gtk::Label::builder()
+                    .label(choice.detail)
+                    .xalign(0.0)
+                    .max_width_chars(34)
+                    .wrap(true)
+                    .css_classes(["dim-label", "caption"])
+                    .build(),
+            );
+            let button = gtk::Button::builder()
+                .child(&text)
+                .css_classes(["flat"])
+                .build();
+            button.connect_clicked({
+                let view = self.clone();
+                let popover = popover.clone();
+                move |_| {
+                    popover.popdown();
+                    // Picking from the menu both chooses and acts, so the arrow
+                    // is never a settings menu the user has to press twice.
+                    view.connect_strategy.set(index);
+                    view.connect_active_group();
+                }
+            });
+            list.append(&button);
+        }
+        self.connect_button.set_popover(Some(&popover));
+    }
+
+    /// Hand the visible selection to the window as a pool.
+    fn connect_active_group(&self) {
+        let Some(query) = self.connect_query() else {
+            return;
+        };
+        if let Some(callback) = self.on_connect_pool.borrow().as_ref() {
+            callback(query);
+        }
+    }
+
+    /// What Connect would run: exactly what is on screen, under the group's
+    /// name and the chosen strategy.
+    ///
+    /// Deliberately the *visible* selection rather than the group as saved. The
+    /// chip already marks itself when the two differ, and connecting something
+    /// other than what the page is showing would make that mark a lie.
+    fn connect_query(&self) -> Option<PoolQuery> {
+        let group = self.active_group_value()?;
+        let mut query = self.current_filter.borrow().clone();
+        if filtered_ids(&query, &self.subscriptions.borrow()).is_empty() {
+            return None;
+        }
+        query.name = group.name.clone();
+        query.strategy = connect_choices()
+            .get(self.connect_strategy.get())
+            .map(|choice| choice.strategy)
+            .unwrap_or_default();
+        Some(query)
+    }
+
+    fn sync_connect_bar(&self) {
+        let Some(group) = self.active_group_value() else {
+            self.connect_bar.set_visible(false);
+            return;
+        };
+        let subscriptions = self.subscriptions.borrow().clone();
+        let visible = filtered_ids(&self.current_filter.borrow(), &subscriptions).len();
+        let saved = group_member_ids(&group, &subscriptions).len();
+        // "8 of 12" rather than a bare "8" whenever the search box is hiding
+        // part of the group: Connect acts on the eight, and the difference is
+        // the only warning that it will.
+        let count = if visible == saved {
+            format!("{visible} server{}", if visible == 1 { "" } else { "s" })
+        } else {
+            format!("{visible} of {saved} shown")
+        };
+        self.connect_title
+            .set_label(&format!("{} · {count}", group.label()));
+        let choice = connect_choices()
+            .into_iter()
+            .nth(self.connect_strategy.get());
+        self.connect_button.set_sensitive(visible > 0);
+        self.connect_button
+            .set_tooltip_text(Some(&match (visible, choice.as_ref()) {
+                (0, _) => "Nothing to connect: this scope shows no servers.".to_string(),
+                (_, Some(choice)) => format!(
+                    "Point the selected profile at these {visible} servers. {} {}",
+                    choice.label, choice.detail
+                ),
+                (_, None) => format!("Point the selected profile at these {visible} servers."),
+            }));
+        self.connect_bar.set_visible(true);
+    }
+
     /// One popover holding both the quick row and the detailed controls.
     ///
     /// Quick and advanced are two presentations of *one* state, never two
@@ -788,6 +957,7 @@ impl ServersView {
                 self.filter_subscriptions.clone(),
                 self.clone(),
             ),
+            exclude_menu(subscriptions, self.filter_exclude.clone(), self.clone()),
         ];
         self.filter_rows.borrow_mut().clear();
         for row in &rows {
@@ -871,6 +1041,28 @@ impl ServersView {
             let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             spacer.set_hexpand(true);
             manage.append(&spacer);
+
+            // The chip row is the fastest control on the page, so its order is
+            // worth arranging. Buttons here rather than a menu on the chip
+            // itself: a chip is already a click target, and hanging a second
+            // gesture off it would make selecting a scope a gamble.
+            for (icon, label, delta) in [
+                ("go-previous-symbolic", "Move this group left", -1_isize),
+                ("go-next-symbolic", "Move this group right", 1),
+            ] {
+                let move_button = gtk::Button::builder()
+                    .icon_name(icon)
+                    .tooltip_text(label)
+                    .css_classes(["flat", "circular"])
+                    .build();
+                move_button.update_property(&[gtk::accessible::Property::Label(label)]);
+                move_button.connect_clicked({
+                    let view = self.clone();
+                    let id = group.id.clone();
+                    move |_| view.move_chip(&id, delta)
+                });
+                manage.append(&move_button);
+            }
 
             let update = gtk::Button::builder()
                 .label("Update")
@@ -964,6 +1156,7 @@ impl ServersView {
         self.filter_subscriptions
             .borrow_mut()
             .clone_from(&query.subscriptions);
+        self.filter_exclude.borrow_mut().clone_from(&query.exclude);
         self.build_filter_popover(&self.subscriptions.borrow().clone());
     }
 
@@ -992,12 +1185,7 @@ impl ServersView {
     fn save_as_group_dialog(&self, editing: Option<ServerGroup>) {
         let current = self.current_filter.borrow().clone();
         let visible = filtered_ids(&current, &self.subscriptions.borrow()).len();
-        let rule = PoolQuery {
-            countries: self.filter_countries.borrow().clone(),
-            protocols: self.filter_protocols.borrow().clone(),
-            subscriptions: self.filter_subscriptions.borrow().clone(),
-            ..PoolQuery::default()
-        };
+        let rule = self.rule_from_filters(String::new());
         // A frozen list is the only honest option for a selection that came
         // from a search box: the text has no equivalent in a rule, so a rule
         // saved here would quietly be wider than what is on screen.
@@ -1011,6 +1199,41 @@ impl ServersView {
                 .map(|group| group.name.clone())
                 .unwrap_or_else(|| suggested_group_name(&rule)),
         );
+        // A chip row of five identically shaped words is hard to aim at. One
+        // glyph in front makes each one findable at a glance, which is the only
+        // job a chip has. Free text, not a fixed palette: the presets below are
+        // a shortcut, not the vocabulary.
+        let icon_row = adw::EntryRow::builder().title("Icon (optional)").build();
+        icon_row.set_text(
+            &editing
+                .as_ref()
+                .map(|group| group.icon.clone())
+                .unwrap_or_default(),
+        );
+        let presets = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        presets.set_valign(gtk::Align::Center);
+        for preset in ["★", "⚡", "🌍", "🏠", "🔒", "🎬"] {
+            let button = gtk::Button::builder()
+                .label(preset)
+                .tooltip_text(format!("Use {preset}"))
+                .css_classes(["flat", "circular"])
+                .build();
+            button.connect_clicked({
+                let icon_row = icon_row.clone();
+                // Pressing the one already chosen clears it, so a group can get
+                // back to having no icon without selecting the text by hand.
+                move |_| {
+                    let next = if icon_row.text() == preset {
+                        ""
+                    } else {
+                        preset
+                    };
+                    icon_row.set_text(next);
+                }
+            });
+            presets.append(&button);
+        }
+        icon_row.add_suffix(&presets);
         let list_choice = gtk::CheckButton::with_label(&format!(
             "List — {visible} server{}, frozen",
             if visible == 1 { "" } else { "s" }
@@ -1036,6 +1259,7 @@ impl ServersView {
         let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
         let rows = adw::PreferencesGroup::new();
         rows.add(&name_row);
+        rows.add(&icon_row);
         body.append(&rows);
         body.append(&list_choice);
         body.append(&rule_choice);
@@ -1070,7 +1294,12 @@ impl ServersView {
                 } else {
                     GroupKind::List
                 };
-                view.save_group(editing.clone(), name, kind);
+                view.save_group(
+                    editing.clone(),
+                    name,
+                    icon_row.text().trim().to_string(),
+                    kind,
+                );
                 dialog.close();
             }
         });
@@ -1185,7 +1414,26 @@ impl ServersView {
         }
     }
 
-    fn save_group(&self, editing: Option<ServerGroup>, name: String, kind: GroupKind) {
+    /// The advanced rows read back as a rule. One place rather than three, so
+    /// adding a filter cannot reach the screen without reaching what is saved.
+    fn rule_from_filters(&self, name: String) -> PoolQuery {
+        PoolQuery {
+            name,
+            countries: self.filter_countries.borrow().clone(),
+            protocols: self.filter_protocols.borrow().clone(),
+            subscriptions: self.filter_subscriptions.borrow().clone(),
+            exclude: self.filter_exclude.borrow().clone(),
+            ..PoolQuery::default()
+        }
+    }
+
+    fn save_group(
+        &self,
+        editing: Option<ServerGroup>,
+        name: String,
+        icon: String,
+        kind: GroupKind,
+    ) {
         let query = match kind {
             // Freeze exactly what is on screen, in the order it is shown.
             GroupKind::List => PoolQuery {
@@ -1193,20 +1441,14 @@ impl ServersView {
                 members: filtered_ids(&self.current_filter.borrow(), &self.subscriptions.borrow()),
                 ..PoolQuery::default()
             },
-            GroupKind::Rule => PoolQuery {
-                name: name.clone(),
-                countries: self.filter_countries.borrow().clone(),
-                protocols: self.filter_protocols.borrow().clone(),
-                subscriptions: self.filter_subscriptions.borrow().clone(),
-                ..PoolQuery::default()
-            },
+            GroupKind::Rule => self.rule_from_filters(name.clone()),
         };
         let group = ServerGroup {
             id: editing
                 .map(|group| group.id)
                 .unwrap_or_else(|| free_group_id(&name, &self.prefs.borrow().groups)),
             name,
-            icon: String::new(),
+            icon,
             kind,
             query,
         };
@@ -1298,6 +1540,7 @@ impl ServersView {
                 &self.filter_subscriptions.borrow(),
                 &self.filter_countries.borrow(),
                 &self.filter_protocols.borrow(),
+                &self.filter_exclude.borrow(),
                 &self.search_texts.borrow(),
                 &self.query.borrow(),
             )
@@ -1335,6 +1578,7 @@ impl ServersView {
         *self.current_filter.borrow_mut() = query;
         self.sync_filter_sensitivity();
         self.sync_chip_modified();
+        self.sync_connect_bar();
         let selected = self.selected.borrow().clone();
         let mut total_visible = 0usize;
         {
@@ -1643,7 +1887,7 @@ impl ServersView {
             .iter()
             .map(|group| group.id.clone())
             .collect();
-        let order = moved_subscription(&visible, subscription_id, delta);
+        let order = moved_in_order(&visible, subscription_id, delta);
         if order == visible {
             return;
         }
@@ -1656,10 +1900,11 @@ impl ServersView {
                     .position(|id| id == &group.id)
                     .unwrap_or(usize::MAX)
             });
-            // `content` also holds the filter bar (first) and the "no matches"
-            // page (last); re-seating the groups after the filter bar in order
-            // leaves both where they belong.
-            let mut previous = self.content.first_child();
+            // `content` also holds the chip row and the connect bar above the
+            // groups and the "no matches" page below them. Re-seating starts
+            // after the connect bar by name rather than at `first_child`, so
+            // the first group cannot slip in front of it.
+            let mut previous = Some(self.connect_bar.clone().upcast::<gtk::Widget>());
             for group in groups.iter() {
                 self.content
                     .reorder_child_after(&group.root, previous.as_ref());
@@ -1672,6 +1917,38 @@ impl ServersView {
         if let Err(error) = prefs.save() {
             log::warn!("could not save gui prefs: {error:#}");
         }
+    }
+
+    /// Move a group chip one slot along the row.
+    ///
+    /// Rebuilding the row rather than re-seating widgets: a chip carries no
+    /// animation or expansion to lose, and the row is small enough that the
+    /// simpler path costs nothing.
+    fn move_chip(&self, group_id: &str, delta: isize) {
+        let visible: Vec<String> = self
+            .saved_groups
+            .borrow()
+            .iter()
+            .map(|group| group.id.clone())
+            .collect();
+        let order = moved_in_order(&visible, group_id, delta);
+        if order == visible {
+            return;
+        }
+        {
+            let mut prefs = self.prefs.borrow_mut();
+            prefs.groups.sort_by_key(|group| {
+                order
+                    .iter()
+                    .position(|id| id == &group.id)
+                    .unwrap_or(usize::MAX)
+            });
+            if let Err(error) = prefs.save() {
+                log::warn!("could not save gui prefs: {error:#}");
+            }
+        }
+        *self.saved_groups.borrow_mut() = self.prefs.borrow().groups.clone();
+        self.build_chip_bar();
     }
 
     fn reorder_popover(&self, subscription_id: &str) -> gtk::Popover {
@@ -1828,25 +2105,6 @@ fn group_chip_tooltip(group: &ServerGroup, matched: usize) -> String {
     }
 }
 
-/// The rule in the words the filter uses, for a tooltip or a radio label.
-fn describe_rule(query: &PoolQuery) -> String {
-    let mut parts = Vec::new();
-    if !query.countries.is_empty() {
-        parts.push(query.countries.join(", ").to_uppercase());
-    }
-    if !query.protocols.is_empty() {
-        parts.push(query.protocols.join(", "));
-    }
-    if !query.subscriptions.is_empty() {
-        parts.push(format!("{} subscription(s)", query.subscriptions.len()));
-    }
-    if parts.is_empty() {
-        "every server".to_string()
-    } else {
-        parts.join(" · ")
-    }
-}
-
 /// A name the user will probably keep, so saving a scope is one click and a
 /// confirmation rather than a blank field to invent something for.
 fn suggested_group_name(rule: &PoolQuery) -> String {
@@ -1903,6 +2161,121 @@ fn filter_menu(
     let popover = gtk::Popover::builder().child(&list).build();
     button.set_popover(Some(&popover));
     button
+}
+
+/// The "except these servers" row: every server, under the subscription it
+/// came from, each with a checkbox.
+///
+/// A rule cannot say "Germany except that one box" with countries and protocols
+/// alone, and freezing the whole thing into a list to drop one server throws
+/// away the reason it was a rule. `PoolQuery.exclude` is exactly that gap, and
+/// until now nothing in the GUI could write it.
+fn exclude_menu(
+    subscriptions: &[Subscription],
+    selected: Rc<RefCell<Vec<String>>>,
+    view: ServersView,
+) -> gtk::MenuButton {
+    let grouped = excludable_servers(subscriptions);
+    let total: usize = grouped.iter().map(|(_, servers)| servers.len()).sum();
+    let button = gtk::MenuButton::builder()
+        .label(exclude_label(&selected.borrow()))
+        .sensitive(total > 0)
+        .css_classes(["flat", "filter-menu"])
+        .build();
+
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    list.set_margin_top(8);
+    list.set_margin_bottom(8);
+    list.set_margin_start(8);
+    list.set_margin_end(8);
+    // Rows are kept so the search can hide them. A provider with two hundred
+    // nodes turns this list into a scroll hunt otherwise, and the user asked
+    // for exclusions of *specific* servers — which means finding one.
+    let mut rows: Vec<(String, gtk::Widget)> = Vec::new();
+    for (subscription, servers) in &grouped {
+        let heading = section_title(subscription);
+        heading.set_margin_top(6);
+        list.append(&heading);
+        rows.push((subscription.to_lowercase(), heading.upcast::<gtk::Widget>()));
+        for server in servers {
+            let check = gtk::CheckButton::with_label(&server.label);
+            check.set_active(selected.borrow().contains(&server.value));
+            check.connect_toggled({
+                let selected = selected.clone();
+                let value = server.value.clone();
+                let button = button.clone();
+                let view = view.clone();
+                move |check| {
+                    let mut values = selected.borrow_mut();
+                    if check.is_active() {
+                        if !values.contains(&value) {
+                            values.push(value.clone());
+                        }
+                    } else {
+                        values.retain(|selected| selected != &value);
+                    }
+                    button.set_label(&exclude_label(&values));
+                    drop(values);
+                    view.apply_filter();
+                }
+            });
+            list.append(&check);
+            rows.push((server.label.to_lowercase(), check.upcast::<gtk::Widget>()));
+        }
+    }
+
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(&list)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(320)
+        .build();
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Find a server")
+        .build();
+    search.connect_search_changed(move |entry| {
+        let text = entry.text().trim().to_lowercase();
+        // A subscription heading is shown when it or any of its servers match,
+        // which is why the headings are marked and re-scanned rather than
+        // filtered independently.
+        let mut heading: Option<(gtk::Widget, bool)> = None;
+        for (haystack, row) in &rows {
+            let is_heading = row.is::<gtk::Label>();
+            let matches = text.is_empty() || haystack.contains(&text);
+            if is_heading {
+                if let Some((widget, any)) = heading.take() {
+                    widget.set_visible(any);
+                }
+                heading = Some((row.clone(), matches));
+                continue;
+            }
+            row.set_visible(matches);
+            if matches && let Some((_, any)) = heading.as_mut() {
+                *any = true;
+            }
+        }
+        if let Some((widget, any)) = heading {
+            widget.set_visible(any);
+        }
+    });
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    content.set_margin_top(6);
+    content.set_margin_bottom(6);
+    content.set_margin_start(6);
+    content.set_margin_end(6);
+    content.append(&search);
+    content.append(&scroll);
+    button.set_popover(Some(&gtk::Popover::builder().child(&content).build()));
+    button
+}
+
+fn exclude_label(selected: &[String]) -> String {
+    match selected.len() {
+        0 => "Except: nothing".to_string(),
+        1 => "Except: 1 server".to_string(),
+        count => format!("Except: {count} servers"),
+    }
 }
 
 fn filter_label(title: &str, options: &[FilterOption], selected: &[String]) -> String {

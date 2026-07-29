@@ -11,6 +11,7 @@ use oxidom_core::profile::{
     self, Profile, ProfileInterface, ProfileProxy, ProfileSelect, RouteMode,
 };
 
+use super::super::reduce::describe_pool;
 use super::{dialog_content, set_transient_parent, set_validation, validation_label};
 
 const PROFILE_NAME_ERROR: &str = "Use lowercase letters, digits, '_' and '-'; up to 32 \
@@ -29,6 +30,12 @@ const LEAST_PING_WARNING: &str = "leastPing concentrates traffic on one node and
     spreading activity across IPs.";
 const NEW_CONNECTIONS_HINT: &str = "Pool switching affects only new connections; existing \
     connections do not migrate.";
+const POOL_FROM_GROUPS_HINT: &str = "To run several servers at once, save a group on the Servers \
+    page and press Connect on it.";
+const LIST_MEMBERSHIP_HINT: &str = "A fixed list. New servers do not join it on their own. Change \
+    which servers are in it from the group chips on the Servers page.";
+const RULE_MEMBERSHIP_HINT: &str = "A rule, so servers a future refresh adds can join it. Change \
+    what it matches from the group chips on the Servers page.";
 
 /// One server the profile's picker can point at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,11 +210,21 @@ pub fn show_profile_dialog(
         .build();
     profile_group.add(&description_entry);
 
-    let selection_labels = gtk::StringList::new(&["Single server", "Pool"]);
+    // "Pool" is offered only to a profile that already has one. An empty pool
+    // is not a starting point the user can fill in here any more — it is an
+    // unfiltered rule, i.e. every server on the machine — so the entry point
+    // for making one is the group chips, where the servers actually are.
+    let has_pool = initial.pool.is_some();
+    let selection_labels = if has_pool {
+        gtk::StringList::new(&["Single server", "Pool"])
+    } else {
+        gtk::StringList::new(&["Single server"])
+    };
     let selection_mode = adw::ComboRow::builder()
         .title("Selection")
+        .subtitle(if has_pool { "" } else { POOL_FROM_GROUPS_HINT })
         .model(&selection_labels)
-        .selected(u32::from(initial.pool.is_some()))
+        .selected(u32::from(has_pool))
         .build();
     profile_group.add(&selection_mode);
 
@@ -262,53 +279,27 @@ pub fn show_profile_dialog(
         .build();
     pool_group.add(&strategy);
 
-    // A pool built from an explicit list has no filters to show, and the two
-    // cannot coexist — `Profile::validate` rejects that combination rather than
-    // letting the file claim one thing and the tunnel do another. So the filter
-    // rows are shown for what they are: not this pool's business. The list
-    // itself is carried through the dialog untouched.
-    let is_list = initial_pool.kind() == PoolKind::List;
-    if is_list {
-        let members = adw::ActionRow::builder()
-            .title(match initial_pool.members.len() {
-                1 => "1 server, chosen by hand".to_string(),
-                count => format!("{count} servers, chosen by hand"),
-            })
-            .subtitle("This pool is a fixed list. Editing which servers are in it happens where the servers are.")
-            .subtitle_lines(2)
-            .activatable(false)
-            .build();
-        pool_group.add(&members);
-    }
+    // Which servers a pool holds is chosen where the servers are, on the
+    // Servers page, with real country and protocol pickers. Four comma-separated
+    // text fields were the only way to say it before that existed; keeping them
+    // now would be a second, blind editor for the same thing — and a save from
+    // one of them could silently disagree with the group the pool came from.
+    // The membership is carried through untouched and reported here instead.
+    let membership = adw::ActionRow::builder()
+        .title(if initial_pool.name.is_empty() {
+            describe_pool(&initial_pool)
+        } else {
+            format!("{} — {}", initial_pool.name, describe_pool(&initial_pool))
+        })
+        .subtitle(match initial_pool.kind() {
+            PoolKind::List => LIST_MEMBERSHIP_HINT,
+            PoolKind::Rule => RULE_MEMBERSHIP_HINT,
+        })
+        .subtitle_lines(3)
+        .activatable(false)
+        .build();
+    pool_group.add(&membership);
 
-    let pool_subscriptions = adw::EntryRow::builder()
-        .title("Subscriptions")
-        .text(join_values(&initial_pool.subscriptions))
-        .build();
-    pool_group.add(&pool_subscriptions);
-    let pool_countries = adw::EntryRow::builder()
-        .title("Countries")
-        .text(join_values(&initial_pool.countries))
-        .build();
-    pool_group.add(&pool_countries);
-    let pool_protocols = adw::EntryRow::builder()
-        .title("Protocols")
-        .text(join_values(&initial_pool.protocols))
-        .build();
-    pool_group.add(&pool_protocols);
-    let pool_exclude = adw::EntryRow::builder()
-        .title("Exclude")
-        .text(join_values(&initial_pool.exclude))
-        .build();
-    pool_group.add(&pool_exclude);
-    for row in [
-        &pool_subscriptions,
-        &pool_countries,
-        &pool_protocols,
-        &pool_exclude,
-    ] {
-        row.set_visible(!is_list);
-    }
     let pool_max = adw::SpinRow::with_range(0.0, profile::MAX_POOL_MEMBERS as f64, 1.0);
     pool_max.set_title("Maximum nodes");
     pool_max.set_subtitle("0 means no query limit; activation still caps a pool at 64 nodes");
@@ -461,12 +452,7 @@ pub fn show_profile_dialog(
         let server = server.clone();
         let picker_entries = picker_entries.clone();
         let strategy = strategy.clone();
-        let carried_name = initial_pool.name.clone();
-        let carried_members = initial_pool.members.clone();
-        let pool_subscriptions = pool_subscriptions.clone();
-        let pool_countries = pool_countries.clone();
-        let pool_protocols = pool_protocols.clone();
-        let pool_exclude = pool_exclude.clone();
+        let carried = initial_pool.clone();
         let pool_max = pool_max.clone();
         let pool_expected = pool_expected.clone();
         let pool_probe_interval = pool_probe_interval.clone();
@@ -487,20 +473,16 @@ pub fn show_profile_dialog(
             {
                 return None;
             }
-            // The name and the member list are carried, not rebuilt: this
-            // dialog never showed either, and saving is not allowed to erase
-            // what it did not show.
+            // Everything about *which* servers is carried, not rebuilt: this
+            // dialog only reports it, and saving is not allowed to erase what
+            // it did not offer to edit. What is read back is the three runtime
+            // knobs, which have no home anywhere else.
             let pool = pool_mode.then(|| PoolQuery {
-                name: carried_name.clone(),
-                members: carried_members.clone(),
                 strategy: strategy_from_index(strategy.selected()),
-                subscriptions: parse_values(&pool_subscriptions.text()),
-                countries: parse_values(&pool_countries.text()),
-                protocols: parse_values(&pool_protocols.text()),
-                exclude: parse_values(&pool_exclude.text()),
                 max: pool_max.value() as usize,
                 expected: pool_expected.value() as usize,
                 probe_interval: pool_probe_interval.text().trim().to_string(),
+                ..carried.clone()
             });
             let values = DialogValues {
                 description: description_entry.text().to_string(),
@@ -600,18 +582,10 @@ pub fn show_profile_dialog(
         let update_validation = update_validation.clone();
         move |_| update_validation()
     });
-    for entry in [
-        &pool_subscriptions,
-        &pool_countries,
-        &pool_protocols,
-        &pool_exclude,
-        &pool_probe_interval,
-    ] {
-        entry.connect_changed({
-            let update_validation = update_validation.clone();
-            move |_| update_validation()
-        });
-    }
+    pool_probe_interval.connect_changed({
+        let update_validation = update_validation.clone();
+        move |_| update_validation()
+    });
     pool_max.connect_value_notify({
         let update_validation = update_validation.clone();
         move |_| update_validation()
@@ -785,10 +759,6 @@ fn strategy_hint(strategy: Strategy) -> &'static str {
     } else {
         ""
     }
-}
-
-fn join_values(values: &[String]) -> String {
-    values.join(", ")
 }
 
 fn parse_values(text: &str) -> Vec<String> {

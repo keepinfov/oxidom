@@ -20,9 +20,10 @@ use oxidom_core::{paths, sysproxy};
 
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
-    CardAction, Effect, PolledSnapshot, ProbeWait, SessionRowState, SnapshotState, SwitcherItem,
-    active_latency_for, card_action, latency_states, other_sessions_message, reduce,
-    selected_status, session_for, session_rows, switcher_items, switcher_visible,
+    CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
+    SwitcherItem, active_latency_for, card_action, latency_states, other_sessions_message,
+    pool_action, pool_for_profile, reduce, selected_status, session_for, session_rows,
+    switcher_items, switcher_visible,
 };
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
@@ -1615,6 +1616,14 @@ impl Controller {
                     }
                 })
             },
+            connect_pool: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |query| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.connect_pool(query);
+                    }
+                })
+            },
         };
         self.servers.rebuild(
             &subscriptions,
@@ -1833,6 +1842,121 @@ impl Controller {
             }
         });
         dialog.present();
+    }
+
+    /// Run a group as the selected profile's pool.
+    ///
+    /// The same rule a card click follows: the selected profile is what gets
+    /// pointed somewhere. A group is not a second kind of connection — it is
+    /// what a profile selects — so this reuses `repoint_and_up` rather than
+    /// inventing a parallel path that could disagree with it.
+    fn connect_pool(self: &Rc<Self>, query: PoolQuery) {
+        let action = {
+            let state = self.state.borrow();
+            pool_action(&state.profiles, &state.ui, &query)
+        };
+        let (profile_name, replaces_server, replaces_pool) = match action {
+            PoolAction::UpProfile(name) => {
+                self.up_profile(name);
+                return;
+            }
+            PoolAction::DownProfile(name) => {
+                self.down_profile(name);
+                return;
+            }
+            PoolAction::NoProfile(name) => {
+                self.show_message(&format!(
+                    "«{name}» has no profile to write. Create one on the Sessions page first."
+                ));
+                return;
+            }
+            PoolAction::RepointAndUp {
+                profile,
+                replaces_server,
+                replaces_pool,
+            } => (profile, replaces_server, replaces_pool),
+        };
+
+        let Some(profile) = self.profile_with_pool(&profile_name, query.clone()) else {
+            return;
+        };
+        let group = if query.name.is_empty() {
+            "this group".to_string()
+        } else {
+            format!("“{}”", query.name)
+        };
+        let nodes = {
+            let state = self.state.borrow();
+            oxidom_core::pool::resolve(&query, &state.subscriptions)
+                .map(|members| members.len())
+                .unwrap_or_default()
+        };
+        let body = match (replaces_pool, replaces_server.as_deref()) {
+            (true, _) => format!(
+                "«{profile_name}» will run {group} across {nodes} servers instead of its current \
+                 pool. It will reconnect, and existing connections will close."
+            ),
+            (false, Some(server)) => format!(
+                "«{profile_name}» points at {server}. Connecting {group} replaces that with a \
+                 pool of {nodes} servers, and rewrites the saved selection."
+            ),
+            (false, None) => format!(
+                "«{profile_name}» will run {group} across {nodes} servers, and the saved \
+                 selection is rewritten."
+            ),
+        };
+        let title = format!("Connect «{profile_name}» to {group}?");
+        let dialog = adw::MessageDialog::new(
+            Some(&self.window),
+            Some(title.as_str()),
+            Some(body.as_str()),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("connect", "Connect")]);
+        dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, {
+            let weak = Rc::downgrade(self);
+            move |dialog, response| {
+                dialog.close();
+                if response != "connect" {
+                    return;
+                }
+                if let Some(controller) = weak.upgrade() {
+                    controller.repoint_and_up(profile_name.clone(), profile.clone());
+                }
+            }
+        });
+        dialog.present();
+    }
+
+    /// The named profile with its selection replaced by `query`, everything
+    /// else — ports, description, interface — carried through untouched.
+    fn profile_with_pool(self: &Rc<Self>, name: &str, query: PoolQuery) -> Option<Profile> {
+        let state = self.state.borrow();
+        let Some(entry) = state.profiles.iter().find(|entry| entry.name == name) else {
+            drop(state);
+            self.show_message(&format!("Profile «{name}» no longer exists"));
+            return None;
+        };
+        Some(Profile {
+            description: entry.description.clone(),
+            // A pool and a server are the two halves of one choice, so taking
+            // the pool means clearing the server; leaving both set is the one
+            // shape `Profile::validate` refuses.
+            select: ProfileSelect {
+                server: String::new(),
+                // The bar chooses membership and strategy; the pool's tuning —
+                // node cap, rotation width, probe interval — is the profile
+                // editor's, and connecting a group must not quietly reset it.
+                pool: Some(pool_for_profile(Some(entry), query)),
+            },
+            proxy: ProfileProxy {
+                socks_port: entry.socks_port,
+                http_port: entry.http_port,
+            },
+            interface: entry.interface.clone(),
+        })
     }
 
     fn disconnect_if_active(self: &Rc<Self>) {
@@ -3424,6 +3548,10 @@ fn install_css() {
            visible without reading, and both survive a theme that ignores one. */
         .group-chip-modified { color: @accent_color; }
         .group-chip-add { min-height: 28px; min-width: 28px; padding: 0; }
+        /* A card of its own rather than a loose row: it speaks for the scope
+           above it, not for the subscription block that follows. */
+        .group-connect-bar { padding: 10px 14px; border-radius: 12px; background: alpha(@window_fg_color, 0.04); }
+        .group-connect-bar > label { font-weight: 500; }
         .quick-filter { min-height: 26px; padding: 2px 12px; font-weight: normal; }
         menubutton.filter-menu > button { min-height: 30px; padding: 3px 12px; border-radius: 999px; }
         .compact-search { min-height: 28px; }
