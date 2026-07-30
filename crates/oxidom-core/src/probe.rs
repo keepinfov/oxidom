@@ -290,9 +290,13 @@ pub fn tcp_ping(host: &str, port: u16) -> ProbeOutcome {
 }
 
 /// ICMP via the `ping` command (avoids raw-socket privileges).
+///
+/// `--` matters: the host comes from subscription content, and without the
+/// end-of-options marker an address like `-f` is parsed as a flag rather than a
+/// destination.
 pub fn icmp_ping(host: &str) -> ProbeOutcome {
     let output = match Command::new("ping")
-        .args(["-c", "1", "-W", "1", host])
+        .args(["-c", "1", "-W", "1", "--", host])
         .output()
     {
         Ok(output) => output,
