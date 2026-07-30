@@ -10,11 +10,17 @@ repository = "https://github.com/keepinfov/oxidom"
 
 [workspace.dependencies]
 oxidom-core = { path = "crates/oxidom-core" }
-# v4_6 is what exposes `GtkMenuButton:child`, i.e. the only way to give the
-# profile switcher a label that can ellipsize. libadwaita 1.4 already requires
-# GTK 4.12, so this raises nothing that was not already required.
-gtk = { package = "gtk4", version = "0.9", features = ["v4_6"] }
-adw = { package = "libadwaita", version = "0.7", features = ["v1_4"] }
+# v4_6 exposes `GtkMenuButton:child`, the only way to give the profile switcher a
+# label that can ellipsize; v4_8 does the same for `GtkCheckButton:child`, which
+# the server pickers need — a check button's built-in label demands its full
+# width, and two hundred provider names then push that demand out through a
+# non-scrolling viewport and resize the dialog around them. libadwaita 1.7
+# already requires GTK newer than either, so this raises nothing.
+gtk = { package = "gtk4", version = "0.9", features = ["v4_8"] }
+# v1_7 is `AdwToggleGroup` — the segmented control the scope row is built from,
+# whose indicator animates between toggles on its own. Hand-rolling that meant
+# owning a widget's worth of layout maths to move one rectangle.
+adw = { package = "libadwaita", version = "0.7", features = ["v1_7"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

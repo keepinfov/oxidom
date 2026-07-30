@@ -402,8 +402,7 @@ pub fn show_profile_dialog(
         let remove = callbacks.remove.clone();
         let profile_window = window.clone();
         delete.connect_clicked(move |_| {
-            let dialog = adw::MessageDialog::new(
-                Some(&profile_window),
+            let dialog = adw::AlertDialog::new(
                 Some("Delete profile?"),
                 Some(&format!(
                     "«{name}» will be removed. The tunnel it started, if any, keeps running."
@@ -425,7 +424,7 @@ pub fn show_profile_dialog(
                     }
                 }
             });
-            dialog.present();
+            dialog.present(Some(&profile_window));
         });
     }
 
@@ -697,8 +696,7 @@ fn confirm_dns_leak(
     reverting: Rc<std::cell::Cell<bool>>,
     update_validation: Rc<dyn Fn()>,
 ) {
-    let dialog = adw::MessageDialog::new(
-        Some(parent),
+    let dialog = adw::AlertDialog::new(
         Some("Route everything, but not DNS?"),
         Some(DNS_LEAK_WARNING),
     );
@@ -719,7 +717,7 @@ fn confirm_dns_leak(
             update_validation();
         }
     });
-    dialog.present();
+    dialog.present(Some(parent));
 }
 
 fn route_mode_index(mode: RouteMode) -> u32 {

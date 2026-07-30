@@ -392,6 +392,14 @@ pub fn start(
     });
 }
 
+/// The one dialog that is still an `AdwMessageDialog`, and has to be.
+///
+/// This runs when the daemon could not be reached, which is *before* there is a
+/// window. `AdwDialog` is not a toplevel — it is presented into a widget, and
+/// presenting one with no parent shows nothing at all, so the user would be left
+/// with a held process, no window and no way to answer. `AdwMessageDialog` is a
+/// `GtkWindow` and can stand on its own. Every other dialog in the app moved.
+#[allow(deprecated)]
 fn show_daemon_error(app: &adw::Application, message: &str) {
     let dialog = adw::MessageDialog::new(
         None::<&gtk::Window>,
@@ -1085,8 +1093,7 @@ impl Controller {
             self.show_message("Settings are still being applied");
             return;
         }
-        let dialog = adw::MessageDialog::new(
-            Some(&self.window),
+        let dialog = adw::AlertDialog::new(
             Some("Apply settings before closing?"),
             Some("Your settings draft has not been applied."),
         );
@@ -1121,7 +1128,7 @@ impl Controller {
                 }
             }
         });
-        dialog.present();
+        dialog.present(Some(&self.window));
     }
 
     fn show_page(self: &Rc<Self>, page: Page) {
@@ -1810,11 +1817,7 @@ impl Controller {
                 "This will rewrite the saved server selection for «{profile_name}» and connect it."
             )
         };
-        let dialog = adw::MessageDialog::new(
-            Some(&self.window),
-            Some(title.as_str()),
-            Some(body.as_str()),
-        );
+        let dialog = adw::AlertDialog::new(Some(title.as_str()), Some(body.as_str()));
         dialog.add_responses(&[
             ("cancel", "Cancel"),
             (
@@ -1841,7 +1844,7 @@ impl Controller {
                 }
             }
         });
-        dialog.present();
+        dialog.present(Some(&self.window));
     }
 
     /// Run a group as the selected profile's pool.
@@ -1906,11 +1909,7 @@ impl Controller {
             ),
         };
         let title = format!("Connect «{profile_name}» to {group}?");
-        let dialog = adw::MessageDialog::new(
-            Some(&self.window),
-            Some(title.as_str()),
-            Some(body.as_str()),
-        );
+        let dialog = adw::AlertDialog::new(Some(title.as_str()), Some(body.as_str()));
         dialog.add_responses(&[("cancel", "Cancel"), ("connect", "Connect")]);
         dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("cancel"));
@@ -1927,7 +1926,7 @@ impl Controller {
                 }
             }
         });
-        dialog.present();
+        dialog.present(Some(&self.window));
     }
 
     /// The named profile with its selection replaced by `query`, everything
@@ -3333,7 +3332,7 @@ impl Controller {
 
     /// Full error text, selectable and dismissible.
     fn show_error_details(self: &Rc<Self>, title: &str, detail: &str) {
-        let dialog = adw::MessageDialog::new(Some(&self.window), Some(title), Some(detail));
+        let dialog = adw::AlertDialog::new(Some(title), Some(detail));
         dialog.set_body_use_markup(false);
         dialog.add_response("close", "Close");
         if ipc::error_action(detail) == ipc::ErrorAction::OpenSettings {
@@ -3353,7 +3352,7 @@ impl Controller {
                 }
             }
         });
-        dialog.present();
+        dialog.present(Some(&self.window));
     }
 
     /// Records an error the caller has already surfaced, so the poll loop does

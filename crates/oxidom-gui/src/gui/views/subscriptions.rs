@@ -682,8 +682,7 @@ fn show_subscription_details(
     let details_window = window.clone();
     delete.connect_clicked(move |_| {
         let affected = holding_any(remove_id.clone());
-        let dialog = adw::MessageDialog::new(
-            Some(&details_window),
+        let dialog = adw::AlertDialog::new(
             Some("Delete subscription?"),
             Some(&format!(
                 "“{remove_name}” and all of its servers will be removed.{}",
@@ -696,14 +695,17 @@ fn show_subscription_details(
         dialog.set_close_response("cancel");
         let remove = remove.clone();
         let remove_id = remove_id.clone();
-        let details_window = details_window.clone();
+        let closing = details_window.clone();
         dialog.connect_response(None, move |_, response| {
             if response == "delete" {
                 remove(remove_id.clone());
-                details_window.close();
+                closing.close();
             }
         });
-        dialog.present();
+        // An `AdwDialog` is presented *into* a widget rather than parented to a
+        // window at construction, so the window is still needed after the
+        // handler has taken its own reference.
+        dialog.present(Some(&details_window));
     });
     window.present();
 }
@@ -758,8 +760,7 @@ fn show_local_servers(
         remove.connect_clicked(move |_| {
             // Deleting is irreversible (there is no undo), so mirror the
             // subscription-delete confirmation.
-            let dialog = adw::MessageDialog::new(
-                Some(&window_for_remove),
+            let dialog = adw::AlertDialog::new(
                 Some("Remove server?"),
                 Some(&format!(
                     "“{server_name}” will be removed permanently.{}",
@@ -782,7 +783,7 @@ fn show_local_servers(
                     }
                 }
             });
-            dialog.present();
+            dialog.present(Some(&window_for_remove));
         });
         row.add_suffix(&remove);
         servers.add(&row);
