@@ -10,6 +10,21 @@ use crate::model::{Hysteria2Settings, OutboundSpec, Server, StreamSettings};
 // stable HTTP target regardless of the user's direct/active probe method.
 const POOL_PROBE_DESTINATION: &str = "https://connectivitycheck.gstatic.com/generate_204";
 
+/// Namespace every balancer-selectable outbound tag shares.
+///
+/// Xray resolves a balancer `selector` by prefix-matching outbound tags, and
+/// `scaffold` always appends `direct` and `block`. Keeping the selectable
+/// outbounds under one prefix oxidom owns is what stops a selector from
+/// resolving to either of those.
+const SELECTABLE_TAG_PREFIX: &str = "s-";
+
+/// Balancer tag oxidom's own catch-all routing rule dispatches to.
+const BALANCER_TAG: &str = "pool";
+
+/// The balancer strategies Xray accepts. Anything else is a provider typo or an
+/// injection attempt, and both should land on the same safe default.
+const BALANCER_STRATEGIES: [&str; 4] = ["random", "roundRobin", "leastPing", "leastLoad"];
+
 /// Generate a full Xray config JSON for `server`, with local SOCKS + HTTP inbounds.
 pub fn generate(server: &Server, bind: Ipv4Addr, socks_port: u16, http_port: u16) -> Value {
     match &server.spec {
@@ -19,14 +34,38 @@ pub fn generate(server: &Server, bind: Ipv4Addr, socks_port: u16, http_port: u16
             burst_observatory,
             balancer_tag,
         } => {
-            let mut config = scaffold(bind, socks_port, http_port, proxy_outbounds.clone());
+            // Everything below is provider-supplied, so none of it may reach the
+            // core as written. A balancer selector is prefix-matched against
+            // outbound tags, and `scaffold` always appends `direct` (freedom):
+            // an imported selector of ["direct"] — or [""], which matches every
+            // tag — would route the whole tunnel out in the clear while the UI
+            // still reported Connected. Re-tag the imported outbounds into a
+            // namespace we own and rebuild the balancer around that prefix, so
+            // the selector can only ever resolve to a proxy outbound.
+            let namespaced = namespace_outbounds(proxy_outbounds);
+            let mut config = scaffold(bind, socks_port, http_port, namespaced);
             config["routing"]["rules"] = json!([
                 { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
-                { "type": "field", "network": "tcp,udp", "balancerTag": balancer_tag }
+                { "type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG }
             ]);
-            config["routing"]["balancers"] = Value::Array(balancers.clone());
-            if let Some(observatory) = burst_observatory {
-                config["burstObservatory"] = observatory.clone();
+            config["routing"]["balancers"] = json!([{
+                "tag": BALANCER_TAG,
+                "selector": [SELECTABLE_TAG_PREFIX],
+                "strategy": import_strategy(balancers, balancer_tag)
+            }]);
+            if burst_observatory.is_some() {
+                // Keep the observatory the leastPing/leastLoad strategies need,
+                // but not the provider's `pingConfig.destination`: that is a URL
+                // the core would fetch on a timer, i.e. a beacon from the host.
+                config["burstObservatory"] = json!({
+                    "subjectSelector": [SELECTABLE_TAG_PREFIX],
+                    "pingConfig": {
+                        "destination": POOL_PROBE_DESTINATION,
+                        "interval": "5m",
+                        "timeout": "3s",
+                        "sampling": 3
+                    }
+                });
             }
             config
         }
@@ -72,7 +111,7 @@ pub fn generate_pool(
     let mut outbounds = Vec::with_capacity(members.len());
     for server in members {
         let handle = server.alias.as_deref().unwrap_or(&server.id);
-        let tag = format!("s-{handle}");
+        let tag = format!("{SELECTABLE_TAG_PREFIX}{handle}");
         if !seen_tags.insert(tag.clone()) {
             bail!("duplicate Xray pool outbound tag {tag:?}");
         }
@@ -105,8 +144,8 @@ pub fn generate_pool(
         strategy_value["settings"] = json!({ "expected": expected.max(1) });
     }
     config["routing"]["balancers"] = json!([{
-        "tag": "pool",
-        "selector": ["s-"],
+        "tag": BALANCER_TAG,
+        "selector": [SELECTABLE_TAG_PREFIX],
         "strategy": strategy_value
     }]);
     // This rule must precede the catch-all balancer rule or `xray api bi`
@@ -114,10 +153,10 @@ pub fn generate_pool(
     config["routing"]["rules"] = json!([
         { "type": "field", "inboundTag": ["api-in"], "outboundTag": "api" },
         { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
-        { "type": "field", "network": "tcp,udp", "balancerTag": "pool" }
+        { "type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG }
     ]);
     config["burstObservatory"] = json!({
-        "subjectSelector": ["s-"],
+        "subjectSelector": [SELECTABLE_TAG_PREFIX],
         "pingConfig": {
             "destination": POOL_PROBE_DESTINATION,
             "interval": probe_interval,
@@ -130,6 +169,55 @@ pub fn generate_pool(
         "services": ["RoutingService"]
     });
     Ok(config)
+}
+
+/// Re-tag imported proxy outbounds into the [`SELECTABLE_TAG_PREFIX`] namespace.
+///
+/// The imported tags are provider-supplied and nothing in the generated config
+/// refers to them — oxidom writes its own routing rules — so overwriting them
+/// costs nothing and makes the balancer selector exact.
+fn namespace_outbounds(proxy_outbounds: &[Value]) -> Vec<Value> {
+    proxy_outbounds
+        .iter()
+        .enumerate()
+        .map(|(index, outbound)| {
+            let mut outbound = outbound.clone();
+            if let Some(object) = outbound.as_object_mut() {
+                object.insert(
+                    "tag".to_string(),
+                    Value::String(format!("{SELECTABLE_TAG_PREFIX}{index}")),
+                );
+            }
+            outbound
+        })
+        .collect()
+}
+
+/// The imported balancer's strategy, reduced to the fields Xray reads.
+///
+/// `balancer_tag` names the balancer the provider's own routing rule pointed at,
+/// so its strategy is the part of the import worth honouring. Everything else
+/// about the balancer — above all its `selector` — is rebuilt by the caller.
+fn import_strategy(balancers: &[Value], balancer_tag: &str) -> Value {
+    let chosen = balancers
+        .iter()
+        .find(|balancer| balancer.get("tag").and_then(Value::as_str) == Some(balancer_tag))
+        .or_else(|| balancers.first());
+    let name = chosen
+        .and_then(|balancer| balancer.pointer("/strategy/type"))
+        .and_then(Value::as_str)
+        .filter(|name| BALANCER_STRATEGIES.contains(name))
+        .unwrap_or("random");
+    let mut strategy = json!({ "type": name });
+    if name == "leastLoad" {
+        let expected = chosen
+            .and_then(|balancer| balancer.pointer("/strategy/settings/expected"))
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1);
+        strategy["settings"] = json!({ "expected": expected });
+    }
+    strategy
 }
 
 fn scaffold(
@@ -421,8 +509,109 @@ mod tests {
         assert_eq!(config["inbounds"][0]["port"], 10808);
         assert_eq!(config["outbounds"].as_array().map(Vec::len), Some(4));
         assert_eq!(config["routing"]["rules"][0]["ip"][0], "geoip:private");
-        assert_eq!(config["routing"]["rules"][1]["balancerTag"], "balance");
-        assert_eq!(config["burstObservatory"]["subjectSelector"][0], "proxy");
+        // The imported tags are replaced by oxidom's own namespace, so the rule,
+        // the balancer and the observatory all speak the `s-` prefix rather than
+        // anything the provider chose.
+        assert_eq!(config["routing"]["rules"][1]["balancerTag"], "pool");
+        assert_eq!(config["routing"]["balancers"][0]["tag"], "pool");
+        assert_eq!(config["routing"]["balancers"][0]["selector"][0], "s-");
+        assert_eq!(config["outbounds"][0]["tag"], "s-0");
+        assert_eq!(config["outbounds"][1]["tag"], "s-1");
+        assert_eq!(config["burstObservatory"]["subjectSelector"][0], "s-");
+    }
+
+    /// The balancer is the one way a subscription could reach the built-in
+    /// `freedom` outbound: Xray prefix-matches a selector against outbound tags,
+    /// and `scaffold` always appends `direct`. A selector of ["direct"] — or [""],
+    /// which matches every tag — would put the whole tunnel in the clear while
+    /// the UI still said Connected.
+    #[test]
+    fn an_imported_balancer_cannot_select_the_direct_outbound() {
+        for hostile in [json!(["direct"]), json!([""]), json!(["block"])] {
+            let server = Server {
+                id: "profile".to_string(),
+                name: "Auto".to_string(),
+                protocol: Protocol::Vless,
+                address: "one.example".to_string(),
+                port: 443,
+                transport_label: "xray + balanced (2)".to_string(),
+                country: None,
+                spec: OutboundSpec::XrayProfile {
+                    proxy_outbounds: vec![
+                        json!({"tag":"direct","protocol":"vless","settings":{}}),
+                        json!({"tag":"proxy-2","protocol":"vless","settings":{}}),
+                    ],
+                    balancers: vec![json!({
+                        "tag": "b",
+                        "selector": hostile,
+                        "strategy": {"type": "leastPing"}
+                    })],
+                    burst_observatory: None,
+                    balancer_tag: "b".to_string(),
+                },
+                link: None,
+                alias: None,
+                latency_ms: None,
+            };
+
+            let config = generate(&server, Ipv4Addr::LOCALHOST, 10808, 10809);
+            let balancers = config["routing"]["balancers"].as_array().unwrap();
+            assert_eq!(balancers.len(), 1, "{hostile}");
+            assert_eq!(balancers[0]["selector"], json!(["s-"]), "{hostile}");
+            // The strategy is the only part of the import that survives.
+            assert_eq!(balancers[0]["strategy"]["type"], "leastPing", "{hostile}");
+            // An imported outbound cannot squat on a built-in tag either.
+            let tags: Vec<&str> = config["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|outbound| outbound["tag"].as_str().unwrap())
+                .collect();
+            assert_eq!(tags, ["s-0", "s-1", "direct", "block"], "{hostile}");
+        }
+    }
+
+    /// A provider-chosen observatory destination would be a beacon the core
+    /// fetches on a timer.
+    #[test]
+    fn an_imported_observatory_destination_is_replaced() {
+        let server = Server {
+            id: "profile".to_string(),
+            name: "Auto".to_string(),
+            protocol: Protocol::Vless,
+            address: "one.example".to_string(),
+            port: 443,
+            transport_label: "xray + balanced (2)".to_string(),
+            country: None,
+            spec: OutboundSpec::XrayProfile {
+                proxy_outbounds: vec![
+                    json!({"tag":"a","protocol":"vless","settings":{}}),
+                    json!({"tag":"b","protocol":"vless","settings":{}}),
+                ],
+                balancers: vec![json!({"tag":"b","selector":["a"]})],
+                burst_observatory: Some(json!({
+                    "subjectSelector": ["a"],
+                    "pingConfig": {"destination": "https://tracker.example/beacon"}
+                })),
+                balancer_tag: "b".to_string(),
+            },
+            link: None,
+            alias: None,
+            latency_ms: None,
+        };
+
+        let config = generate(&server, Ipv4Addr::LOCALHOST, 10808, 10809);
+        assert_eq!(
+            config["burstObservatory"]["pingConfig"]["destination"],
+            super::POOL_PROBE_DESTINATION
+        );
+        assert_eq!(config["burstObservatory"]["subjectSelector"], json!(["s-"]));
+        // An unrecognised strategy falls back to a safe default rather than
+        // reaching the core as written.
+        assert_eq!(
+            config["routing"]["balancers"][0]["strategy"]["type"],
+            "random"
+        );
     }
 
     fn tls_vless(allow_insecure: bool, pin: Option<&str>) -> Server {
