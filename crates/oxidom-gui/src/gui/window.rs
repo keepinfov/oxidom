@@ -603,10 +603,10 @@ fn build(
     header.pack_start(&header_status);
     header.pack_start(&profile_switcher);
     header.pack_start(&search);
-    // The filter belongs next to the search because it is the same act — find
-    // the servers I mean — and putting it in the header keeps it from taking a
-    // strip of the page for controls that are usually left alone.
-    header.pack_start(&servers.header_filter());
+    // The filter used to be packed here, sixth in a row of six, on the theory
+    // that it belonged beside the search because both are "find the servers I
+    // mean". It cost nothing vertically and nobody found it. It now lives at
+    // the head of the chip row, where the scopes it builds are.
     header.pack_end(&profile_actions);
     header.pack_end(&subscription_actions);
     header.pack_end(&settings_actions);
@@ -1254,8 +1254,6 @@ impl Controller {
         self.profile_actions.set_visible(profiles);
         self.subscription_actions.set_visible(subscriptions);
         self.settings_actions.set_visible(settings);
-        // Filtering only means anything where the cards are.
-        self.servers.header_filter().set_visible(general);
         if self.compact.get() {
             self.sync_search_entry(&self.compact_search);
             self.search.set_visible(false);
@@ -1871,6 +1869,19 @@ impl Controller {
                 self.show_message(&format!(
                     "«{name}» has no profile to write. Create one on the Sessions page first."
                 ));
+                return;
+            }
+            // Same servers, different rotation width. Nothing is replaced, so
+            // there is nothing to confirm — but the write is still a write, and
+            // a toast is what keeps it from being silent.
+            PoolAction::RetuneAndUp { profile, expected } => {
+                if let Some(rewritten) = self.profile_with_pool(&profile, query.clone()) {
+                    self.show_message(&match expected {
+                        0 => format!("«{profile}» now rotates over every live node"),
+                        count => format!("«{profile}» now rotates over {count} nodes"),
+                    });
+                    self.repoint_and_up(profile, rewritten);
+                }
                 return;
             }
             PoolAction::RepointAndUp {
@@ -3533,28 +3544,57 @@ fn install_css() {
         .profile-switcher-dot.status-error { color: @error_color; }
         button.flat { min-height: 24px; font-weight: normal; }
         button.pill { font-weight: 500; }
-        button.slim-pill { min-height: 24px; padding: 2px 16px; }
-        /* The group title doubles as the expander, so it needs a button's hover
-           feedback without a button's indent: the negative margin puts the text
-           back on the same vertical line as the cards underneath it. */
-        button.subscription-toggle { padding: 2px 8px; margin-left: -8px; border-radius: 10px; min-height: 0; }
+        /* The group title doubles as the expander, but it is a heading first: a
+           full-width slab lighting up under the pointer reads as a selection the
+           user did not make, and the chevron beside it already says the group
+           folds. So it keeps the click and loses the paint. The negative margin
+           puts the text back on the same vertical line as the cards underneath
+           it; the focus ring stays, or the keyboard would lose the title
+           entirely. */
+        button.subscription-toggle {
+            padding: 2px 8px;
+            margin-left: -8px;
+            border-radius: 10px;
+            min-height: 0;
+            background: none;
+            box-shadow: none;
+        }
+        button.subscription-toggle:hover,
+        button.subscription-toggle:active { background: none; box-shadow: none; }
+        button.subscription-toggle:focus-visible {
+            outline: 2px solid @accent_color;
+            outline-offset: -2px;
+        }
         .group-chip-bar { padding: 0 2px 2px; }
         .group-chip { min-height: 28px; padding: 2px 14px; font-weight: 500; }
+        menubutton.group-chip > button { min-height: 28px; padding: 2px 14px; font-weight: 500; border-radius: 999px; }
+        .group-chip-bar > separator { margin: 4px 4px; }
+        .filter-pill image { -gtk-icon-size: 14px; }
         /* The dot in the label already says "modified"; the accent makes it
            visible without reading, and both survive a theme that ignores one. */
         .group-chip-modified { color: @accent_color; }
-        .group-chip-add { min-height: 28px; min-width: 28px; padding: 0; }
+        .group-chip-add image { -gtk-icon-size: 14px; }
+        /* The scope switcher is an AdwToggleGroup, which brings its own frame
+           and its own sliding indicator; it only needs to match the height of
+           the pills either side of it. */
+        .group-chip-bar > toggle-group { min-height: 30px; }
+        .group-chip-bar > toggle-group toggle { padding: 2px 12px; font-weight: 500; }
+        /* One menu for whichever scope is selected, so it keeps its place in the
+           row instead of travelling with the selection. */
+        menubutton.group-chip-menu > button {
+            min-height: 28px;
+            min-width: 28px;
+            padding: 2px 4px;
+            border-radius: 999px;
+        }
+        menubutton.group-chip-menu > button image { -gtk-icon-size: 16px; }
+        .group-chip-hint { padding: 0 4px 2px; }
         /* A card of its own rather than a loose row: it speaks for the scope
            above it, not for the subscription block that follows. */
         .group-connect-bar { padding: 10px 14px; border-radius: 12px; background: alpha(@window_fg_color, 0.04); }
         .group-connect-bar > label { font-weight: 500; }
-        .quick-filter { min-height: 26px; padding: 2px 12px; font-weight: normal; }
-        menubutton.filter-menu > button { min-height: 30px; padding: 3px 12px; border-radius: 999px; }
         .compact-search { min-height: 28px; }
         .compact-search text { padding-top: 1px; padding-bottom: 1px; }
-        .compact-connect { min-height: 24px; padding: 2px 14px; font-weight: 500; }
-        .ultra-connect-bar { padding: 8px 12px 10px; border-top: 1px solid alpha(@window_fg_color, 0.08); background: alpha(@window_fg_color, 0.025); }
-        .ultra-connect-bar .compact-connect { min-height: 34px; }
 
         .sidebar { background: alpha(@window_fg_color, 0.035); }
         .sidebar-status { padding: 8px 10px; border-radius: 10px; background: alpha(@window_fg_color, 0.055); }

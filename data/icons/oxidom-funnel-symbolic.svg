@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A funnel, drawn here because Adwaita has no filter icon under any name.
+     One flat path in one colour: GTK recolours a `-symbolic` icon by forcing
+     `fill` on every shape, so a gradient or a stroke would simply be lost. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path d="M2.25 2.5h11.5a.75.75 0 0 1 .58 1.23L9.75 9.27v4.23a.75.75 0 0 1-1.09.67l-2.5-1.25a.75.75 0 0 1-.41-.67V9.27L1.67 3.73A.75.75 0 0 1 2.25 2.5Z" fill="#222222"/>
+</svg>

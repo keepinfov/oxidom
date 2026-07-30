@@ -417,9 +417,43 @@ empty, so every pool profile written before lists existed still round-trips to t
 The same `PoolQuery` drives the balancer and the GUI's server filter: a filter is a pool
 constructor, not a second search. A **group** in the GUI is a saved `PoolQuery` under a name, so
 connecting one writes it straight into `select.pool` — the daemon never learns a new noun. Group
-membership is therefore edited only where the servers are (the chip row and the funnel popover on
-the Servers page); the profile editor reports the pool and edits only `strategy`, `max`,
+membership is therefore edited only where the servers are (the chip row on the Servers page: the
+`Filter` pill at its head, the `⋮` menu beside the scope row, and the New group dialog's own
+server picker); the profile editor reports the pool and edits only `strategy`, `max`,
 `expected` and `probe_interval`, carrying everything about *which* servers through untouched.
+
+**The filter popover is one boxed list, built once.** Three `AdwExpanderRow`s (Country, Protocol,
+Subscription) hold a checkbox per choice, and `Except` stays an `AdwActionRow` with a popover of
+its own because it is a search over a provider's two hundred nodes, not a handful of choices.
+Nested popovers — a `GtkMenuButton` per filter, each opening over the row it came from — were
+what this replaced. The popover is rebuilt only when `filter_universe` changes, i.e. when a
+subscription refresh changes what could be picked; a filter write goes in through
+`sync_filter_checks`, guarded by `syncing_filter` because GTK emits `toggled` for a programmatic
+`set_active` exactly as for a click. Rebuilding on every write is what previously forced the
+expanded state into a `Cell` and threw away the exclude picker's rows: the click destroyed the
+rows it was meant to be explaining.
+
+**`⋮` acts on the scope on screen, not on the selected group.** It is never insensitive.
+`New profile from this…` lives there — it is the only way to make a *new* profile from the visible
+selection, and it needs no name for that selection, so it works on an unsaved filter too. The
+group-only items (`Edit…`, `Update to what's shown`, `Move left/right`, `Delete`) are simply
+absent when no group is selected, rather than present and dead. The filter popover's footer is
+`Reset` and `Save as group…` and nothing else: three buttons in a footer is a menu pretending to
+be an action bar.
+
+**A group stores selection; the Connect bar states rotation width.** The bar carries a rotation
+picker defaulting to `pool::DEFAULT_POOL_ROTATION` (6), and `connect_query` writes it into
+`expected`. It is deliberately *not* also stored on the group: a group answers "which servers",
+the width answers "how many at once for this run", and a second copy is how the two come to
+disagree. Consequently `same_pool` compares selection only while `same_rotation` compares
+`expected`, and a changed width yields `PoolAction::RetuneAndUp` — neither a no-op (which would
+drop the width just chosen) nor `RepointAndUp` (which would ask the user to confirm replacing a
+pool with itself). It rewrites without a dialog and says so in a toast. `pool_for_profile` takes
+`expected` from what the bar chose and still carries `max` and `probe_interval` through from the
+saved profile, because nothing outside the profile editor can express those two.
+The default exists because `expected = 0` means "all", and a country-wide pool is mostly repeats
+of a handful of hosts: rotating over all 42 buys no more spread than its 9 distinct addresses
+while costing an observatory ping per entry.
 Two blind editors for one thing is how a saved profile comes to disagree with the group it was
 made from. `leastLoad` is the default because the point of a pool is to
 spread activity across exit IPs *and keep working*; `roundRobin` was measured on Xray 26.3.27 to

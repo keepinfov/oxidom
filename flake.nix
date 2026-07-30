@@ -45,7 +45,11 @@
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFlags = ["-p" "oxidom-gui"];
           nativeBuildInputs = with pkgs; [pkg-config wrapGAppsHook4];
-          buildInputs = with pkgs; [gtk4 libadwaita glib];
+          # adwaita-icon-theme is a runtime dependency, not a link-time one:
+          # naming it here is what puts it on the wrapper's XDG_DATA_DIRS. Left
+          # out, every symbolic icon in the app falls back to a broken square on
+          # a target that has no icon theme installed system-wide.
+          buildInputs = with pkgs; [gtk4 libadwaita glib adwaita-icon-theme];
           preFixup = ''
             gappsWrapperArgs+=(
               --set-default OXIDOM_XRAY_BIN ${pkgs.xray}/bin/xray
@@ -57,6 +61,8 @@
               $out/share/icons/hicolor/scalable/apps/dev.keepinfov.oxidom.svg
             install -Dm444 data/dev.keepinfov.oxidom-symbolic.svg \
               $out/share/icons/hicolor/symbolic/apps/dev.keepinfov.oxidom-symbolic.svg
+            install -Dm444 data/icons/oxidom-funnel-symbolic.svg \
+              $out/share/icons/hicolor/scalable/actions/oxidom-funnel-symbolic.svg
             install -Dm444 data/dev.keepinfov.oxidom.desktop \
               $out/share/applications/dev.keepinfov.oxidom.desktop
             install -Dm444 data/dev.keepinfov.oxidom.metainfo.xml \

@@ -12,10 +12,10 @@ use oxidom_core::pool::PoolQuery;
 use super::super::group::subscription_description;
 use super::super::prefs::{FAVOURITES_ID, GroupKind, GuiPrefs, ServerGroup};
 use super::super::reduce::{
-    FilterOption, Quick, ServerProfiles, available_countries, available_protocols,
+    FilterOption, ServerProfiles, available_countries, available_protocols,
     available_subscriptions, connect_choices, describe_rule, excludable_servers, filtered_ids,
     filters_to_query, group_member_ids, groups_holding, moved_in_order, ordered_subscriptions,
-    query_equals_group, quick_filters, toggled_member, upsert_group,
+    query_equals_group, toggled_member, upsert_group,
 };
 use super::super::server_card::{
     CARD_MEASURE_WIDTH, COMPACT_CARD_HEIGHT, CardConnectionState, CardHandlers, LatencyState,
@@ -83,11 +83,56 @@ struct GroupUi {
 type BrowseCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 /// Set on every rebuild, read long afterwards by the filter popover.
 type PoolCallback = Rc<RefCell<Option<Rc<dyn Fn(PoolQuery)>>>>;
+/// Filled in once its dialog exists, so widgets built before the dialog can
+/// still ask it to re-check whether Save means anything.
+type Revalidate = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+/// Server id to its checkbox, in the order the picker laid them out.
+type PickerChecks = Rc<RefCell<Vec<(String, gtk::CheckButton)>>>;
+/// The handles a picker's checkboxes write into. Shared with whoever will save
+/// them, so there is one answer to "what is ticked" rather than two.
+type Selection = Rc<RefCell<Vec<String>>>;
+/// Told what is ticked now, every time a checkbox moves.
+type SelectionChanged = Rc<dyn Fn(&[String])>;
+
+/// Which list of hand-picked servers a picker page writes into. The two pages
+/// are the same screen over two different fields, so the field travels as a
+/// closure rather than as a duplicated page.
+type DraftField = Rc<dyn Fn(&mut FilterDraft, Vec<String>)>;
+
+/// Which of the three multi-select filters a checkbox writes into.
+///
+/// The boxes all look alike and all live in one list, so the field is carried
+/// beside each one rather than inferred from which row it happens to be under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterField {
+    Country,
+    Protocol,
+    Subscription,
+}
+
+/// What the filter dialog is editing, before Apply writes it to the page.
+///
+/// A copy rather than the live fields: a modal dialog hides the list it would be
+/// changing, so applying each tick was work nobody could watch — and a form that
+/// commits once can also be abandoned.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FilterDraft {
+    countries: Vec<String>,
+    protocols: Vec<String>,
+    subscriptions: Vec<String>,
+    exclude: Vec<String>,
+    /// Servers named by hand. Non-empty means the rule is not in force at all —
+    /// the same precedence `pool::resolve` gives a list over a rule.
+    members: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct ServersView {
     pub root: gtk::ScrolledWindow,
     content: gtk::Box,
+    /// Just the subscription blocks and the "nothing matches" page — the part a
+    /// scope change actually replaces, and therefore the only part that fades.
+    servers_area: gtk::Box,
     cards: Rc<RefCell<HashMap<String, ServerCard>>>,
     groups: Rc<RefCell<Vec<GroupUi>>>,
     subscriptions: Rc<RefCell<Vec<Subscription>>>,
@@ -116,7 +161,18 @@ pub struct ServersView {
     saved_groups: Rc<RefCell<Vec<ServerGroup>>>,
     /// The selected chip's widget, so the "modified" mark can be updated on a
     /// keystroke without rebuilding the row under the pointer.
-    active_chip: Rc<RefCell<Option<gtk::ToggleButton>>>,
+    /// The scope switcher, rebuilt whenever the set of groups changes. Held so
+    /// `sync_chip_modified` can relabel one toggle without rebuilding the row
+    /// under the pointer.
+    scopes: Rc<RefCell<Option<adw::ToggleGroup>>>,
+    /// Set while the row is being repopulated, so `active-name` changes made by
+    /// the code do not re-enter `select_group` and rebuild the row from inside
+    /// its own construction.
+    syncing_scopes: Rc<Cell<bool>>,
+    /// Set from the moment a scope is chosen until the list has been recomputed
+    /// for it. Only [`Self::sync_chip_modified`] reads it, and only to keep quiet
+    /// about a difference that is its own doing.
+    switching_scope: Rc<Cell<bool>>,
     /// Set on every rebuild; the popover's "Create pool" needs it long after
     /// the callbacks that carried it went out of scope.
     on_create_pool: PoolCallback,
@@ -124,24 +180,35 @@ pub struct ServersView {
     /// The row of saved scopes, above the subscription groups.
     chip_bar: gtk::Box,
     chip_scroll: gtk::ScrolledWindow,
-    /// Shown only while a chip is selected, so an unfiltered list costs no
-    /// vertical space for a button that would have nothing to connect.
+    /// One line under the chip row, shown only until the first group exists.
+    chip_hint: gtk::Label,
+    /// Shown while a chip is selected, or while the filter is narrowing the
+    /// list — never for a bare search, so the page does not gain and lose a
+    /// strip on every keystroke.
     connect_bar: gtk::Box,
     connect_title: gtk::Label,
     connect_button: adw::SplitButton,
+    /// Offered beside Connect only for a scope that is not saved yet: it is the
+    /// answer to "and how do I keep this?", asked exactly where it comes up.
+    connect_save: gtk::Button,
     /// Strategy the split button's primary half uses, last chosen from its
     /// menu. Not persisted: it describes this session's intent, and a pool the
     /// user actually kept is written into the profile anyway.
     connect_strategy: Rc<Cell<usize>>,
-    /// Lives in the window header next to the search entry, so the filter
-    /// costs no vertical space until it is opened.
-    filter_button: gtk::MenuButton,
-    filter_popover: gtk::Popover,
-    /// Rows the popover disables while a fixed list is selected: a list has no
-    /// filters, and the two are mutually exclusive.
-    filter_rows: Rc<RefCell<Vec<gtk::Widget>>>,
-    match_label: gtk::Label,
-    advanced_expanded: Rc<Cell<bool>>,
+    /// How many nodes the pool rotates over, `0` meaning every live one. Starts
+    /// at [`DEFAULT_POOL_ROTATION`] rather than at "all": a pool over a whole
+    /// country is mostly repeats of a handful of hosts, and rotating over all of
+    /// them buys no extra spread while costing an observatory ping apiece.
+    connect_rotation_value: Rc<Cell<usize>>,
+    connect_rotation: gtk::MenuButton,
+    /// First thing in the chip row rather than an icon in the header. The
+    /// header had six widgets packed before it and this one was the sixth, so
+    /// nobody found it; the row of chips is where a scope is chosen, and the
+    /// filter is how a new one is made.
+    filter_button: gtk::Button,
+    /// The pill's text, so `apply_filter` can say how many fields are set
+    /// without rebuilding the row under the pointer.
+    filter_label: gtk::Label,
     /// Number of card columns; driven by the window width (1, 2, or 3).
     columns: Rc<Cell<usize>>,
     pending_columns: Rc<Cell<usize>>,
@@ -206,6 +273,16 @@ impl ServersView {
             .propagate_natural_height(true)
             .build();
 
+        let chip_hint = gtk::Label::builder()
+            .label("Servers you use together can be saved as a group — then one click connects to the whole set.")
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(1)
+            .visible(false)
+            .css_classes(["dim-label", "caption", "group-chip-hint"])
+            .build();
+
         let connect_title = gtk::Label::builder()
             .xalign(0.0)
             .hexpand(true)
@@ -216,6 +293,20 @@ impl ServersView {
             .label("Connect")
             .css_classes(["suggested-action"])
             .build();
+        let connect_save = gtk::Button::builder()
+            .label("Save as group")
+            .tooltip_text("Keep this selection as a chip you can come back to")
+            .visible(false)
+            .css_classes(["flat"])
+            .build();
+        // How wide the rotation is belongs beside Connect, because that is where
+        // the pool is made. Leaving it to the profile editor meant every pool
+        // the UI built rotated over everything it matched — forty-two nodes for
+        // a country with nine distinct hosts.
+        let connect_rotation = gtk::MenuButton::builder()
+            .tooltip_text("How many nodes carry traffic at once")
+            .css_classes(["flat"])
+            .build();
         let connect_bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(12)
@@ -223,41 +314,57 @@ impl ServersView {
             .css_classes(["group-connect-bar"])
             .build();
         connect_bar.append(&connect_title);
+        connect_bar.append(&connect_rotation);
+        connect_bar.append(&connect_save);
         connect_bar.append(&connect_button);
 
-        let filter_popover = gtk::Popover::builder().width_request(320).build();
-        let filter_button = gtk::MenuButton::builder()
-            .icon_name("funnel-symbolic")
-            .tooltip_text("Filter servers")
-            .visible(false)
-            .css_classes(["flat", "header-icon-button"])
+        // A word, not a lone glyph. Testing found nobody guessing that an icon
+        // in the header was the way to build a group, and the icon it used
+        // (`funnel-symbolic`) is not an Adwaita name at all, so it drew as a
+        // broken square. The funnel now travels with the app, and the label
+        // carries the meaning even where the icon does not load.
+        //
+        // No `pan-down-symbolic` any more: that arrow promises a menu dropping
+        // out of the button, and this opens a dialog. It was also a third widget
+        // of width in the first thing on the row, next to a scope switcher that
+        // needs the space.
+        let filter_label = gtk::Label::new(Some("Filter"));
+        let filter_content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+        filter_content.append(&gtk::Image::from_icon_name("oxidom-funnel-symbolic"));
+        filter_content.append(&filter_label);
+        let filter_button = gtk::Button::builder()
+            .tooltip_text("Narrow the list by country, protocol or subscription")
+            .css_classes(["pill", "group-chip", "filter-pill"])
             .build();
+        filter_button.set_child(Some(&filter_content));
         filter_button.update_property(&[gtk::accessible::Property::Label("Filter servers")]);
-        filter_button.set_popover(Some(&filter_popover));
-        let match_label = gtk::Label::builder()
-            .xalign(0.0)
-            .css_classes(["dim-label", "caption"])
-            .build();
+        filter_button.update_property(&[gtk::accessible::Property::HasPopup(true)]);
+        let servers_area = gtk::Box::new(gtk::Orientation::Vertical, 20);
+        servers_area.set_hexpand(true);
 
         let view = Self {
             root,
             content,
+            servers_area,
             no_matches,
             chip_bar,
             chip_scroll,
+            chip_hint,
             connect_bar,
             connect_title,
             connect_button,
+            connect_save,
             connect_strategy: Rc::new(Cell::new(0)),
+            connect_rotation_value: Rc::new(Cell::new(oxidom_core::pool::DEFAULT_POOL_ROTATION)),
+            connect_rotation,
             filter_button,
-            filter_popover,
-            match_label,
-            advanced_expanded: Rc::new(Cell::new(false)),
-            filter_rows: Rc::new(RefCell::new(Vec::new())),
+            filter_label,
             scope_members: Rc::new(RefCell::new(Vec::new())),
             active_group: Rc::new(RefCell::new(None)),
             saved_groups: Rc::new(RefCell::new(Vec::new())),
-            active_chip: Rc::new(RefCell::new(None)),
+            scopes: Rc::new(RefCell::new(None)),
+            syncing_scopes: Rc::new(Cell::new(false)),
+            switching_scope: Rc::new(Cell::new(false)),
             on_create_pool: Rc::new(RefCell::new(None)),
             on_connect_pool: Rc::new(RefCell::new(None)),
             on_browse_subscriptions: Rc::new(RefCell::new(None)),
@@ -282,8 +389,13 @@ impl ServersView {
         };
         // Once, not per rebuild: the split button outlives every rebuild, and
         // re-connecting its handlers would make the Nth click perform N
-        // connections.
+        // connections. The filter pill is the same widget for the same reason —
+        // it is only unparented and re-appended when the row is rebuilt.
         view.build_connect_button();
+        view.filter_button.connect_clicked({
+            let view = view.clone();
+            move |_| view.present_filter_dialog()
+        });
         view
     }
 
@@ -354,6 +466,13 @@ impl ServersView {
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
+        // The area survives the page rebuild as a widget, so its opacity — which
+        // an interrupted fade could have left below 1.0 — is reset rather than
+        // inherited.
+        while let Some(child) = self.servers_area.first_child() {
+            self.servers_area.remove(&child);
+        }
+        self.servers_area.set_opacity(1.0);
         self.cards.borrow_mut().clear();
         self.groups.borrow_mut().clear();
         *self.subscriptions.borrow_mut() = subscriptions.to_vec();
@@ -395,9 +514,15 @@ impl ServersView {
         }
 
         self.content.append(&self.chip_scroll);
+        self.content.append(&self.chip_hint);
         self.content.append(&self.connect_bar);
+        // The cards live in their own box so a scope change can cross-fade *them*
+        // and nothing else. Fading `content` faded the scope row, the filter pill
+        // and the Connect bar along with them, which read as the whole window
+        // blinking — and the controls that did not change are exactly the ones
+        // that must stay put while the thing they control is replaced.
+        self.content.append(&self.servers_area);
         self.build_chip_bar();
-        self.build_filter_popover(subscriptions);
         let favourites: HashSet<String> = self
             .prefs
             .borrow()
@@ -659,7 +784,7 @@ impl ServersView {
             group.set_hexpand(true);
             group.append(&header);
             group.append(&columns_box);
-            self.content.append(&group);
+            self.servers_area.append(&group);
             let group_ui = GroupUi {
                 id: subscription.id.clone(),
                 root: group.upcast::<gtk::Widget>(),
@@ -676,7 +801,7 @@ impl ServersView {
             self.groups.borrow_mut().push(group_ui);
         }
         // Last child, so it sits below the groups it stands in for.
-        self.content.append(&self.no_matches);
+        self.servers_area.append(&self.no_matches);
         self.apply_filter();
         if let Some(server_id) = selected_id {
             self.set_selected_immediately(server_id);
@@ -684,86 +809,299 @@ impl ServersView {
         self.schedule_expanded_remeasure();
     }
 
-    /// The filter control the window packs into its header, beside the search
-    /// entry. Handed out rather than owned by the window so every decision
-    /// about filtering stays in one file.
-    pub fn header_filter(&self) -> gtk::MenuButton {
-        self.filter_button.clone()
-    }
-
-    /// The row of saved scopes: All, then one chip per group, then "+".
+    /// The row of saved scopes: Filter, All, one chip per group, then "+".
     ///
     /// A group is a *scope*, not a place servers live. Rendering it as another
     /// block of cards would show the same server two or three times over and
     /// leave no way to tell which card was the real one; narrowing the single
     /// list keeps every server in exactly one place — its subscription.
     fn build_chip_bar(&self) {
+        self.syncing_scopes.set(true);
         while let Some(child) = self.chip_bar.first_child() {
             self.chip_bar.remove(&child);
         }
         let active = self.active_group.borrow().clone();
         let saved = self.prefs.borrow().groups.clone();
         *self.saved_groups.borrow_mut() = saved.clone();
-        self.active_chip.borrow_mut().take();
+        self.scopes.borrow_mut().take();
 
-        let all = gtk::ToggleButton::builder()
-            .label("All")
-            .active(active.is_none())
-            .css_classes(["pill", "group-chip"])
-            .build();
-        all.connect_clicked({
-            let view = self.clone();
-            move |button| {
-                if button.is_active() {
-                    view.select_group(None);
-                } else {
-                    // A chip is a radio, not a checkbox: clicking the active
-                    // one must not leave the row with nothing selected.
-                    button.set_active(true);
-                }
-            }
-        });
-        self.chip_bar.append(&all);
+        // The filter sits at the head of the row it feeds: everything to its
+        // right is a scope that was once made with it. Unparented rather than
+        // rebuilt, because it is one long-lived widget carrying the field count.
+        self.filter_button.unparent();
+        self.chip_bar.append(&self.filter_button);
+        self.chip_bar
+            .append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
+        // One `AdwToggleGroup` rather than a row of `GtkToggleButton`s.
+        //
+        // Three things come with it that the loose row had to fake or went
+        // without: the radio behaviour (a group always has exactly one active
+        // toggle, so "clicking the active chip must not clear the row" stops
+        // being a special case), arrow-key navigation between scopes, and an
+        // indicator that *slides* from the old scope to the new one — which is
+        // the animation this row wanted, at no cost in code.
+        let scopes = adw::ToggleGroup::new();
+        scopes.add(
+            adw::Toggle::builder()
+                .name("")
+                .label("All")
+                .tooltip("Every server from every subscription")
+                .build(),
+        );
         for group in &saved {
             let count = group_member_ids(group, &self.subscriptions.borrow()).len();
-            let chip = gtk::ToggleButton::builder()
-                .label(group.label())
-                .active(active.as_deref() == Some(group.id.as_str()))
-                .tooltip_text(group_chip_tooltip(group, count))
-                .css_classes(["pill", "group-chip"])
-                .build();
-            chip.connect_clicked({
-                let view = self.clone();
-                let id = group.id.clone();
-                move |button| {
-                    if button.is_active() {
-                        view.select_group(Some(&id));
-                    } else {
-                        button.set_active(true);
-                    }
-                }
-            });
-            if chip.is_active() {
-                *self.active_chip.borrow_mut() = Some(chip.clone());
-            }
-            self.chip_bar.append(&chip);
+            scopes.add(
+                adw::Toggle::builder()
+                    .name(&group.id)
+                    .label(group.label())
+                    .tooltip(group_chip_tooltip(group, count))
+                    .build(),
+            );
         }
+        scopes.set_active_name(Some(active.as_deref().unwrap_or("")));
+        scopes.connect_active_name_notify({
+            let view = self.clone();
+            move |scopes| {
+                if view.syncing_scopes.get() {
+                    return;
+                }
+                let name = scopes.active_name().unwrap_or_default();
+                view.select_group(Some(name.as_str()).filter(|name| !name.is_empty()));
+            }
+        });
+        *self.scopes.borrow_mut() = Some(scopes.clone());
+        self.chip_bar.append(&scopes);
+
+        // The `⋮` used to be a second half welded onto the selected chip. A
+        // toggle inside an `AdwToggleGroup` cannot carry one, and it turns out
+        // not to want to: one menu beside the group, acting on whatever is
+        // selected, is a target that stays in the same place instead of moving
+        // with the selection — and it removes the rule that only the selected
+        // chip has a menu, which was itself only there to stop five identical
+        // buttons appearing in a row.
+        let manage = gtk::MenuButton::builder()
+            .tooltip_text("What to do with the scope on screen")
+            .css_classes(["flat", "group-chip-menu"])
+            .build();
+        manage.set_child(Some(&gtk::Image::from_icon_name("view-more-symbolic")));
+        manage.update_property(&[gtk::accessible::Property::Label("Scope actions")]);
+        // Never insensitive, because it no longer means "the selected group": it
+        // acts on the scope that is on screen, saved or not, and making a profile
+        // out of that is exactly what somebody looking at an unsaved filter wants.
+        // The items that need a saved group disable themselves instead.
+        let position = active
+            .as_deref()
+            .and_then(|id| saved.iter().position(|group| group.id == id));
+        manage.set_popover(Some(&self.scope_menu(
+            position.map(|index| (saved[index].clone(), index, saved.len())),
+        )));
+        self.chip_bar.append(&manage);
         self.sync_chip_modified();
 
+        // Labelled, not a bare "+": a circle with a plus in it was read as
+        // "add a subscription" by everyone who was asked, and the word is the
+        // only thing that says what gets added.
+        let add_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        add_content.append(&gtk::Image::from_icon_name("list-add-symbolic"));
+        add_content.append(&gtk::Label::new(Some("New group")));
         let add = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .tooltip_text("Save what is shown as a new group")
-            .css_classes(["flat", "circular", "group-chip-add"])
+            .child(&add_content)
+            .tooltip_text("Pick servers you use together and give them a name")
+            .css_classes(["pill", "group-chip", "group-chip-add"])
             .build();
-        add.update_property(&[gtk::accessible::Property::Label(
-            "Save what is shown as a new group",
-        )]);
+        add.update_property(&[gtk::accessible::Property::Label("New group")]);
         add.connect_clicked({
             let view = self.clone();
             move |_| view.save_as_group_dialog(None)
         });
         self.chip_bar.append(&add);
+
+        // Until the first group exists, the row is two chips whose purpose is
+        // not obvious from their labels alone. One line says what the row is
+        // for; it goes away as soon as the answer is on screen.
+        self.chip_hint
+            .set_visible(saved.iter().all(|group| group.id == FAVOURITES_ID));
+        self.syncing_scopes.set(false);
+    }
+
+    /// Everything that can be done to one group, hung off its own chip.
+    ///
+    /// This used to be a row inside the filter popover, on the reasoning that
+    /// the popover is where a scope is worked on and a chip is already a click
+    /// target. Both halves turned out to be wrong: the popover was behind a
+    /// header button nobody found, and "already a click target" only rules out
+    /// a second gesture on the same target — a menu button beside it is its own
+    /// target and cannot be hit by accident.
+    ///
+    /// `group` is `None` for "All" and for an unsaved filter: the menu is still
+    /// offered, because "make a profile out of what I am looking at" is the one
+    /// action that does not need the scope to have a name. It used to be a third
+    /// button in the filter popover's footer, where three buttons had turned that
+    /// footer into a menu pretending to be an action bar.
+    fn scope_menu(&self, group: Option<(ServerGroup, usize, usize)>) -> gtk::Popover {
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        list.set_margin_top(6);
+        list.set_margin_bottom(6);
+        list.set_margin_start(6);
+        list.set_margin_end(6);
+        let popover = gtk::Popover::builder().child(&list).build();
+
+        // A `Button`'s own label centres itself, which reads as a row of
+        // headings rather than a menu; an explicit child left-aligns it.
+        let item = |label: &str, tooltip: &str| {
+            gtk::Button::builder()
+                .child(&gtk::Label::builder().label(label).xalign(0.0).build())
+                .tooltip_text(tooltip)
+                .css_classes(["flat"])
+                .build()
+        };
+
+        // Named for what it makes. "Create pool…" was a third word for a thing
+        // that already had two — a group is a pool, and connecting one runs it —
+        // and the only thing that actually distinguished it was that it produces
+        // a *profile*, which is what it now says.
+        let create_pool = item(
+            "New profile from this…",
+            "Create a connection profile whose pool is the visible selection. Connect only \
+             re-points the profile already chosen; this makes a new one.",
+        );
+        create_pool.connect_clicked({
+            let view = self.clone();
+            let popover = popover.clone();
+            move |_| {
+                popover.popdown();
+                let query = view.current_filter.borrow().clone();
+                if let Some(callback) = view.on_create_pool.borrow().as_ref() {
+                    callback(query);
+                }
+            }
+        });
+        list.append(&create_pool);
+
+        let Some((group, index, total)) = group else {
+            // Nothing else in this menu means anything without a saved group,
+            // and a row of five insensitive items is worse than a short menu.
+            return popover;
+        };
+
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let edit = item(
+            "Edit…",
+            "Rename it, change its icon, or pick different servers",
+        );
+        edit.connect_clicked({
+            let view = self.clone();
+            let group = group.clone();
+            let popover = popover.clone();
+            move |_| {
+                popover.popdown();
+                view.save_as_group_dialog(Some(group.clone()));
+            }
+        });
+        list.append(&edit);
+
+        // Only useful while the chip carries its "·": otherwise it would
+        // overwrite the group with itself. Decided when the menu opens rather
+        // than when the row is built, because the search box moves this without
+        // rebuilding the row.
+        let update = item(
+            "Update to what's shown",
+            "Replace this group's servers with the ones on screen",
+        );
+        update.connect_clicked({
+            let view = self.clone();
+            let group = group.clone();
+            let popover = popover.clone();
+            move |_| {
+                popover.popdown();
+                let members =
+                    filtered_ids(&view.current_filter.borrow(), &view.subscriptions.borrow());
+                view.save_group(
+                    Some(group.clone()),
+                    group.name.clone(),
+                    group.icon.clone(),
+                    group.kind,
+                    members,
+                );
+            }
+        });
+        popover.connect_show({
+            let view = self.clone();
+            let group = group.clone();
+            let update = update.clone();
+            move |_| update.set_sensitive(view.group_is_modified(&group))
+        });
+        list.append(&update);
+
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        for (label, tooltip, delta, enabled) in [
+            (
+                "Move left",
+                "Move this chip towards the start",
+                -1_isize,
+                index > 0,
+            ),
+            (
+                "Move right",
+                "Move this chip towards the end",
+                1,
+                index + 1 < total,
+            ),
+        ] {
+            let move_item = item(label, tooltip);
+            move_item.set_sensitive(enabled);
+            move_item.connect_clicked({
+                let view = self.clone();
+                let id = group.id.clone();
+                let popover = popover.clone();
+                move |_| {
+                    popover.popdown();
+                    view.move_chip(&id, delta);
+                }
+            });
+            list.append(&move_item);
+        }
+
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let delete = item(
+            "Delete",
+            // Favourites is where the star puts things, so removing it would
+            // leave the star with nowhere to go. Emptying it is always
+            // possible, and is what "delete" would have meant.
+            if group.id == FAVOURITES_ID {
+                "Favourites is built in. Unstar its servers to empty it."
+            } else {
+                "Delete this group. The servers in it are not touched."
+            },
+        );
+        delete.add_css_class("destructive-action");
+        delete.set_sensitive(group.id != FAVOURITES_ID);
+        delete.connect_clicked({
+            let view = self.clone();
+            let group = group.clone();
+            let popover = popover.clone();
+            move |_| {
+                popover.popdown();
+                view.delete_group_dialog(group.clone());
+            }
+        });
+        list.append(&delete);
+
+        popover
+    }
+
+    /// Whether the visible selection has drifted from the group as saved.
+    ///
+    /// A list is compared against what it currently resolves to, not against
+    /// the handles it stores: a member whose server went away is not an edit
+    /// the user made, and counting it would blame them for a refresh.
+    fn group_is_modified(&self, group: &ServerGroup) -> bool {
+        let mut basis = group.clone();
+        if basis.kind == GroupKind::List {
+            basis.query.members = group_member_ids(group, &self.subscriptions.borrow());
+        }
+        !query_equals_group(&self.current_filter.borrow(), &basis)
     }
 
     /// Wire the split button: a click connects with the strategy last chosen,
@@ -777,6 +1115,10 @@ impl ServersView {
         self.connect_button.connect_clicked({
             let view = self.clone();
             move |_| view.connect_active_group()
+        });
+        self.connect_save.connect_clicked({
+            let view = self.clone();
+            move |_| view.save_as_group_dialog(None)
         });
         let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
         list.set_margin_top(6);
@@ -819,6 +1161,38 @@ impl ServersView {
             list.append(&button);
         }
         self.connect_button.set_popover(Some(&popover));
+        self.build_rotation_menu();
+    }
+
+    /// The rotation picker beside Connect.
+    ///
+    /// Built once, like the strategy menu: the bar outlives every rebuild, and
+    /// hooking it up per rebuild is how the Nth click came to fire N times.
+    fn build_rotation_menu(&self) {
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        list.set_margin_top(6);
+        list.set_margin_bottom(6);
+        list.set_margin_start(6);
+        list.set_margin_end(6);
+        let popover = gtk::Popover::builder().child(&list).build();
+        for value in ROTATION_CHOICES {
+            let button = gtk::Button::builder()
+                .label(rotation_label(value))
+                .css_classes(["flat"])
+                .build();
+            button.set_tooltip_text(Some(&rotation_detail(value)));
+            button.connect_clicked({
+                let view = self.clone();
+                let popover = popover.clone();
+                move |_| {
+                    popover.popdown();
+                    view.connect_rotation_value.set(value);
+                    view.sync_connect_bar();
+                }
+            });
+            list.append(&button);
+        }
+        self.connect_rotation.set_popover(Some(&popover));
     }
 
     /// Hand the visible selection to the window as a pool.
@@ -831,44 +1205,77 @@ impl ServersView {
         }
     }
 
-    /// What Connect would run: exactly what is on screen, under the group's
-    /// name and the chosen strategy.
+    /// What Connect would run: exactly what is on screen, under a name and the
+    /// chosen strategy.
     ///
     /// Deliberately the *visible* selection rather than the group as saved. The
     /// chip already marks itself when the two differ, and connecting something
-    /// other than what the page is showing would make that mark a lie.
+    /// other than what the page is showing would make that mark a lie. With no
+    /// group selected the name comes from the rule, and `PoolQuery.name` is a
+    /// label only — it takes no part in selection and does not make a session
+    /// stale — so an unsaved scope connects on the same footing as a saved one.
     fn connect_query(&self) -> Option<PoolQuery> {
-        let group = self.active_group_value()?;
+        let name = match self.active_group_value() {
+            Some(group) => group.name,
+            None if self.active_filter_fields() > 0 => {
+                suggested_group_name(&self.rule_from_filters(String::new()))
+            }
+            None => return None,
+        };
         let mut query = self.current_filter.borrow().clone();
         if filtered_ids(&query, &self.subscriptions.borrow()).is_empty() {
             return None;
         }
-        query.name = group.name.clone();
+        query.name = name;
         query.strategy = connect_choices()
             .get(self.connect_strategy.get())
             .map(|choice| choice.strategy)
             .unwrap_or_default();
+        query.expected = self.connect_rotation_value.get();
         Some(query)
     }
 
+    /// The bar appears for a saved chip, and for a filter the user set by hand.
+    ///
+    /// Not for a bare search: the filter fields are a deliberate act that stays
+    /// put, while search text changes on every keystroke, and a strip that
+    /// appears and vanishes under the pointer moves the cards out from under
+    /// the click that was aimed at them. Hence `active_filter_fields`, which
+    /// does not consult the search box.
     fn sync_connect_bar(&self) {
-        let Some(group) = self.active_group_value() else {
-            self.connect_bar.set_visible(false);
-            return;
-        };
         let subscriptions = self.subscriptions.borrow().clone();
         let visible = filtered_ids(&self.current_filter.borrow(), &subscriptions).len();
-        let saved = group_member_ids(&group, &subscriptions).len();
-        // "8 of 12" rather than a bare "8" whenever the search box is hiding
-        // part of the group: Connect acts on the eight, and the difference is
-        // the only warning that it will.
-        let count = if visible == saved {
-            format!("{visible} server{}", if visible == 1 { "" } else { "s" })
-        } else {
-            format!("{visible} of {saved} shown")
+        let unsaved = self.active_group_value().is_none();
+        let title = match self.active_group_value() {
+            Some(group) => {
+                let saved = group_member_ids(&group, &subscriptions).len();
+                // "8 of 12" rather than a bare "8" whenever the search box is
+                // hiding part of the group: Connect acts on the eight, and the
+                // difference is the only warning that it will.
+                let count = if visible == saved {
+                    format!("{visible} server{}", if visible == 1 { "" } else { "s" })
+                } else {
+                    format!("{visible} of {saved} shown")
+                };
+                format!("{} · {count}", group.label())
+            }
+            None if self.active_filter_fields() > 0 => format!(
+                "{} · {visible} server{}",
+                describe_rule(&self.rule_from_filters(String::new())),
+                if visible == 1 { "" } else { "s" }
+            ),
+            None => {
+                self.connect_bar.set_visible(false);
+                return;
+            }
         };
-        self.connect_title
-            .set_label(&format!("{} · {count}", group.label()));
+        self.connect_title.set_label(&title);
+        let rotation = self.connect_rotation_value.get();
+        self.connect_rotation
+            .set_label(&rotation_summary(rotation, visible));
+        // Only worth choosing when there is something to choose between: over
+        // one or two nodes every width is the same rotation.
+        self.connect_rotation.set_sensitive(visible > 2);
         let choice = connect_choices()
             .into_iter()
             .nth(self.connect_strategy.get());
@@ -882,240 +1289,429 @@ impl ServersView {
                 ),
                 (_, None) => format!("Point the selected profile at these {visible} servers."),
             }));
+        self.connect_save.set_visible(unsaved);
+        self.connect_save.set_sensitive(visible > 0);
         self.connect_bar.set_visible(true);
     }
 
-    /// One popover holding both the quick row and the detailed controls.
+    /// The filter as its own dialog, built fresh each time it is opened.
     ///
-    /// Quick and advanced are two presentations of *one* state, never two
-    /// filters: a quick chip writes the same values the advanced list shows, so
-    /// opening it right afterwards explains what the click did.
-    fn build_filter_popover(&self, subscriptions: &[Subscription]) {
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        content.set_margin_top(10);
-        content.set_margin_bottom(10);
-        content.set_margin_start(10);
-        content.set_margin_end(10);
+    /// It was a popover, and the `Except` picker inside it was a second popover
+    /// parented to the first. GTK4 gives an autohide popover a grab; opening
+    /// another one inside it takes that grab away and leaves the outer popover
+    /// believing it is still shown, so its button silently refuses to open it
+    /// ever again. Measured behaviour, and the reason this is a dialog: a dialog
+    /// is an ordinary widget tree, so `Except` becomes a pushed page with a
+    /// slide animation instead of a popover inside a popover.
+    ///
+    /// The dialog edits a **draft** and commits on Apply. Nothing behind a modal
+    /// dialog can be watched changing, so applying each tick was work the user
+    /// could not see; a form with one commit can also be abandoned.
+    fn present_filter_dialog(&self) {
+        let subscriptions = self.subscriptions.borrow().clone();
+        // Hand-picked servers are part of the draft, not a separate mode: this is
+        // the whole selection — a rule, or a list, exactly as `PoolQuery` puts it
+        // — so a scope that *is* a list can be opened and edited here rather than
+        // greying the dialog out and sending the user to look for another door.
+        let draft = Rc::new(RefCell::new(FilterDraft {
+            countries: self.filter_countries.borrow().clone(),
+            protocols: self.filter_protocols.borrow().clone(),
+            subscriptions: self.filter_subscriptions.borrow().clone(),
+            exclude: self.filter_exclude.borrow().clone(),
+            members: self.scope_members.borrow().clone(),
+        }));
 
-        let quick = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .column_spacing(6)
-            .row_spacing(6)
-            .max_children_per_line(4)
-            .min_children_per_line(2)
+        let dialog = adw::Dialog::builder()
+            .title("Filter")
+            .content_width(420)
+            .content_height(560)
             .build();
-        for item in quick_filters(subscriptions, 4) {
-            let button = gtk::Button::builder()
-                .label(&item.label)
-                .css_classes(["pill", "quick-filter"])
-                .build();
-            button.connect_clicked({
-                let view = self.clone();
-                let quick = item.quick.clone();
-                move |_| view.apply_quick(&quick)
-            });
-            quick.insert(&button, -1);
-        }
-        content.append(&section_title("Quick"));
-        content.append(&quick);
+        let navigation = adw::NavigationView::new();
 
-        let countries = available_countries(subscriptions)
+        let apply = gtk::Button::builder()
+            .label("Apply")
+            .css_classes(["suggested-action"])
+            .build();
+        let cancel = gtk::Button::with_label("Cancel");
+        let header = adw::HeaderBar::builder()
+            .show_end_title_buttons(false)
+            .show_start_title_buttons(false)
+            .build();
+        header.pack_start(&cancel);
+        header.pack_end(&apply);
+
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        body.set_margin_top(12);
+        body.set_margin_bottom(12);
+        body.set_margin_start(12);
+        body.set_margin_end(12);
+
+        // Two lists, because they are two answers to one question and only one of
+        // them can be in force: a rule that keeps matching, or the servers named
+        // by hand. `pool::resolve` already gives the named ones precedence, so the
+        // dialog disables the rule rather than letting the user write something
+        // that would be silently ignored.
+        let rows = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+
+        let matches = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .css_classes(["dim-label"])
+            .build();
+
+        let checks: Rc<RefCell<Vec<(FilterField, String, gtk::CheckButton)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let field_rows: Rc<RefCell<Vec<(FilterField, adw::ExpanderRow)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let step_row = |title: &str, subtitle: &str| {
+            let row = adw::ActionRow::builder()
+                .title(title)
+                .subtitle(subtitle)
+                .activatable(true)
+                .build();
+            row.add_suffix(
+                &gtk::Image::builder()
+                    .icon_name("go-next-symbolic")
+                    .css_classes(["dim-label"])
+                    .build(),
+            );
+            row
+        };
+        let exclude_row = step_row("Except", &exclude_label(&draft.borrow().exclude));
+        // The other half of "pick specific servers": `Except` says which ones to
+        // drop out of a rule, and this says which ones are the whole selection.
+        // Until now the only way to name servers by hand was the New group dialog,
+        // so choosing five nodes meant first inventing a name for them.
+        let only_row = step_row(
+            "Only these servers",
+            &picked_label(draft.borrow().members.len()),
+        );
+        let picked = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        picked.append(&only_row);
+        // Set while the boxes are written from the draft: GTK emits `toggled` for
+        // a programmatic `set_active` exactly as for a click, so without this each
+        // write would run the read-back once per checkbox.
+        let syncing = Rc::new(Cell::new(false));
+
+        // One closure both directions of the sync go through, so the subtitles,
+        // the match count and the draft cannot describe different things.
+        let refresh: Rc<dyn Fn()> = Rc::new({
+            let checks = checks.clone();
+            let field_rows = field_rows.clone();
+            let exclude_row = exclude_row.clone();
+            let only_row = only_row.clone();
+            let rows = rows.clone();
+            let matches = matches.clone();
+            let draft = draft.clone();
+            let subscriptions = subscriptions.clone();
+            let view = self.clone();
+            move || {
+                let borrowed = checks.borrow();
+                for (field, row) in field_rows.borrow().iter() {
+                    let mut chosen = 0;
+                    let mut total = 0;
+                    for (candidate, _, check) in borrowed.iter() {
+                        if candidate != field {
+                            continue;
+                        }
+                        total += 1;
+                        chosen += usize::from(check.is_active());
+                    }
+                    // A row that has to be opened to find out whether it is doing
+                    // anything gets opened again and again.
+                    row.set_subtitle(&match (chosen, total) {
+                        (0, 0) => "None available".to_string(),
+                        (0, total) => format!("Any of {total}"),
+                        (chosen, total) => format!("{chosen} of {total}"),
+                    });
+                }
+                drop(borrowed);
+                let draft = draft.borrow();
+                exclude_row.set_subtitle(&exclude_label(&draft.exclude));
+                only_row.set_subtitle(&picked_label(draft.members.len()));
+                // Named servers win over a rule wherever this is resolved, so the
+                // rule is disabled rather than left writable and ignored.
+                let by_hand = !draft.members.is_empty();
+                rows.set_sensitive(!by_hand);
+                rows.set_tooltip_text(by_hand.then_some(
+                    "These servers are named by hand, so no filter applies. Clear them to \
+                     go back to a rule.",
+                ));
+                // The same computation the page will do on Apply, so the number
+                // promised here is the number that appears.
+                let count = if by_hand {
+                    filtered_ids(
+                        &PoolQuery {
+                            members: draft.members.clone(),
+                            ..PoolQuery::default()
+                        },
+                        &subscriptions,
+                    )
+                    .len()
+                } else {
+                    let query = filters_to_query(
+                        &subscriptions,
+                        &draft.subscriptions,
+                        &draft.countries,
+                        &draft.protocols,
+                        &draft.exclude,
+                        &view.search_texts.borrow(),
+                        "",
+                    );
+                    filtered_ids(&query, &subscriptions).len()
+                };
+                matches.set_label(&match count {
+                    1 => "1 server matches".to_string(),
+                    count => format!("{count} servers match"),
+                });
+            }
+        });
+
+        // Read every box rather than tracking the one that moved: the boxes are
+        // the truth on screen, and rebuilding the draft from them cannot drift
+        // from what the user sees.
+        let read_back: Rc<dyn Fn()> = Rc::new({
+            let checks = checks.clone();
+            let draft = draft.clone();
+            let syncing = syncing.clone();
+            let refresh = refresh.clone();
+            move || {
+                if syncing.get() {
+                    return;
+                }
+                {
+                    let mut draft = draft.borrow_mut();
+                    draft.countries.clear();
+                    draft.protocols.clear();
+                    draft.subscriptions.clear();
+                    for (field, value, check) in checks.borrow().iter() {
+                        if !check.is_active() {
+                            continue;
+                        }
+                        match field {
+                            FilterField::Country => draft.countries.push(value.clone()),
+                            FilterField::Protocol => draft.protocols.push(value.clone()),
+                            FilterField::Subscription => draft.subscriptions.push(value.clone()),
+                        }
+                    }
+                }
+                refresh();
+            }
+        });
+
+        let countries = available_countries(&subscriptions)
             .into_iter()
             .map(|value| FilterOption {
                 label: value.to_ascii_uppercase(),
                 value,
             })
             .collect::<Vec<_>>();
-        let protocols = available_protocols(subscriptions)
+        let protocols = available_protocols(&subscriptions)
             .into_iter()
             .map(|value| FilterOption {
                 label: value.clone(),
                 value,
             })
             .collect::<Vec<_>>();
-        let groups = available_subscriptions(subscriptions);
+        let groups = available_subscriptions(&subscriptions);
 
-        let advanced_rows = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        advanced_rows.set_margin_top(6);
-        advanced_rows.set_margin_start(6);
-        let rows = [
-            filter_menu(
-                "Country",
-                &countries,
-                self.filter_countries.clone(),
-                self.clone(),
-            ),
-            filter_menu(
-                "Protocol",
-                &protocols,
-                self.filter_protocols.clone(),
-                self.clone(),
-            ),
-            filter_menu(
-                "Subscription",
-                &groups,
-                self.filter_subscriptions.clone(),
-                self.clone(),
-            ),
-            exclude_menu(subscriptions, self.filter_exclude.clone(), self.clone()),
-        ];
-        self.filter_rows.borrow_mut().clear();
-        for row in &rows {
-            advanced_rows.append(row);
-            self.filter_rows
-                .borrow_mut()
-                .push(row.clone().upcast::<gtk::Widget>());
+        // One boxed list instead of four buttons that each opened a popover of
+        // their own. An expander row shows its choices in place.
+        for (field, title, options) in [
+            (FilterField::Country, "Country", &countries),
+            (FilterField::Protocol, "Protocol", &protocols),
+            (FilterField::Subscription, "Subscription", &groups),
+        ] {
+            let row = adw::ExpanderRow::builder()
+                .title(title)
+                .sensitive(!options.is_empty())
+                .build();
+            let chosen = {
+                let draft = draft.borrow();
+                match field {
+                    FilterField::Country => draft.countries.clone(),
+                    FilterField::Protocol => draft.protocols.clone(),
+                    FilterField::Subscription => draft.subscriptions.clone(),
+                }
+            };
+            for option in options {
+                let check = gtk::CheckButton::new();
+                check.set_active(chosen.contains(&option.value));
+                check.connect_toggled({
+                    let read_back = read_back.clone();
+                    move |_| read_back()
+                });
+                let inner = adw::ActionRow::builder()
+                    .title(&option.label)
+                    .activatable_widget(&check)
+                    .build();
+                inner.add_prefix(&check);
+                row.add_row(&inner);
+                checks
+                    .borrow_mut()
+                    .push((field, option.value.clone(), check));
+            }
+            // Opened when it already has something in it: the row is then a
+            // report on the filter, and closing it would hide the answer.
+            row.set_expanded(!chosen.is_empty());
+            rows.append(&row);
+            field_rows.borrow_mut().push((field, row));
         }
-        // Whether Advanced is open survives a rebuild: a quick chip writes into
-        // these very rows, and collapsing the section at that moment hides the
-        // one thing the click was supposed to explain.
-        let advanced = gtk::Expander::builder()
-            .label("Advanced")
-            .child(&advanced_rows)
-            .expanded(self.advanced_expanded.get())
-            .build();
-        advanced.connect_expanded_notify({
-            let expanded = self.advanced_expanded.clone();
-            move |expander| expanded.set(expander.is_expanded())
-        });
-        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        content.append(&advanced);
 
-        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        // The match count is one long-lived widget so `apply_filter` can update
-        // it on a keystroke without touching the popover. Rebuilding the
-        // popover therefore has to take it off the box it was in — GTK refuses
-        // to give a widget a second parent, and the old box is not finalised
-        // before this line runs.
-        self.match_label.unparent();
-        content.append(&self.match_label);
+        body.append(&section_title("Matching"));
+        body.append(&rows);
+        body.append(&section_title("Or name them"));
+        body.append(&picked);
 
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let reset = gtk::Button::builder()
             .label("Reset")
             .css_classes(["flat"])
             .build();
         reset.connect_clicked({
-            let view = self.clone();
-            move |_| view.apply_quick(&Quick::All)
-        });
-        let create_pool = gtk::Button::builder()
-            .label("Create pool…")
-            .tooltip_text(
-                "Create a profile whose pool is the visible selection. Saving it as a list \
-                 freezes those servers; saving it as a rule lets servers added by a future \
-                 refresh join.",
-            )
-            .css_classes(["flat"])
-            .build();
-        create_pool.connect_clicked({
-            let view = self.clone();
+            let draft = draft.clone();
+            let checks = checks.clone();
+            let syncing = syncing.clone();
+            let refresh = refresh.clone();
             move |_| {
-                view.filter_popover.popdown();
-                let query = view.current_filter.borrow().clone();
-                if let Some(callback) = view.on_create_pool.borrow().as_ref() {
-                    callback(query);
+                *draft.borrow_mut() = FilterDraft::default();
+                syncing.set(true);
+                for (_, _, check) in checks.borrow().iter() {
+                    check.set_active(false);
                 }
+                syncing.set(false);
+                refresh();
             }
         });
-        let save = gtk::Button::builder()
-            .label("Save as group…")
-            .hexpand(true)
-            .halign(gtk::Align::End)
-            .css_classes(["suggested-action", "pill"])
-            .build();
-        save.connect_clicked({
-            let view = self.clone();
+        let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        footer.set_margin_top(6);
+        footer.set_margin_bottom(6);
+        footer.set_margin_start(12);
+        footer.set_margin_end(12);
+        footer.append(&matches);
+        footer.append(&reset);
+
+        // Both server pickers push a page instead of opening a popover: each is a
+        // checkbox per server with a search over two hundred of them, which is a
+        // screen, and `AdwNavigationView` slides between screens on its own.
+        let picker_page = |title: &str, tag: &str, initial: Vec<String>, write: DraftField| {
+            let picker = server_picker(
+                &subscriptions,
+                &self.search_texts.borrow(),
+                Rc::new(RefCell::new(initial)),
+                Rc::new({
+                    let draft = draft.clone();
+                    let refresh = refresh.clone();
+                    move |values: &[String]| {
+                        write(&mut draft.borrow_mut(), values.to_vec());
+                        refresh();
+                    }
+                }),
+            );
+            let page_view = adw::ToolbarView::builder().content(&picker.root).build();
+            page_view.add_top_bar(&adw::HeaderBar::new());
+            let page = adw::NavigationPage::builder()
+                .title(title)
+                .tag(tag)
+                .child(&page_view)
+                .build();
+            // Built empty and filled before the push rather than on `shown`: two
+            // hundred rows arriving after the slide finished made the page jump —
+            // and with `hscrollbar-policy: never` above them their width demand
+            // reached the dialog, so it jumped sideways too. Still lazy, because
+            // nothing is built until the row is activated at all.
+            (page, picker.fill)
+        };
+
+        let (except_page, fill_except) = picker_page(
+            "Except",
+            "except",
+            draft.borrow().exclude.clone(),
+            Rc::new(|draft: &mut FilterDraft, values| draft.exclude = values),
+        );
+        exclude_row.connect_activated({
+            let navigation = navigation.clone();
             move |_| {
-                view.filter_popover.popdown();
-                view.save_as_group_dialog(None);
+                fill_except();
+                navigation.push(&except_page);
             }
         });
-        // Managing the selected group belongs here rather than behind a
-        // right-click on its chip: this popover is already where the scope is
-        // worked on, and a group that can be created but never renamed or
-        // deleted is a trap.
-        if let Some(group) = self.active_group_value() {
-            let manage = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            manage.append(&section_title(&format!("Group “{}”", group.name)));
-            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            spacer.set_hexpand(true);
-            manage.append(&spacer);
+        rows.append(&exclude_row);
 
-            // The chip row is the fastest control on the page, so its order is
-            // worth arranging. Buttons here rather than a menu on the chip
-            // itself: a chip is already a click target, and hanging a second
-            // gesture off it would make selecting a scope a gamble.
-            for (icon, label, delta) in [
-                ("go-previous-symbolic", "Move this group left", -1_isize),
-                ("go-next-symbolic", "Move this group right", 1),
-            ] {
-                let move_button = gtk::Button::builder()
-                    .icon_name(icon)
-                    .tooltip_text(label)
-                    .css_classes(["flat", "circular"])
-                    .build();
-                move_button.update_property(&[gtk::accessible::Property::Label(label)]);
-                move_button.connect_clicked({
-                    let view = self.clone();
-                    let id = group.id.clone();
-                    move |_| view.move_chip(&id, delta)
-                });
-                manage.append(&move_button);
+        let (only_page, fill_only) = picker_page(
+            "Only these servers",
+            "only",
+            draft.borrow().members.clone(),
+            Rc::new(|draft: &mut FilterDraft, values| draft.members = values),
+        );
+        only_row.connect_activated({
+            let navigation = navigation.clone();
+            move |_| {
+                fill_only();
+                navigation.push(&only_page);
             }
+        });
 
-            let update = gtk::Button::builder()
-                .label("Update")
-                .tooltip_text("Replace this group with what is shown")
-                .css_classes(["flat"])
-                .build();
-            update.connect_clicked({
-                let view = self.clone();
-                let group = group.clone();
-                move |_| {
-                    view.filter_popover.popdown();
-                    view.save_as_group_dialog(Some(group.clone()));
-                }
-            });
-            manage.append(&update);
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&body)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+        let toolbar = adw::ToolbarView::builder().content(&scroll).build();
+        toolbar.add_top_bar(&header);
+        toolbar.add_bottom_bar(&footer);
+        navigation.add(
+            &adw::NavigationPage::builder()
+                .title("Filter")
+                .tag("filter")
+                .child(&toolbar)
+                .build(),
+        );
+        dialog.set_child(Some(&navigation));
 
-            let delete = gtk::Button::builder()
-                .label("Delete")
-                // Favourites is where the star puts things, so removing it
-                // would leave the star with nowhere to go. Emptying it is
-                // always possible, and is what "delete" would have meant.
-                .sensitive(group.id != FAVOURITES_ID)
-                .tooltip_text(if group.id == FAVOURITES_ID {
-                    "Favourites is built in. Unstar its servers to empty it."
-                } else {
-                    "Delete this group. The servers in it are not touched."
-                })
-                .css_classes(["flat", "destructive-action"])
-                .build();
-            delete.connect_clicked({
-                let view = self.clone();
-                let group = group.clone();
-                move |_| {
-                    view.filter_popover.popdown();
-                    view.delete_group_dialog(group.clone());
-                }
-            });
-            manage.append(&delete);
-            content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-            content.append(&manage);
-        }
-
-        actions.append(&reset);
-        actions.append(&create_pool);
-        actions.append(&save);
-        content.append(&actions);
-
-        self.filter_popover.set_child(Some(&content));
-        self.sync_filter_sensitivity();
+        cancel.connect_clicked({
+            let dialog = dialog.clone();
+            move |_| {
+                dialog.close();
+            }
+        });
+        apply.connect_clicked({
+            let view = self.clone();
+            let dialog = dialog.clone();
+            let draft = draft.clone();
+            move |_| {
+                dialog.close();
+                let draft = draft.borrow();
+                view.filter_countries
+                    .borrow_mut()
+                    .clone_from(&draft.countries);
+                view.filter_protocols
+                    .borrow_mut()
+                    .clone_from(&draft.protocols);
+                view.filter_subscriptions
+                    .borrow_mut()
+                    .clone_from(&draft.subscriptions);
+                view.filter_exclude.borrow_mut().clone_from(&draft.exclude);
+                view.scope_members.borrow_mut().clone_from(&draft.members);
+                // The saved scope is kept, not cleared: narrowing "Germany" is a
+                // narrowed view of Germany, which the chip marks with a "·" and
+                // offers to save.
+                view.apply_filter();
+            }
+        });
+        (*refresh)();
+        dialog.present(Some(&self.root));
     }
 
     /// Load a saved scope, or clear back to "All".
     fn select_group(&self, id: Option<&str>) {
+        // Cleared by `apply_filter`, at the far end of the cross-fade.
+        self.switching_scope.set(true);
         let group = id.and_then(|id| {
             self.saved_groups
                 .borrow()
@@ -1141,11 +1737,47 @@ impl ServersView {
             }
         }
         self.build_chip_bar();
-        self.apply_filter();
+        self.fade_through(|view| view.apply_filter());
     }
 
-    /// Write a query into the filter widgets' backing state. The popover is
-    /// rebuilt from that state, so the two cannot drift.
+    /// Swap what the list shows behind a short cross-fade.
+    ///
+    /// Switching scope replaces most of the grid at once, and a hard cut reads
+    /// as a flicker rather than as a change of view. Fired only from
+    /// `select_group` — deliberately not from `apply_filter`, which runs on
+    /// every keystroke in the search box, where a fade would be a strobe.
+    ///
+    /// The swap happens at the far end of the fade-out, so nothing moves while
+    /// anything is still legible; cards are already collapsed by `apply_filter`
+    /// before it repacks, so this never fights `server_card`'s own height
+    /// animation.
+    fn fade_through(&self, swap: impl Fn(&Self) + 'static) {
+        let target = self.servers_area.clone();
+        let out = adw::TimedAnimation::builder()
+            .widget(&target)
+            .value_from(1.0)
+            .value_to(0.35)
+            .duration(90)
+            .target(&adw::PropertyAnimationTarget::new(&target, "opacity"))
+            .build();
+        let view = self.clone();
+        out.connect_done(move |_| {
+            swap(&view);
+            let target = view.servers_area.clone();
+            adw::TimedAnimation::builder()
+                .widget(&target)
+                .value_from(0.35)
+                .value_to(1.0)
+                .duration(130)
+                .target(&adw::PropertyAnimationTarget::new(&target, "opacity"))
+                .build()
+                .play();
+        });
+        out.play();
+    }
+
+    /// Write a query into the filter widgets' backing state, then into the
+    /// widgets themselves, so the two cannot drift.
     fn set_filter_values(&self, query: &PoolQuery) {
         self.filter_countries
             .borrow_mut()
@@ -1157,40 +1789,43 @@ impl ServersView {
             .borrow_mut()
             .clone_from(&query.subscriptions);
         self.filter_exclude.borrow_mut().clone_from(&query.exclude);
-        self.build_filter_popover(&self.subscriptions.borrow().clone());
     }
 
-    fn apply_quick(&self, quick: &Quick) {
-        // A quick pick replaces rather than adds: "Germany" means Germany, and
-        // a chip that silently intersected with whatever was left over from
-        // last time would show an empty page for no visible reason.
-        let mut query = PoolQuery::default();
-        match quick {
-            Quick::All => {}
-            Quick::Country(country) => query.countries = vec![country.clone()],
-            Quick::Protocol(protocol) => query.protocols = vec![protocol.clone()],
-        }
-        self.scope_members.borrow_mut().clear();
-        *self.active_group.borrow_mut() = None;
-        self.set_filter_values(&query);
-        self.build_chip_bar();
-        self.apply_filter();
-    }
-
-    /// Ask for a name and whether the group should be a list or a rule.
+    /// Ask for a name, which servers, and whether the group should be a list or
+    /// a rule.
     ///
-    /// The choice is the whole point and cannot be inferred: the same visible
+    /// The list/rule choice is the whole point and cannot be inferred: the same
     /// forty-two servers are either "these forty-two, frozen" or "whatever is
     /// German and VLESS, forever". Only the user knows which they meant.
+    ///
+    /// The servers are picked *here*, not on the page behind the dialog.
+    /// Requiring the list to be narrowed first meant the way to make a group
+    /// was to find a control that did something else, which is how testing
+    /// found people stuck: they knew what they wanted a group to hold and had
+    /// nowhere to say it.
     fn save_as_group_dialog(&self, editing: Option<ServerGroup>) {
-        let current = self.current_filter.borrow().clone();
-        let visible = filtered_ids(&current, &self.subscriptions.borrow()).len();
+        let subscriptions = self.subscriptions.borrow().clone();
         let rule = self.rule_from_filters(String::new());
         // A frozen list is the only honest option for a selection that came
         // from a search box: the text has no equivalent in a rule, so a rule
-        // saved here would quietly be wider than what is on screen.
-        let rule_available =
-            self.scope_members.borrow().is_empty() && self.query.borrow().is_empty();
+        // saved here would quietly be wider than what is on screen. An empty
+        // rule is refused for the opposite reason — it would mean every server
+        // on the machine, which is what the "All" chip already is.
+        let rule_available = self.scope_members.borrow().is_empty()
+            && self.query.borrow().is_empty()
+            && self.active_filter_fields() > 0;
+
+        // Editing starts from what the group holds; a new group starts from
+        // whatever the page is showing, which is nothing at all when the filter
+        // is clear.
+        let members: Vec<String> = match editing.as_ref() {
+            Some(group) => group_member_ids(group, &subscriptions),
+            None if self.active_filter_fields() > 0 || !self.query.borrow().is_empty() => {
+                filtered_ids(&self.current_filter.borrow(), &subscriptions)
+            }
+            None => Vec::new(),
+        };
+        let chosen = Rc::new(RefCell::new(members));
 
         let name_row = adw::EntryRow::builder().title("Name").build();
         name_row.set_text(
@@ -1234,10 +1869,12 @@ impl ServersView {
             presets.append(&button);
         }
         icon_row.add_suffix(&presets);
-        let list_choice = gtk::CheckButton::with_label(&format!(
-            "List — {visible} server{}, frozen",
-            if visible == 1 { "" } else { "s" }
-        ));
+
+        let count_label = gtk::Label::builder()
+            .xalign(0.0)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let list_choice = gtk::CheckButton::with_label("List — frozen, chosen by hand");
         list_choice.set_tooltip_text(Some(
             "New servers will not join on their own. A server that goes away leaves.",
         ));
@@ -1246,12 +1883,86 @@ impl ServersView {
         rule_choice.set_sensitive(rule_available);
         rule_choice.set_tooltip_text(Some(if rule_available {
             "Servers added by a future subscription refresh will join on their own."
+        } else if self.active_filter_fields() == 0 {
+            "Set a filter first: a rule with nothing in it would mean every server."
         } else {
             "The search text has no equivalent in a rule, so this selection can only be frozen."
         }));
+
+        // Set once the dialog exists, then called by everything that can change
+        // whether Save means anything. A greyed-out Save says "not ready yet";
+        // a live one that silently does nothing says the app is broken.
+        let revalidate: Revalidate = Rc::new(RefCell::new(None));
+
+        let picker = server_picker(
+            &subscriptions,
+            &self.search_texts.borrow(),
+            chosen.clone(),
+            Rc::new({
+                let count_label = count_label.clone();
+                let revalidate = revalidate.clone();
+                move |values: &[String]| {
+                    count_label.set_label(&picked_label(values.len()));
+                    if let Some(revalidate) = revalidate.borrow().as_ref() {
+                        revalidate();
+                    }
+                }
+            }),
+        );
+        // This dialog is a form with the picker as one field among several, so the
+        // picker gets a window onto the list rather than the whole dialog's
+        // height. The Except page, which is nothing but the picker, does not cap
+        // it.
+        picker.scroll.set_propagate_natural_height(true);
+        picker.scroll.set_max_content_height(320);
+        (picker.fill)();
+        count_label.set_label(&picked_label(chosen.borrow().len()));
+
+        // Bulk buttons act on what the search left on screen, not on everything:
+        // "select all" after typing "de" is the shortest honest way to say
+        // "every German node", and it is the reason the search is here at all.
+        let bulk = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        bulk.set_halign(gtk::Align::End);
+        for (label, wanted) in [("Select all shown", true), ("Clear", false)] {
+            let button = gtk::Button::builder()
+                .label(label)
+                .css_classes(["flat"])
+                .build();
+            button.connect_clicked({
+                let checks = picker.checks.clone();
+                move |_| {
+                    for (_, check) in checks.borrow().iter() {
+                        if check.get_visible() {
+                            check.set_active(wanted);
+                        }
+                    }
+                }
+            });
+            bulk.append(&button);
+        }
+
+        let servers_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        servers_section.append(&section_title("Servers"));
+        servers_section.append(&picker.root);
+        servers_section.append(&count_label);
+        servers_section.append(&bulk);
+        // A rule does not have members, so leaving the checkboxes live under it
+        // would show a selection that is not what gets saved.
+        rule_choice.connect_toggled({
+            let servers_section = servers_section.clone();
+            let revalidate = revalidate.clone();
+            move |choice| {
+                servers_section.set_sensitive(!choice.is_active());
+                if let Some(revalidate) = revalidate.borrow().as_ref() {
+                    revalidate();
+                }
+            }
+        });
+
         let saved_kind = editing.as_ref().map(|group| group.kind);
         if saved_kind == Some(GroupKind::Rule) && rule_available {
             rule_choice.set_active(true);
+            servers_section.set_sensitive(false);
         } else {
             list_choice.set_active(true);
         }
@@ -1261,12 +1972,13 @@ impl ServersView {
         rows.add(&name_row);
         rows.add(&icon_row);
         body.append(&rows);
+        body.append(&servers_section);
+        body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         body.append(&list_choice);
         body.append(&rule_choice);
 
         let parent = self.root.root().and_downcast::<gtk::Window>();
-        let dialog = adw::MessageDialog::new(
-            parent.as_ref(),
+        let dialog = adw::AlertDialog::new(
             Some(if editing.is_some() {
                 "Edit group"
             } else {
@@ -1279,8 +1991,40 @@ impl ServersView {
         dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("save"));
         dialog.set_close_response("cancel");
+
+        // Weak: this closure is reached from the dialog's own checkboxes, so a
+        // strong handle here would make the dialog keep itself alive for good.
+        let weak_dialog = dialog.downgrade();
+        *revalidate.borrow_mut() = Some(Box::new({
+            let name_row = name_row.clone();
+            let rule_choice = rule_choice.clone();
+            let chosen = chosen.clone();
+            move || {
+                let Some(dialog) = weak_dialog.upgrade() else {
+                    return;
+                };
+                let named = !name_row.text().trim().is_empty();
+                // A rule carries no members, so an empty selection only blocks a
+                // list. An unnamed group blocks either: the chip is the name.
+                let has_servers = rule_choice.is_active() || !chosen.borrow().is_empty();
+                dialog.set_response_enabled("save", named && has_servers);
+            }
+        }));
+        name_row.connect_changed({
+            let revalidate = revalidate.clone();
+            move |_| {
+                if let Some(revalidate) = revalidate.borrow().as_ref() {
+                    revalidate();
+                }
+            }
+        });
+        if let Some(check) = revalidate.borrow().as_ref() {
+            check();
+        }
+
         dialog.connect_response(None, {
             let view = self.clone();
+            let chosen = chosen.clone();
             move |dialog, response| {
                 if response != "save" {
                     return;
@@ -1299,11 +2043,12 @@ impl ServersView {
                     name,
                     icon_row.text().trim().to_string(),
                     kind,
+                    chosen.borrow().clone(),
                 );
                 dialog.close();
             }
         });
-        dialog.present();
+        dialog.present(parent.as_ref());
     }
 
     /// Names of the groups that currently hold `server_id`. The subscriptions
@@ -1356,8 +2101,7 @@ impl ServersView {
 
     fn delete_group_dialog(&self, group: ServerGroup) {
         let parent = self.root.root().and_downcast::<gtk::Window>();
-        let dialog = adw::MessageDialog::new(
-            parent.as_ref(),
+        let dialog = adw::AlertDialog::new(
             Some("Delete group?"),
             Some(&format!(
                 "“{}” will be removed. The servers in it stay where they are.",
@@ -1386,7 +2130,7 @@ impl ServersView {
                 view.select_group(None);
             }
         });
-        dialog.present();
+        dialog.present(parent.as_ref());
     }
 
     /// Star or unstar one server. Handled here rather than routed through the
@@ -1427,18 +2171,29 @@ impl ServersView {
         }
     }
 
+    /// `members` is passed in rather than re-derived from `current_filter`:
+    /// the New group dialog picks servers with its own checkboxes, and reading
+    /// the page's filter here instead would save something the dialog never
+    /// showed.
     fn save_group(
         &self,
         editing: Option<ServerGroup>,
         name: String,
         icon: String,
         kind: GroupKind,
+        members: Vec<String>,
     ) {
+        // A group stores *which servers*, and nothing else. `expected` is
+        // deliberately left at 0 here even though the Connect bar sets it: the
+        // rotation width is an intent about the run, chosen where Connect is
+        // pressed and visible at that moment, and giving the group a second
+        // copy of it is how the two come to disagree — the same reason the
+        // profile dialog stopped carrying a pool editor.
         let query = match kind {
-            // Freeze exactly what is on screen, in the order it is shown.
+            // Freeze exactly what was chosen, in the order it is shown.
             GroupKind::List => PoolQuery {
                 name: name.clone(),
-                members: filtered_ids(&self.current_filter.borrow(), &self.subscriptions.borrow()),
+                members,
                 ..PoolQuery::default()
             },
             GroupKind::Rule => self.rule_from_filters(name.clone()),
@@ -1469,53 +2224,87 @@ impl ServersView {
     /// "Save as group…" is understood as saving the change rather than the
     /// group as it was.
     fn sync_chip_modified(&self) {
-        let Some(chip) = self.active_chip.borrow().clone() else {
+        // A scope change writes the new filters, rebuilds the row, and only then
+        // recomputes what is on screen. Asked in between, `group_is_modified`
+        // compares the *incoming* group against the *outgoing* query and says
+        // yes, so the new chip flashed a "·" that vanished a moment later — a
+        // warning about an edit nobody made.
+        if self.switching_scope.get() {
+            return;
+        }
+        let Some(scopes) = self.scopes.borrow().clone() else {
             return;
         };
         let Some(id) = self.active_group.borrow().clone() else {
             return;
         };
-        let saved = self.saved_groups.borrow();
-        let Some(group) = saved.iter().find(|group| group.id == id) else {
+        let group = {
+            let saved = self.saved_groups.borrow();
+            let Some(group) = saved.iter().find(|group| group.id == id) else {
+                return;
+            };
+            group.clone()
+        };
+        // The toggle is addressed by name rather than by index: the row is
+        // rebuilt whenever a group is added, removed or moved, and an index
+        // captured before that would relabel somebody else's scope.
+        let Some(toggle) = scopes.toggle_by_name(&id) else {
             return;
         };
-        // A list is compared against what it currently resolves to, not against
-        // the handles it stores: a member whose server went away is not an edit
-        // the user made, and marking the chip for it would be blaming them for
-        // a subscription refresh.
-        let mut basis = group.clone();
-        if basis.kind == GroupKind::List {
-            basis.query.members = group_member_ids(group, &self.subscriptions.borrow());
-        }
-        let modified = !query_equals_group(&self.current_filter.borrow(), &basis);
-        chip.set_label(&if modified {
+        let modified = self.group_is_modified(&group);
+        toggle.set_label(Some(&if modified {
             format!("{} ·", group.label())
         } else {
             group.label()
-        });
-        if modified {
-            chip.add_css_class("group-chip-modified");
-            chip.set_tooltip_text(Some(&format!(
+        }));
+        toggle.set_tooltip(&if modified {
+            format!(
                 "Showing a narrowed view of “{}”. Save it to keep the change.",
                 group.name
-            )));
+            )
         } else {
-            chip.remove_css_class("group-chip-modified");
+            group_chip_tooltip(
+                &group,
+                group_member_ids(&group, &self.subscriptions.borrow()).len(),
+            )
+        });
+    }
+
+    /// How many filter fields are set, on the pill itself. A popover that has
+    /// to be opened to find out whether it is doing anything is a popover the
+    /// user will open again and again.
+    fn sync_filter_pill(&self) {
+        let active = self.active_filter_fields();
+        self.filter_label.set_label(&if active == 0 {
+            "Filter".to_string()
+        } else {
+            format!("Filter · {active}")
+        });
+        if active == 0 {
+            self.filter_button.remove_css_class("group-chip-modified");
+        } else {
+            self.filter_button.add_css_class("group-chip-modified");
         }
     }
 
-    fn sync_filter_sensitivity(&self) {
-        let is_list = !self.scope_members.borrow().is_empty();
-        for row in self.filter_rows.borrow().iter() {
-            row.set_sensitive(!is_list);
-            if is_list {
-                row.set_tooltip_text(Some(
-                    "This group is a fixed list of servers, so it has no filters.",
-                ));
-            } else {
-                row.set_tooltip_text(None);
-            }
-        }
+    /// Filter fields the user has set, ignoring the search box. The search is
+    /// deliberately not counted: it is transient text, and a control that
+    /// lights up on every keystroke stops meaning anything.
+    fn active_filter_fields(&self) -> usize {
+        [
+            self.filter_countries.borrow().is_empty(),
+            self.filter_protocols.borrow().is_empty(),
+            self.filter_subscriptions.borrow().is_empty(),
+            self.filter_exclude.borrow().is_empty(),
+            // Servers named by hand count as a field too, now that the dialog can
+            // write them: without this a hand-picked selection left the pill
+            // reading "Filter" and, worse, gave the Connect bar no reason to
+            // appear — so there was no way to run what had just been chosen.
+            self.scope_members.borrow().is_empty(),
+        ]
+        .into_iter()
+        .filter(|empty| !empty)
+        .count()
     }
 
     pub fn set_query(&self, query: &str) {
@@ -1571,12 +2360,11 @@ impl ServersView {
         let filtered = filtered_ids(&query, &subscriptions)
             .into_iter()
             .collect::<HashSet<_>>();
-        self.match_label.set_label(&match filtered.len() {
-            1 => "1 server matches".to_string(),
-            count => format!("{count} servers match"),
-        });
         *self.current_filter.borrow_mut() = query;
-        self.sync_filter_sensitivity();
+        // The query now describes what is on screen, so the "modified" marker can
+        // be trusted again.
+        self.switching_scope.set(false);
+        self.sync_filter_pill();
         self.sync_chip_modified();
         self.sync_connect_bar();
         let selected = self.selected.borrow().clone();
@@ -2116,111 +2904,112 @@ fn suggested_group_name(rule: &PoolQuery) -> String {
     }
 }
 
-fn filter_menu(
-    title: &str,
-    options: &[FilterOption],
-    selected: Rc<RefCell<Vec<String>>>,
-    view: ServersView,
-) -> gtk::MenuButton {
-    let button = gtk::MenuButton::builder()
-        .label(filter_label(title, options, &selected.borrow()))
-        .sensitive(!options.is_empty())
-        .css_classes(["flat", "filter-menu"])
-        .build();
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    list.set_margin_top(8);
-    list.set_margin_bottom(8);
-    list.set_margin_start(8);
-    list.set_margin_end(8);
-    for option in options {
-        let check = gtk::CheckButton::with_label(&option.label);
-        check.set_active(selected.borrow().contains(&option.value));
-        check.connect_toggled({
-            let selected = selected.clone();
-            let value = option.value.clone();
-            let options = options.to_vec();
-            let title = title.to_string();
-            let button = button.clone();
-            let view = view.clone();
-            move |check| {
-                let mut values = selected.borrow_mut();
-                if check.is_active() {
-                    if !values.contains(&value) {
-                        values.push(value.clone());
-                    }
-                } else {
-                    values.retain(|selected| selected != &value);
-                }
-                button.set_label(&filter_label(&title, &options, &values));
-                drop(values);
-                view.apply_filter();
-            }
-        });
-        list.append(&check);
+/// Widths the rotation picker offers. `0` is "every live node", which is what
+/// `expected` has always meant on disk.
+const ROTATION_CHOICES: [usize; 6] = [2, 4, 6, 8, 12, 0];
+
+fn rotation_label(value: usize) -> String {
+    match value {
+        0 => "All nodes".to_string(),
+        count => format!("{count} nodes"),
     }
-    let popover = gtk::Popover::builder().child(&list).build();
-    button.set_popover(Some(&popover));
-    button
 }
 
-/// The "except these servers" row: every server, under the subscription it
-/// came from, each with a checkbox.
-///
-/// A rule cannot say "Germany except that one box" with countries and protocols
-/// alone, and freezing the whole thing into a list to drop one server throws
-/// away the reason it was a rule. `PoolQuery.exclude` is exactly that gap, and
-/// until now nothing in the GUI could write it.
-fn exclude_menu(
-    subscriptions: &[Subscription],
-    selected: Rc<RefCell<Vec<String>>>,
-    view: ServersView,
-) -> gtk::MenuButton {
-    let grouped = excludable_servers(subscriptions);
-    let total: usize = grouped.iter().map(|(_, servers)| servers.len()).sum();
-    let button = gtk::MenuButton::builder()
-        .label(exclude_label(&selected.borrow()))
-        .sensitive(total > 0)
-        .css_classes(["flat", "filter-menu"])
-        .build();
+fn rotation_detail(value: usize) -> String {
+    match value {
+        0 => "Every node that still answers carries traffic. Widest spread, and \
+              one reachability check per node."
+            .to_string(),
+        count => format!(
+            "The {count} fastest reachable nodes carry traffic; a node that stops \
+             answering is replaced from the rest of the pool."
+        ),
+    }
+}
 
+/// What the bar says the rotation will be, against what the pool actually has.
+///
+/// A pool of three cannot rotate over six, and printing "6 nodes" over three
+/// would promise a spread the core will not produce.
+fn rotation_summary(value: usize, available: usize) -> String {
+    match value {
+        0 => "All nodes".to_string(),
+        count if count >= available => format!(
+            "All {available} node{}",
+            if available == 1 { "" } else { "s" }
+        ),
+        count => format!("{count} of {available} active"),
+    }
+}
+
+/// A searchable checkbox per server, grouped by the subscription it came from.
+///
+/// One implementation behind two callers — the "Except: N servers" row and the
+/// New group dialog — because a second copy of this is exactly how the two
+/// would come to disagree about what a server is called or which ones can be
+/// pooled at all.
+struct ServerPicker {
+    root: gtk::Box,
+    /// The list's scroller, so a caller that cannot give the picker a whole page
+    /// can cap its height instead of being made as tall as the server list.
+    scroll: gtk::ScrolledWindow,
+    /// Builds the rows. Safe to call more than once; only the first does work.
+    fill: Rc<dyn Fn()>,
+    /// Every checkbox by server id, populated by `fill`. A caller offering
+    /// "select all shown" reads visibility off these rather than keeping its
+    /// own idea of what the search left on screen.
+    checks: PickerChecks,
+}
+
+fn server_picker(
+    subscriptions: &[Subscription],
+    haystacks: &HashMap<String, String>,
+    selected: Selection,
+    on_change: SelectionChanged,
+) -> ServerPicker {
+    let grouped = excludable_servers(subscriptions);
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     list.set_margin_top(8);
     list.set_margin_bottom(8);
     list.set_margin_start(8);
     list.set_margin_end(8);
+    // Unbounded by default, so a caller that hands the picker a whole page gets a
+    // list that fills it: capped at 320 px it left the rest of the page blank
+    // while its own list was still scrolling, which is the worst of both. A
+    // caller with no page to spare caps `scroll` itself.
     let scroll = gtk::ScrolledWindow::builder()
         .child(&list)
         .hscrollbar_policy(gtk::PolicyType::Never)
-        .propagate_natural_height(true)
-        .max_content_height(320)
+        .vexpand(true)
         .build();
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Find a server")
         .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    content.set_margin_top(6);
-    content.set_margin_bottom(6);
-    content.set_margin_start(6);
-    content.set_margin_end(6);
-    content.append(&search);
-    content.append(&scroll);
-    let popover = gtk::Popover::builder().child(&content).build();
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    root.set_margin_top(6);
+    root.set_margin_bottom(6);
+    root.set_margin_start(6);
+    root.set_margin_end(6);
+    root.set_vexpand(true);
+    root.append(&search);
+    root.append(&scroll);
 
-    // Filled when the menu is first opened, not when it is built. The other
-    // three filters offer a handful of choices; this one offers a checkbox per
-    // server, and the popover is rebuilt every time a chip or a quick filter
-    // writes into the rows around it. Building two hundred widgets each of
-    // those times, for a menu most sessions never open, is pure waste.
+    let checks: PickerChecks = Rc::new(RefCell::new(Vec::new()));
     let filled = Rc::new(Cell::new(false));
-    popover.connect_show({
-        let button = button.clone();
-        move |_| {
+    // The search matches the same text the page's search box matches — name,
+    // transport, protocol, address and country — so typing "de" here finds the
+    // German nodes rather than only the ones with "de" in their name.
+    let haystacks = haystacks.clone();
+    let fill: Rc<dyn Fn()> = Rc::new({
+        let checks = checks.clone();
+        move || {
             if filled.replace(true) {
                 return;
             }
             // Rows are kept so the search can hide them. A provider with two
-            // hundred nodes turns this list into a scroll hunt otherwise, and the
-            // user asked to exclude *specific* servers — which means finding one.
+            // hundred nodes turns this list into a scroll hunt otherwise, and
+            // the user asked to pick *specific* servers — which means finding
+            // one.
             let mut rows: Vec<(String, gtk::Widget)> = Vec::new();
             for (subscription, servers) in &grouped {
                 let heading = section_title(subscription);
@@ -2228,13 +3017,27 @@ fn exclude_menu(
                 list.append(&heading);
                 rows.push((subscription.to_lowercase(), heading.upcast::<gtk::Widget>()));
                 for server in servers {
-                    let check = gtk::CheckButton::with_label(&server.label);
+                    // An explicit ellipsizing child rather than
+                    // `with_label`: a `GtkCheckButton`'s own label demands its
+                    // full width, and with `hscrollbar-policy: never` above it
+                    // that demand travels all the way out to the dialog — two
+                    // hundred provider names made the page jump wider the moment
+                    // it was filled. The whole name lives in the tooltip.
+                    let label = gtk::Label::builder()
+                        .label(&server.label)
+                        .ellipsize(gtk::pango::EllipsizeMode::End)
+                        .xalign(0.0)
+                        .max_width_chars(28)
+                        .build();
+                    let check = gtk::CheckButton::builder()
+                        .child(&label)
+                        .tooltip_text(&server.label)
+                        .build();
                     check.set_active(selected.borrow().contains(&server.value));
                     check.connect_toggled({
                         let selected = selected.clone();
                         let value = server.value.clone();
-                        let button = button.clone();
-                        let view = view.clone();
+                        let on_change = on_change.clone();
                         move |check| {
                             let mut values = selected.borrow_mut();
                             if check.is_active() {
@@ -2244,13 +3047,18 @@ fn exclude_menu(
                             } else {
                                 values.retain(|selected| selected != &value);
                             }
-                            button.set_label(&exclude_label(&values));
+                            let snapshot = values.clone();
                             drop(values);
-                            view.apply_filter();
+                            on_change(&snapshot);
                         }
                     });
                     list.append(&check);
-                    rows.push((server.label.to_lowercase(), check.upcast::<gtk::Widget>()));
+                    let haystack = haystacks
+                        .get(&server.value)
+                        .cloned()
+                        .unwrap_or_else(|| server.label.to_lowercase());
+                    rows.push((haystack, check.clone().upcast::<gtk::Widget>()));
+                    checks.borrow_mut().push((server.value.clone(), check));
                 }
             }
             search.connect_search_changed(move |entry| {
@@ -2280,8 +3088,21 @@ fn exclude_menu(
             });
         }
     });
-    button.set_popover(Some(&popover));
-    button
+
+    ServerPicker {
+        root,
+        scroll,
+        fill,
+        checks,
+    }
+}
+
+fn picked_label(count: usize) -> String {
+    match count {
+        0 => "Nothing picked yet".to_string(),
+        1 => "1 server picked".to_string(),
+        count => format!("{count} servers picked"),
+    }
 }
 
 fn exclude_label(selected: &[String]) -> String {
@@ -2289,17 +3110,6 @@ fn exclude_label(selected: &[String]) -> String {
         0 => "Except: nothing".to_string(),
         1 => "Except: 1 server".to_string(),
         count => format!("Except: {count} servers"),
-    }
-}
-
-fn filter_label(title: &str, options: &[FilterOption], selected: &[String]) -> String {
-    match selected {
-        [] => format!("{title}: All"),
-        [only] => options
-            .iter()
-            .find(|option| option.value == *only)
-            .map_or_else(|| format!("{title}: {only}"), |option| option.label.clone()),
-        many => format!("{title}: {}", many.len()),
     }
 }
 
@@ -2469,9 +3279,34 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        collapse_would_shift, columns_for_width, columns_for_width_with_hysteresis,
-        distribute_columns, sorted_by_latency,
+        ROTATION_CHOICES, collapse_would_shift, columns_for_width,
+        columns_for_width_with_hysteresis, distribute_columns, rotation_summary, sorted_by_latency,
     };
+
+    #[test]
+    fn the_rotation_label_never_promises_more_nodes_than_the_pool_has() {
+        assert_eq!(rotation_summary(6, 42), "6 of 42 active");
+        // Six over three would advertise a spread the core cannot produce:
+        // `expected` above the live count returns exactly the live ones.
+        assert_eq!(rotation_summary(6, 3), "All 3 nodes");
+        assert_eq!(rotation_summary(6, 6), "All 6 nodes");
+        // A Favourites group with one server in it reads as a sentence.
+        assert_eq!(rotation_summary(6, 1), "All 1 node");
+        // 0 is what `expected` has always meant on disk: every live node.
+        assert_eq!(rotation_summary(0, 42), "All nodes");
+    }
+
+    #[test]
+    fn the_rotation_picker_offers_all_nodes_exactly_once() {
+        assert_eq!(
+            ROTATION_CHOICES.iter().filter(|value| **value == 0).count(),
+            1
+        );
+        // Ascending, with "all" last: the list reads as widening.
+        let capped = &ROTATION_CHOICES[..ROTATION_CHOICES.len() - 1];
+        assert!(capped.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(capped.contains(&oxidom_core::pool::DEFAULT_POOL_ROTATION));
+    }
 
     #[test]
     fn distribution_reads_row_major_and_keeps_column_order() {

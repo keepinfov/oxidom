@@ -692,9 +692,13 @@ pub(super) fn excludable_servers(groups: &[Subscription]) -> Vec<(String, Vec<Fi
                 .servers
                 .iter()
                 .filter(|server| !matches!(&server.spec, OutboundSpec::XrayProfile { .. }))
+                // The provider's name as it stands, flag and all. Stripping the
+                // flag is only right where one is drawn beside the label — on a
+                // card — and these are plain checkbox rows, so cutting it here
+                // just deleted the one glyph that says where the node is.
                 .map(|server| FilterOption {
                     value: server.id.clone(),
-                    label: oxidom_core::model::name_without_flag(&server.name).to_string(),
+                    label: server.name.clone(),
                 })
                 .collect();
             (!servers.is_empty()).then(|| (group.name.clone(), servers))
@@ -717,64 +721,6 @@ pub(super) fn available_subscriptions(groups: &[Subscription]) -> Vec<FilterOpti
             label: group.name.clone(),
         })
         .collect()
-}
-
-/// A one-click filter offered above the detailed controls.
-///
-/// Quick and advanced are two presentations of *one* state, never two filters:
-/// picking "Germany" here sets the same `countries` the advanced list shows, so
-/// opening it immediately afterwards explains what the click did.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Quick {
-    /// Clear every filter.
-    All,
-    Country(String),
-    Protocol(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct QuickFilter {
-    pub label: String,
-    pub quick: Quick,
-}
-
-/// The quick row: everything, then the countries carrying the most servers,
-/// then each protocol present. Derived from the data rather than hardcoded —
-/// a fixed "Germany" chip is noise for someone whose provider has none.
-pub(super) fn quick_filters(groups: &[Subscription], countries_shown: usize) -> Vec<QuickFilter> {
-    let mut counts: Vec<(String, usize)> = Vec::new();
-    for server in pool_servers(groups) {
-        let Some(country) = server.country.as_deref() else {
-            continue;
-        };
-        let country = country.to_ascii_lowercase();
-        match counts.iter_mut().find(|(value, _)| *value == country) {
-            Some((_, count)) => *count += 1,
-            None => counts.push((country, 1)),
-        }
-    }
-    // Count descending, then alphabetically, so the row does not reshuffle
-    // between two equally sized countries on every rebuild.
-    counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    counts.truncate(countries_shown);
-
-    let mut quick = vec![QuickFilter {
-        label: "All".to_string(),
-        quick: Quick::All,
-    }];
-    quick.extend(counts.into_iter().map(|(country, count)| QuickFilter {
-        label: format!("{} {count}", country.to_ascii_uppercase()),
-        quick: Quick::Country(country),
-    }));
-    quick.extend(
-        available_protocols(groups)
-            .into_iter()
-            .map(|protocol| QuickFilter {
-                label: protocol.clone(),
-                quick: Quick::Protocol(protocol),
-            }),
-    );
-    quick
 }
 
 /// The rule in the words the filter uses, for a tooltip or a radio label.
@@ -1601,6 +1547,19 @@ pub(super) enum PoolAction {
     DownProfile(String),
     /// It carries exactly this pool but nothing is up.
     UpProfile(String),
+    /// It carries exactly this pool, but over a different number of nodes.
+    ///
+    /// Separate from [`Self::RepointAndUp`] because nothing is being replaced:
+    /// the same servers stay selected and only the rotation width changes.
+    /// Asking "replace your pool?" for that would describe an act the user did
+    /// not request, and folding it into `UpProfile` would drop the new width on
+    /// the floor — the profile would come up on the width it already had.
+    RetuneAndUp {
+        profile: String,
+        /// Nodes the rotation will use, `0` meaning every live one. Named in
+        /// the toast so a silent rewrite still says what it did.
+        expected: usize,
+    },
     /// It selects something else. Like [`CardAction::RepointAndUp`] this
     /// rewrites `profiles/<name>.toml`, so the widget layer has to ask first.
     RepointAndUp {
@@ -1616,12 +1575,14 @@ pub(super) enum PoolAction {
     NoProfile(String),
 }
 
-/// Whether two pools select the same thing under the same strategy.
+/// Whether two pools **select** the same thing under the same strategy.
 ///
-/// `max`, `expected` and `probe_interval` are excluded on purpose: the Connect
-/// bar has no widget for any of them, only the profile editor does, and a
-/// comparison that counted them would report "different pool" for a profile the
-/// user merely tuned — then offer to overwrite the tuning as the fix.
+/// `max` and `probe_interval` are excluded on purpose: only the profile editor
+/// has a widget for either, and a comparison that counted them would report
+/// "different pool" for a profile the user merely tuned — then offer to
+/// overwrite the tuning as the fix. `expected` is excluded here too, but for
+/// the opposite reason: the Connect bar *does* set it, so a change to it is a
+/// retune of this pool rather than a different one. See [`same_rotation`].
 fn same_pool(saved: &PoolQuery, wanted: &PoolQuery) -> bool {
     saved.name == wanted.name
         && saved.strategy == wanted.strategy
@@ -1632,15 +1593,27 @@ fn same_pool(saved: &PoolQuery, wanted: &PoolQuery) -> bool {
         && saved.exclude == wanted.exclude
 }
 
+/// Whether both pools rotate over the same number of nodes.
+///
+/// Split from [`same_pool`] so "the same servers, six at a time instead of all
+/// of them" is neither mistaken for a no-op nor dressed up as replacing a pool.
+fn same_rotation(saved: &PoolQuery, wanted: &PoolQuery) -> bool {
+    saved.expected == wanted.expected
+}
+
 /// The pool to write when a group is connected: what the bar chose, over the
 /// runtime knobs the profile already carried.
 pub(super) fn pool_for_profile(entry: Option<&ProfileEntry>, wanted: PoolQuery) -> PoolQuery {
     let Some(saved) = entry.and_then(|entry| entry.pool.as_ref()) else {
         return wanted;
     };
+    // `expected` comes from `wanted` — the bar has a control for it, so keeping
+    // the profile's old value would make that control do nothing. `max` and
+    // `probe_interval` still travel through untouched: nothing outside the
+    // profile editor can express them, and a write that reset them would undo
+    // tuning the user did not revisit.
     PoolQuery {
         max: saved.max,
-        expected: saved.expected,
         probe_interval: saved.probe_interval.clone(),
         ..wanted
     }
@@ -1664,11 +1637,13 @@ pub(super) fn pool_action(
     // session resolved: a session that went `stale` because a subscription
     // refreshed still belongs to this group, and calling that "a different
     // pool" would ask the user to confirm replacing a pool with itself.
-    if entry
-        .pool
-        .as_ref()
-        .is_some_and(|pool| same_pool(pool, query))
-    {
+    if let Some(pool) = entry.pool.as_ref().filter(|pool| same_pool(pool, query)) {
+        if !same_rotation(pool, query) {
+            return PoolAction::RetuneAndUp {
+                profile: selected,
+                expected: query.expected,
+            };
+        }
         return if session_for(state, &selected).is_some() {
             PoolAction::DownProfile(selected)
         } else {
@@ -2148,43 +2123,6 @@ mod tests {
     }
 
     #[test]
-    fn quick_filters_are_derived_from_the_servers_that_exist() {
-        let groups = vec![filter_group(
-            "main",
-            "Main",
-            &[
-                (
-                    "a",
-                    "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.example:443#A",
-                    Some("de"),
-                ),
-                (
-                    "b",
-                    "vless://b831381d-6324-4d53-ad4f-8cda48b30811@b.example:443#B",
-                    Some("DE"),
-                ),
-                ("c", "trojan://secret@c.example:443#C", Some("ch")),
-                ("d", "trojan://secret@d.example:443#D", None),
-            ],
-        )];
-
-        let quick = quick_filters(&groups, 2);
-        assert_eq!(
-            quick
-                .iter()
-                .map(|item| item.label.as_str())
-                .collect::<Vec<_>>(),
-            ["All", "DE 2", "CH 1", "trojan", "vless"]
-        );
-        // Case folds into one country, and a server without one contributes
-        // to no country chip at all.
-        assert_eq!(quick[1].quick, Quick::Country("de".to_string()));
-        assert_eq!(quick[3].quick, Quick::Protocol("trojan".to_string()));
-        // Fewer countries than asked for is not an error.
-        assert_eq!(quick_filters(&groups, 99).len(), 5);
-    }
-
-    #[test]
     fn a_group_matches_the_filter_regardless_of_what_the_pool_is_called() {
         let saved = group(
             "eu",
@@ -2392,9 +2330,10 @@ mod tests {
             }
         );
 
-        // Tuning the profile is not repointing it. The bar has no widget for
-        // any of these three, so a comparison that counted them would call a
-        // tuned profile "a different pool" and offer to erase the tuning.
+        // Tuning the profile is not repointing it. `max` and `probe_interval`
+        // have no widget outside the profile editor, so a comparison that
+        // counted them would call a tuned profile "a different pool" and offer
+        // to erase the tuning as the fix.
         let tuned = PoolQuery {
             max: 8,
             expected: 4,
@@ -2403,13 +2342,40 @@ mod tests {
         };
         carrying[0].pool = Some(tuned.clone());
         state.sessions.clear();
+        let at_four = PoolQuery {
+            expected: 4,
+            ..europe.clone()
+        };
         assert_eq!(
-            pool_action(&carrying, &state, &europe),
+            pool_action(&carrying, &state, &at_four),
             PoolAction::UpProfile("work".to_string())
         );
-        assert_eq!(pool_for_profile(carrying.first(), europe.clone()), tuned);
+        // The knobs the bar cannot express ride through untouched.
+        assert_eq!(pool_for_profile(carrying.first(), at_four.clone()), tuned);
+
+        // `expected` is different: the bar does have a control for it, so a new
+        // width is this pool retuned, not a different pool. Neither a no-op
+        // (which would drop the width the user just chose) nor a replacement
+        // (which would ask them to confirm swapping a pool for itself).
+        let at_six = PoolQuery {
+            expected: 6,
+            ..europe.clone()
+        };
+        assert_eq!(
+            pool_action(&carrying, &state, &at_six),
+            PoolAction::RetuneAndUp {
+                profile: "work".to_string(),
+                expected: 6,
+            }
+        );
+        assert_eq!(
+            pool_for_profile(carrying.first(), at_six).expected,
+            6,
+            "the width the bar chose is what gets written"
+        );
+
         // With nothing saved to carry, what the bar chose is what gets written.
-        assert_eq!(pool_for_profile(None, europe.clone()), europe);
+        assert_eq!(pool_for_profile(None, at_four.clone()), at_four);
     }
 
     #[test]

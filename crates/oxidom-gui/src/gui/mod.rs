@@ -111,6 +111,13 @@ fn install_development_desktop_integration() {
                 .join(format!("{APP_ID}-symbolic.svg")),
             include_bytes!("../../../../data/dev.keepinfov.oxidom-symbolic.svg").as_slice(),
         ),
+        // Adwaita ships no filter icon under any name, so the funnel travels
+        // with the application. The packaged build installs it from
+        // `flake.nix`; a `cargo run` has no install step, so it lands here.
+        (
+            data_home.join("icons/hicolor/scalable/actions/oxidom-funnel-symbolic.svg"),
+            include_bytes!("../../../../data/icons/oxidom-funnel-symbolic.svg").as_slice(),
+        ),
     ];
 
     for (path, contents) in files {
