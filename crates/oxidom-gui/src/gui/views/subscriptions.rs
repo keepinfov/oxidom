@@ -816,11 +816,23 @@ fn scrollable_dialog_content(content: &impl IsA<gtk::Widget>) -> gtk::ScrolledWi
         .build()
 }
 
+/// Whether the Add button may light up for this URL.
+///
+/// `https`, plus plaintext to loopback for a locally hosted panel — the same
+/// rule the daemon applies in `subscription::require_https`. The daemon refuses
+/// plaintext regardless, since D-Bus clients never reach this function, but
+/// keeping the two in step turns a doomed fetch into a button that never enables.
 fn is_valid_subscription_url(value: &str) -> bool {
     let Ok(parsed) = url::Url::parse(value) else {
         return false;
     };
-    matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some()
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => return false,
+    };
+    parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback)
 }
 
 /// Refuse a paste the importer would silently drop lines from. Ask the real

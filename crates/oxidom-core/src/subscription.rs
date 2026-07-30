@@ -47,6 +47,7 @@ pub fn fetch(
     if send_hwid && hwid.is_none() {
         bail!("Send HWID is enabled, but the per-install identifier is unavailable");
     }
+    require_https(url)?;
     let agent = ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).build();
     let mut req = agent.get(url).set("User-Agent", ua);
     if send_hwid && let Some(id) = hwid {
@@ -103,6 +104,41 @@ pub fn fetch(
         title,
         update_interval,
     })
+}
+
+/// Loopback is exempt from [`require_https`]: there is no on-path position
+/// between a process and 127.0.0.1, and a locally hosted panel has nowhere else
+/// to live.
+fn is_loopback_url(parsed: &url::Url) -> bool {
+    match parsed.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// Refuse a subscription URL that is not `https` (or plaintext to loopback).
+///
+/// The response body is authoritative — it supplies every server's address,
+/// credentials and transport, and for an imported Xray profile the routing
+/// material as well — so over plaintext an on-path attacker owns the whole
+/// tunnel. This client exists for people on exactly such networks, and TLS is
+/// otherwise fully verified, which makes cleartext the one way around it. The
+/// check lives here rather than in a caller because `fetch` is the single
+/// network boundary every path reaches.
+fn require_https(url: &str) -> Result<()> {
+    let Ok(parsed) = url::Url::parse(url) else {
+        bail!("this subscription URL cannot be parsed");
+    };
+    if parsed.scheme() == "https" || (parsed.scheme() == "http" && is_loopback_url(&parsed)) {
+        return Ok(());
+    }
+    bail!(
+        "subscriptions must use https; {}:// is an unauthenticated transport that anyone on the \
+         network can rewrite",
+        parsed.scheme()
+    )
 }
 
 /// Fetch into an existing Subscription, updating servers/userinfo/name/timestamp.
@@ -199,8 +235,33 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
 
-    use super::{fetch, preserve_server_identity};
+    use super::{fetch, preserve_server_identity, require_https};
     use crate::link::parse_link;
+
+    #[test]
+    fn plaintext_subscriptions_are_refused_off_loopback() {
+        for rejected in [
+            "http://panel.example/sub",
+            "HTTP://panel.example/sub",
+            "ftp://panel.example/sub",
+            "file:///etc/passwd",
+            "http://localhost.evil.example/sub",
+            "not a url",
+        ] {
+            assert!(
+                require_https(rejected).is_err(),
+                "{rejected} must be refused"
+            );
+        }
+        for accepted in [
+            "https://panel.example/sub",
+            "http://127.0.0.1:8080/sub",
+            "http://localhost:8080/sub",
+            "http://[::1]:8080/sub",
+        ] {
+            require_https(accepted).unwrap_or_else(|error| panic!("{accepted}: {error}"));
+        }
+    }
 
     fn serve_once(headers: &str, body: &str) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
