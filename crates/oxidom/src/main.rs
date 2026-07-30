@@ -911,13 +911,20 @@ fn pool_status(session: &SessionInfo, latency_ms: Option<u32>) -> String {
     } else {
         format!("pool {:?}", selection.name)
     };
+    // Providers list one host many times, so the node count alone overstates
+    // the spread. Said only when it differs: on a pool where every node is its
+    // own host, "6 nodes on 6 exits" is one number twice.
+    let nodes = match selection.endpoints {
+        exits if exits > 0 && exits < selection.members.len() => format!(
+            "{} nodes on {exits} exit{}",
+            selection.members.len(),
+            if exits == 1 { "" } else { "s" }
+        ),
+        _ => format!("{} nodes", selection.members.len()),
+    };
     let mut output = format!(
-        "{}  socks {}:{}  {latency}\nselection: {label} ({}, {} nodes, {current}{stale})\n",
-        session.state,
-        session.address,
-        session.socks_port,
-        selection.strategy,
-        selection.members.len(),
+        "{}  socks {}:{}  {latency}\nselection: {label} ({}, {nodes}, {current}{stale})\n",
+        session.state, session.address, session.socks_port, selection.strategy,
     );
     for member in &selection.members {
         let health = match member.in_rotation {
@@ -1087,6 +1094,9 @@ mod tests {
                     in_rotation: Some(false),
                 },
             ],
+            // Both members share one host, which is exactly the case the node
+            // count alone hides.
+            endpoints: 1,
             // roundRobin has no single current exit, so the daemon leaves this
             // unset and the line reports the rotation instead.
             selecting: None,
@@ -1111,7 +1121,7 @@ mod tests {
             pool_status(&session, Some(84)),
             concat!(
                 "connected  socks 127.72.14.1:10808  84 ms\n",
-                "selection: pool (roundRobin, 2 nodes, 1/2 in rotation, stale)\n",
+                "selection: pool (roundRobin, 2 nodes on 1 exit, 1/2 in rotation, stale)\n",
                 "  ✓ ch-one  Swiss\n",
                 "  ✗ id-two  Dutch\n",
             )
@@ -1147,6 +1157,9 @@ mod tests {
                         in_rotation: None,
                     },
                 ],
+                // Two nodes on two hosts: the exit count says nothing the node
+                // count did not, and the line does not print it.
+                endpoints: 2,
                 selecting: Some("nl-two".to_string()),
                 stale: false,
             },

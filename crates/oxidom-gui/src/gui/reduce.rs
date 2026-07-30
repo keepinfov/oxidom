@@ -2448,6 +2448,9 @@ mod tests {
                         in_rotation: Some(false),
                     },
                 ],
+                // Two nodes on two hosts: the exit count repeats the node count
+                // and the row must not say it twice.
+                endpoints: 2,
                 selecting: None,
                 stale: true,
             },

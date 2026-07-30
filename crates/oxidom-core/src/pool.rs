@@ -5,6 +5,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{OutboundSpec, Server, Subscription};
 
+/// How many nodes a pool built through the UI rotates over unless told
+/// otherwise.
+///
+/// Applied where a `PoolQuery` is *constructed*, never in `Deserialize` and
+/// never in [`PoolQuery::expected_or_all`]: `expected = 0` is a written-down
+/// answer meaning "all of them", and giving it a new meaning would silently
+/// retune every profile already on disk. Six because a pool exists to spread
+/// activity over exit addresses while staying steerable — rotating over all
+/// forty-two entries of a subscription buys no more spread than its handful of
+/// distinct hosts, and costs an observatory ping per entry.
+pub const DEFAULT_POOL_ROTATION: usize = 6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum Strategy {
@@ -196,6 +208,108 @@ pub fn resolve<'a>(query: &PoolQuery, groups: &'a [Subscription]) -> Result<Vec<
     Ok(matches)
 }
 
+/// What the caller knows about a candidate. Ordering only — nothing here
+/// decides membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Known {
+    /// Answered a probe, in milliseconds.
+    Reachable(u32),
+    /// Never measured. Ranked ahead of [`Known::Unreachable`] because a node
+    /// nobody asked might work, while one that already refused is the worst
+    /// possible opening bid.
+    Unmeasured,
+    Unreachable,
+}
+
+impl Known {
+    fn order(self) -> (u8, u32) {
+        match self {
+            Self::Reachable(ms) => (0, ms),
+            Self::Unmeasured => (1, 0),
+            Self::Unreachable => (2, 0),
+        }
+    }
+}
+
+/// The endpoint a server actually exits through, which is what a pool spreads
+/// over. Two subscription entries sharing one of these are one exit IP, however
+/// differently they are spelled.
+fn endpoint(server: &Server) -> (&str, u16) {
+    (server.address.as_str(), server.port)
+}
+
+/// Resolve a pool for activation: the same membership as [`resolve`], ordered so
+/// that the pool is worth having, and only then cut to `max`.
+///
+/// Two things make the order matter, and neither is visible to the pure
+/// `resolve` the GUI calls on every keystroke:
+///
+/// - **`max` truncates.** On a real subscription 26 of 42 German entries share
+///   one `address:port`; taking "the first 6" took six spellings of one host,
+///   which is one exit IP — the opposite of what a pool is for. So distinct
+///   endpoints are dealt out one apiece before any endpoint gets a second.
+/// - **The first member is the pool's opening exit.** Until `burstObservatory`
+///   reports, the balancer routes to the first outbound in config order (see
+///   `AGENTS.md`), so putting a known-reachable node there is the difference
+///   between connecting at once and waiting out the confirmation window.
+///
+/// Membership is unchanged — this only decides order, and truncation after it.
+pub fn resolve_ranked<'a>(
+    query: &PoolQuery,
+    groups: &'a [Subscription],
+    known: impl Fn(&Server) -> Known,
+) -> Result<Vec<&'a Server>> {
+    let mut uncapped = query.clone();
+    uncapped.max = 0;
+    let matches = resolve(&uncapped, groups)?;
+
+    // Group by exit endpoint, keeping first-seen order so the result stays
+    // deterministic for two candidates nothing is known about.
+    let mut buckets: Vec<Vec<&'a Server>> = Vec::new();
+    let mut seen: Vec<(&str, u16)> = Vec::new();
+    for server in matches {
+        match seen.iter().position(|known| *known == endpoint(server)) {
+            Some(index) => buckets[index].push(server),
+            None => {
+                seen.push(endpoint(server));
+                buckets.push(vec![server]);
+            }
+        }
+    }
+    for bucket in &mut buckets {
+        bucket.sort_by_key(|server| known(server).order());
+    }
+    // Best host first, so member #1 is the best opening exit available.
+    buckets.sort_by_key(|bucket| known(bucket[0]).order());
+
+    let mut ranked = Vec::new();
+    for round in 0..buckets.iter().map(Vec::len).max().unwrap_or(0) {
+        for bucket in &buckets {
+            if let Some(server) = bucket.get(round) {
+                ranked.push(*server);
+            }
+        }
+    }
+    if query.max != 0 {
+        ranked.truncate(query.max);
+    }
+    Ok(ranked)
+}
+
+/// How many distinct exit endpoints a resolved pool actually covers.
+///
+/// A pool of 42 entries over 9 hosts spreads across 9 addresses, not 42, and
+/// saying "42 nodes" without this is the pool's least honest number.
+pub fn distinct_endpoints(members: &[&Server]) -> usize {
+    let mut seen: Vec<(&str, u16)> = Vec::new();
+    for server in members {
+        if !seen.contains(&endpoint(server)) {
+            seen.push(endpoint(server));
+        }
+    }
+    seen.len()
+}
+
 /// Composite profiles that the pool names but cannot turn into outbounds.
 ///
 /// `resolve` stays silent because the GUI calls it continuously. Activation
@@ -311,7 +425,10 @@ fn empty_pool_message(query: &PoolQuery) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{PoolKind, PoolQuery, Strategy, excluded_composites, missing_members, resolve};
+    use super::{
+        Known, PoolKind, PoolQuery, Strategy, distinct_endpoints, excluded_composites,
+        missing_members, resolve, resolve_ranked,
+    };
     use crate::model::{OutboundSpec, Protocol, Server, Subscription};
 
     fn server(id: &str, protocol: Protocol, country: Option<&str>, alias: Option<&str>) -> Server {
@@ -367,6 +484,141 @@ mod tests {
             .into_iter()
             .map(|server| server.id.as_str())
             .collect()
+    }
+
+    /// A server pinned to a shared exit endpoint, as a provider's duplicate
+    /// entries are.
+    fn at(id: &str, host: &str) -> Server {
+        let mut server = server(id, Protocol::Vless, Some("de"), Some(id));
+        server.address = host.to_string();
+        server
+    }
+
+    /// The German set as it actually arrives: many entries, few hosts, and the
+    /// live ones buried.
+    fn duplicated_hosts() -> Vec<Subscription> {
+        vec![group(
+            "main",
+            "Main",
+            vec![
+                at("dead-1", "31.12.75.21"),
+                at("dead-2", "31.12.75.21"),
+                at("dead-3", "31.12.75.21"),
+                at("unknown-1", "194.93.0.28"),
+                at("unknown-2", "194.93.0.28"),
+                at("live-1", "meadow.example"),
+                at("live-2", "de10.example"),
+            ],
+        )]
+    }
+
+    fn known_for(server: &Server) -> Known {
+        match server.id.as_str() {
+            "live-1" => Known::Reachable(333),
+            "live-2" => Known::Reachable(336),
+            id if id.starts_with("dead") => Known::Unreachable,
+            _ => Known::Unmeasured,
+        }
+    }
+
+    #[test]
+    fn ranking_deals_out_distinct_hosts_before_a_second_entry_of_any_host() {
+        let groups = duplicated_hosts();
+        let query = PoolQuery {
+            countries: vec!["de".to_string()],
+            ..PoolQuery::default()
+        };
+
+        // Plain resolve keeps subscription order, so `max` would take three
+        // spellings of one dead host — one exit IP, and a dead one.
+        let plain = PoolQuery {
+            max: 3,
+            ..query.clone()
+        };
+        assert_eq!(
+            ids(resolve(&plain, &groups).unwrap()),
+            ["dead-1", "dead-2", "dead-3"]
+        );
+
+        // Ranked: the reachable hosts open, then the unmeasured host, then the
+        // dead one, and no host repeats until every host has been dealt.
+        let ranked = resolve_ranked(&query, &groups, known_for).unwrap();
+        assert_eq!(
+            ids(ranked),
+            [
+                "live-1",
+                "live-2",
+                "unknown-1",
+                "dead-1",
+                "unknown-2",
+                "dead-2",
+                "dead-3"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_capped_ranked_pool_spends_its_budget_on_different_hosts() {
+        let groups = duplicated_hosts();
+        let query = PoolQuery {
+            countries: vec!["de".to_string()],
+            max: 4,
+            ..PoolQuery::default()
+        };
+        let ranked = resolve_ranked(&query, &groups, known_for).unwrap();
+        assert_eq!(
+            ids(ranked.clone()),
+            ["live-1", "live-2", "unknown-1", "dead-1"]
+        );
+        // Four members, four exit addresses. The whole point of the pool.
+        assert_eq!(distinct_endpoints(&ranked), 4);
+    }
+
+    #[test]
+    fn distinct_endpoints_counts_hosts_and_not_entries() {
+        let groups = duplicated_hosts();
+        let query = PoolQuery {
+            countries: vec!["de".to_string()],
+            ..PoolQuery::default()
+        };
+        let members = resolve(&query, &groups).unwrap();
+        assert_eq!(members.len(), 7);
+        // Seven entries, four addresses: "7 nodes" alone would overstate the
+        // spread by nearly two to one.
+        assert_eq!(distinct_endpoints(&members), 4);
+    }
+
+    #[test]
+    fn ranking_never_changes_who_is_in_the_pool() {
+        let groups = duplicated_hosts();
+        let query = PoolQuery {
+            countries: vec!["de".to_string()],
+            ..PoolQuery::default()
+        };
+        let mut plain = ids(resolve(&query, &groups).unwrap());
+        let mut ranked = ids(resolve_ranked(&query, &groups, known_for).unwrap());
+        plain.sort_unstable();
+        ranked.sort_unstable();
+        assert_eq!(plain, ranked);
+    }
+
+    #[test]
+    fn a_list_keeps_its_own_hosts_dealt_the_same_way() {
+        let groups = duplicated_hosts();
+        // A list is what the user picked, so ranking may reorder it but must
+        // not drop anyone — losing a named member is `missing_members`' job.
+        let query = PoolQuery {
+            members: vec![
+                "dead-1".to_string(),
+                "dead-2".to_string(),
+                "live-1".to_string(),
+            ],
+            ..PoolQuery::default()
+        };
+        assert_eq!(
+            ids(resolve_ranked(&query, &groups, known_for).unwrap()),
+            ["live-1", "dead-1", "dead-2"]
+        );
     }
 
     #[test]

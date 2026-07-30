@@ -125,6 +125,13 @@ pub struct SelectionInfo {
     pub name: String,
     pub strategy: String,
     pub members: Vec<PoolMember>,
+    /// How many distinct exit `address:port` pairs the members cover.
+    ///
+    /// A provider lists one host many times, so a pool of 42 entries is
+    /// routinely nine exits counted 42 times, and "42 nodes" alone promises a
+    /// spread it will not produce. Zero means "not reported" — an older daemon
+    /// answers without the field — which is why nothing renders it as a count.
+    pub endpoints: usize,
     pub selecting: Option<String>,
     pub stale: bool,
 }

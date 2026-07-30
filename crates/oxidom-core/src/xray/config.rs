@@ -566,6 +566,69 @@ mod tests {
         assert_eq!(config["api"]["services"], json!(["RoutingService"]));
     }
 
+    /// A pool the size a country rule actually produces, with the shape a real
+    /// subscription has: many entries over few hosts.
+    ///
+    /// Every earlier pool test used two members, so nothing pinned that 42
+    /// outbounds, one balancer and one observatory still come out as one config
+    /// the core will take. Paired with the `--ignored` check below, which runs
+    /// this very shape through `xray run -test`.
+    fn country_sized_pool() -> Vec<Server> {
+        (0..42)
+            .map(|index| {
+                let mut server = tls_vless(false, None);
+                // Distinct handles: `s-<handle>` tags collide otherwise, which
+                // `generate_pool` rejects outright.
+                server.id = format!("de-{index}");
+                server.name = format!("Germany {index}");
+                // Nine hosts for 42 entries — the store this was measured on had
+                // 26 of its 42 German entries on one `address:port`.
+                server.address = format!("de{}.example", index % 9);
+                server
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_country_sized_pool_generates_one_outbound_per_member() {
+        let servers = country_sized_pool();
+        let members = servers.iter().collect::<Vec<_>>();
+        let config = generate_pool(
+            &PoolSpec {
+                members: &members,
+                strategy: "leastLoad",
+                expected: 6,
+                probe_interval: "5m",
+            },
+            Ipv4Addr::new(127, 72, 14, 1),
+            10808,
+            10809,
+            10810,
+        )
+        .unwrap();
+
+        let outbounds = config["outbounds"].as_array().unwrap();
+        // 42 members, then the two fixed outbounds every config carries.
+        assert_eq!(outbounds.len(), 44);
+        assert_eq!(outbounds[0]["tag"], "s-de-0");
+        assert_eq!(outbounds[41]["tag"], "s-de-41");
+        assert_eq!(outbounds[42]["tag"], "direct");
+        assert_eq!(outbounds[43]["tag"], "block");
+        // The rotation width the Connect bar defaults to, against a pool that
+        // has seven times as many members: `expected` is what keeps the core
+        // from pinging all 42 into rotation.
+        assert_eq!(
+            config["routing"]["balancers"][0]["strategy"]["settings"]["expected"],
+            6
+        );
+        assert_eq!(config["routing"]["balancers"][0]["selector"], json!(["s-"]));
+        assert_eq!(
+            crate::pool::distinct_endpoints(&members),
+            9,
+            "the fixture must keep the many-entries-few-hosts shape it is for"
+        );
+    }
+
     #[test]
     fn duplicate_pool_tags_are_rejected() {
         let mut by_alias = socks_server();
@@ -870,6 +933,27 @@ mod tests {
                 10810,
             )
             .expect("sample pool should generate"),
+        ));
+        // A pool the size a country rule produces. Two members proved the shape;
+        // this proves the core still parses one when the shape is repeated 42
+        // times and `expected` is well below the member count.
+        let big = country_sized_pool();
+        let big_members = big.iter().collect::<Vec<_>>();
+        configs.push((
+            "pool-42".to_string(),
+            generate_pool(
+                &PoolSpec {
+                    members: &big_members,
+                    strategy: "leastLoad",
+                    expected: 6,
+                    probe_interval: "5m",
+                },
+                Ipv4Addr::new(127, 72, 14, 1),
+                10808,
+                10809,
+                10810,
+            )
+            .expect("a country-sized pool should generate"),
         ));
 
         for (index, (label, config)) in configs.into_iter().enumerate() {

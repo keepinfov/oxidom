@@ -22,6 +22,7 @@ use oxidom_core::ipc::{
     SessionInfo, StatusInfo, UpResult, UpServer,
 };
 use oxidom_core::model::Server;
+use oxidom_core::pool;
 use oxidom_core::probe;
 use oxidom_core::profile::{self, MAX_POOL_MEMBERS, Profile, RouteMode};
 use oxidom_core::xray::core::Status;
@@ -36,6 +37,20 @@ const CORE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const POOL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const BALANCER_INFO_TTL: Duration = Duration::from_secs(2);
 const BALANCER_API_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a *pool* gets to prove itself before the session is torn down.
+///
+/// A single server is ready the moment its inbound binds; a pool is not. Until
+/// `burstObservatory` returns its first round the balancer has no ranking and
+/// hands the request to the first outbound in config order, so one shot at a
+/// freshly started pool measures member #1 and nothing else. Measured on Xray
+/// 26.3.27 with eight members of which six were dead: dead member first failed
+/// 6 of 6 attempts, the same eight with a live member first connected 3 of 3.
+/// That is a race, not a verdict on the pool.
+const POOL_CONFIRM_WINDOW: Duration = Duration::from_secs(20);
+/// Gap between confirmation attempts inside that window. Long enough that the
+/// observatory makes progress between tries, short enough that a healthy pool
+/// still comes up promptly.
+const POOL_CONFIRM_RETRY_GAP: Duration = Duration::from_secs(2);
 const CORE_EXITED_MESSAGE: &str = "Xray exited unexpectedly";
 const RECONNECTING_MESSAGE: &str = "Xray exited unexpectedly — reconnecting";
 
@@ -891,6 +906,39 @@ impl Shared {
     /// distinguish two connects to the same server.
     /// The id is already `running` when this starts — `start_connection` claims
     /// the slot — so this thread owns it and must release it on every path.
+    /// Probe a freshly started pool until it carries a request or its window
+    /// runs out.
+    ///
+    /// The retry is the whole point: a pool that has not been observed yet
+    /// routes to its first member, so a single shot reports on member #1 rather
+    /// than on the pool. Retrying costs nothing when the pool is healthy — the
+    /// first attempt succeeds — and is the difference between "this pool is
+    /// dead" and "this pool had not been measured yet".
+    fn confirm_pool(&self, profile: &str, generation: u64) -> Option<u32> {
+        let deadline = Instant::now() + POOL_CONFIRM_WINDOW;
+        loop {
+            if let Some(ms) = self.run_session_probe(profile) {
+                return Some(ms);
+            }
+            // A superseded attempt or a core that already exited has nothing to
+            // wait for; retrying would only delay the report of what happened.
+            if !self.generation_is_current(profile, generation) {
+                return None;
+            }
+            let running = {
+                let engine = oxidom_core::sync::lock(&self.engine);
+                engine
+                    .sessions
+                    .get(profile)
+                    .is_some_and(|session| session.status() == Status::Connected)
+            };
+            if !running || Instant::now() + POOL_CONFIRM_RETRY_GAP >= deadline {
+                return None;
+            }
+            std::thread::sleep(POOL_CONFIRM_RETRY_GAP);
+        }
+    }
+
     fn confirm_connection(
         &self,
         profile: String,
@@ -929,7 +977,9 @@ impl Shared {
             // below from racing a core that simply has not bound yet.
             let ready = probe::wait_for_socks(address, socks_port);
 
-            let latency = if ready {
+            let latency = if ready && target.server_id().is_none() {
+                shared.confirm_pool(&profile, generation)
+            } else if ready {
                 shared.run_session_probe(&profile)
             } else {
                 // Nothing could be measured, but the GUI is waiting on this id
@@ -989,17 +1039,12 @@ impl Shared {
                 .get(&profile)
                 .map(|session| session.recent_logs())
                 .unwrap_or_default();
-            let reason = if core_rejected_the_protocol(&logs) {
-                format!(
-                    "the core does not support this server's protocol — {}",
-                    oxidom_core::xray::core::HYSTERIA2_CORE_HINT
-                )
-            } else if ready {
-                "active server did not pass its latency check".to_string()
-            } else {
-                "the local SOCKS inbound never came up — the core is not carrying traffic"
-                    .to_string()
-            };
+            let rotating = engine
+                .sessions
+                .get(&profile)
+                .and_then(|session| session.balancer_info.as_ref())
+                .map(|info| info.principle.len());
+            let reason = confirmation_failure(&target, ready, &logs, rotating);
             let still_active = engine.sessions.get(&profile).is_some_and(|session| {
                 session.selection.as_ref() == Some(&target.selection())
                     && session.status() == Status::Connected
@@ -1339,10 +1384,23 @@ fn selection_info(
             // strategy — and only a strategy that settles on one node may have
             // that node called the current exit.
             let picks_one = strategy == "leastPing";
+            // Counted here rather than snapshotted at `up` precisely because
+            // this loop already looks every member up: the lookup is the cost,
+            // and a `Status` that pays it anyway may as well answer the pool's
+            // least honest number. Members that no subscription holds any more
+            // contribute no endpoint, so a shrunken pool understates rather
+            // than invents.
+            let mut exits: Vec<(String, u16)> = Vec::new();
             let pool_members = members
                 .iter()
                 .map(|server_id| {
                     let server = engine.find_server(server_id);
+                    if let Some(server) = server.as_ref() {
+                        let exit = (server.address.clone(), server.port);
+                        if !exits.contains(&exit) {
+                            exits.push(exit);
+                        }
+                    }
                     let alias = server.as_ref().and_then(|server| server.alias.clone());
                     let tag = format!("s-{}", alias.as_deref().unwrap_or(server_id.as_str()));
                     let in_rotation = match live {
@@ -1389,6 +1447,7 @@ fn selection_info(
                 name: session.pool_name.clone(),
                 strategy: strategy.clone(),
                 members: pool_members,
+                endpoints: exits.len(),
                 selecting,
                 stale: session.pool_stale,
             }
@@ -1651,6 +1710,11 @@ impl Service {
             )));
         }
 
+        // Snapshotted before the engine lock rather than under it: this is the
+        // only place the two are wanted together, and taking them in one order
+        // here and the other elsewhere is how a deadlock gets written.
+        let readings = oxidom_core::sync::lock(&self.shared.readings).clone();
+
         // Resolve and apply everything that needs the engine, then drop the
         // guard: `start_connection` takes the same lock itself.
         let (target, up_server, ignored_ports) = {
@@ -1711,14 +1775,37 @@ impl Service {
                         missing.join(", ")
                     );
                 }
-                let resolved = oxidom_core::pool::resolve(query, &engine.registry.subscriptions)
-                    .map_err(failed)?;
+                // Ranked, not merely resolved: `max` truncates, and the first
+                // member is the exit the balancer uses until the observatory
+                // reports. Subscription order gave both jobs to whichever
+                // entry the provider happened to list first.
+                let resolved = oxidom_core::pool::resolve_ranked(
+                    query,
+                    &engine.registry.subscriptions,
+                    |server| known_state(&readings, &server.id),
+                )
+                .map_err(failed)?;
                 if resolved.len() > MAX_POOL_MEMBERS {
                     return Err(failed(format!(
                         "profile {name:?} pool resolves to {} nodes; set [select.pool] max to \
                          {MAX_POOL_MEMBERS} or less",
                         resolved.len()
                     )));
+                }
+                // A pool spreads traffic over exit addresses, not over
+                // subscription entries. Providers list the same host many times
+                // — 26 of 42 German entries shared one `address:port` on the
+                // store this was found on — and a pool that says "42 nodes"
+                // while owning 9 addresses overstates itself nearly fivefold.
+                // Reported here, once, rather than by `resolve`, which the GUI
+                // calls on every keystroke.
+                let hosts = oxidom_core::pool::distinct_endpoints(&resolved);
+                if hosts < resolved.len() {
+                    log::warn!(
+                        "profile {name:?} pool has {} member(s) on only {hosts} exit address(es); \
+                         traffic can spread no wider than that",
+                        resolved.len()
+                    );
                 }
                 let servers = resolved.into_iter().cloned().collect::<Vec<_>>();
                 let members = servers
@@ -2187,6 +2274,68 @@ pub fn run(options: DaemonOptions) -> Result<()> {
     Ok(())
 }
 
+/// What the last direct probe says about a candidate, for pool ordering.
+///
+/// Only a `Direct` reading describes the *server*; a `Proxied` one describes a
+/// tunnel that happened to be carrying it. And a probe that never left this
+/// machine (`NoNetwork`) or that the prober could not classify (`Unknown`) is
+/// this machine's failure, so ranking the server below one nobody measured
+/// would launder our own outage into a verdict on somebody's node.
+fn known_state(readings: &HashMap<String, LatencyReading>, server_id: &str) -> pool::Known {
+    let Some(reading) = readings.get(server_id) else {
+        return pool::Known::Unmeasured;
+    };
+    if reading.route != ProbeRoute::Direct {
+        return pool::Known::Unmeasured;
+    }
+    match (reading.value, reading.failure) {
+        (Some(ms), _) => pool::Known::Reachable(ms),
+        (None, Some(ProbeFailure::Unreachable | ProbeFailure::Timeout)) => pool::Known::Unreachable,
+        (None, _) => pool::Known::Unmeasured,
+    }
+}
+
+/// Why a connection that started could not be confirmed.
+///
+/// `rotating` is how many members the balancer had in rotation when the window
+/// closed, when that could be read at all.
+///
+/// Kept pure and separate because this string is the only account the user gets
+/// of a session that was torn down: the core's own status goes with it.
+fn confirmation_failure(
+    target: &ConnectionTarget,
+    inbound_ready: bool,
+    logs: &[String],
+    rotating: Option<usize>,
+) -> String {
+    // A core that rejected the config exited at once, so both the dead inbound
+    // and the failed probe are symptoms. Say the actual cause.
+    if core_rejected_the_protocol(logs) {
+        return format!(
+            "the core does not support this server's protocol — {}",
+            oxidom_core::xray::core::HYSTERIA2_CORE_HINT
+        );
+    }
+    if !inbound_ready {
+        return "the local SOCKS inbound never came up — the core is not carrying traffic"
+            .to_string();
+    }
+    // A pool has no active server by construction, so naming one would describe
+    // a thing that does not exist. Report what was tried and how much of it the
+    // balancer had in rotation.
+    let ConnectionTarget::Pool { members, .. } = target else {
+        return "active server did not pass its latency check".to_string();
+    };
+    let seen = match rotating {
+        Some(live) => format!("{live} of {} nodes were in rotation", members.len()),
+        None => format!("none of its {} nodes answered", members.len()),
+    };
+    format!(
+        "the pool carried no traffic within {}s — {seen}",
+        POOL_CONFIRM_WINDOW.as_secs()
+    )
+}
+
 /// Whether the core's own output says it could not build the outbound at all —
 /// which is what an Xray older than the hysteria2 support does.
 fn core_rejected_the_protocol(logs: &[String]) -> bool {
@@ -2227,6 +2376,68 @@ mod tests {
             oxidom_core::paths::set_test_root(None);
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn pool_target(members: &[&str]) -> ConnectionTarget {
+        ConnectionTarget::Pool {
+            members: members.iter().map(|name| name.to_string()).collect(),
+            name: "Germany".to_string(),
+            strategy: "leastLoad".to_string(),
+            expected: 0,
+            probe_interval: "5m".to_string(),
+            api_port: 18080,
+        }
+    }
+
+    #[test]
+    fn a_pool_that_failed_to_confirm_counts_nodes_instead_of_naming_a_server() {
+        // `Session::server_id()` returns `None` for a pool on purpose, so a
+        // message about "the active server" would describe something that does
+        // not exist.
+        let target = pool_target(&["one", "two", "three"]);
+        assert_eq!(
+            confirmation_failure(&target, true, &[], Some(0)),
+            "the pool carried no traffic within 20s — 0 of 3 nodes were in rotation"
+        );
+        assert_eq!(
+            confirmation_failure(&target, true, &[], Some(1)),
+            "the pool carried no traffic within 20s — 1 of 3 nodes were in rotation"
+        );
+        // The balancer could not be asked at all — claiming "0 in rotation"
+        // would report a measurement nobody took.
+        assert_eq!(
+            confirmation_failure(&target, true, &[], None),
+            "the pool carried no traffic within 20s — none of its 3 nodes answered"
+        );
+    }
+
+    #[test]
+    fn a_dead_inbound_and_a_rejected_protocol_outrank_the_selection() {
+        let target = pool_target(&["one"]);
+        // Nothing bound, so nothing was measured: the pool count would be a
+        // conclusion drawn from an experiment that never ran.
+        assert_eq!(
+            confirmation_failure(&target, false, &[], None),
+            "the local SOCKS inbound never came up — the core is not carrying traffic"
+        );
+        let logs = vec![format!(
+            "failed to parse outbound: {}",
+            oxidom_core::xray::core::UNSUPPORTED_PROTOCOL_MARKERS[0]
+        )];
+        assert!(
+            confirmation_failure(&target, false, &logs, None)
+                .contains("does not support this server's protocol")
+        );
+        // A single server keeps the wording it had before pools existed.
+        assert_eq!(
+            confirmation_failure(
+                &ConnectionTarget::Server("one".to_string()),
+                true,
+                &[],
+                None
+            ),
+            "active server did not pass its latency check"
+        );
     }
 
     fn poison<T: Send + 'static>(target: Arc<Mutex<T>>) {

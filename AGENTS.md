@@ -184,6 +184,22 @@ Three further details are binding:
 A single-server session emits none of this — its config is byte-identical to what it was before
 pools existed, and a test pins that.
 
+**A pool is not ready when its inbound binds** (binding, measured 2026-07-30 on Xray 26.3.27).
+Until `burstObservatory` returns its first round the balancer has no ranking and hands the
+request to the **first outbound in config order** — which is `pool::resolve` order, i.e.
+subscription order. A single confirmation probe therefore measures member #1 and nothing else.
+Measured with eight members of which six were dead: dead member first failed **6 of 6**
+attempts, the same eight with a live member first connected **3 of 3**. Real subscriptions
+always carry dead nodes, so this made pools over them fail outright — the reported symptom was
+"a big German pool never comes up", where 40 of 42 nodes were dead.
+`Shared::confirm_pool` therefore retries within `POOL_CONFIRM_WINDOW` (20 s, gap
+`POOL_CONFIRM_RETRY_GAP`) instead of firing once, and stops early when the attempt is superseded
+or the core has already exited. It costs a healthy pool nothing — the first attempt succeeds,
+measured at 47 ms — and a single-server session keeps the single shot, because it *is* ready
+when its inbound binds. A pool that still fails reports counts (`0 of 3 nodes were in rotation`)
+via `confirmation_failure`; it must never speak of "the active server", which a pool has not got
+by construction.
+
 The daemon reads balancer state by running `xray api bi --json` against that inbound (no gRPC
 client, no new dependency) from its background loop, never from `Status`: the GUI polls `Status`
 twice a second and it must not block on a subprocess.
@@ -424,6 +440,38 @@ there would silently drop half a pool or enrol a server nobody chose. A handle l
 companions report it once, at `up`, where a user can act: `excluded_composites` for balancer
 servers that cannot become outbounds, and `missing_members` for handles a list names that no
 subscription holds any more. Neither is fatal — only an empty result is.
+
+**Activation resolves through `pool.resolve_ranked`, not `resolve`** (binding). Membership is
+identical — a test pins that — but the order is not, and two jobs ride on the order that
+subscription order does badly:
+
+- **A pool spreads over exit addresses, not over subscription entries.** Providers list one host
+  many times; on the store this was found on, 26 of 42 German entries shared `31.12.75.21:2087`
+  and the whole set covered 9 addresses. `max` cutting "the first 6" therefore bought six
+  spellings of one exit IP. `resolve_ranked` groups candidates by `address:port` and deals the
+  groups out one apiece before any group gets a second, so a capped pool spends its budget on
+  different hosts. `distinct_endpoints` is the honest count, and `up` warns when it is below the
+  member count.
+- **The first member is the pool's opening exit**, per the observatory note above. Groups are
+  ordered by the best `pool::Known` in each, so a node that last answered opens the pool.
+  `known_state` maps the daemon's direct readings onto that; a `Proxied` reading describes a
+  tunnel rather than a server, and `NoNetwork`/`Unknown` are this machine's failure, so both rank
+  as `Unmeasured` rather than as a verdict on somebody's node. Measured end to end: the same
+  41-node German rule took ~25 s to confirm with nothing measured and **70 ms** once two of its
+  nodes had been probed.
+
+Ranking never changes who is in the pool, so a list still gets everyone the user named; losing a
+named member stays `missing_members`' job.
+
+**The exit count is reported, not only logged.** `SelectionInfo.endpoints` carries it to every
+surface, and both `oxidom status` (`… 42 nodes on 9 exits …`) and the Sessions page's `Nodes` row
+(`6 of 42 in rotation · 9 exit addresses`) say it — but only when it is *below* the member count,
+because on a pool where every node is its own host it is one number printed twice. Zero means an
+older daemon did not report it, so nothing renders zero as a count. It is counted inside
+`selection_info`, which already looks every member up to name it, rather than snapshotted at `up`:
+that loop is the cost, and a `Status` paying it anyway may as well answer the question. Members
+that no subscription holds any more contribute no endpoint, so a shrunken pool understates rather
+than invents.
 
 Pool membership is resolved **once, at `up`**. A subscription refresh that changes what the
 query would match marks the session `stale` and invites a reconnect; it never rewrites the
