@@ -6,8 +6,8 @@ aesthetic.
 
 oxidom manages subscriptions and standalone servers, drives an **Xray core**
 child process (generating its JSON config), and exposes the tunnel as local
-SOCKS5 + HTTP proxies — with an optional GNOME system-proxy toggle. The GUI
-runs fully unprivileged.
+SOCKS5 + HTTP proxies — with an optional GNOME system-proxy toggle, optional TUN
+interfaces, and per-app routing. The GUI runs fully unprivileged.
 
 ## Features
 
@@ -19,22 +19,19 @@ runs fully unprivileged.
   port hopping; needs Xray 26.1+, which is where the native outbound landed).
 - **Server browser**: multi-column card grid with country flags, inline card
   details, search, per-subscription latency check and sort.
+- **Pools**: select many servers by rule or by list and let the core balance
+  across them, so activity spreads over exit addresses and a dead node does not
+  end the session.
+- **Several tunnels at once**: profiles run side by side, each on its own
+  loopback address, optionally each on its own TUN interface.
+- **Per-app routing**: `oxidom run -- <cmd>` sends one command through a profile
+  and leaves everything else on the ordinary route.
 - **Latency probes**: ICMP / TCP / HTTP HEAD / HTTP GET (through the tunnel),
   selectable in Settings.
 - **Privacy**: HWID device headers are strictly opt-in per subscription; no
   telemetry. State files are written `0600`.
-- Crash-safe: an orphaned xray child or a stuck GNOME system proxy left by a
-  killed instance is repaired on the next start.
-
-## Architecture
-
-The Cargo workspace is split into three crates: `oxidom-core` contains the
-shared tunnel, subscription, probe, and D-Bus client logic; `oxidom` is the
-headless CLI/daemon; and `oxidom-gui` is the GTK application. `oxidom daemon`
-owns the tunnel and serves D-Bus (`dev.keepinfov.oxidom.Daemon`); the GUI is a
-thin client with a tray icon. Closing the window keeps the connection; the
-daemon can run as a system service that starts at boot and survives logout.
-Launching the GUI without a daemon auto-spawns a session one.
+- Crash-safe: an orphaned xray child, a stuck GNOME system proxy, or leftover
+  routes and devices left by a killed instance are repaired on the next start.
 
 ## Install
 
@@ -47,82 +44,70 @@ imports = [ inputs.oxidom.nixosModules.default ];
 programs.oxidom.enable = true;          # GUI
 programs.oxidom.trayAutostart = true;   # tray at login
 services.oxidom.enable = true;          # system daemon at boot
-services.oxidom.socksPort = 20172;      # optional
+services.oxidom.tun.enable = true;      # allow TUN interfaces
 ```
 
-The flake exposes separate `oxidom-cli` (headless) and `oxidom-gui` packages;
-the default package contains both. The NixOS module installs the GUI and CLI
-when `programs.oxidom.enable` is set and uses only the headless package for the
-system daemon.
-
-**Arch (AUR):** `packaging/aur/PKGBUILD` (`oxidom-git`) installs both binaries, then
+**Arch (AUR):** `packaging/aur/PKGBUILD` (`oxidom-git`), then
 `systemctl enable --now oxidom.service`.
 
-The system daemon rewrites the machine's proxy configuration and runs the
-core, so its D-Bus policy admits root, `wheel`, and the `oxidom` group only —
-an unprivileged service account on the same machine cannot redirect your
-traffic. Administrators need no setup; to let a non-admin account drive it,
-add them to the `oxidom` group (`services.oxidom.users = [ "alice" ];` on
-NixOS, `gpasswd -a alice oxidom` elsewhere).
+**Anything else:** a Rust toolchain (1.85+), GTK4 and libadwaita development
+packages, and an `xray` binary.
 
-## Build & run
+Full instructions, the tested distro matrix, and the from-source asset list are in
+**[docs/installation.md](docs/installation.md)**.
 
-With nix (recommended — provides GTK, libadwaita, and the Xray core):
+## Try it
 
 ```sh
-nix develop -c cargo build                   # all three workspace crates
+nix run github:keepinfov/oxidom      # the GUI
+```
+
+or, in a clone:
+
+```sh
 nix develop -c cargo run -p oxidom-gui       # graphical client
 nix develop -c cargo run -p oxidom -- daemon # headless daemon
 nix build                                    # both wrapped binaries
-nix build .#oxidom-cli                       # headless package only
-nix build .#oxidom-gui                       # graphical package only
 ```
-
-Without nix you need GTK4 ≥ 4.14, libadwaita ≥ 1.4, a Rust toolchain, and an
-`xray` binary on `PATH` (or point `OXIDOM_XRAY_BIN` at one).
-
-## CLI
 
 ```sh
-oxidom up [PROFILE]                  # connect a profile (default: default)
-oxidom down [PROFILE]                # stop unconditionally or only its owner
-oxidom connect HANDLE                # connect one server without a profile
-oxidom status [--json]               # active server, ports, and tunnel latency
-oxidom ip [--egress] [--fresh]       # endpoint IP or cached public egress IP
-oxidom list [servers|profiles|subscriptions] [--json]
-oxidom ping HANDLE                   # print only milliseconds on success
-oxidom alias HANDLE NEW
-oxidom profile {list,show,new,edit,rm}
-oxidom daemon [--system]             # headless daemon (session bus by default)
-oxidom gui [--background] [--debug]  # compatibility shim to oxidom-gui
-oxidom run -- CMD                    # reserved per-process proxy launcher
+oxidom connect ch-trojan
+oxidom status
+oxidom ip --egress
 ```
 
-Started from a terminal, `oxidom-gui` forks into the background so closing that
-terminal does not take the window and tray with it. `--debug` keeps it in the
-foreground and raises the default log level; `$RUST_LOG` still overrides either
-way. Nothing is detached when stdout is not a terminal, so the tray unit and
-`oxidom-gui | tee` behave as before.
+## Documentation
 
-Structured data is printed only to stdout; diagnostics and ambiguous-handle
-candidates go to stderr. Stable exit codes are `0` (success), `1` (command
-error), `3` (not connected), and `4` (daemon unavailable). Read commands do
-not start a private daemon; only `up` and `connect` may do so.
+| | |
+|---|---|
+| [Installation](docs/installation.md) | NixOS, Arch, from source, tested distro matrix |
+| [Quickstart](docs/quickstart.md) | Subscription → connected → verified |
+| [GUI guide](docs/gui.md) | The five pages, filters and groups, the tray |
+| [CLI reference](docs/cli.md) | Every command, flag, exit code, JSON schema |
+| [Configuration](docs/configuration.md) | `config.toml`, paths, environment variables |
+| [Profiles and pools](docs/profiles-and-pools.md) | Profile files, balancing, systemd units |
+| [Subscriptions and protocols](docs/subscriptions-and-protocols.md) | Link schemes, formats, HWID and privacy |
+| [Routing](docs/routing.md) | Local proxies, system proxy, TUN, per-app routing |
+| [Architecture](docs/architecture.md) | Crates, the daemon, the security model |
+| [Troubleshooting](docs/troubleshooting.md) | By symptom, with the real error text |
 
-Profiles are TOML files owned by the daemon. For example, after
-`oxidom profile new work`, set `select.server` with `oxidom profile edit work`
-and run it directly or as a boot-managed oneshot:
+## Architecture in one paragraph
 
-```sh
-sudo systemctl start oxidom@work
-sudo systemctl enable oxidom@work
-```
+The Cargo workspace is split into three crates: `oxidom-core` contains the shared
+tunnel, subscription, probe, and D-Bus client logic; `oxidom` is the headless
+CLI/daemon; and `oxidom-gui` is the GTK application. `oxidom daemon` owns the
+tunnel and serves D-Bus (`dev.keepinfov.oxidom.Daemon`); the GUI is a thin client
+with a tray icon. Closing the window keeps the connection; the daemon can run as a
+system service that starts at boot and survives logout. Launching the GUI without
+a daemon auto-spawns a session one. See
+[docs/architecture.md](docs/architecture.md), and
+[`AGENTS.md`](AGENTS.md) for the full implementation spec.
 
 ## Status
 
-V1 targets a local-proxy workflow (SOCKS/HTTP inbounds + GNOME system proxy).
-TUN system-wide VPN, per-app netns routing, and routing-rule editing are
-planned. See `AGENTS.md` for the full spec.
+The local-proxy workflow (SOCKS/HTTP inbounds + GNOME system proxy), TUN
+interfaces, pools and per-app routing are implemented. Routing-rule editing is
+still planned.
 
 ## License
 

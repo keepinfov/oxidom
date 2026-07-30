@@ -1,0 +1,323 @@
+# Installation
+
+oxidom ships two binaries:
+
+- **`oxidom`** — the CLI and the daemon. No GTK dependency at all, so it installs
+  cleanly on a server.
+- **`oxidom-gui`** — the GTK4 / libadwaita interface. Needs a desktop.
+
+You also need an **Xray core**. oxidom drives it as a child process; it does not
+bundle one.
+
+## Contents
+
+- [NixOS](#nixos)
+- [Nix without NixOS](#nix-without-nixos)
+- [Arch](#arch)
+- [From source](#from-source)
+- [Tested distro matrix](#tested-distro-matrix)
+- [Getting an Xray core](#getting-an-xray-core)
+- [Optional runtime dependencies](#optional-runtime-dependencies)
+- [Installing the assets by hand](#installing-the-assets-by-hand)
+- [Who may drive the system daemon](#who-may-drive-the-system-daemon)
+
+## NixOS
+
+```nix
+{
+  inputs.oxidom.url = "github:keepinfov/oxidom";
+
+  # in your system configuration:
+  imports = [ inputs.oxidom.nixosModules.default ];
+
+  programs.oxidom.enable = true;          # installs GUI + CLI
+  programs.oxidom.trayAutostart = true;   # tray at login
+
+  services.oxidom.enable = true;          # system daemon at boot
+  services.oxidom.tun.enable = true;      # allow TUN interfaces
+  services.oxidom.users = [ "alice" ];    # non-admins allowed to drive it
+}
+```
+
+### `programs.oxidom` — the desktop side
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `programs.oxidom.enable` | bool | `false` | Installs **both** the GUI and CLI packages. |
+| `programs.oxidom.package` | package | `oxidom-gui` | Which GUI package to install. |
+| `programs.oxidom.trayAutostart` | bool | `false` | Adds a user unit running `oxidom-gui --background` with the graphical session, so the tray and the GNOME proxy toggle exist before a window is opened. |
+
+### `services.oxidom` — the system daemon
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `services.oxidom.enable` | bool | `false` | Runs the daemon at boot, independent of any GUI session, on the system bus. |
+| `services.oxidom.package` | package | `oxidom-cli` | The headless package the daemon runs from. |
+| `services.oxidom.socksPort` | port | `10808` | Local SOCKS5 inbound. Passed on the command line, so it is **pinned** — clients cannot change it. |
+| `services.oxidom.httpPort` | port | `10809` | Local HTTP inbound. Also pinned. |
+| `services.oxidom.users` | list of string | `[]` | Accounts added to the `oxidom` group, i.e. allowed to drive the daemon. |
+| `services.oxidom.tun.enable` | bool | `false` | Grants **only** the daemon `CAP_NET_ADMIN` and keeps NetworkManager away from `oxi-*` devices. Required for TUN and `oxidom run`. |
+
+The unit is `Type=dbus`, so a client asking for the name starts it rather than
+racing it, and `KillMode=process`, so a daemon crash does not drop every tunnel
+with it.
+
+### Running a profile at boot
+
+The `oxidom@` template unit deliberately ships **without** an `[Install]` section,
+so enable instances declaratively:
+
+```nix
+systemd.services."oxidom@work".wantedBy = [ "multi-user.target" ];
+```
+
+Remember the system daemon keeps its database in `/var/lib/oxidom`, not in your
+home directory — see
+[configuration.md § The two databases](configuration.md#the-two-databases).
+
+## Nix without NixOS
+
+```sh
+nix run github:keepinfov/oxidom            # launch the GUI
+nix profile install github:keepinfov/oxidom
+```
+
+In a clone:
+
+```sh
+nix build                  # packages.default — both binaries
+nix build .#oxidom-cli     # headless only
+nix build .#oxidom-gui     # graphical only
+nix run .                  # the GUI
+nix develop                # dev shell: GTK, rust, xray, tun2socks, nft
+nix flake check            # builds and tests both packages
+```
+
+The flake exposes `packages.{default,oxidom,oxidom-cli,oxidom-gui}`,
+`apps.default`, `checks.{cli,gui}`, `devShells.default`, `formatter`, and
+`nixosModules.default`.
+
+The Nix packages wrap the binaries so the core is found without any `PATH` setup:
+the CLI gets `OXIDOM_XRAY_BIN`, `OXIDOM_TUN2SOCKS_BIN` and `OXIDOM_NFT_BIN`; the
+GUI gets `OXIDOM_XRAY_BIN` and `OXIDOM_BIN`.
+
+Supported systems are `x86_64-linux` and `aarch64-linux`. The flake also declares
+`aarch64-darwin`, but oxidom is Linux-only in practice — it uses netlink, TUN
+ioctls, nftables and systemd — so treat that attribute as vestigial.
+
+## Arch
+
+```sh
+git clone https://aur.archlinux.org/oxidom-git.git
+cd oxidom-git
+makepkg -si
+sudo systemctl enable --now oxidom.service
+```
+
+The PKGBUILD lives in this repository at `packaging/aur/PKGBUILD`.
+
+Two things it does not do for you:
+
+- **`depends` covers only `gtk4 libadwaita xray`.** TUN mode needs `tun2socks` and
+  per-app routing needs `nftables`. Install them if you use those features.
+- **The Arch unit does not grant `CAP_NET_ADMIN`.** For TUN:
+
+  ```sh
+  sudo systemctl edit oxidom.service
+  ```
+  ```ini
+  [Service]
+  AmbientCapabilities=CAP_NET_ADMIN
+  CapabilityBoundingSet=CAP_NET_ADMIN
+  ```
+
+To let a non-admin account drive the daemon: `sudo gpasswd -a alice oxidom`, then
+log out and back in.
+
+## From source
+
+Requirements:
+
+- **Rust 1.85 or newer.** The workspace is edition 2024 with resolver 3. There is
+  no `rust-toolchain.toml`, so your system toolchain is used; if it is older than
+  1.85, install [rustup](https://rustup.rs).
+- **`pkg-config`** and a C toolchain.
+- For the GUI only: **GTK 4** and **libadwaita ≥ 1.7** development packages.
+  libadwaita 1.7 is the binding floor — it is where `AdwToggleGroup` arrives — and
+  it in turn requires GTK ≥ 4.18.
+
+```sh
+git clone https://github.com/keepinfov/oxidom
+cd oxidom
+
+cargo build --release -p oxidom      # CLI + daemon only, no GTK needed
+cargo build --release                # everything
+```
+
+Binaries land in `target/release/`. To install them properly, see
+[Installing the assets by hand](#installing-the-assets-by-hand).
+
+### Distro packages
+
+**Debian 13 / Ubuntu 25.04+**
+
+```sh
+sudo apt install build-essential pkg-config rustc cargo \
+                 libgtk-4-dev libadwaita-1-dev
+```
+
+**Fedora**
+
+```sh
+sudo dnf install gcc pkgconf-pkg-config rust cargo \
+                 gtk4-devel libadwaita-devel
+```
+
+**Arch**
+
+```sh
+sudo pacman -S base-devel rust gtk4 libadwaita
+```
+
+## Tested distro matrix
+
+What each distribution ships in its own repositories, measured in containers.
+The CLI needs Rust ≥ 1.85; the GUI additionally needs libadwaita ≥ 1.7.
+
+| Distribution | Rust | GTK4 | libadwaita | CLI | GUI |
+|---|---|---|---|:--:|:--:|
+| Debian 13 (trixie) | 1.85.0 | 4.18.6 | 1.7.6 | ✅ | ✅ |
+| Ubuntu 25.10 | 1.85.1 | 4.20.1 | 1.8.0 | ✅ | ✅ |
+| Ubuntu 24.04 LTS | 1.75.0 | 4.14.5 | 1.5.0 | ❌ | ❌ |
+| Debian 12 (bookworm) | 1.63.0 | 4.8.3 | 1.2.2 | ❌ | ❌ |
+
+Arch and Fedora were not measured here. Arch is rolling, so it is always current;
+recent Fedora ships GNOME 48 or newer and should clear the libadwaita floor
+comfortably. Check yours before filing a bug:
+
+```sh
+rustc --version
+pkg-config --modversion libadwaita-1
+```
+
+**Debian 13 is exactly on the line** — it ships Rust 1.85.0, the minimum. Anything
+older needs a newer toolchain.
+
+### If your distribution is too old
+
+The blocker is almost always Rust, and that is easy to fix:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup default stable
+cargo build --release -p oxidom      # CLI, no GTK needed
+```
+
+That is enough for the **CLI and daemon** on any of the distributions above,
+including Ubuntu 24.04 and Debian 12 — the headless build has no GTK dependency
+at all.
+
+The **GUI** additionally needs libadwaita ≥ 1.7, which rustup cannot supply. On
+Ubuntu 24.04 LTS or Debian 12 your options are to upgrade the distribution, or to
+use the [Nix package](#nix-without-nixos), which brings its own GTK stack and
+works on any distribution.
+
+## Getting an Xray core
+
+oxidom needs an `xray` binary and will not start without one. **Most distributions
+do not package it** — Nix and the AUR are the exceptions.
+
+Download a release from
+[XTLS/Xray-core](https://github.com/XTLS/Xray-core/releases):
+
+```sh
+curl -LO https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+unzip Xray-linux-64.zip xray
+sudo install -Dm755 xray /usr/local/bin/xray
+xray version
+```
+
+**Use 26.1 or newer** if you have any Hysteria2 servers — that is where the native
+outbound landed, and an older core exits immediately rather than connecting.
+
+If the binary is somewhere unusual, point oxidom at it with the `xray_binary`
+setting or `$OXIDOM_XRAY_BIN` — see
+[configuration.md](configuration.md#finding-helper-binaries).
+
+No geoip/geosite `.dat` files are needed. The only geo reference in the generated
+config is the built-in `geoip:private` rule, which modern Xray resolves itself.
+
+## Optional runtime dependencies
+
+| Program | Needed for | Package |
+|---|---|---|
+| `tun2socks` | TUN interfaces | `tun2socks` |
+| `nft` | `oxidom run` (per-app routing) | `nftables` |
+| `gsettings` | the GNOME system-proxy toggle | `glib2` + `gsettings-desktop-schemas` |
+| `ping` | ICMP latency probes | `iputils` |
+| `systemd-run` | `oxidom run` | `systemd` |
+
+The tray icon needs a **StatusNotifierItem host**. On stock GNOME that means an
+AppIndicator extension; without one the window still works, there is just no icon.
+
+## Installing the assets by hand
+
+`cargo build` produces binaries only. A release build does **not** install its
+icons — debug builds drop them into `$XDG_DATA_HOME` for convenience, release
+builds do not. The full list, mirroring what the packages do:
+
+| Source | Destination |
+|---|---|
+| `target/release/oxidom` | `/usr/bin/oxidom` (0755) |
+| `target/release/oxidom-gui` | `/usr/bin/oxidom-gui` (0755) |
+| `data/dev.keepinfov.oxidom.desktop` | `/usr/share/applications/` |
+| `data/dev.keepinfov.oxidom.svg` | `/usr/share/icons/hicolor/scalable/apps/` |
+| `data/dev.keepinfov.oxidom-symbolic.svg` | `/usr/share/icons/hicolor/symbolic/apps/` |
+| `data/icons/oxidom-funnel-symbolic.svg` | `/usr/share/icons/hicolor/scalable/actions/` |
+| `data/dev.keepinfov.oxidom.metainfo.xml` | `/usr/share/metainfo/` |
+| `data/dev.keepinfov.oxidom.Daemon.conf` | `/usr/share/dbus-1/system.d/` |
+| `data/dev.keepinfov.oxidom.Daemon.service` | `/usr/share/dbus-1/system-services/` |
+| `packaging/aur/oxidom.service` | `/usr/lib/systemd/system/` |
+| `packaging/aur/oxidom@.service` | `/usr/lib/systemd/system/` |
+| `packaging/aur/oxidom-git.sysusers` | `/usr/lib/sysusers.d/oxidom.conf` |
+
+Country flags need no install step — they are compiled into the GUI binary. No
+GSettings schema is shipped either; oxidom only *writes* to the stock
+`org.gnome.system.proxy` schemas.
+
+For the system daemon you also need the `oxidom` user, which the sysusers file
+creates:
+
+```sh
+sudo systemd-sysusers
+sudo systemctl daemon-reload
+sudo systemctl enable --now oxidom.service
+```
+
+## Who may drive the system daemon
+
+The system daemon rewrites the machine's proxy configuration and runs the core, so
+its D-Bus policy is not an "any local user" surface. Only these may send to it:
+
+- `root`
+- members of `wheel`
+- members of `oxidom`
+
+Everyone else is denied — an unprivileged service account on the same machine
+cannot redirect your traffic. Administrators need no setup. To let a non-admin
+account drive it:
+
+```nix
+services.oxidom.users = [ "alice" ];   # NixOS
+```
+
+```sh
+sudo gpasswd -a alice oxidom           # elsewhere
+```
+
+A user who is denied is not left broken: oxidom gives them a session daemon of
+their own instead, with its own database.
+
+---
+
+Next: [quickstart.md](quickstart.md) · [configuration.md](configuration.md) · [troubleshooting.md](troubleshooting.md)
