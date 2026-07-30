@@ -473,6 +473,12 @@ that loop is the cost, and a `Status` paying it anyway may as well answer the qu
 that no subscription holds any more contribute no endpoint, so a shrunken pool understates rather
 than invents.
 
+**A pool's node count is explained by its strategy, not by its width.** `reduce::rotation_help`
+is keyed on the running strategy, deliberately *not* shared with the Connect bar's
+`rotation_detail`: that one is one sentence about a width being chosen and describes `leastLoad`,
+and `roundRobin` keeps unreachable nodes in the rotation, so the same sentence would be false.
+Two facts, two sentences.
+
 Pool membership is resolved **once, at `up`**. A subscription refresh that changes what the
 query would match marks the session `stale` and invites a reconnect; it never rewrites the
 config under live connections.

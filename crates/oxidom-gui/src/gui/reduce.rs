@@ -1068,23 +1068,104 @@ pub(super) fn selected_status(state: &SnapshotState) -> Status {
         .unwrap_or_else(|| reported_status_for(state, &state.selected_profile))
 }
 
+/// One row on the Sessions page.
+///
+/// The shape is the fix for what the page had become: every fact about a
+/// session was a coloured pill in a `GtkFlowBox` suffix, and a flow box gives
+/// each child the same column width, so `210 ms` was stretched to the width of
+/// `pool · 1 node · now ch-hysteria2` and four pills wrapped into a ragged grid.
+/// Beside a `Connected` pill and a switch, that is five competing colours to
+/// answer one question — is this on?
+///
+/// So the row now says one thing at a glance and keeps the rest folded away:
+/// a headline, at most one *state* badge plus a latency reading, and every
+/// remaining fact as a labelled detail row. A pill is reserved for state and
+/// for a warning, which is what a pill is good at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SessionRow {
     /// Profile name; also the row's stable key.
     pub profile: String,
     pub state: SessionRowState,
-    /// Server as the user reads it: the session's alias or name while it runs,
-    /// the profile's stored handle when it does not.
-    pub server: String,
+    /// The one line under the name: what this session is pointed at, and — for
+    /// a pool — how much of it is carrying traffic.
+    pub headline: String,
     /// A pool is a selection in its own right, never an active member.
     pub pool: bool,
-    pub description: String,
-    pub chips: Vec<SessionChip>,
+    /// Round-trip through this session, when there is a current measurement.
+    pub latency: Option<String>,
+    /// Something the user should see without expanding the row. Only a warning
+    /// earns this; ordinary facts are [`Self::details`].
+    pub warning: Option<SessionWarning>,
+    /// Everything else, shown when the row is expanded.
+    pub details: Vec<SessionDetail>,
     /// Where the toggle sits before the user touches it.
     pub toggle_on: bool,
     /// An operation for this profile is in flight; the row is insensitive.
     pub busy: bool,
     pub error: Option<String>,
+}
+
+/// A labelled fact about a session, shown as its own row when expanded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SessionDetail {
+    pub label: String,
+    pub value: String,
+    /// Worth offering a copy button for — an address someone will paste into
+    /// another program.
+    pub copyable: bool,
+    /// What the row means, when the value is a number whose rule is not
+    /// self-evident. Never a restatement of the value: a tooltip that says the
+    /// same thing louder is a tooltip nobody reads twice.
+    pub tooltip: Option<String>,
+}
+
+impl SessionDetail {
+    fn new(label: &str, value: impl Into<String>) -> Self {
+        Self {
+            label: label.to_string(),
+            value: value.into(),
+            copyable: false,
+            tooltip: None,
+        }
+    }
+
+    fn copyable(mut self) -> Self {
+        self.copyable = true;
+        self
+    }
+
+    fn explained(mut self, tooltip: impl Into<String>) -> Self {
+        self.tooltip = Some(tooltip.into());
+        self
+    }
+}
+
+/// What "in rotation" means for the strategy actually running.
+///
+/// Deliberately *not* shared with `rotation_detail` in the Connect bar, which
+/// reads as one sentence about a width being chosen and describes `leastLoad`
+/// because that is the default the bar is about to write. Here the strategy is
+/// already decided and may be one that keeps dead nodes in the rotation, so the
+/// same sentence would be false. Two sentences, two different facts.
+fn rotation_help(strategy: &str) -> &'static str {
+    match strategy {
+        "leastLoad" => {
+            "The fastest reachable nodes carry traffic. A node that stops answering \
+             leaves the rotation and one of the rest takes over."
+        }
+        "roundRobin" | "random" => {
+            "Every member takes turns, including ones that are not answering — this \
+             strategy does not check reachability."
+        }
+        "leastPing" => {
+            "One node carries traffic: whichever answers fastest. It changes when \
+             another node becomes faster."
+        }
+        _ => {
+            "How many of the pool's nodes the core is currently willing to send \
+             traffic through."
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1095,37 +1176,18 @@ pub(super) enum SessionRowState {
     Error,
 }
 
+/// Something about a session the user must see without expanding the row.
+///
+/// There used to be a `SessionChipKind` enum with seven variants, one per fact:
+/// interface, inbound address, latency, system proxy, "proxy only". Each was
+/// painted in accent or warning colour, so a session with nothing wrong still
+/// looked like four alerts. A device name and a loopback address are *facts*,
+/// and facts are [`SessionDetail`]s. What is left is a warning, which is the one
+/// thing a coloured pill is genuinely good for.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SessionChip {
+pub(super) struct SessionWarning {
     pub text: String,
-    pub kind: SessionChipKind,
     pub tooltip: Option<String>,
-}
-
-impl SessionChip {
-    fn new(text: impl Into<String>, kind: SessionChipKind) -> Self {
-        Self {
-            text: text.into(),
-            kind,
-            tooltip: None,
-        }
-    }
-
-    fn with_tooltip(mut self, tooltip: impl Into<String>) -> Self {
-        self.tooltip = Some(tooltip.into());
-        self
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SessionChipKind {
-    Pool,
-    Stale,
-    Interface,
-    Inbound,
-    Latency,
-    SystemProxy,
-    ProxyOnly,
 }
 
 fn session_row_state(session: Option<&SessionInfo>) -> SessionRowState {
@@ -1145,41 +1207,109 @@ fn route_mode_label(mode: RouteMode) -> &'static str {
     }
 }
 
-fn latency_chip(reading: Option<&LatencyReading>, now_unix_ms: u64) -> Option<SessionChip> {
+/// The reading badge, and the fuller line that goes with it when expanded.
+///
+/// The badge stays short — a number is scanned, not read — while the age moves
+/// into the detail. Showing "210 ms · 3 min ago" in a pill next to a `Connected`
+/// pill and a switch was three widths of text where one was wanted.
+fn latency_parts(
+    reading: Option<&LatencyReading>,
+    now_unix_ms: u64,
+) -> (Option<String>, Option<SessionDetail>) {
     let LatencyState::Tunnel { ms, age, .. } = latency_state(reading, false, true, now_unix_ms)
     else {
-        return None;
+        return (None, None);
     };
-    let text = match age {
-        LatencyAge::Stale(minutes) => format!("{ms} ms · {minutes} min ago"),
+    let detail = match age {
+        LatencyAge::Stale(minutes) => format!("{ms} ms · measured {minutes} min ago"),
         _ => format!("{ms} ms"),
     };
-    Some(SessionChip::new(text, SessionChipKind::Latency))
+    (
+        Some(format!("{ms} ms")),
+        Some(SessionDetail::new("Latency", detail)),
+    )
 }
 
-fn pool_chip(selection: &SelectionInfo) -> SessionChip {
+/// How many of a pool's members the balancer is rotating through, when that is
+/// knowable at all.
+///
+/// "In rotation", never "healthy": under `roundRobin` a node in the rotation may
+/// well be unreachable, and under `leastLoad` a node out of it may be alive and
+/// merely unselected. `None` when the balancer could not be asked or an override
+/// pins one target, because a count invented there would read as a measurement.
+fn rotation_count(selection: &SelectionInfo) -> Option<usize> {
+    let known = selection
+        .members
+        .iter()
+        .filter_map(|member| member.in_rotation)
+        .collect::<Vec<_>>();
+    (known.len() == selection.members.len() && !known.is_empty())
+        .then(|| known.into_iter().filter(|value| *value).count())
+}
+
+/// The pool in as few characters as it can honestly be put.
+///
+/// For the header chip, the sidebar strip and the tray, where the full headline
+/// would be truncated to nothing useful. It still never names a member as "the"
+/// server — a pool has no active server — so the surfaces that show it cannot
+/// accidentally claim one.
+pub(super) fn pool_short_label(selection: &SelectionInfo) -> String {
+    let count = selection.members.len();
+    let inner = match rotation_count(selection) {
+        Some(live) if live != count => format!("{live}/{count}"),
+        _ => count.to_string(),
+    };
+    if selection.name.is_empty() {
+        format!("pool ({inner})")
+    } else {
+        format!("{} ({inner})", selection.name)
+    }
+}
+
+/// The line under a pool session's name.
+///
+/// Says what the pool is and how much of it is working, in that order, because
+/// "6 of 42 active" is the answer to the question a pool raises and "pool · 42
+/// nodes · now ch-hysteria2" was three facts competing to be first.
+fn pool_headline(selection: &SelectionInfo) -> String {
     let count = selection.members.len();
     let nodes = if count == 1 { "node" } else { "nodes" };
-    let mut text = format!("pool · {count} {nodes}");
-
-    if let Some(selecting) = selection.selecting.as_deref() {
-        text.push_str(" · now ");
-        text.push_str(selecting);
+    let name = if selection.name.is_empty() {
+        "Pool".to_string()
     } else {
-        let known = selection
-            .members
-            .iter()
-            .filter_map(|member| member.in_rotation)
-            .collect::<Vec<_>>();
-        // "In rotation", never "healthy": under `roundRobin` a node in the
-        // rotation may well be unreachable, and under `leastLoad` a node out
-        // of it may be alive and merely unselected.
-        if known.len() == count && !known.is_empty() {
-            let live = known.into_iter().filter(|value| *value).count();
-            text.push_str(&format!(" · {live}/{count} in rotation"));
-        }
+        format!("Pool “{}”", selection.name)
+    };
+    if let Some(selecting) = selection.selecting.as_deref() {
+        // Only a strategy that settles on one node, or an explicit override,
+        // has a current exit worth naming.
+        return format!("{name} · {count} {nodes} · now {selecting}");
     }
-    SessionChip::new(text, SessionChipKind::Pool)
+    match rotation_count(selection) {
+        Some(live) => format!("{name} · {live} of {count} active"),
+        None => format!("{name} · {count} {nodes}"),
+    }
+}
+
+/// The single line under a session's name.
+///
+/// A failed session says why. Everything else says what it is pointed at — and
+/// nothing else, because the row's remaining space belongs to the state badge
+/// and the switch, and a subtitle that also carried the description used to push
+/// the profile name into an ellipsis at 680 px.
+fn session_headline(
+    state: SessionRowState,
+    selection: &str,
+    session: Option<&SessionInfo>,
+) -> String {
+    if state == SessionRowState::Error {
+        return session
+            .and_then(|session| session.error.clone())
+            .unwrap_or_else(|| "The session failed".to_string());
+    }
+    if selection.is_empty() {
+        return "No server selected yet".to_string();
+    }
+    selection.to_string()
 }
 
 /// The operation currently running for `profile`, if any.
@@ -1208,31 +1338,57 @@ pub(super) fn session_rows(
                 Some(UiOperationKind::DownProfile) => SessionRowState::Stopped,
                 _ => session_row_state(session),
             };
-            let mut chips = Vec::new();
             let running_pool = session
                 .filter(|session| session.selection.kind == "pool")
                 .map(|session| &session.selection);
             let is_pool = running_pool.is_some() || entry.pool.is_some();
 
-            if let Some(selection) = running_pool {
-                chips.push(pool_chip(selection));
-                if selection.stale {
-                    chips.push(
-                        SessionChip::new("stale", SessionChipKind::Stale)
-                            .with_tooltip("Reconnect to pick up new servers"),
-                    );
-                }
-            }
+            // The one warning that has to survive the row being collapsed: a
+            // stale pool is still carrying traffic, so nothing else says it.
+            let warning =
+                running_pool
+                    .filter(|selection| selection.stale)
+                    .map(|_| SessionWarning {
+                        text: "stale".to_string(),
+                        tooltip: Some("Reconnect to pick up new servers".to_string()),
+                    });
 
+            let selection = match running_pool {
+                Some(selection) => pool_headline(selection),
+                None if is_pool => "Pool".to_string(),
+                None => session
+                    .and_then(|session| {
+                        session
+                            .server_alias
+                            .as_ref()
+                            .or(session.server_name.as_ref())
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| entry.server.clone()),
+            };
+
+            let (latency, latency_detail) =
+                latency_parts(state.proxied.get(&entry.name), now_unix_ms);
+
+            let mut details = Vec::new();
+            if let Some(session) = session {
+                details.push(
+                    SessionDetail::new(
+                        "Proxy",
+                        format!("{}:{}", session.address, session.socks_port),
+                    )
+                    .copyable(),
+                );
+            }
             if let Some(interface) = session.and_then(|session| session.interface.as_ref()) {
-                let mut text = format!(
+                let mut value = format!(
                     "{} · {} · {}",
                     interface.device, interface.address, interface.routes
                 );
                 if !interface.up {
-                    text.push_str(" · down");
+                    value.push_str(" · down");
                 }
-                chips.push(SessionChip::new(text, SessionChipKind::Interface));
+                details.push(SessionDetail::new("Interface", value));
             } else if session.is_none() && entry.interface.enable {
                 let device = if entry.interface.device.is_empty() {
                     oxidom_core::bind::device_name(&entry.name).ok()
@@ -1240,51 +1396,56 @@ pub(super) fn session_rows(
                     Some(entry.interface.device.clone())
                 };
                 if let Some(device) = device {
-                    chips.push(SessionChip::new(
+                    details.push(SessionDetail::new(
+                        "Interface",
                         format!("{device} · {}", route_mode_label(entry.interface.routes)),
-                        SessionChipKind::Interface,
                     ));
                 }
             } else if !entry.interface.enable {
-                chips.push(SessionChip::new("proxy only", SessionChipKind::ProxyOnly));
+                // "Proxy only" is the answer to "does this capture my whole
+                // machine?", which is worth stating rather than implying by the
+                // absence of an interface row.
+                details.push(SessionDetail::new("Routing", "Proxy only — no interface"));
             }
-
-            if let Some(session) = session {
-                chips.push(SessionChip::new(
-                    format!("{}:{}", session.address, session.socks_port),
-                    SessionChipKind::Inbound,
-                ));
+            if let Some(selection) = running_pool {
+                let count = selection.members.len();
+                let mut nodes = match rotation_count(selection) {
+                    Some(live) => format!("{live} of {count} in rotation"),
+                    None => format!("{count} in the pool"),
+                };
+                // The pool's least honest number, and only worth a line when it
+                // is smaller than the node count: a provider that lists one host
+                // 26 times gives 42 nodes and 9 places to leave from. Zero means
+                // an older daemon did not report it, not "no exits".
+                if selection.endpoints > 0 && selection.endpoints < count {
+                    nodes.push_str(&format!(
+                        " · {} exit address{}",
+                        selection.endpoints,
+                        if selection.endpoints == 1 { "" } else { "es" }
+                    ));
+                }
+                details.push(
+                    SessionDetail::new("Nodes", nodes)
+                        .explained(rotation_help(&selection.strategy)),
+                );
+                details.push(SessionDetail::new("Strategy", selection.strategy.clone()));
             }
-            if let Some(chip) = latency_chip(state.proxied.get(&entry.name), now_unix_ms) {
-                chips.push(chip);
-            }
+            details.extend(latency_detail);
             if session.is_some_and(|session| session.owns_system_proxy) {
-                chips.push(SessionChip::new(
-                    "system proxy",
-                    SessionChipKind::SystemProxy,
-                ));
+                details.push(SessionDetail::new("System proxy", "Set by this session"));
+            }
+            if !entry.description.is_empty() {
+                details.push(SessionDetail::new("Description", entry.description.clone()));
             }
 
             SessionRow {
                 profile: entry.name.clone(),
                 state: row_state,
-                server: running_pool
-                    .map(|selection| format!("pool ({})", selection.members.len()))
-                    .or_else(|| is_pool.then(|| "pool".to_string()))
-                    .unwrap_or_else(|| {
-                        session
-                            .and_then(|session| {
-                                session
-                                    .server_alias
-                                    .as_ref()
-                                    .or(session.server_name.as_ref())
-                            })
-                            .cloned()
-                            .unwrap_or_else(|| entry.server.clone())
-                    }),
+                headline: session_headline(row_state, &selection, session),
                 pool: is_pool,
-                description: entry.description.clone(),
-                chips,
+                latency,
+                warning,
+                details,
                 toggle_on: matches!(
                     row_state,
                     SessionRowState::Connected | SessionRowState::Connecting
@@ -2390,30 +2551,47 @@ mod tests {
             vec!["work", "home"]
         );
         assert_eq!(rows[0].state, SessionRowState::Connected);
-        assert_eq!(rows[0].server, "shared");
-        assert_eq!(rows[0].description, "Office");
+        assert_eq!(rows[0].headline, "shared");
         assert!(rows[0].toggle_on);
         assert!(!rows[0].busy);
+        // One badge, not four: the number is scanned beside the state, and its
+        // age is spelled out below where there is room for the words.
+        assert_eq!(rows[0].latency.as_deref(), Some("71 ms"));
+        assert!(rows[0].warning.is_none());
         assert_eq!(
-            rows[0].chips,
+            rows[0]
+                .details
+                .iter()
+                .map(|detail| (detail.label.as_str(), detail.value.as_str()))
+                .collect::<Vec<_>>(),
             vec![
-                SessionChip::new("oxi-work · 198.18.7.1 · manual", SessionChipKind::Interface),
-                SessionChip::new("127.91.37.1:10808", SessionChipKind::Inbound),
-                SessionChip::new("71 ms · 3 min ago", SessionChipKind::Latency),
-                SessionChip::new("system proxy", SessionChipKind::SystemProxy),
+                ("Proxy", "127.91.37.1:10808"),
+                ("Interface", "oxi-work · 198.18.7.1 · manual"),
+                ("Latency", "71 ms · measured 3 min ago"),
+                ("System proxy", "Set by this session"),
+                ("Description", "Office"),
             ]
         );
+        // The address is the one thing here someone pastes elsewhere.
+        assert!(rows[0].details[0].copyable);
+        assert!(rows[0].details[1..].iter().all(|detail| !detail.copyable));
+
         assert_eq!(rows[1].state, SessionRowState::Connecting);
-        assert_eq!(rows[1].server, "Shared server");
-        assert_eq!(rows[1].description, "Personal");
+        assert_eq!(rows[1].headline, "Shared server");
         assert!(rows[1].toggle_on);
         assert!(rows[1].busy);
+        assert_eq!(rows[1].latency.as_deref(), Some("83 ms"));
         assert_eq!(
-            rows[1].chips,
+            rows[1]
+                .details
+                .iter()
+                .map(|detail| (detail.label.as_str(), detail.value.as_str()))
+                .collect::<Vec<_>>(),
             vec![
-                SessionChip::new("proxy only", SessionChipKind::ProxyOnly),
-                SessionChip::new("127.92.38.1:10808", SessionChipKind::Inbound),
-                SessionChip::new("83 ms", SessionChipKind::Latency),
+                ("Proxy", "127.92.38.1:10808"),
+                ("Routing", "Proxy only — no interface"),
+                ("Latency", "83 ms"),
+                ("Description", "Personal"),
             ]
         );
     }
@@ -2459,16 +2637,44 @@ mod tests {
 
         let rows = session_rows(&[work.clone()], &state, NOW_MS);
         assert!(rows[0].pool);
-        assert_eq!(rows[0].server, "pool (2)");
+        assert_eq!(rows[0].headline, "Pool · 1 of 2 active");
+        assert_eq!(pool_short_label(&state.sessions[0].selection), "pool (1/2)");
+        let warning = rows[0].warning.as_ref().expect("a stale pool warns");
+        assert_eq!(warning.text, "stale");
         assert_eq!(
-            rows[0].chips[0],
-            SessionChip::new("pool · 2 nodes · 1/2 in rotation", SessionChipKind::Pool)
+            warning.tooltip.as_deref(),
+            Some("Reconnect to pick up new servers")
         );
-        assert_eq!(
-            rows[0].chips[1],
-            SessionChip::new("stale", SessionChipKind::Stale)
-                .with_tooltip("Reconnect to pick up new servers")
+        assert!(
+            rows[0]
+                .details
+                .iter()
+                .any(|detail| detail.label == "Nodes" && detail.value == "1 of 2 in rotation")
         );
+        assert!(
+            rows[0]
+                .details
+                .iter()
+                .any(|detail| detail.label == "Strategy" && detail.value == "roundRobin")
+        );
+        assert!(
+            !rows[0]
+                .details
+                .iter()
+                .any(|detail| detail.value.contains("exit address")),
+            "a pool whose nodes are all on their own host says nothing about exits"
+        );
+        // The explanation belongs to the strategy, not to the count: roundRobin
+        // must not be described as keeping only the nodes that answer.
+        let nodes = |rows: &[SessionRow]| {
+            rows[0]
+                .details
+                .iter()
+                .find(|detail| detail.label == "Nodes")
+                .and_then(|detail| detail.tooltip.clone())
+                .expect("the node count is explained")
+        };
+        assert!(nodes(&rows).contains("takes turns"));
 
         state.sessions[0].selection.strategy = "leastPing".to_string();
         state.sessions[0].selection.selecting = Some("two".to_string());
@@ -2476,14 +2682,61 @@ mod tests {
             member.in_rotation = None;
         }
         let rows = session_rows(&[work], &state, NOW_MS);
-        assert_eq!(
-            rows[0].chips[0],
-            SessionChip::new("pool · 2 nodes · now two", SessionChipKind::Pool)
-        );
+        assert_eq!(rows[0].headline, "Pool · 2 nodes · now two");
         assert!(
-            !rows[0].chips[0].text.contains("in rotation"),
+            !rows[0].headline.contains("active"),
             "unknown health under a picking strategy must not become dead nodes"
         );
+        // …and the short label cannot invent a rotation it was not told about.
+        assert_eq!(pool_short_label(&state.sessions[0].selection), "pool (2)");
+        assert!(
+            rows[0]
+                .details
+                .iter()
+                .any(|detail| detail.label == "Nodes" && detail.value == "2 in the pool")
+        );
+        assert!(nodes(&rows).contains("One node carries traffic"));
+    }
+
+    #[test]
+    fn a_named_pool_is_called_by_its_name_everywhere_it_appears() {
+        let mut work = profile("work", "");
+        work.pool = Some(PoolQuery::default());
+        let mut state = state();
+        state.sessions = vec![SessionInfo {
+            profile: "work".to_string(),
+            state: "connected".to_string(),
+            selection: SelectionInfo {
+                kind: "pool".to_string(),
+                name: "Germany".to_string(),
+                strategy: "leastLoad".to_string(),
+                members: (0..6)
+                    .map(|index| PoolMember {
+                        server_id: index.to_string(),
+                        alias: Some(index.to_string()),
+                        name: index.to_string(),
+                        tag: format!("s-{index}"),
+                        in_rotation: Some(index < 4),
+                    })
+                    .collect(),
+                // The real German case in miniature: the provider spelled two
+                // hosts six times.
+                endpoints: 2,
+                selecting: None,
+                stale: false,
+            },
+            ..SessionInfo::default()
+        }];
+        let rows = session_rows(&[work], &state, NOW_MS);
+        assert_eq!(rows[0].headline, "Pool “Germany” · 4 of 6 active");
+        assert_eq!(
+            pool_short_label(&state.sessions[0].selection),
+            "Germany (4/6)"
+        );
+        // The headline counts nodes because that is what the rotation is over;
+        // the expanded row is where the spread the pool actually buys is said.
+        assert!(rows[0].details.iter().any(|detail| detail.label == "Nodes"
+            && detail.value == "4 of 6 in rotation · 2 exit addresses"));
     }
 
     #[test]
@@ -2496,11 +2749,12 @@ mod tests {
         assert_eq!(rows[0].state, SessionRowState::Stopped);
         assert!(!rows[0].toggle_on);
         assert_eq!(
-            rows[0].chips,
-            vec![SessionChip::new(
-                "oxi-work · list",
-                SessionChipKind::Interface
-            )]
+            rows[0]
+                .details
+                .iter()
+                .map(|detail| (detail.label.as_str(), detail.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Interface", "oxi-work · list")]
         );
     }
 

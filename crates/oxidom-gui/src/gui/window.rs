@@ -22,8 +22,8 @@ use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
     SwitcherItem, active_latency_for, card_action, latency_states, other_sessions_message,
-    pool_action, pool_for_profile, reduce, selected_status, session_for, session_rows,
-    switcher_items, switcher_visible,
+    pool_action, pool_for_profile, pool_short_label, reduce, selected_status, session_for,
+    session_rows, switcher_items, switcher_visible,
 };
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
@@ -3088,17 +3088,14 @@ impl Controller {
         self.active_server_display(state).map(|(name, _)| name)
     }
 
-    /// The pool label comes from the same reduced row as the Sessions page and
-    /// tray menu, so no surface can accidentally name one member as active.
+    /// The pool label comes from one reducer shared by the header, the sidebar
+    /// and the tray, so no surface can accidentally name one member as active.
     fn active_pool_name(&self, state: &AppState) -> Option<String> {
         let session = session_for(&state.ui, &state.ui.selected_profile)?;
         if session.selection.kind != "pool" {
             return None;
         }
-        session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
-            .into_iter()
-            .find(|row| row.profile == state.ui.selected_profile && row.pool)
-            .map(|row| row.server)
+        Some(pool_short_label(&session.selection))
     }
 
     /// Display name and country of the connected server.
@@ -3611,14 +3608,14 @@ fn install_css() {
         .status-badge.status-working { color: @accent_color; background: alpha(@accent_color, 0.13); }
         .status-badge.status-connected { color: @success_color; background: alpha(@success_color, 0.14); }
         .status-badge.status-error { color: @error_color; background: alpha(@error_color, 0.13); }
+        /* Two kinds left, and both earn their colour: a warning and a reading.
+           The five that went — interface, inbound, system proxy, "proxy only",
+           pool — were facts painted like alerts, and a healthy session read as
+           four things going wrong. They are labelled rows inside the expander
+           now. */
         .session-chip { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; background: alpha(@window_fg_color, 0.07); }
-        .session-chip-pool { color: @accent_color; background: alpha(@accent_color, 0.12); }
         .session-chip-stale { color: @warning_color; background: alpha(@warning_color, 0.13); }
-        .session-chip-interface { color: @accent_color; background: alpha(@accent_color, 0.12); }
-        .session-chip-inbound { color: alpha(@window_fg_color, 0.78); }
         .session-chip-latency { color: @success_color; background: alpha(@success_color, 0.14); }
-        .session-chip-system-proxy { color: @warning_color; background: alpha(@warning_color, 0.13); }
-        .session-chip-proxy-only { color: alpha(@window_fg_color, 0.62); }
         .dns-leak-row { background: alpha(@warning_color, 0.10); }
         .dns-leak-row > box > box > label.title { color: @warning_color; }
         .dns-leak-icon { color: @warning_color; }

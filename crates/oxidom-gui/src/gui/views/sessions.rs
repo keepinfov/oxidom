@@ -5,7 +5,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use crate::gui::operation::UiOperation;
-use crate::gui::reduce::{SessionChip, SessionChipKind, SessionRow, SessionRowState};
+use crate::gui::reduce::{SessionDetail, SessionRow, SessionRowState};
 use oxidom_core::ipc::ProfileEntry;
 
 use super::icon_button;
@@ -31,15 +31,22 @@ struct HeaderControls {
 
 #[derive(Clone)]
 struct RowControls {
-    row: adw::ActionRow,
+    row: adw::ExpanderRow,
     spinner: gtk::Spinner,
+    /// Warning badge, e.g. a stale pool. Hidden when there is nothing to warn
+    /// about, rather than present-and-empty, so it takes no width.
+    warning: gtk::Label,
+    latency: gtk::Label,
     state: gtk::Label,
-    chips: gtk::FlowBox,
     toggle: gtk::Switch,
+    edit: adw::ButtonRow,
+    /// Detail rows currently hanging off the expander, so they can be removed
+    /// before the next set is added — `AdwExpanderRow` has no "clear".
+    details: Rc<RefCell<Vec<adw::ActionRow>>>,
     syncing_toggle: Rc<Cell<bool>>,
     /// The model this row is currently showing. `set_rows` runs on every poll,
-    /// and rebuilding the chip labels twice a second for rows nothing happened
-    /// to is churn the user pays for in a flickering list.
+    /// and rebuilding the labels twice a second for rows nothing happened to is
+    /// churn the user pays for in a flickering list.
     applied: Rc<RefCell<Option<SessionRow>>>,
 }
 
@@ -169,34 +176,33 @@ impl SessionsView {
         self.content.set_spacing(if enabled { 16 } else { 22 });
     }
 
+    /// One row: a headline and the state, with every other fact folded away.
+    ///
+    /// An expander rather than a wall of suffixes because the row has to answer
+    /// "is this on?" at a glance and "what exactly is it doing?" on request, and
+    /// those are different questions. The former is the badge and the switch;
+    /// the latter is eight labelled lines that have no business competing with
+    /// them for the same strip of pixels.
     fn add_session_row(
         &self,
         list: &adw::PreferencesGroup,
         model: &SessionRow,
         callbacks: SessionCallbacks,
     ) {
-        let row = adw::ActionRow::builder()
+        let row = adw::ExpanderRow::builder()
             .title(&model.profile)
-            .subtitle(session_subtitle(model))
+            .subtitle(&model.headline)
             .subtitle_lines(2)
-            .activatable(true)
             .build();
 
-        let chips = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .column_spacing(6)
-            .row_spacing(4)
-            .min_children_per_line(1)
-            .max_children_per_line(3)
-            .build();
-        chips.set_valign(gtk::Align::Center);
-        row.add_suffix(&chips);
-
-        let state = gtk::Label::builder()
+        // `AdwExpanderRow::add_suffix` packs towards the title, so suffixes are
+        // added in the reverse of the order they are read: switch first ends up
+        // rightmost, next to the expander arrow where a switch belongs.
+        let toggle = gtk::Switch::builder()
             .valign(gtk::Align::Center)
-            .css_classes(["status-badge"])
+            .active(model.toggle_on)
             .build();
-        row.add_suffix(&state);
+        row.add_suffix(&toggle);
 
         let spinner = gtk::Spinner::builder()
             .valign(gtk::Align::Center)
@@ -204,11 +210,26 @@ impl SessionsView {
             .build();
         row.add_suffix(&spinner);
 
-        let toggle = gtk::Switch::builder()
+        let state = gtk::Label::builder()
             .valign(gtk::Align::Center)
-            .active(model.toggle_on)
+            .css_classes(["status-badge"])
             .build();
-        row.add_suffix(&toggle);
+        row.add_suffix(&state);
+
+        let latency = gtk::Label::builder()
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .css_classes(["session-chip", "session-chip-latency"])
+            .build();
+        row.add_suffix(&latency);
+
+        let warning = gtk::Label::builder()
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .css_classes(["session-chip", "session-chip-stale"])
+            .build();
+        row.add_suffix(&warning);
+
         let syncing_toggle = Rc::new(Cell::new(false));
         toggle.connect_active_notify({
             let callback = callbacks.toggle.clone();
@@ -222,19 +243,28 @@ impl SessionsView {
             }
         });
 
-        let entry_name = model.profile.clone();
-        row.connect_activated({
+        // Editing moved off the row itself: activating an `AdwExpanderRow`
+        // expands it, so the row's own gesture is spoken for. A button inside
+        // the expanded body is its own target and says what it does. It is
+        // re-added after the details on every change so the action stays last —
+        // facts first, then the thing that changes them.
+        let edit = adw::ButtonRow::builder().title("Edit profile…").build();
+        edit.connect_activated({
             let edit = callbacks.edit.clone();
             let profile = model.profile.clone();
             move |_| edit(profile.clone())
         });
 
+        let entry_name = model.profile.clone();
         let controls = RowControls {
             row: row.clone(),
             spinner,
+            warning,
+            latency,
             state,
-            chips,
             toggle,
+            edit,
+            details: Rc::new(RefCell::new(Vec::new())),
             syncing_toggle,
             applied: Rc::new(RefCell::new(None)),
         };
@@ -281,14 +311,42 @@ fn apply_row(controls: &RowControls, row: &SessionRow) {
     if controls.applied.borrow().as_ref() == Some(row) {
         return;
     }
+    let changed_details = controls
+        .applied
+        .borrow()
+        .as_ref()
+        .map(|applied| applied.details != row.details)
+        .unwrap_or(true);
     *controls.applied.borrow_mut() = Some(row.clone());
     controls.row.set_title(&row.profile);
-    controls.row.set_subtitle(&session_subtitle(row));
+    controls.row.set_subtitle(&row.headline);
     controls.row.set_sensitive(!row.busy);
     controls.spinner.set_spinning(row.busy);
     controls.spinner.set_visible(row.busy);
+
+    match &row.warning {
+        Some(chip) => {
+            controls.warning.set_label(&chip.text);
+            controls.warning.set_tooltip_text(chip.tooltip.as_deref());
+            controls.warning.set_visible(true);
+        }
+        None => controls.warning.set_visible(false),
+    }
+    match &row.latency {
+        Some(text) => {
+            controls.latency.set_label(text);
+            controls.latency.set_visible(true);
+        }
+        None => controls.latency.set_visible(false),
+    }
     set_state_label(&controls.state, row.state);
-    set_chips(&controls.chips, &row.chips);
+
+    // Detail rows are rebuilt only when they actually changed: the page polls
+    // twice a second, and removing and re-adding rows under the pointer makes
+    // an expanded row unusable.
+    if changed_details {
+        set_details(controls, &row.details);
+    }
 
     // `set_active` emits the same signal as a user's click. Polling must not
     // turn its own repaint into an UpProfile/Down request every 500 ms.
@@ -297,19 +355,53 @@ fn apply_row(controls: &RowControls, row: &SessionRow) {
     controls.syncing_toggle.set(false);
 }
 
-fn session_subtitle(row: &SessionRow) -> String {
-    if row.state == SessionRowState::Error {
-        return row
-            .error
-            .clone()
-            .unwrap_or_else(|| "The session failed".to_string());
+fn set_details(controls: &RowControls, details: &[SessionDetail]) {
+    for previous in controls.details.borrow_mut().drain(..) {
+        controls.row.remove(&previous);
     }
-    match (row.server.is_empty(), row.description.is_empty()) {
-        (false, false) => format!("{} · {}", row.server, row.description),
-        (false, true) => row.server.clone(),
-        (true, false) => row.description.clone(),
-        (true, true) => String::new(),
+    // Asked of the widget rather than inferred from the detail count: a session
+    // with no details still gets the edit row, so "details were empty" is not
+    // the same question as "the edit row is already in there", and answering the
+    // wrong one adds it a second time on every repaint.
+    if controls.edit.parent().is_some() {
+        controls.row.remove(&controls.edit);
     }
+    let mut built = Vec::with_capacity(details.len());
+    for detail in details {
+        let row = adw::ActionRow::builder()
+            .title(&detail.label)
+            .subtitle(&detail.value)
+            .subtitle_selectable(true)
+            .build();
+        // On the row rather than on a help icon beside it: the whole row is the
+        // hover target already, and an icon whose only job is to be hovered is
+        // a second thing to notice for one sentence.
+        if let Some(tooltip) = &detail.tooltip {
+            row.set_tooltip_text(Some(tooltip));
+        }
+        if detail.copyable {
+            let copy = gtk::Button::builder()
+                .icon_name("edit-copy-symbolic")
+                .tooltip_text("Copy")
+                .valign(gtk::Align::Center)
+                .css_classes(["flat"])
+                .build();
+            copy.connect_clicked({
+                let value = detail.value.clone();
+                move |button| {
+                    if let Some(display) = gtk::gdk::Display::default() {
+                        display.clipboard().set_text(&value);
+                    }
+                    button.set_icon_name("object-select-symbolic");
+                }
+            });
+            row.add_suffix(&copy);
+        }
+        controls.row.add_row(&row);
+        built.push(row);
+    }
+    controls.row.add_row(&controls.edit);
+    *controls.details.borrow_mut() = built;
 }
 
 fn set_state_label(label: &gtk::Label, state: SessionRowState) {
@@ -331,49 +423,20 @@ fn set_state_label(label: &gtk::Label, state: SessionRowState) {
     label.add_css_class(class);
 }
 
-fn set_chips(container: &gtk::FlowBox, chips: &[SessionChip]) {
-    while let Some(child) = container.first_child() {
-        let child = child
-            .downcast::<gtk::FlowBoxChild>()
-            .expect("GtkFlowBox owns FlowBoxChild wrappers");
-        container.remove(&child);
-    }
-    for chip in chips {
-        let label = gtk::Label::builder()
-            .label(&chip.text)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["session-chip", chip_class(chip.kind)])
-            .build();
-        label.set_tooltip_text(chip.tooltip.as_deref());
-        container.insert(&label, -1);
-    }
-    container.set_visible(!chips.is_empty());
-}
-
-fn chip_class(kind: SessionChipKind) -> &'static str {
-    match kind {
-        SessionChipKind::Pool => "session-chip-pool",
-        SessionChipKind::Stale => "session-chip-stale",
-        SessionChipKind::Interface => "session-chip-interface",
-        SessionChipKind::Inbound => "session-chip-inbound",
-        SessionChipKind::Latency => "session-chip-latency",
-        SessionChipKind::SystemProxy => "session-chip-system-proxy",
-        SessionChipKind::ProxyOnly => "session-chip-proxy-only",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::reduce::SessionWarning;
 
     fn row(state: SessionRowState) -> SessionRow {
         SessionRow {
             profile: "work".to_string(),
             state,
-            server: "ch-trojan".to_string(),
+            headline: "ch-trojan".to_string(),
             pool: false,
-            description: "Office tunnel".to_string(),
-            chips: Vec::new(),
+            latency: None,
+            warning: None,
+            details: Vec::new(),
             toggle_on: false,
             busy: false,
             error: None,
@@ -381,27 +444,25 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_session_says_why_instead_of_which_server_it_was_pointed_at() {
-        let mut failed = row(SessionRowState::Error);
-        failed.error = Some("tun2socks exited".to_string());
-        assert_eq!(session_subtitle(&failed), "tun2socks exited");
+    fn a_row_with_no_warning_and_no_reading_shows_neither_badge() {
+        // Both badges are `visible(false)` until there is something to say, so
+        // an ordinary connected session carries exactly one pill — its state.
+        let plain = row(SessionRowState::Connected);
+        assert!(plain.warning.is_none());
+        assert!(plain.latency.is_none());
 
-        // A daemon that reports the failure without a message still has to
-        // leave the row saying something other than "everything is fine".
-        failed.error = None;
-        assert_eq!(session_subtitle(&failed), "The session failed");
-    }
-
-    #[test]
-    fn a_running_session_reads_as_server_then_description() {
-        let mut running = row(SessionRowState::Connected);
-        assert_eq!(session_subtitle(&running), "ch-trojan · Office tunnel");
-        running.description.clear();
-        assert_eq!(session_subtitle(&running), "ch-trojan");
-        running.server.clear();
-        running.description = "Office tunnel".to_string();
-        assert_eq!(session_subtitle(&running), "Office tunnel");
-        running.description.clear();
-        assert_eq!(session_subtitle(&running), "");
+        let stale = SessionRow {
+            warning: Some(SessionWarning {
+                text: "stale".to_string(),
+                tooltip: Some("Reconnect to pick up new servers".to_string()),
+            }),
+            latency: Some("210 ms".to_string()),
+            ..plain
+        };
+        let warning = stale.warning.as_ref().expect("just set");
+        assert_eq!(warning.text, "stale");
+        // The badge is the number alone; its age lives in the detail rows,
+        // where there is room to read it.
+        assert_eq!(stale.latency.as_deref(), Some("210 ms"));
     }
 }
