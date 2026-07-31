@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 
+use crate::core_options::ResolvedCore;
 use crate::model::{OutboundSpec, Server};
 use crate::proc::{push_log, spawn_reader, stop_child};
 use crate::xray::config;
@@ -133,11 +134,17 @@ impl XrayCore {
     }
 
     /// Start (or restart) the core for `server`.
-    pub fn connect(&mut self, server: &Server, bind: Ipv4Addr, profile: &str) -> Result<()> {
+    pub fn connect(
+        &mut self,
+        server: &Server,
+        bind: Ipv4Addr,
+        profile: &str,
+        core: &ResolvedCore,
+    ) -> Result<()> {
         self.disconnect();
         self.set_status(Status::Connecting);
         crate::sync::lock(&self.logs).clear();
-        match self.try_connect(server, bind, profile) {
+        match self.try_connect(server, bind, profile, core) {
             Ok(()) => Ok(()),
             Err(error) => {
                 // `{:#}` keeps the anyhow cause chain: the outermost context
@@ -157,11 +164,12 @@ impl XrayCore {
         bind: Ipv4Addr,
         api_port: u16,
         profile: &str,
+        core: &ResolvedCore,
     ) -> Result<()> {
         self.disconnect();
         self.set_status(Status::Connecting);
         crate::sync::lock(&self.logs).clear();
-        match self.try_connect_pool(spec, bind, api_port, profile) {
+        match self.try_connect_pool(spec, bind, api_port, profile, core) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let message = format!("{error:#}");
@@ -211,12 +219,18 @@ impl XrayCore {
         }
     }
 
-    fn try_connect(&mut self, server: &Server, bind: Ipv4Addr, profile: &str) -> Result<()> {
+    fn try_connect(
+        &mut self,
+        server: &Server,
+        bind: Ipv4Addr,
+        profile: &str,
+        core: &ResolvedCore,
+    ) -> Result<()> {
         // Resolve before checking ports: a busy port must not mask a missing core.
         let xray = self.resolve_binary()?;
         self.preflight_notes(server);
         self.ensure_ports_free(bind, None)?;
-        let cfg = config::generate(server, bind, self.socks_port, self.http_port);
+        let cfg = config::generate(server, bind, self.socks_port, self.http_port, core);
         self.spawn_config(&xray, &cfg, profile)?;
         self.active = Some(server.clone());
         Ok(())
@@ -228,13 +242,15 @@ impl XrayCore {
         bind: Ipv4Addr,
         api_port: u16,
         profile: &str,
+        core: &ResolvedCore,
     ) -> Result<()> {
         let xray = self.resolve_binary()?;
         for member in spec.members {
             self.preflight_notes(member);
         }
         self.ensure_ports_free(bind, Some(api_port))?;
-        let cfg = config::generate_pool(spec, bind, self.socks_port, self.http_port, api_port)?;
+        let cfg =
+            config::generate_pool(spec, bind, self.socks_port, self.http_port, api_port, core)?;
         self.spawn_config(&xray, &cfg, profile)?;
         self.active = None;
         Ok(())

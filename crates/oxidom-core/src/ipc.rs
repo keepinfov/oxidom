@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::LatencyMethod;
+use crate::core_options::CoreOptions;
 use crate::xray::core::Status;
 use crate::xray::resolve::XraySource;
 
@@ -342,6 +343,11 @@ pub struct ProfileEntry {
     pub interface: crate::profile::ProfileInterface,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<crate::pool::PoolQuery>,
+    /// The profile's `[core]` section, carried for the same reason as
+    /// `interface`: the GUI does not show these settings yet, and a save that
+    /// dropped them would quietly un-fragment a profile that needed it.
+    #[serde(default, skip_serializing_if = "CoreOptions::is_unset")]
+    pub core: CoreOptions,
 }
 
 /// The selected server returned after bringing a profile up.

@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::core_options::{CoreOptions, Origin};
 use crate::ipc::{InterfaceInfo, ProfileEntry, SelectionInfo, SessionInfo};
 use crate::model::{Server, Subscription, UserInfo};
 
@@ -214,12 +215,316 @@ pub struct EgressCache {
     pub at_unix_ms: u64,
 }
 
+/// One resolved core setting and the level it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreSettingOutput {
+    pub setting: String,
+    pub value: String,
+    /// `built-in`, `global`, or `profile`.
+    pub origin: String,
+}
+
+/// What `oxidom core show` prints.
+///
+/// A row exists exactly when the generated config will carry the key, so the
+/// table reads as the config rather than as the union of everything settable:
+/// listing `mux.concurrency` under a disabled `mux` would describe a value that
+/// never reaches the core.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreOutput {
+    pub profile: String,
+    pub settings: Vec<CoreSettingOutput>,
+}
+
+impl CoreOutput {
+    pub fn new(profile_name: &str, global: &CoreOptions, profile: &CoreOptions) -> Self {
+        let resolved = CoreOptions::resolve(global, profile);
+        let mut settings = Vec::new();
+        let mut row = |setting: &str, value: String, origin: Origin| {
+            settings.push(CoreSettingOutput {
+                setting: setting.to_string(),
+                value,
+                origin: origin.as_str().to_string(),
+            });
+        };
+
+        row(
+            "log_level",
+            resolved.log_level.as_xray().to_string(),
+            Origin::of(global.log_level.as_ref(), profile.log_level.as_ref()),
+        );
+        row(
+            "domain_strategy",
+            resolved.domain_strategy.as_xray().to_string(),
+            Origin::of(
+                global.domain_strategy.as_ref(),
+                profile.domain_strategy.as_ref(),
+            ),
+        );
+
+        row(
+            "sniffing.enabled",
+            resolved.sniffing.enabled.to_string(),
+            Origin::of(
+                global.sniffing.enabled.as_ref(),
+                profile.sniffing.enabled.as_ref(),
+            ),
+        );
+        if resolved.sniffing.enabled {
+            row(
+                "sniffing.dest_override",
+                resolved
+                    .sniffing
+                    .dest_override
+                    .iter()
+                    .map(|kind| kind.as_xray())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                Origin::of(
+                    global.sniffing.dest_override.as_ref(),
+                    profile.sniffing.dest_override.as_ref(),
+                ),
+            );
+            row(
+                "sniffing.route_only",
+                resolved.sniffing.route_only.to_string(),
+                Origin::of(
+                    global.sniffing.route_only.as_ref(),
+                    profile.sniffing.route_only.as_ref(),
+                ),
+            );
+        }
+
+        let mux_origin = Origin::of(global.mux.enabled.as_ref(), profile.mux.enabled.as_ref());
+        row(
+            "mux.enabled",
+            resolved.mux.is_some().to_string(),
+            mux_origin,
+        );
+        if let Some(mux) = &resolved.mux {
+            if let Some(concurrency) = mux.concurrency {
+                row(
+                    "mux.concurrency",
+                    concurrency.to_string(),
+                    Origin::of(
+                        global.mux.concurrency.as_ref(),
+                        profile.mux.concurrency.as_ref(),
+                    ),
+                );
+            }
+            if let Some(concurrency) = mux.xudp_concurrency {
+                row(
+                    "mux.xudp_concurrency",
+                    concurrency.to_string(),
+                    Origin::of(
+                        global.mux.xudp_concurrency.as_ref(),
+                        profile.mux.xudp_concurrency.as_ref(),
+                    ),
+                );
+            }
+            if let Some(mode) = mux.xudp_proxy_udp_443 {
+                row(
+                    "mux.xudp_proxy_udp_443",
+                    mode.as_xray().to_string(),
+                    Origin::of(
+                        global.mux.xudp_proxy_udp_443.as_ref(),
+                        profile.mux.xudp_proxy_udp_443.as_ref(),
+                    ),
+                );
+            }
+        }
+
+        let fragment = resolved.dialer.as_ref().and_then(|d| d.fragment.as_ref());
+        row(
+            "fragment.enabled",
+            fragment.is_some().to_string(),
+            Origin::of(
+                global.fragment.enabled.as_ref(),
+                profile.fragment.enabled.as_ref(),
+            ),
+        );
+        if let Some(fragment) = fragment {
+            for (setting, value, global_field, profile_field) in [
+                (
+                    "fragment.packets",
+                    &fragment.packets,
+                    &global.fragment.packets,
+                    &profile.fragment.packets,
+                ),
+                (
+                    "fragment.length",
+                    &fragment.length,
+                    &global.fragment.length,
+                    &profile.fragment.length,
+                ),
+                (
+                    "fragment.interval",
+                    &fragment.interval,
+                    &global.fragment.interval,
+                    &profile.fragment.interval,
+                ),
+            ] {
+                row(
+                    setting,
+                    value.clone(),
+                    Origin::of(global_field.as_ref(), profile_field.as_ref()),
+                );
+            }
+        }
+
+        let noises = resolved
+            .dialer
+            .as_ref()
+            .map(|dialer| dialer.noises.len())
+            .unwrap_or(0);
+        if noises > 0 {
+            row(
+                "noises",
+                noises.to_string(),
+                Origin::of(global.noises.as_ref(), profile.noises.as_ref()),
+            );
+        }
+
+        if let Some(dns) = &resolved.dns {
+            row(
+                "dns.server",
+                dns.server.clone(),
+                Origin::of(global.dns.server.as_ref(), profile.dns.server.as_ref()),
+            );
+            if let Some(direct) = &dns.direct_server {
+                row(
+                    "dns.direct_server",
+                    direct.clone(),
+                    Origin::of(
+                        global.dns.direct_server.as_ref(),
+                        profile.dns.direct_server.as_ref(),
+                    ),
+                );
+            }
+            row(
+                "dns.query_strategy",
+                dns.query_strategy.as_xray().to_string(),
+                Origin::of(
+                    global.dns.query_strategy.as_ref(),
+                    profile.dns.query_strategy.as_ref(),
+                ),
+            );
+        }
+
+        CoreOutput {
+            profile: profile_name.to_string(),
+            settings,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_options::{FragmentOptions, LogLevel, MuxOptions};
     use crate::ipc::SessionInfo;
     use crate::link::parse_link;
     use crate::model::{Subscription, UserInfo};
+
+    fn rows(output: &CoreOutput) -> Vec<(&str, &str, &str)> {
+        output
+            .settings
+            .iter()
+            .map(|setting| {
+                (
+                    setting.setting.as_str(),
+                    setting.value.as_str(),
+                    setting.origin.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_untouched_machine_reports_every_setting_as_built_in() {
+        let output = CoreOutput::new("default", &CoreOptions::default(), &CoreOptions::default());
+
+        assert!(
+            output
+                .settings
+                .iter()
+                .all(|setting| setting.origin == "built-in"),
+            "{:?}",
+            rows(&output)
+        );
+        assert_eq!(
+            rows(&output),
+            [
+                ("log_level", "warning", "built-in"),
+                ("domain_strategy", "IPIfNonMatch", "built-in"),
+                ("sniffing.enabled", "true", "built-in"),
+                ("sniffing.dest_override", "http,tls", "built-in"),
+                ("sniffing.route_only", "false", "built-in"),
+                ("mux.enabled", "false", "built-in"),
+                ("fragment.enabled", "false", "built-in"),
+            ]
+        );
+    }
+
+    /// The table has to answer "why is it this value", which is the whole
+    /// reason two levels are worth reporting at all.
+    #[test]
+    fn each_row_names_the_level_that_decided_it() {
+        let global = CoreOptions {
+            log_level: Some(LogLevel::Error),
+            mux: MuxOptions {
+                enabled: Some(true),
+                concurrency: Some(4),
+                ..MuxOptions::default()
+            },
+            ..CoreOptions::default()
+        };
+        let profile = CoreOptions {
+            mux: MuxOptions {
+                concurrency: Some(16),
+                ..MuxOptions::default()
+            },
+            ..CoreOptions::default()
+        };
+
+        let output = CoreOutput::new("work", &global, &profile);
+        let rows = rows(&output);
+
+        assert_eq!(output.profile, "work");
+        assert!(rows.contains(&("log_level", "error", "global")));
+        // Enabled globally, tuned in the profile: two levels in one section.
+        assert!(rows.contains(&("mux.enabled", "true", "global")));
+        assert!(rows.contains(&("mux.concurrency", "16", "profile")));
+    }
+
+    /// A row exists exactly when the key reaches the config, so a disabled
+    /// section must not list the knobs that would be inert under it.
+    #[test]
+    fn a_disabled_section_lists_nothing_but_the_switch() {
+        let output = CoreOutput::new(
+            "default",
+            &CoreOptions {
+                mux: MuxOptions {
+                    concurrency: Some(8),
+                    ..MuxOptions::default()
+                },
+                fragment: FragmentOptions {
+                    length: Some("40-60".to_string()),
+                    ..FragmentOptions::default()
+                },
+                ..CoreOptions::default()
+            },
+            &CoreOptions::default(),
+        );
+        let rows = rows(&output);
+
+        assert!(rows.contains(&("mux.enabled", "false", "built-in")));
+        assert!(!rows.iter().any(|(name, ..)| *name == "mux.concurrency"));
+        assert!(rows.contains(&("fragment.enabled", "false", "built-in")));
+        assert!(!rows.iter().any(|(name, ..)| *name == "fragment.length"));
+        // No DNS server means no `dns` block at all, so no rows describing one.
+        assert!(!rows.iter().any(|(name, ..)| name.starts_with("dns.")));
+    }
 
     #[test]
     fn status_json_shape_is_frozen() {
@@ -312,6 +617,7 @@ mod tests {
             http_port: 12081,
             interface: Default::default(),
             pool: None,
+            core: Default::default(),
         }];
 
         assert_eq!(

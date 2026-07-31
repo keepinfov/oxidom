@@ -4,7 +4,10 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use oxidom_core::config::{Config, LatencyMethod};
+use oxidom_core::core_options::CoreOptions;
 use oxidom_core::ipc::RuntimeInfo;
+
+use super::core_editor::{CoreEditor, CoreLevel};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsValues {
@@ -22,6 +25,9 @@ pub struct SettingsValues {
     pub tun2socks_binary: String,
     /// Kept for the same reason as tun2socks.
     pub nft_binary: String,
+    /// The machine-wide `[core]`. Every profile that does not override a
+    /// section inherits it, and so do latency probes.
+    pub core: CoreOptions,
 }
 
 impl From<&Config> for SettingsValues {
@@ -37,6 +43,7 @@ impl From<&Config> for SettingsValues {
             xray_binary: config.xray_binary.clone(),
             tun2socks_binary: config.tun2socks_binary.clone(),
             nft_binary: config.nft_binary.clone(),
+            core: config.core.clone(),
         }
     }
 }
@@ -48,16 +55,23 @@ pub struct SettingsState {
     pub applying: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettingsValidation {
     pub ports: Option<&'static str>,
     pub latency_url: Option<&'static str>,
     pub xray_binary: Option<&'static str>,
+    /// Not a `&'static str` like its neighbours: this one names the offending
+    /// value, because "must be a number or a range" without saying which field
+    /// or what it read is no help among a dozen core rows.
+    pub core: Option<String>,
 }
 
 impl SettingsValidation {
-    pub fn is_valid(self) -> bool {
-        self.ports.is_none() && self.latency_url.is_none() && self.xray_binary.is_none()
+    pub fn is_valid(&self) -> bool {
+        self.ports.is_none()
+            && self.latency_url.is_none()
+            && self.xray_binary.is_none()
+            && self.core.is_none()
     }
 }
 
@@ -109,9 +123,11 @@ struct SettingsWidgets {
     tun2socks_binary: adw::EntryRow,
     nft_binary: adw::EntryRow,
     xray_effective: adw::ActionRow,
+    core: CoreEditor,
     ports_error: gtk::Label,
     url_error: gtk::Label,
     xray_error: gtk::Label,
+    core_error: gtk::Label,
     apply: gtk::Button,
     reset: gtk::Button,
 }
@@ -136,6 +152,7 @@ impl SettingsWidgets {
             xray_binary: self.xray_binary.text().trim().to_string(),
             tun2socks_binary: self.tun2socks_binary.text().trim().to_string(),
             nft_binary: self.nft_binary.text().trim().to_string(),
+            core: self.core.values(),
         }
     }
 
@@ -155,6 +172,9 @@ impl SettingsWidgets {
         self.xray_binary.set_text(&values.xray_binary);
         self.tun2socks_binary.set_text(&values.tun2socks_binary);
         self.nft_binary.set_text(&values.nft_binary);
+        // Nothing sits below `config.toml`, so the editor inherits from the
+        // built-in defaults — an untouched table.
+        self.core.set_values(&CoreOptions::default(), &values.core);
     }
 }
 
@@ -185,7 +205,7 @@ impl SettingsView {
     /// Builds a settings editor. `on_apply` is called only after the user
     /// explicitly activates Apply; editing never persists configuration.
     pub fn new(config: &Config, on_apply: impl Fn(SettingsValues) + 'static) -> Self {
-        let applied = SettingsValues::from(config);
+        let mut applied = SettingsValues::from(config);
         let socks = adw::SpinRow::with_range(1.0, 65535.0, 1.0);
         socks.set_title("SOCKS port");
         socks.set_subtitle("Local port other apps can use as a SOCKS5 proxy");
@@ -269,9 +289,18 @@ impl SettingsView {
             .build();
         xray_effective.add_css_class("property");
 
+        let core = CoreEditor::new(CoreLevel::Machine, &CoreOptions::default(), &applied.core);
+        // A hand-written `[core] log_level = "warning"` says the same thing as
+        // no `[core]` at all, and the editor stores the shorter of the two. The
+        // baseline has to agree, or the page would open already dirty over a
+        // difference nobody made and Apply could not remove.
+        applied.core = core.values();
+
         let ports_error = validation_label();
         let url_error = validation_label();
         let xray_error = validation_label();
+        let core_error = validation_label();
+        core.group.add(&core_error);
 
         let proxy_group = adw::PreferencesGroup::builder()
             .title("Local proxy")
@@ -314,6 +343,9 @@ impl SettingsView {
         root.add(&proxy_group);
         root.add(&xray_group);
         root.add(&latency_group);
+        // Below Latency, above the paths: these change what the tunnel does,
+        // which puts them above the rows that only say where binaries live.
+        root.add(&core.group);
         root.add(&advanced_group);
 
         let apply = gtk::Button::builder()
@@ -342,9 +374,11 @@ impl SettingsView {
             tun2socks_binary,
             nft_binary,
             xray_effective,
+            core,
             ports_error,
             url_error,
             xray_error,
+            core_error,
             apply,
             reset,
         };
@@ -603,6 +637,10 @@ fn connect_draft_signals(
             refresh_state(&widgets, &model);
         })
     };
+    widgets.core.connect_changed({
+        let update = update.clone();
+        move || update()
+    });
     widgets.socks.connect_value_notify({
         let update = update.clone();
         move |_| update()
@@ -667,6 +705,7 @@ fn refresh_state(widgets: &SettingsWidgets, model: &Rc<RefCell<SettingsModel>>) 
     set_validation_message(&widgets.ports_error, validation.ports);
     set_validation_message(&widgets.url_error, validation.latency_url);
     set_validation_message(&widgets.xray_error, validation.xray_binary);
+    set_validation_message(&widgets.core_error, validation.core.as_deref());
     widgets
         .apply
         .set_sensitive(state.dirty && state.valid && !state.applying);
@@ -728,10 +767,20 @@ fn validate(values: &SettingsValues) -> SettingsValidation {
     } else {
         None
     };
+    // The same check the daemon and `oxidom profile edit` run, borrowed rather
+    // than restated: the core takes a reversed range or an out-of-band
+    // concurrency without a word and then quietly does nothing with it, so
+    // there is no later moment at which a wrong value announces itself.
+    let core = values
+        .core
+        .validate("core")
+        .err()
+        .map(|error| error.to_string().trim_start_matches("[core] ").to_string());
     SettingsValidation {
         ports,
         latency_url,
         xray_binary,
+        core,
     }
 }
 
@@ -751,6 +800,7 @@ mod tests {
             xray_binary: String::new(),
             tun2socks_binary: String::new(),
             nft_binary: String::new(),
+            core: CoreOptions::default(),
         }
     }
 
@@ -836,6 +886,26 @@ mod tests {
                 "{valid:?} should be accepted"
             );
         }
+    }
+
+    /// The core takes a reversed range without a word and then fragments
+    /// nothing, so Apply is the last moment at which a wrong value can be
+    /// pointed at — nothing downstream will ever complain about it.
+    #[test]
+    fn a_core_value_the_xray_core_would_swallow_blocks_apply() {
+        let mut draft = values();
+        draft.core.fragment.length = Some("200-100".into());
+
+        let validation = validate(&draft);
+        assert!(!validation.is_valid());
+        let message = validation.core.expect("the range runs backwards");
+        assert!(message.contains("runs backwards"), "{message}");
+        // The section prefix belongs in a file, not on a row that is already
+        // inside the group it names.
+        assert!(!message.starts_with("[core]"), "{message}");
+
+        draft.core.fragment.length = Some("100-200".into());
+        assert!(validate(&draft).is_valid());
     }
 
     #[test]

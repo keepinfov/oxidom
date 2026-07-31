@@ -4,6 +4,7 @@ use std::net::Ipv4Addr;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::core_options::{ResolvedCore, ResolvedDialer, ResolvedDns, ResolvedMux};
 use crate::model::{Hysteria2Settings, OutboundSpec, Server, StreamSettings};
 
 // The pool generator has no Config parameter, and an observatory needs one
@@ -21,12 +22,27 @@ const SELECTABLE_TAG_PREFIX: &str = "s-";
 /// Balancer tag oxidom's own catch-all routing rule dispatches to.
 const BALANCER_TAG: &str = "pool";
 
+/// The `freedom` outbound that proxy outbounds dial through when fragmentation
+/// or noises are configured.
+///
+/// Named for the job rather than for fragmentation, because noises can be asked
+/// for without it. Note that it does **not** start with [`SELECTABLE_TAG_PREFIX`]:
+/// a balancer selector must never be able to resolve to it, or a pool would send
+/// traffic straight out through freedom while the UI still said Connected.
+const DIALER_TAG: &str = "dialer";
+
 /// The balancer strategies Xray accepts. Anything else is a provider typo or an
 /// injection attempt, and both should land on the same safe default.
 const BALANCER_STRATEGIES: [&str; 4] = ["random", "roundRobin", "leastPing", "leastLoad"];
 
 /// Generate a full Xray config JSON for `server`, with local SOCKS + HTTP inbounds.
-pub fn generate(server: &Server, bind: Ipv4Addr, socks_port: u16, http_port: u16) -> Value {
+pub fn generate(
+    server: &Server,
+    bind: Ipv4Addr,
+    socks_port: u16,
+    http_port: u16,
+    core: &ResolvedCore,
+) -> Value {
     match &server.spec {
         OutboundSpec::XrayProfile {
             proxy_outbounds,
@@ -43,7 +59,7 @@ pub fn generate(server: &Server, bind: Ipv4Addr, socks_port: u16, http_port: u16
             // namespace we own and rebuild the balancer around that prefix, so
             // the selector can only ever resolve to a proxy outbound.
             let namespaced = namespace_outbounds(proxy_outbounds);
-            let mut config = scaffold(bind, socks_port, http_port, namespaced);
+            let mut config = scaffold(bind, socks_port, http_port, namespaced, core);
             config["routing"]["rules"] = json!([
                 { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
                 { "type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG }
@@ -70,7 +86,7 @@ pub fn generate(server: &Server, bind: Ipv4Addr, socks_port: u16, http_port: u16
             config
         }
         _ => {
-            let mut config = scaffold(bind, socks_port, http_port, vec![outbound(server)]);
+            let mut config = scaffold(bind, socks_port, http_port, vec![outbound(server)], core);
             config["routing"]["rules"] = json!([
                 { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" }
             ]);
@@ -96,6 +112,7 @@ pub fn generate_pool(
     socks_port: u16,
     http_port: u16,
     api_port: u16,
+    core: &ResolvedCore,
 ) -> Result<Value> {
     let PoolSpec {
         members,
@@ -124,7 +141,7 @@ pub fn generate_pool(
         outbounds.push(outbound);
     }
 
-    let mut config = scaffold(bind, socks_port, http_port, outbounds);
+    let mut config = scaffold(bind, socks_port, http_port, outbounds, core);
     config["inbounds"]
         .as_array_mut()
         .expect("the shared scaffold always has inbounds")
@@ -225,11 +242,23 @@ fn scaffold(
     socks_port: u16,
     http_port: u16,
     mut proxy_outbounds: Vec<Value>,
+    core: &ResolvedCore,
 ) -> Value {
+    // Only the proxy outbounds are multiplexed and dialed through the dialer.
+    // `direct` and `block` are appended below and must stay untouched — and the
+    // dialer must never be told to dial through itself.
+    for outbound in &mut proxy_outbounds {
+        apply_outbound_core(outbound, core);
+    }
+    if let Some(dialer) = &core.dialer {
+        proxy_outbounds.push(dialer_outbound(dialer));
+    }
     proxy_outbounds.push(json!({ "protocol": "freedom", "tag": "direct" }));
     proxy_outbounds.push(json!({ "protocol": "blackhole", "tag": "block" }));
-    json!({
-        "log": { "loglevel": "warning" },
+
+    let sniffing = sniffing_block(core);
+    let mut config = json!({
+        "log": { "loglevel": core.log_level.as_xray() },
         "inbounds": [
             {
                 "tag": "socks-in",
@@ -237,18 +266,118 @@ fn scaffold(
                 "port": socks_port,
                 "protocol": "socks",
                 "settings": { "auth": "noauth", "udp": true },
-                "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+                "sniffing": sniffing
             },
             {
                 "tag": "http-in",
                 "listen": bind.to_string(),
                 "port": http_port,
                 "protocol": "http",
-                "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+                "sniffing": sniffing
             }
         ],
         "outbounds": proxy_outbounds,
-        "routing": { "domainStrategy": "IPIfNonMatch" }
+        "routing": { "domainStrategy": core.domain_strategy.as_xray() }
+    });
+    if let Some(dns) = &core.dns {
+        config["dns"] = dns_block(dns);
+    }
+    config
+}
+
+/// `routeOnly` is emitted only when asked for, because `false` is the core's own
+/// default and writing it would move bytes in a config nobody changed.
+fn sniffing_block(core: &ResolvedCore) -> Value {
+    let dest_override = core
+        .sniffing
+        .dest_override
+        .iter()
+        .map(|kind| kind.as_xray())
+        .collect::<Vec<_>>();
+    let mut sniffing = json!({
+        "enabled": core.sniffing.enabled,
+        "destOverride": dest_override
+    });
+    if core.sniffing.route_only {
+        sniffing["routeOnly"] = json!(true);
+    }
+    sniffing
+}
+
+/// The direct resolver comes first and is scoped to `geosite:private`, so a name
+/// the local network answers is not sent to the resolver behind the tunnel.
+/// `geosite:private` is a real list — the core rejects an unknown one outright,
+/// which is what makes this safe to emit unconditionally alongside a server.
+fn dns_block(dns: &ResolvedDns) -> Value {
+    let mut servers = Vec::with_capacity(2);
+    if let Some(direct) = &dns.direct_server {
+        servers.push(json!({
+            "address": direct,
+            "domains": ["geosite:private"],
+            "skipFallback": true
+        }));
+    }
+    servers.push(json!(dns.server));
+    json!({
+        "servers": servers,
+        "queryStrategy": dns.query_strategy.as_xray()
+    })
+}
+
+/// Attach the per-outbound half of the core settings.
+///
+/// Done here rather than inside [`outbound_tagged`] because `mux` and `sockopt`
+/// are the same two keys on all eight protocol shapes; threading them through
+/// the match would repeat the logic once per arm and let the arms drift.
+fn apply_outbound_core(outbound: &mut Value, core: &ResolvedCore) {
+    if let Some(mux) = &core.mux {
+        outbound["mux"] = mux_block(mux);
+    }
+    if core.dialer.is_some() {
+        // `sockopt` hangs off `streamSettings`, which the plain protocols
+        // (shadowsocks, socks, http) do not otherwise emit at all; indexing
+        // creates the objects on the way down. Only `dialerProxy` is written,
+        // so an imported profile's own sockopt keys survive.
+        outbound["streamSettings"]["sockopt"]["dialerProxy"] = json!(DIALER_TAG);
+    }
+}
+
+fn mux_block(mux: &ResolvedMux) -> Value {
+    trim_obj(json!({
+        "enabled": true,
+        "concurrency": mux.concurrency,
+        "xudpConcurrency": mux.xudp_concurrency,
+        "xudpProxyUDP443": mux.xudp_proxy_udp_443.map(|mode| mode.as_xray())
+    }))
+}
+
+fn dialer_outbound(dialer: &ResolvedDialer) -> Value {
+    let noises = dialer
+        .noises
+        .iter()
+        .map(|noise| {
+            json!({
+                "type": noise.kind.as_xray(),
+                "packet": noise.packet,
+                "delay": noise.delay
+            })
+        })
+        .collect::<Vec<_>>();
+    let fragment = dialer.fragment.as_ref().map(|fragment| {
+        json!({
+            "packets": fragment.packets,
+            "length": fragment.length,
+            "interval": fragment.interval
+        })
+    });
+
+    json!({
+        "tag": DIALER_TAG,
+        "protocol": "freedom",
+        "settings": trim_obj(json!({
+            "fragment": fragment,
+            "noises": (!noises.is_empty()).then_some(noises)
+        }))
     })
 }
 
@@ -476,7 +605,11 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{PoolSpec, generate, generate_pool};
+    use super::{DIALER_TAG, PoolSpec, SELECTABLE_TAG_PREFIX, generate, generate_pool};
+    use crate::core_options::{
+        CoreOptions, DestOverride, DnsOptions, DomainStrategy, FragmentOptions, LogLevel,
+        MuxOptions, Noise, NoiseKind, QueryStrategy, ResolvedCore, SniffingOptions, XudpMode,
+    };
     use crate::model::{
         Hysteria2Obfs, Hysteria2Settings, OutboundSpec, PortRange, Protocol, Server, StreamSettings,
     };
@@ -505,7 +638,13 @@ mod tests {
             latency_ms: None,
         };
 
-        let config = generate(&server, Ipv4Addr::LOCALHOST, 10808, 10809);
+        let config = generate(
+            &server,
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
         assert_eq!(config["inbounds"][0]["port"], 10808);
         assert_eq!(config["outbounds"].as_array().map(Vec::len), Some(4));
         assert_eq!(config["routing"]["rules"][0]["ip"][0], "geoip:private");
@@ -554,7 +693,13 @@ mod tests {
                 latency_ms: None,
             };
 
-            let config = generate(&server, Ipv4Addr::LOCALHOST, 10808, 10809);
+            let config = generate(
+                &server,
+                Ipv4Addr::LOCALHOST,
+                10808,
+                10809,
+                &ResolvedCore::default(),
+            );
             let balancers = config["routing"]["balancers"].as_array().unwrap();
             assert_eq!(balancers.len(), 1, "{hostile}");
             assert_eq!(balancers[0]["selector"], json!(["s-"]), "{hostile}");
@@ -600,7 +745,13 @@ mod tests {
             latency_ms: None,
         };
 
-        let config = generate(&server, Ipv4Addr::LOCALHOST, 10808, 10809);
+        let config = generate(
+            &server,
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
         assert_eq!(
             config["burstObservatory"]["pingConfig"]["destination"],
             super::POOL_PROBE_DESTINATION
@@ -663,7 +814,13 @@ mod tests {
 
     #[test]
     fn default_bind_keeps_the_legacy_config_bytes() {
-        let generated = generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809);
+        let generated = generate(
+            &socks_server(),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
         let legacy = json!({
             "log": { "loglevel": "warning" },
             "inbounds": [
@@ -725,6 +882,7 @@ mod tests {
             10808,
             10809,
             10810,
+            &ResolvedCore::default(),
         )
         .unwrap();
 
@@ -778,6 +936,292 @@ mod tests {
             .collect()
     }
 
+    /// Core settings as they arrive from a profile: everything unset globally.
+    fn from_profile(options: CoreOptions) -> ResolvedCore {
+        CoreOptions::resolve(&CoreOptions::default(), &options)
+    }
+
+    fn fragmenting() -> ResolvedCore {
+        from_profile(CoreOptions {
+            fragment: FragmentOptions {
+                enabled: Some(true),
+                ..FragmentOptions::default()
+            },
+            ..CoreOptions::default()
+        })
+    }
+
+    #[test]
+    fn without_fragmentation_or_noises_nothing_dials_through_anything() {
+        let config = generate(
+            &socks_server(),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
+
+        let outbounds = config["outbounds"].as_array().unwrap();
+        assert!(!outbounds.iter().any(|out| out["tag"] == DIALER_TAG));
+        // Not merely absent from the tags — the proxy outbound must carry no
+        // reference to it either. The core accepts a dangling `dialerProxy`
+        // without a word, so only this assertion catches the pairing breaking.
+        assert_eq!(outbounds[0]["streamSettings"]["sockopt"], json!(null));
+    }
+
+    #[test]
+    fn fragmentation_adds_a_dialer_and_points_the_proxy_at_it() {
+        let config = generate(
+            &socks_server(),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &fragmenting(),
+        );
+
+        let outbounds = config["outbounds"].as_array().unwrap();
+        // The proxy stays first: on a pool the core hands the very first
+        // request to whatever leads the list, and that ordering is load-bearing.
+        assert_eq!(outbounds[0]["tag"], "proxy");
+        assert_eq!(
+            outbounds[0]["streamSettings"]["sockopt"]["dialerProxy"],
+            DIALER_TAG
+        );
+        assert_eq!(outbounds[1]["tag"], DIALER_TAG);
+        assert_eq!(outbounds[1]["protocol"], "freedom");
+        assert_eq!(outbounds[1]["settings"]["fragment"]["packets"], "tlshello");
+        assert_eq!(outbounds[1]["settings"]["noises"], json!(null));
+
+        // `direct` and `block` must not be dialed through the fragmenter: they
+        // exist precisely to leave the tunnel.
+        assert_eq!(outbounds[2]["tag"], "direct");
+        assert_eq!(outbounds[2]["streamSettings"], json!(null));
+        assert_eq!(outbounds[3]["tag"], "block");
+        assert_eq!(outbounds[3]["streamSettings"], json!(null));
+    }
+
+    /// Noises without fragmentation still need the outbound to hang off.
+    #[test]
+    fn noises_alone_are_enough_to_raise_a_dialer() {
+        let core = from_profile(CoreOptions {
+            noises: Some(vec![Noise {
+                kind: NoiseKind::Base64,
+                packet: "aGVsbG8=".to_string(),
+                delay: "10-16".to_string(),
+            }]),
+            ..CoreOptions::default()
+        });
+
+        let config = generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809, &core);
+
+        let dialer = &config["outbounds"][1];
+        assert_eq!(dialer["tag"], DIALER_TAG);
+        assert_eq!(dialer["settings"]["fragment"], json!(null));
+        assert_eq!(dialer["settings"]["noises"][0]["type"], "base64");
+    }
+
+    /// The whole reason the tag is `dialer` and not `s-dialer`: a balancer
+    /// selector is a prefix match, and picking the fragmenter would send the
+    /// pool's traffic out through plain freedom.
+    #[test]
+    fn a_pool_dials_every_member_through_one_dialer_it_can_never_select() {
+        let mut first = socks_server();
+        first.alias = Some("node-a".to_string());
+        let mut second = tls_vless(false, None);
+        second.id = "node-b".to_string();
+
+        let config = generate_pool(
+            &PoolSpec {
+                members: &[&first, &second],
+                strategy: "leastLoad",
+                expected: 2,
+                probe_interval: "5m",
+            },
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            10810,
+            &fragmenting(),
+        )
+        .unwrap();
+
+        assert!(!DIALER_TAG.starts_with(SELECTABLE_TAG_PREFIX));
+        let outbounds = config["outbounds"].as_array().unwrap();
+        for (index, member) in outbounds.iter().take(2).enumerate() {
+            assert_eq!(
+                member["streamSettings"]["sockopt"]["dialerProxy"], DIALER_TAG,
+                "member {index} was left dialing directly"
+            );
+        }
+        assert_eq!(outbounds[2]["tag"], DIALER_TAG);
+        // One fragmenter for the whole pool, not one per member.
+        assert_eq!(
+            outbounds
+                .iter()
+                .filter(|out| out["tag"] == DIALER_TAG)
+                .count(),
+            1
+        );
+        assert_eq!(config["routing"]["balancers"][0]["selector"], json!(["s-"]));
+    }
+
+    /// Shadowsocks, socks and http outbounds carry no `streamSettings` of their
+    /// own, so the dialer has to bring the object into being.
+    #[test]
+    fn a_plain_protocol_gains_stream_settings_only_to_hold_the_dialer() {
+        let plain = generate(
+            &socks_server(),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
+        assert_eq!(plain["outbounds"][0]["streamSettings"], json!(null));
+
+        let fragmented = generate(
+            &socks_server(),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &fragmenting(),
+        );
+        assert_eq!(
+            fragmented["outbounds"][0]["streamSettings"],
+            json!({ "sockopt": { "dialerProxy": DIALER_TAG } })
+        );
+    }
+
+    #[test]
+    fn mux_rides_on_the_proxy_outbounds_and_nowhere_else() {
+        let core = from_profile(CoreOptions {
+            mux: MuxOptions {
+                enabled: Some(true),
+                concurrency: Some(8),
+                xudp_proxy_udp_443: Some(XudpMode::Skip),
+                ..MuxOptions::default()
+            },
+            ..CoreOptions::default()
+        });
+
+        let config = generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809, &core);
+
+        let outbounds = config["outbounds"].as_array().unwrap();
+        assert_eq!(
+            outbounds[0]["mux"],
+            json!({ "enabled": true, "concurrency": 8, "xudpProxyUDP443": "skip" })
+        );
+        // Unset knobs stay out rather than being written as the core's own
+        // defaults, so the config keeps saying only what was asked for.
+        assert_eq!(outbounds[0]["mux"]["xudpConcurrency"], json!(null));
+        assert_eq!(outbounds[1]["mux"], json!(null));
+        assert_eq!(outbounds[2]["mux"], json!(null));
+    }
+
+    #[test]
+    fn sniffing_says_route_only_just_when_it_was_asked_for() {
+        let quiet = generate(
+            &socks_server(),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
+        assert_eq!(quiet["inbounds"][0]["sniffing"]["routeOnly"], json!(null));
+
+        let core = from_profile(CoreOptions {
+            sniffing: SniffingOptions {
+                enabled: Some(true),
+                dest_override: Some(vec![
+                    DestOverride::Http,
+                    DestOverride::Tls,
+                    DestOverride::Quic,
+                ]),
+                route_only: Some(true),
+            },
+            ..CoreOptions::default()
+        });
+        let config = generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809, &core);
+
+        // Both inbounds, not just the SOCKS one people test through.
+        for index in 0..2 {
+            let sniffing = &config["inbounds"][index]["sniffing"];
+            assert_eq!(sniffing["routeOnly"], json!(true));
+            assert_eq!(sniffing["destOverride"], json!(["http", "tls", "quic"]));
+        }
+    }
+
+    #[test]
+    fn turning_sniffing_off_reaches_both_inbounds() {
+        let core = from_profile(CoreOptions {
+            sniffing: SniffingOptions {
+                enabled: Some(false),
+                ..SniffingOptions::default()
+            },
+            ..CoreOptions::default()
+        });
+
+        let config = generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809, &core);
+
+        assert_eq!(config["inbounds"][0]["sniffing"]["enabled"], json!(false));
+        assert_eq!(config["inbounds"][1]["sniffing"]["enabled"], json!(false));
+    }
+
+    #[test]
+    fn the_local_resolver_is_asked_first_and_only_about_local_names() {
+        let core = from_profile(CoreOptions {
+            dns: DnsOptions {
+                server: Some("https://1.1.1.1/dns-query".to_string()),
+                direct_server: Some("localhost".to_string()),
+                query_strategy: Some(QueryStrategy::UseIpv4),
+            },
+            ..CoreOptions::default()
+        });
+
+        let config = generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809, &core);
+
+        assert_eq!(
+            config["dns"],
+            json!({
+                "servers": [
+                    {
+                        "address": "localhost",
+                        "domains": ["geosite:private"],
+                        "skipFallback": true
+                    },
+                    "https://1.1.1.1/dns-query"
+                ],
+                "queryStrategy": "UseIPv4"
+            })
+        );
+    }
+
+    #[test]
+    fn no_dns_server_means_no_dns_block_at_all() {
+        let config = generate(
+            &socks_server(),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
+
+        assert_eq!(config["dns"], json!(null));
+    }
+
+    #[test]
+    fn the_log_level_and_domain_strategy_reach_the_config_as_the_core_spells_them() {
+        let core = from_profile(CoreOptions {
+            log_level: Some(LogLevel::Silent),
+            domain_strategy: Some(DomainStrategy::IpOnDemand),
+            ..CoreOptions::default()
+        });
+
+        let config = generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809, &core);
+
+        assert_eq!(config["log"]["loglevel"], "none");
+        assert_eq!(config["routing"]["domainStrategy"], "IPOnDemand");
+    }
+
     #[test]
     fn a_country_sized_pool_generates_one_outbound_per_member() {
         let servers = country_sized_pool();
@@ -793,6 +1237,7 @@ mod tests {
             10808,
             10809,
             10810,
+            &ResolvedCore::default(),
         )
         .unwrap();
 
@@ -836,6 +1281,7 @@ mod tests {
             10808,
             10809,
             10810,
+            &ResolvedCore::default(),
         )
         .unwrap_err()
         .to_string();
@@ -845,7 +1291,13 @@ mod tests {
     #[test]
     fn both_inbounds_use_the_session_address() {
         let bind = Ipv4Addr::new(127, 72, 14, 1);
-        let config = generate(&socks_server(), bind, 10808, 10809);
+        let config = generate(
+            &socks_server(),
+            bind,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
         assert_eq!(config["inbounds"][0]["listen"], "127.72.14.1");
         assert_eq!(config["inbounds"][1]["listen"], "127.72.14.1");
     }
@@ -860,6 +1312,7 @@ mod tests {
                 Ipv4Addr::LOCALHOST,
                 10808,
                 10809,
+                &ResolvedCore::default(),
             );
             let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
             assert!(
@@ -878,6 +1331,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             10808,
             10809,
+            &ResolvedCore::default(),
         );
         let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
         // A bare string, not an array: Xray 26.x fails to decode the array form.
@@ -886,7 +1340,13 @@ mod tests {
 
     #[test]
     fn absent_pin_leaves_the_key_out() {
-        let config = generate(&tls_vless(false, None), Ipv4Addr::LOCALHOST, 10808, 10809);
+        let config = generate(
+            &tls_vless(false, None),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
         let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
         assert!(tls.get("pinnedPeerCertSha256").is_none(), "{tls}");
     }
@@ -922,6 +1382,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             10808,
             10809,
+            &ResolvedCore::default(),
         );
         let out = &config["outbounds"][0];
         assert_eq!(out["protocol"], "hysteria");
@@ -960,6 +1421,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             10808,
             10809,
+            &ResolvedCore::default(),
         );
         let stream = &config["outbounds"][0]["streamSettings"];
         assert_eq!(stream["finalmask"]["type"], "salamander");
@@ -983,6 +1445,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             10808,
             10809,
+            &ResolvedCore::default(),
         );
         assert!(
             config["outbounds"][0]["streamSettings"]
@@ -1011,6 +1474,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             10808,
             10809,
+            &ResolvedCore::default(),
         );
         let hop = &config["outbounds"][0]["streamSettings"]["hysteriaSettings"]["udpHop"];
         assert_eq!(hop["ports"], json!(["443", "5000-6000", "7000"]));
@@ -1024,6 +1488,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             10808,
             10809,
+            &ResolvedCore::default(),
         );
         let stream = &config["outbounds"][0]["streamSettings"];
         let hy = &stream["hysteriaSettings"];
@@ -1035,7 +1500,13 @@ mod tests {
 
     #[test]
     fn vless_outbound_shape() {
-        let config = generate(&tls_vless(false, None), Ipv4Addr::LOCALHOST, 10808, 10809);
+        let config = generate(
+            &tls_vless(false, None),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
         let out = &config["outbounds"][0];
         assert_eq!(out["protocol"], "vless");
         assert_eq!(out["settings"]["vnext"][0]["address"], "example.com");
@@ -1104,7 +1575,7 @@ mod tests {
             };
             configs.push((
                 server.protocol.as_str().to_string(),
-                generate(server, bind, 10808, 10809),
+                generate(server, bind, 10808, 10809, &ResolvedCore::default()),
             ));
         }
         configs.push((
@@ -1120,6 +1591,7 @@ mod tests {
                 10808,
                 10809,
                 10810,
+                &ResolvedCore::default(),
             )
             .expect("sample pool should generate"),
         ));
@@ -1141,8 +1613,115 @@ mod tests {
                 10808,
                 10809,
                 10810,
+                &ResolvedCore::default(),
             )
             .expect("a country-sized pool should generate"),
+        ));
+
+        // Phase 6. Every one of these was accepted by 26.3.27 by hand before
+        // being written down — and `-test` accepting a config proves only that
+        // it parses: the core takes an unknown key, an unknown `loglevel` and a
+        // dangling `dialerProxy` without a word. What these cases pin is the
+        // half the core *does* police: `destOverride`, `xudpProxyUDP443`,
+        // `noises[].type`, `sockopt.domainStrategy`, a zero-minimum range, and
+        // whether `geosite:private` resolves at all.
+        let everything = CoreOptions {
+            log_level: Some(LogLevel::Debug),
+            domain_strategy: Some(DomainStrategy::IpOnDemand),
+            sniffing: SniffingOptions {
+                enabled: Some(true),
+                dest_override: Some(vec![
+                    DestOverride::Http,
+                    DestOverride::Tls,
+                    DestOverride::Quic,
+                ]),
+                route_only: Some(true),
+            },
+            mux: MuxOptions {
+                enabled: Some(true),
+                concurrency: Some(8),
+                xudp_concurrency: Some(16),
+                xudp_proxy_udp_443: Some(XudpMode::Reject),
+            },
+            fragment: FragmentOptions {
+                enabled: Some(true),
+                packets: Some("tlshello".to_string()),
+                length: Some("100-200".to_string()),
+                interval: Some("10-20".to_string()),
+            },
+            noises: Some(vec![
+                Noise {
+                    kind: NoiseKind::Rand,
+                    packet: "10-20".to_string(),
+                    delay: "10-16".to_string(),
+                },
+                Noise {
+                    kind: NoiseKind::Base64,
+                    packet: "aGVsbG8=".to_string(),
+                    delay: "5".to_string(),
+                },
+            ]),
+            dns: DnsOptions {
+                server: Some("https://1.1.1.1/dns-query".to_string()),
+                direct_server: Some("localhost".to_string()),
+                query_strategy: Some(QueryStrategy::UseIpv4),
+            },
+        };
+        let everything = CoreOptions::resolve(&CoreOptions::default(), &everything);
+
+        // A plain protocol, which has no `streamSettings` of its own until the
+        // dialer gives it one, and a vless one, which already has some.
+        configs.push((
+            "core-plain".to_string(),
+            generate(
+                &socks_server(),
+                Ipv4Addr::LOCALHOST,
+                10808,
+                10809,
+                &everything,
+            ),
+        ));
+        configs.push((
+            "core-vless".to_string(),
+            generate(&servers[2], Ipv4Addr::LOCALHOST, 10808, 10809, &everything),
+        ));
+        // The one place phase 5 and phase 6 meet: `mux` and `dialerProxy` land
+        // on every member, and the balancer selector must still not resolve to
+        // the dialer.
+        configs.push((
+            "core-pool".to_string(),
+            generate_pool(
+                &PoolSpec {
+                    members: &big_members,
+                    strategy: "leastLoad",
+                    expected: 6,
+                    probe_interval: "5m",
+                },
+                Ipv4Addr::new(127, 72, 14, 1),
+                10808,
+                10809,
+                10810,
+                &everything,
+            )
+            .expect("a fragmented pool should generate"),
+        ));
+        // Sniffing off with the log silenced: the opposite corner of the same
+        // settings, since `enabled: false` travels a different branch.
+        let quiet = CoreOptions::resolve(
+            &CoreOptions::default(),
+            &CoreOptions {
+                log_level: Some(LogLevel::Silent),
+                domain_strategy: Some(DomainStrategy::AsIs),
+                sniffing: SniffingOptions {
+                    enabled: Some(false),
+                    ..SniffingOptions::default()
+                },
+                ..CoreOptions::default()
+            },
+        );
+        configs.push((
+            "core-quiet".to_string(),
+            generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809, &quiet),
         ));
 
         for (index, (label, config)) in configs.into_iter().enumerate() {

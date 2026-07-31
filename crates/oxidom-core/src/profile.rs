@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::core_options::CoreOptions;
 use crate::engine::Engine;
 use crate::pool::{PoolKind, PoolQuery};
 use crate::{fsutil, paths};
@@ -32,6 +33,7 @@ pub const RESERVED_NAMES: &[&str] = &[
     "ping",
     "alias",
     "profile",
+    "core",
     "connect",
     "daemon",
     "gui",
@@ -49,6 +51,11 @@ pub struct Profile {
     pub select: ProfileSelect,
     pub proxy: ProfileProxy,
     pub interface: ProfileInterface,
+    /// Overrides for the machine-wide `[core]` settings, field by field. An
+    /// unset field here keeps whatever `config.toml` says; see
+    /// [`crate::core_options`].
+    #[serde(skip_serializing_if = "CoreOptions::is_unset")]
+    pub core: CoreOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -177,6 +184,8 @@ impl Profile {
                 })?;
             }
         }
+
+        self.core.validate("core")?;
         Ok(())
     }
 
@@ -359,6 +368,7 @@ mod tests {
     use anyhow::Result;
 
     use super::{Profile, ProfileProxy, ProfileSelect, RouteMode, is_reserved, list, valid_name};
+    use crate::core_options::{CoreOptions, FragmentOptions, LogLevel};
     use crate::pool::{PoolQuery, Strategy};
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -557,6 +567,47 @@ list = []
 
         assert_eq!(profile.to_toml()?, legacy);
         Ok(())
+    }
+
+    /// One `[core]` field must not drag the other four sections into the file
+    /// with it: a profile that sets only the log level should read as a profile
+    /// that sets only the log level.
+    #[test]
+    fn a_core_override_writes_only_the_section_it_touches() -> Result<()> {
+        let profile = Profile {
+            core: CoreOptions {
+                log_level: Some(LogLevel::Debug),
+                ..CoreOptions::default()
+            },
+            ..Profile::default()
+        };
+
+        let toml = profile.to_toml()?;
+        assert!(toml.contains("[core]\nlog_level = \"debug\""), "{toml}");
+        assert!(!toml.contains("[core.sniffing]"), "{toml}");
+        assert!(!toml.contains("[core.dns]"), "{toml}");
+        assert_eq!(Profile::from_toml(&toml)?, profile);
+        Ok(())
+    }
+
+    /// The core takes a reversed range and then fragments nothing, so the
+    /// refusal has to happen while the profile is being saved.
+    #[test]
+    fn a_profile_carrying_a_nonsense_fragment_range_does_not_validate() {
+        let profile = Profile {
+            core: CoreOptions {
+                fragment: FragmentOptions {
+                    enabled: Some(true),
+                    length: Some("200-100".to_string()),
+                    ..Default::default()
+                },
+                ..CoreOptions::default()
+            },
+            ..Profile::default()
+        };
+
+        let error = profile.validate("work").unwrap_err().to_string();
+        assert!(error.contains("runs backwards"), "{error}");
     }
 
     #[test]

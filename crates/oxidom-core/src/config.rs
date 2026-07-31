@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::core_options::CoreOptions;
 use crate::{fsutil, paths};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +30,10 @@ pub struct Config {
     /// Path (or bare command name) of nft. Empty falls back to
     /// `$OXIDOM_NFT_BIN` — set by the nix wrapper — and then `PATH`.
     pub nft_binary: String,
+    /// Machine-wide defaults for the generated Xray config. A profile's
+    /// `[core]` overrides these field by field; see [`crate::core_options`].
+    #[serde(skip_serializing_if = "CoreOptions::is_unset")]
+    pub core: CoreOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -56,6 +61,7 @@ impl Default for Config {
             xray_binary: String::new(),
             tun2socks_binary: String::new(),
             nft_binary: String::new(),
+            core: CoreOptions::default(),
         }
     }
 }

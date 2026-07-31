@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use oxidom_core::core_options::CoreOptions;
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
 use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
@@ -12,6 +13,7 @@ use oxidom_core::profile::{
 };
 
 use super::super::reduce::describe_pool;
+use super::core_editor::{CoreEditor, CoreLevel};
 use super::{dialog_content, set_transient_parent, set_validation, validation_label};
 
 const PROFILE_NAME_ERROR: &str = "Use lowercase letters, digits, '_' and '-'; up to 32 \
@@ -107,6 +109,9 @@ struct DialogValues {
     interface_mtu: u16,
     interface_routes: RouteMode,
     interface_list: String,
+    /// Only the sections this profile overrides; the rest is inherited from
+    /// `config.toml` and never written here.
+    core: CoreOptions,
 }
 
 impl DialogValues {
@@ -132,6 +137,7 @@ impl DialogValues {
             interface_mtu: interface.mtu,
             interface_routes: interface.routes,
             interface_list: interface.list.join(", "),
+            core: entry.map(|entry| entry.core.clone()).unwrap_or_default(),
         }
     }
 }
@@ -155,6 +161,7 @@ fn profile_from_dialog(values: DialogValues) -> Profile {
             routes: values.interface_routes,
             list: parse_subnets(&values.interface_list),
         },
+        core: values.core,
     }
 }
 
@@ -163,6 +170,9 @@ pub fn show_profile_dialog(
     mode: ProfileDialog<'_>,
     profiles: &[ProfileEntry],
     choices: &[ServerChoice],
+    // The machine's `[core]`, so every section this profile does not override
+    // can show what it inherits instead of standing blank.
+    machine_core: &CoreOptions,
     callbacks: ProfileDialogCallbacks,
 ) {
     let (title, edit_name, initial) = match mode {
@@ -386,10 +396,13 @@ pub fn show_profile_dialog(
         .build();
     interface_group.add(&routed_subnets);
 
+    let core_editor = CoreEditor::new(CoreLevel::Profile, machine_core, &initial.core);
+
     let groups = gtk::Box::new(gtk::Orientation::Vertical, 24);
     groups.append(&profile_group);
     groups.append(&pool_group);
     groups.append(&interface_group);
+    groups.append(&core_editor.group);
     if let Some(name) = edit_name.as_deref() {
         let remove_group = adw::PreferencesGroup::builder().title("Remove").build();
         let delete = gtk::Button::with_label("Delete Profile");
@@ -444,6 +457,7 @@ pub fn show_profile_dialog(
     );
     let interface_address = initial.interface_address.clone();
     let collect_profile: Rc<dyn Fn() -> Option<(String, Profile)>> = Rc::new({
+        let core_editor = core_editor.clone();
         let name_entry = name_entry.clone();
         let edit_name = edit_name.clone();
         let description_entry = description_entry.clone();
@@ -497,6 +511,7 @@ pub fn show_profile_dialog(
                 interface_mtu: mtu.value() as u16,
                 interface_routes: route_mode(routes.selected()),
                 interface_list: routed_subnets.text().to_string(),
+                core: core_editor.values(),
             };
             Some((name, profile_from_dialog(values)))
         }
@@ -649,6 +664,12 @@ pub fn show_profile_dialog(
     routed_subnets.connect_changed({
         let update_validation = update_validation.clone();
         move |_| update_validation()
+    });
+    // `[core]` is validated by `Profile::validate`, which `update_validation`
+    // already runs — the editor only has to say when something changed.
+    core_editor.connect_changed({
+        let update_validation = update_validation.clone();
+        move || update_validation()
     });
     update_validation();
 
@@ -872,6 +893,8 @@ pub fn profile_name_validation(name: &str, existing_names: &[String]) -> Option<
 
 #[cfg(test)]
 mod tests {
+    use oxidom_core::core_options::{FragmentOptions, LogLevel};
+
     use super::*;
     use oxidom_core::link::parse_link;
 
@@ -995,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn interface_section_survives_an_unchanged_dialog_round_trip() {
+    fn what_the_dialog_never_shows_survives_an_unchanged_round_trip() {
         let entry = ProfileEntry {
             name: "work".to_string(),
             description: "Office tunnel".to_string(),
@@ -1024,10 +1047,23 @@ mod tests {
                 expected: 4,
                 probe_interval: "30s".to_string(),
             }),
+            // `[core]` does have rows now, but it reaches them through the
+            // same carrier, and dropping it on the way would quietly
+            // un-fragment a profile that only connects because of it.
+            core: CoreOptions {
+                log_level: Some(LogLevel::Debug),
+                fragment: FragmentOptions {
+                    enabled: Some(true),
+                    length: Some("40-60".to_string()),
+                    ..FragmentOptions::default()
+                },
+                ..CoreOptions::default()
+            },
         };
 
         let saved = profile_from_dialog(DialogValues::new(Some(&entry)));
         assert_eq!(saved.interface, entry.interface);
+        assert_eq!(saved.core, entry.core);
         assert_eq!(saved.description, entry.description);
         assert_eq!(saved.select.server, entry.server);
         assert_eq!(saved.select.pool, entry.pool);

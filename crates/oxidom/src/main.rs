@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use oxidom_core::cli_json::{
-    ProfileOutput, ServerOutput, SessionOutput, StatusOutput, SubscriptionOutput,
+    CoreOutput, ProfileOutput, ServerOutput, SessionOutput, StatusOutput, SubscriptionOutput,
 };
 use oxidom_core::client::DaemonClient;
 use oxidom_core::handle::{self, HandleMatch};
@@ -24,7 +24,7 @@ use oxidom_core::model::{Server, Subscription};
 use oxidom_core::profile::{Profile, ProfileProxy};
 use serde::Serialize;
 
-use crate::cli::{Cli, Command, ListTarget, ProfileCommand};
+use crate::cli::{Cli, Command, CoreCommand, ListTarget, ProfileCommand};
 
 /// Command completed successfully.
 const EXIT_SUCCESS: u8 = 0;
@@ -148,6 +148,7 @@ fn dispatch(cli: Cli) -> CliResult {
         Command::Ping { handle } => ping(&handle),
         Command::Alias { handle, new } => set_alias(&handle, &new),
         Command::Profile { command } => profile_command(command),
+        Command::Core { command } => core_command(command),
         Command::Gui { background, debug } => {
             cli::run_gui(background, debug).map_err(Failure::error)
         }
@@ -639,6 +640,27 @@ fn profile_command(command: ProfileCommand) -> CliResult {
             } else {
                 Err(Failure::message(format!("profile {name:?} does not exist")))
             }
+        }
+    }
+}
+
+fn core_command(command: CoreCommand) -> CliResult {
+    let client = existing_client()?;
+    match command {
+        CoreCommand::Show { profile, json } => {
+            let global = client.settings().map_err(Failure::error)?;
+            let overrides = client.profile(&profile).map_err(Failure::error)?;
+            let output = CoreOutput::new(&profile, &global.core, &overrides.core);
+            if json {
+                return print_json(&output);
+            }
+            for setting in &output.settings {
+                print_line(format!(
+                    "{}\t{}\t{}",
+                    setting.setting, setting.value, setting.origin
+                ))?;
+            }
+            Ok(())
         }
     }
 }

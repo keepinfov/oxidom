@@ -6,6 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, LatencyMethod};
+use crate::core_options::CoreOptions;
 use crate::model::{Protocol, Server};
 use crate::xray::{config as xray_config, resolve};
 use crate::{fsutil, paths};
@@ -163,7 +164,14 @@ impl ProbeCore {
         // server, which is why the gap is kept as short as possible.
         let socks_port = free_port().map_err(|_| ProbeOutcome::Internal("no free port"))?;
         let http_port = free_port().map_err(|_| ProbeOutcome::Internal("no free port"))?;
-        let generated = xray_config::generate(server, Ipv4Addr::LOCALHOST, socks_port, http_port);
+        // The machine-wide `[core]` and nothing else: a probe belongs to a
+        // server, not to a profile, and there is no profile here to fold in.
+        // It does mean a server that only works with a profile's fragmentation
+        // measures as unreachable — which is why fragmentation belongs in
+        // `config.toml` when it is the machine that needs it.
+        let core = CoreOptions::resolve(&config.core, &CoreOptions::default());
+        let generated =
+            xray_config::generate(server, Ipv4Addr::LOCALHOST, socks_port, http_port, &core);
         let config_path = paths::data_dir()
             .map_err(|_| ProbeOutcome::Internal("cannot stage a probe config"))?
             .join(format!("probe-{socks_port}.json"));

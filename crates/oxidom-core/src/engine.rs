@@ -7,6 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
+use crate::core_options::{CoreOptions, ResolvedCore};
 use crate::model::{Server, Subscription};
 use crate::nft::Nft;
 use crate::profile::{ProfileInterface, RouteMode};
@@ -433,6 +434,11 @@ pub struct Session {
     pub balancer_polled_at: Option<Instant>,
     pub pool_stale: bool,
     pub interface: Option<Interface>,
+    /// Core settings with the profile's `[core]` already folded over the
+    /// machine-wide ones. Snapshotted at `up` for the same reason the pool
+    /// label is: the session keeps generating the config it was brought up
+    /// with, whatever the files say afterwards.
+    pub core_options: ResolvedCore,
 }
 
 impl Session {
@@ -442,6 +448,7 @@ impl Session {
         socks_port: u16,
         http_port: u16,
         xray_binary: String,
+        core_options: ResolvedCore,
     ) -> Self {
         Self {
             profile,
@@ -458,6 +465,7 @@ impl Session {
             balancer_polled_at: None,
             pool_stale: false,
             interface: None,
+            core_options,
         }
     }
 
@@ -465,7 +473,8 @@ impl Session {
         self.selection = None;
         self.api_port = 0;
         self.balancer_info = None;
-        self.core.connect(server, self.address, &self.profile)?;
+        self.core
+            .connect(server, self.address, &self.profile, &self.core_options)?;
         self.selection = Some(SessionSelection::Server(server.id.clone()));
         self.api_port = 0;
         self.pool_name.clear();
@@ -492,6 +501,7 @@ impl Session {
             self.address,
             pool.api_port,
             &self.profile,
+            &self.core_options,
         )?;
         self.selection = Some(SessionSelection::pool(
             members.iter().map(|server| server.id.clone()).collect(),
@@ -683,6 +693,9 @@ impl Sessions {
                 saved.socks_port,
                 saved.http_port,
                 config.xray_binary.clone(),
+                // Recovery has no profile file in hand; a later `up` folds the
+                // profile's `[core]` back over these through `configure_core`.
+                CoreOptions::resolve(&config.core, &CoreOptions::default()),
             );
             session.selection = saved
                 .server_id
@@ -957,8 +970,22 @@ impl Engine {
             socks_port,
             http_port,
             self.registry.config.xray_binary.clone(),
+            CoreOptions::resolve(&self.registry.config.core, &CoreOptions::default()),
         ));
         Ok(())
+    }
+
+    /// Fold the profile's `[core]` over the machine-wide one for this session.
+    ///
+    /// Separate from [`Engine::prepare_session`] for the same reason
+    /// [`Engine::configure_interface`] is: a bare `Connect` has no profile file
+    /// to read, and a session that was never configured has to keep working off
+    /// the global settings alone.
+    pub fn configure_core(&mut self, profile: &str, requested: &CoreOptions) {
+        let resolved = CoreOptions::resolve(&self.registry.config.core, requested);
+        if let Some(session) = self.sessions.get_mut(profile) {
+            session.core_options = resolved;
+        }
     }
 
     /// Attach the profile's requested interface plan to an existing session.
@@ -1816,6 +1843,8 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::core_options::ResolvedCore;
+
     use anyhow::{Context, Result, anyhow};
 
     use super::{Engine, Interface, LOCAL_ID, Session, Sessions};
@@ -1923,6 +1952,7 @@ mod tests {
             10808,
             10809,
             String::new(),
+            ResolvedCore::default(),
         ));
         sessions.insert(Session::new(
             "home".to_string(),
@@ -1930,6 +1960,7 @@ mod tests {
             10808,
             10809,
             String::new(),
+            ResolvedCore::default(),
         ));
 
         assert_eq!(

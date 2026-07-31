@@ -1623,6 +1623,7 @@ impl Service {
             engine
                 .prepare_session("default", Ipv4Addr::LOCALHOST, socks_port, http_port)
                 .map_err(failed)?;
+            engine.configure_core("default", &default_profile.core);
             if let Err(error) = engine.configure_interface(
                 "default",
                 &default_profile.interface,
@@ -1673,6 +1674,7 @@ impl Service {
                     http_port: profile.proxy.http_port,
                     interface: profile.interface,
                     pool: profile.select.pool,
+                    core: profile.core,
                 }),
                 Err(error) => log::warn!("skipping profile {name:?}: {error:#}"),
             }
@@ -1867,6 +1869,7 @@ impl Service {
             engine
                 .prepare_session(&name, address, socks_port, http_port)
                 .map_err(failed)?;
+            engine.configure_core(&name, &profile.core);
             if let Err(error) = engine.configure_interface(&name, &profile.interface, &servers) {
                 engine.sessions.remove(&name);
                 return Err(failed(error));
@@ -2010,6 +2013,13 @@ impl Service {
         if raw.get("reconnect").is_none() {
             config.reconnect = engine.registry.config.reconnect;
         }
+        // Same, for the whole `[core]` section. A client that edits it always
+        // sends the key, empty section included; one that does not know the
+        // section omits it, and overwriting from that absence would erase a
+        // hand-written fragment setting on the next Apply click.
+        if raw.get("core").is_none() {
+            config.core = engine.registry.config.core.clone();
+        }
         if raw.get("tun2socks_binary").is_none() || self.shared.system_bus {
             if self.shared.system_bus
                 && config.tun2socks_binary != engine.registry.config.tun2socks_binary
@@ -2033,6 +2043,12 @@ impl Service {
         }
         if config.socks_port == config.http_port {
             return Err(failed("the SOCKS and HTTP inbounds cannot share a port"));
+        }
+        // Same reasoning one level down: the core takes a reversed fragment
+        // range or an out-of-band mux concurrency without a word and then does
+        // nothing with it, so a bad value would look like a working setting.
+        if let Err(error) = config.core.validate("core") {
+            return Err(failed(format!("{error:#}")));
         }
 
         // Ports fixed on the command line by the service unit are refused
@@ -3256,6 +3272,7 @@ mod tests {
                 http_port: 21081,
             },
             interface: Default::default(),
+            core: Default::default(),
         };
 
         service.save_profile("work".to_string(), serde_json::to_string(&profile)?)?;

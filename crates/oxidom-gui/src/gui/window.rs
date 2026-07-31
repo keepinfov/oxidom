@@ -1447,7 +1447,18 @@ impl Controller {
                 ProfileDialog::Edit { name, entry }
             }
         };
-        show_profile_dialog(&self.sessions.root, mode, &profiles, &choices, callbacks);
+        // The last settings the daemon accepted, not the current draft: an
+        // "inherited" row must name what the profile would really get, and an
+        // unapplied edit on the Settings page is not that yet.
+        let machine_core = self.settings.applied().core;
+        show_profile_dialog(
+            &self.sessions.root,
+            mode,
+            &profiles,
+            &choices,
+            &machine_core,
+            callbacks,
+        );
     }
 
     fn sync_session_rows(self: &Rc<Self>) {
@@ -1796,6 +1807,10 @@ impl Controller {
                         http_port: entry.http_port,
                     },
                     interface: entry.interface.clone(),
+                    // Retargeting changes the selection, nothing else: the
+                    // advanced core settings have no row in this flow and must
+                    // survive it untouched.
+                    core: entry.core.clone(),
                 },
                 server_name,
             )
@@ -1966,6 +1981,9 @@ impl Controller {
                 http_port: entry.http_port,
             },
             interface: entry.interface.clone(),
+            // As with the pool's tuning above: connecting a group changes the
+            // membership, not the core settings the profile was given.
+            core: entry.core.clone(),
         })
     }
 
@@ -2559,6 +2577,7 @@ impl Controller {
             xray_binary: values.xray_binary.clone(),
             tun2socks_binary: values.tun2socks_binary.clone(),
             nft_binary: values.nft_binary.clone(),
+            core: values.core.clone(),
         };
         self.client_job(
             UiOperation::new(UiOperationKind::ApplySettings),

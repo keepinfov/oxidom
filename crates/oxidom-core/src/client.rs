@@ -415,7 +415,19 @@ impl DaemonClient {
     }
 
     pub fn apply_settings(&self, config: &Config) -> Result<ApplySettingsResult> {
-        let payload = serde_json::to_string(config)?;
+        let mut value = serde_json::to_value(config)?;
+        // An untouched `[core]` is left out of the file, and that same
+        // `skip_serializing_if` leaves it out of this payload — where the
+        // daemon reads an absent key as "keep what you have", so that a client
+        // too old to know the section cannot erase it. A client that does edit
+        // the section has to say so even when it ends up empty, or turning the
+        // last core setting off would never reach the daemon.
+        if let Some(object) = value.as_object_mut() {
+            object
+                .entry("core")
+                .or_insert_with(|| serde_json::json!({}));
+        }
+        let payload = serde_json::to_string(&value)?;
         let json: String = self
             .proxy
             .call("SetSettings", &(payload,))

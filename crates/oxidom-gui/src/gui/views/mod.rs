@@ -1,5 +1,6 @@
 use adw::prelude::*;
 
+pub mod core_editor;
 pub mod logs;
 pub mod profile_dialog;
 pub mod servers;

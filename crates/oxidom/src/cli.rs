@@ -100,6 +100,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    /// Inspect the advanced Xray core settings a session would be built with.
+    Core {
+        #[command(subcommand)]
+        command: CoreCommand,
+    },
     /// Launch the graphical interface.
     Gui {
         /// Start without showing the window (for autostart; the tray/daemon
@@ -160,6 +165,19 @@ pub enum ProfileCommand {
     Edit { name: String },
     /// Remove one profile.
     Rm { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CoreCommand {
+    /// Print each resolved setting and the level it came from.
+    Show {
+        /// Profile whose `[core]` is folded over the machine-wide settings.
+        #[arg(default_value = "default")]
+        profile: String,
+        /// Print the stable machine-readable schema.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Accept both `oxidom up work` and `oxidom work up`.

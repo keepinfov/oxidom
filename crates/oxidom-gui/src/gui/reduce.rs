@@ -1839,6 +1839,7 @@ mod tests {
             http_port: 10809,
             interface: ProfileInterface::default(),
             pool: None,
+            core: Default::default(),
         }
     }
 

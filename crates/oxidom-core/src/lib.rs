@@ -3,6 +3,7 @@ pub mod bind;
 pub mod cli_json;
 pub mod client;
 pub mod config;
+pub mod core_options;
 pub mod egress;
 pub mod engine;
 pub mod fsutil;
