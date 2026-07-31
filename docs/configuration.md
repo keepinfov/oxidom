@@ -9,6 +9,7 @@ without fighting over one file.
 - [Where the files are](#where-the-files-are)
 - [The two databases](#the-two-databases) — the single most common surprise
 - [`config.toml`](#configtoml)
+- [Advanced core settings](#advanced-core-settings) — fragmentation, mux, sniffing, DNS
 - [Finding helper binaries](#finding-helper-binaries)
 - [Environment variables](#environment-variables)
 - [File handling](#file-handling)
@@ -103,6 +104,156 @@ one.
 The GUI offers these, and the free-text field remains the source of truth:
 `v2rayNG/1.9.5`, `Happ/3.13.0`, `v2rayN/6.45`, `Streisand`, `Hiddify/2.0.5`,
 `NekoBox/1.3.5`, `Shadowrocket/2.2.9`, `clash-verge/1.7.7`, `SFA/1.10.0`.
+
+## Advanced core settings
+
+`[core]` controls what the generated Xray config says about logging, sniffing,
+DNS, multiplexing and TLS fragmentation. Everything in it is optional and off by
+default: **with an empty `[core]` the generated config is exactly what oxidom
+produced before these settings existed.**
+
+Two levels set them, and they merge field by field:
+
+1. `[core]` in `config.toml` — the machine.
+2. `[core]` in a [profile](profiles-and-pools.md) — one tunnel; wins where it
+   says anything at all.
+
+To see what a session would actually be built with, and which of the two levels
+decided each value:
+
+```console
+$ oxidom core show work
+log_level               warning        built-in
+domain_strategy         IPIfNonMatch   built-in
+sniffing.enabled        true           built-in
+sniffing.dest_override  http,tls       built-in
+sniffing.route_only     false          built-in
+mux.enabled             true           global
+mux.concurrency         16             profile
+fragment.enabled        false          built-in
+```
+
+A row appears exactly when the key reaches the generated config, so the table
+reads as the config rather than as a list of everything settable. `--json` prints
+the same thing as a stable schema.
+
+### `[core]`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `log_level` | enum | `"warning"` | `debug`, `info`, `warning`, `error`, `none`. `debug` is loud enough to matter — see the note below. |
+| `domain_strategy` | enum | `"ip_if_non_match"` | `as_is`, `ip_if_non_match`, `ip_on_demand`. How routing resolves domains before matching. |
+
+### `[core.sniffing]`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `true` | Read the destination host out of the connection. Turning it off means domain-based routing stops seeing domains. |
+| `dest_override` | list | `["http", "tls"]` | Any of `http`, `tls`, `quic`. |
+| `route_only` | bool | `false` | Use the sniffed name to pick a route, but hand the original address to the outbound. |
+
+### `[core.mux]`
+
+Multiplexes several streams over one connection.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `false` | |
+| `concurrency` | int | unset | `-1` disables, otherwise 1–1024. |
+| `xudp_concurrency` | int | unset | Same range. |
+| `xudp_proxy_udp_443` | enum | unset | `reject`, `allow`, `skip`. |
+
+In Xray, mux is a property of an *outbound*, so a [pool](profiles-and-pools.md#pools)
+applies it to every member. Note that holding one connection open works against
+spreading activity across exit addresses, which is the reason pools exist — think
+before combining the two.
+
+### `[core.fragment]` and `noises`
+
+Splits the TLS hello across packets, and optionally sends decoy traffic. This is
+the setting people come to advanced options for.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `false` | |
+| `packets` | string | `"tlshello"` | `tlshello`, a count, or a range like `"1-3"`. |
+| `length` | string | `"100-200"` | Bytes per fragment: a number or a range. Unlike `packets`, this one does not accept `tlshello`. |
+| `interval` | string | `"10-20"` | Milliseconds between fragments. |
+
+```toml
+[core.fragment]
+enabled = true
+packets = "tlshello"
+length = "100-200"
+interval = "10-20"
+
+[[core.noises]]
+kind = "rand"      # rand | str | base64
+packet = "10-20"
+delay = "10-16"
+```
+
+Both are carried by one extra `freedom` outbound, tagged `dialer`, that the proxy
+outbounds dial through. It exists only when one of the two is configured.
+
+### `[core.dns]`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `server` | string | unset | Resolver for what the tunnel carries. A plain address or a DoH URL. Nothing else in this section takes effect without it. |
+| `direct_server` | string | unset | Consulted first, and only for names the local network answers. |
+| `query_strategy` | enum | `"use_ip"` | `use_ip`, `use_ipv4`, `use_ipv6` — the "IPv6 mode" other clients expose. |
+
+```toml
+[core.dns]
+server = "https://1.1.1.1/dns-query"
+direct_server = "localhost"
+query_strategy = "use_ipv4"
+```
+
+`direct_server` is scoped to private names, so today it covers your LAN and
+nothing more: oxidom currently routes everything except private addresses through
+the proxy, which leaves no other class of "direct" name to point it at.
+
+### In the GUI
+
+Settings → **Core behaviour** edits the machine's `[core]`; the profile editor
+carries the same rows under the same heading.
+
+The two differ in what "unset" means, so they behave differently on purpose:
+
+- In Settings, a row set to the built-in value is stored as *nothing at all*.
+  Turning multiplexing on adds `[core.mux] enabled = true` and not one key more;
+  turning it off again removes the table. The file keeps naming only what you
+  chose.
+- In the profile editor, each section is a switch: off inherits the machine's
+  value, and the row underneath says what that value is, so a section can be
+  read without being switched on. Turning it on hands that whole section to the
+  profile — from then on it stops following `config.toml`, which is exactly what
+  a `[core.mux]` table in a profile file means.
+
+`noises` has no rows. A list of hand-tuned byte patterns has no sensible default
+to offer, so the GUI reports how many there are and writes back what it was
+given; edit them in the file.
+
+One thing the GUI cannot express, because the file cannot either: a profile can
+point `dns.server` somewhere else, but it cannot *remove* a resolver set for the
+machine. An unset field means "inherit", and there is no third state.
+
+### Two things worth knowing
+
+**A setting the core accepts is not a setting the core honours.** Xray 26.3.27
+takes an unknown key, an unknown `loglevel`, and a range written backwards
+(`"200-100"`) without a word of complaint — and then does nothing with them.
+oxidom therefore rejects those itself when the file is read, rather than letting
+a typo look like a working setting. If a value is refused here, that is why.
+
+**The log level moves both ends of the same dial.** At `debug` a busy tunnel
+pushes interesting lines out of the bounded log buffer quickly — turn it on to
+answer a question, then turn it back off. At `none` the core prints nothing at
+all, not even its startup banner, so the Logs view stays empty and a failure
+leaves no trace to read afterwards. Connecting still works either way: readiness
+is decided by probing the local SOCKS port, not by watching the log.
 
 ## Finding helper binaries
 

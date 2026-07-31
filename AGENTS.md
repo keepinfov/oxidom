@@ -78,7 +78,19 @@ subscription_user_agent = "v2rayNG/1.9.5"  # panels gate the body on this
 xray_binary = ""              # empty: use $OXIDOM_XRAY_BIN, then xray on PATH
 tun2socks_binary = ""         # empty: use $OXIDOM_TUN2SOCKS_BIN, then tun2socks on PATH
 nft_binary = ""               # empty: use $OXIDOM_NFT_BIN, then nft on PATH
+
+[core]                        # machine-wide Xray core settings; a profile's [core] overrides
+log_level = "warning"         # debug | info | warning | error | none
+domain_strategy = "ip_if_non_match"
+noises = []
+[core.sniffing]               # enabled | dest_override (http/tls/quic) | route_only
+[core.mux]                    # enabled | concurrency | xudp_concurrency | xudp_proxy_udp_443
+[core.fragment]               # enabled | packets | length | interval
+[core.dns]                    # server | direct_server | query_strategy
 ```
+
+Every `[core]` key is optional at both levels, and an untouched section is not written to the file
+at all. See "Advanced core settings" below for what each one generates.
 
 ## Data model
 ```rust
@@ -139,7 +151,9 @@ struct UserInfo { upload: u64, download: u64, total: u64, expire: Option<i64> }
 Derive `country` from a leading flag emoji or country code in the name when present.
 
 ## Xray config generation
-Emit Xray JSON to a temp file, then spawn the core. Structure:
+Emit Xray JSON to a temp file, then spawn the core. Structure below is the **built-in** shape;
+`[core]` (see "Advanced core settings") makes each marked line configurable without moving a byte
+when nothing is set.
 - `log`: `{ loglevel: "warning" }`.
 - `inbounds`: a SOCKS inbound on `socks_port` and an HTTP inbound on `http_port`, both bound to
   the session's stable loopback address, `sniffing` enabled (`http`, `tls`).
@@ -229,6 +243,69 @@ against a real core with `xray run -test -c <file>` rather than against document
   `streamSettings.hysteriaSettings.auth`, and salamander obfuscation is
   `streamSettings.finalmask` — a single object beside `hysteriaSettings`, *not* the `udpmasks`
   array that appears in Xray's protobuf.
+
+### Advanced core settings (cycle 4, phase 6 — binding)
+
+`core_options.rs` owns them. Two levels: `[core]` in `config.toml` for the machine, `[core]` in a
+profile for one tunnel. `None` means "not set at this level", so a profile that mentions one field
+does not reset the rest; `CoreOptions::resolve` folds profile over global over built-in, and
+`Origin::of` derives which of the three won without a structure of its own.
+
+| Setting | Where it lands |
+|---|---|
+| `log_level` | `log.loglevel` |
+| `domain_strategy` | `routing.domainStrategy` |
+| `sniffing.{enabled,dest_override,route_only}` | both inbounds |
+| `dns.{server,direct_server,query_strategy}` | top-level `dns`, absent unless `server` is set |
+| `mux.*` | **every** proxy outbound — in Xray this is an outbound field, so a pool carries it per member |
+| `fragment.*`, `noises` | a `freedom` outbound tagged `dialer`, plus `sockopt.dialerProxy` on every proxy outbound |
+
+Three invariants:
+
+- **`dialer` does not start with `s-`.** That is the whole point of the tag scheme
+  (`SELECTABLE_TAG_PREFIX`): a balancer selector is a prefix match, and one that resolved to the
+  fragmenter would send a pool's traffic out through plain freedom while the UI said Connected.
+- **The `dialer` outbound exists exactly when fragmentation or noises do**, and nothing points at
+  it otherwise. The core accepts a dangling `dialerProxy` silently, so only oxidom's own test
+  catches the pairing breaking.
+- **Unset means absent, not defaulted.** `routeOnly: false`, an empty `mux`, an empty `dns` are all
+  left out; `default_bind_keeps_the_legacy_config_bytes` fails if that stops being true.
+
+**`xray run -test` is necessary and not sufficient.** Measured on 26.3.27: the core rejects a bad
+`destOverride`, `mux.xudpProxyUDP443`, `noises[].type`, `sockopt.domainStrategy` and a zero-minimum
+range — but *silently accepts* `loglevel: "loud"`, `domainStrategy: "Whatever"`,
+`queryStrategy: "UseNothing"`, a reversed range like `"200-100"` (and then fragments nothing), any
+`mux.concurrency` including 4096 and -2, a `dialerProxy` naming no outbound, and **any unknown key
+anywhere**. Everything in that second list is validated by `CoreOptions::validate`, because nothing
+downstream would.
+
+The TOML spellings are snake_case; the wire spellings are not (`IPIfNonMatch`, `UseIPv4`). They are
+deliberately separate — `as_xray()`, not the serde representation — so renaming a key in the file
+format cannot silently change the generated config.
+
+**The GUI** puts the same rows on both levels, from one widget group —
+`gui/views/core_editor.rs`, parameterised by `CoreLevel`. The levels differ only in what "unset"
+means, and that difference is the module:
+
+- `Machine`: nothing below but the built-in values, so a field equal to the built-in is stored as
+  `None` (`drop_built_ins`, field by field). Without it the first Apply on an unrelated setting
+  would write a whole `[core]` table into a file nobody configured.
+- `Profile`: sections carry an enable switch and are owned or inherited whole, which is exactly
+  what a `[core.mux]` table in a profile file means. An inheriting section shows what it inherits
+  in its subtitle, so nobody has to switch one on to look — switching one on to look is how a
+  profile ends up pinning a value nobody meant to pin.
+
+Two things this required elsewhere. `Config.core` is `skip_serializing_if`, which also drops it
+from the D-Bus payload, and the daemon reads an absent `core` as "keep what you have" so an older
+client cannot erase it; `DaemonClient::apply_settings` therefore re-inserts the key explicitly,
+otherwise turning the *last* core setting off would never reach the daemon. And `noises` has no
+editor at all: a list of byte patterns with no useful default is carried through untouched and
+reported by count, the same call as the pool membership in `profile_dialog.rs`.
+
+Geo data is a runtime dependency of **every** config oxidom generates, not just of future routing
+rules: `geoip:private` has been in the default rule set from the start, and without `geoip.dat` the
+core refuses to start rather than quietly not matching. `pkgs.xray` is a wrapper that sets
+`XRAY_LOCATION_ASSET`; a hand-set `xray_binary` pointing at an unwrapped core will fail at spawn.
 
 ## Xray process supervisor
 - Resolve the binary (see above), then spawn `<resolved> run -c <configfile>`. Capture

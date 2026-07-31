@@ -20,6 +20,7 @@ is a per-command flag, not a global one, and exists only on `status`, `list`, an
 - [Inspecting](#inspecting) — `status`, `ip`, `env`, `list`, `tun`
 - [Servers](#servers) — `ping`, `alias`
 - [Profiles](#profiles) — `profile list|show|new|edit|rm`
+- [Core settings](#core-settings) — `core show`
 - [Running things](#running-things) — `run`
 - [Processes](#processes) — `daemon`, `gui`
 - [Exit codes](#exit-codes)
@@ -239,6 +240,36 @@ editor fails.
 Removing a profile deliberately leaves a running session of it alone, so the unit
 that started it can still stop it.
 
+## Core settings
+
+### `oxidom core show [PROFILE] [--json]`
+
+Prints the advanced Xray core settings a session would be built with, one per
+line, together with the level that decided each: `built-in`, `global`
+(`config.toml`), or `profile`. `PROFILE` defaults to `default`.
+
+```console
+$ oxidom core show work
+log_level               warning        built-in
+domain_strategy         IPIfNonMatch   built-in
+sniffing.enabled        true           built-in
+sniffing.dest_override  http,tls       built-in
+sniffing.route_only     false          built-in
+mux.enabled             true           global
+mux.concurrency         16             profile
+fragment.enabled        false          built-in
+```
+
+Fields are tab-separated, as everywhere else in this CLI.
+
+A row exists exactly when the key will reach the generated config, so a disabled
+section shows only its switch — listing `mux.concurrency` under a `mux` that is
+off would describe a value the core never sees. There is no `core set`: these are
+edited in `config.toml` or with `oxidom profile edit`, and fifteen fields would
+mean fifteen verbs. See
+[configuration.md](configuration.md#advanced-core-settings) for what each one
+does.
+
 ## Running things
 
 ### `oxidom run [--profile NAME] [-c COMMAND] [-- ARGS…]`
@@ -366,6 +397,19 @@ deliberately excluded from every one of them.
 **`list subscriptions --json`** — `id`, `name`, `description`, `send_hwid`,
 `server_count`, `updated_at`, and `userinfo` (`{upload, download, total, expire}`
 or `null`).
+
+**`core show --json`** — the profile, and one object per setting that reaches the
+generated config:
+
+```json
+{"profile":"work","settings":[{"setting":"log_level","value":"warning",
+"origin":"built-in"},{"setting":"mux.concurrency","value":"16",
+"origin":"profile"}]}
+```
+
+`value` is always a string, including for numbers and booleans: the settings have
+several different types and a stable schema is worth more here than a faithful
+one. `origin` is `built-in`, `global`, or `profile`.
 
 ---
 
