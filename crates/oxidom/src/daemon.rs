@@ -53,9 +53,39 @@ const POOL_CONFIRM_WINDOW: Duration = Duration::from_secs(20);
 const POOL_CONFIRM_RETRY_GAP: Duration = Duration::from_secs(2);
 const CORE_EXITED_MESSAGE: &str = "Xray exited unexpectedly";
 const RECONNECTING_MESSAGE: &str = "Xray exited unexpectedly — reconnecting";
+/// Consecutive failed liveness probes before a still-running tunnel is declared
+/// dead and revived. At `ACTIVE_PROBE_INTERVAL` this is ~90s of unbroken
+/// failure — long enough that one slow round, or a server merely slower than
+/// the probe budget, never trips it, since any reachable answer resets the run.
+const TUNNEL_DEATH_STRIKES: u32 = 3;
 
 fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_secs((1_u64 << attempt.min(5)).min(30))
+}
+
+/// True while a session is actively carrying an `oxidom run` child — the packet
+/// mark that routes that child's cgroup into the tunnel is installed. Using
+/// `run` is itself the opt-in to resilient recovery, so this outlives a core
+/// death: `cleanup_live_interface` keeps `cgroup` set so the mark is reinstated
+/// when the tunnel comes back.
+fn session_has_run_cgroup(session: &oxidom_core::engine::Session) -> bool {
+    session
+        .interface
+        .as_ref()
+        .and_then(|interface| interface.cgroup.as_ref())
+        .is_some()
+}
+
+/// Whether a profile's tunnel should bring itself back after an unexpected
+/// death. Off by default and opt-in through `reconnect`, except for a session
+/// running a program under `oxidom run`, which always recovers so the child it
+/// carries is not stranded when its server blinks.
+fn resilient(engine: &Engine, profile: &str) -> bool {
+    engine.registry.config.reconnect
+        || engine
+            .sessions
+            .get(profile)
+            .is_some_and(session_has_run_cgroup)
 }
 
 /// The probe pipeline: what is being measured now, and what is waiting for a
@@ -227,6 +257,26 @@ impl ConnectionTarget {
     }
 }
 
+/// Rebuild the reconnect target from a live session, exactly as the death sweep
+/// does, so a hand-driven revival lands on the same `ConnectionTarget` that
+/// `begin_reconnect` will accept as still current — pool members and label
+/// included.
+fn reconnect_target(session: &oxidom_core::engine::Session) -> Option<ConnectionTarget> {
+    Some(match session.selection.clone()? {
+        SessionSelection::Server(server_id) => ConnectionTarget::Server(server_id),
+        SessionSelection::Pool {
+            members, strategy, ..
+        } => ConnectionTarget::Pool {
+            members,
+            name: session.pool_name.clone(),
+            strategy,
+            expected: session.pool_expected,
+            probe_interval: session.pool_probe_interval.clone(),
+            api_port: session.api_port,
+        },
+    })
+}
+
 impl From<&str> for ConnectionTarget {
     fn from(server_id: &str) -> Self {
         Self::Server(server_id.to_string())
@@ -260,6 +310,11 @@ pub(crate) struct Shared {
     /// Layered over the core status, e.g. when the confirming probe after a
     /// connect fails and the daemon shuts the tunnel back down.
     override_status: Arc<Mutex<HashMap<String, ErrorOverride>>>,
+    /// Consecutive dead-tunnel probes per profile, for the watchdog that revives
+    /// a resilient session whose server stops answering while its core keeps
+    /// running (so `note_core_deaths` never sees it). Reset by any reachable
+    /// probe, when a session leaves `Connected`, and on prune.
+    tunnel_failures: Arc<Mutex<HashMap<String, u32>>>,
     /// Generates attempt ids; `current_generations` keeps one cancellation
     /// domain per profile so bringing `work` up cannot invalidate `default`'s
     /// in-flight confirmation.
@@ -298,6 +353,7 @@ impl Shared {
             proxied: Arc::new(Mutex::new(HashMap::new())),
             probes: Arc::new(Mutex::new(ProbeQueue::default())),
             override_status: Arc::new(Mutex::new(HashMap::new())),
+            tunnel_failures: Arc::new(Mutex::new(HashMap::new())),
             // An adopted pool core is already a live attempt. Giving it a
             // generation makes its first post-recovery death reconnectable
             // while retaining the same cancellation rules as a fresh `up`.
@@ -379,21 +435,8 @@ impl Shared {
             if session.status() != Status::Connected || alive {
                 continue;
             }
-            let Some(selection) = session.selection.clone() else {
+            let Some(target) = reconnect_target(session) else {
                 continue;
-            };
-            let target = match selection {
-                SessionSelection::Server(server_id) => ConnectionTarget::Server(server_id),
-                SessionSelection::Pool {
-                    members, strategy, ..
-                } => ConnectionTarget::Pool {
-                    members,
-                    name: session.pool_name.clone(),
-                    strategy,
-                    expected: session.pool_expected,
-                    probe_interval: session.pool_probe_interval.clone(),
-                    api_port: session.api_port,
-                },
             };
             session.core.fail(CORE_EXITED_MESSAGE);
             session.balancer_info = None;
@@ -417,7 +460,7 @@ impl Shared {
         }
         let death_is_current = {
             let engine = oxidom_core::sync::lock(&self.engine);
-            engine.registry.config.reconnect
+            resilient(&engine, &profile)
                 && engine.sessions.get(&profile).is_some_and(|session| {
                     session.selection.as_ref() == Some(&target.selection())
                         && match &target {
@@ -497,11 +540,11 @@ impl Shared {
         if !self.generation_is_current(profile, generation) {
             return false;
         }
-        if !oxidom_core::sync::lock(&self.engine)
-            .registry
-            .config
-            .reconnect
-        {
+        let is_resilient = {
+            let engine = oxidom_core::sync::lock(&self.engine);
+            resilient(&engine, profile)
+        };
+        if !is_resilient {
             self.clear_reconnect_override(profile, target);
             return false;
         }
@@ -713,9 +756,16 @@ impl Shared {
         value
     }
 
-    /// Measure the tunnel owned by one profile.
-    fn run_session_probe(&self, profile: &str) -> Option<u32> {
-        let target = {
+    /// Probe the tunnel owned by one profile, keeping the raw outcome.
+    ///
+    /// Split out from `run_session_probe` so the watchdog can tell a server that
+    /// stopped answering (`Timeout`/`Unreachable`) from one that is merely slow
+    /// or from this machine losing its own uplink — a distinction the collapsed
+    /// `Option<u32>` throws away. Returns the method actually attempted alongside
+    /// the outcome, since a pool measures through a different verb than a single
+    /// server. `None` means there was nothing to measure.
+    fn session_probe_outcome(&self, profile: &str) -> Option<(probe::ProbeOutcome, LatencyMethod)> {
+        let (server, config, address, selection) = {
             let engine = oxidom_core::sync::lock(&self.engine);
             match engine.sessions.get(profile) {
                 Some(session) if session.status() == Status::Connected => {
@@ -725,50 +775,49 @@ impl Shared {
                     let server = session
                         .server_id()
                         .and_then(|server_id| engine.find_server(server_id));
-                    Some((server, config, session.address, session.selection.clone()))
+                    (server, config, session.address, session.selection.clone())
                 }
-                _ => None,
+                _ => return None,
             }
         };
-        let reading = match target {
-            Some((server, config, address, selection)) => {
-                let requested_method = config.latency_method;
-                let (outcome, attempted_method) = match (selection, server) {
-                    (Some(SessionSelection::Server(_)), Some(server)) => (
-                        probe::measure(&server, &config, probe::Route::Proxied, address),
-                        requested_method,
+        let requested_method = config.latency_method;
+        Some(match (selection, server) {
+            (Some(SessionSelection::Server(_)), Some(server)) => (
+                probe::measure(&server, &config, probe::Route::Proxied, address),
+                requested_method,
+            ),
+            (Some(SessionSelection::Pool { .. }), _) => {
+                // ICMP/TCP name one member and therefore cannot measure a
+                // rotating session. HTTP through the live SOCKS inbound measures
+                // exactly what the balancer carries.
+                let (verb, method) = pool_probe_method(requested_method);
+                (
+                    probe::http_ping(
+                        address,
+                        config.socks_port,
+                        &config.latency_test_url,
+                        verb,
+                        Duration::from_secs(3),
                     ),
-                    (Some(SessionSelection::Pool { .. }), _) => {
-                        // ICMP/TCP name one member and therefore cannot measure
-                        // a rotating session. HTTP through the live SOCKS
-                        // inbound measures exactly what the balancer carries.
-                        let (verb, method) = pool_probe_method(requested_method);
-                        (
-                            probe::http_ping(
-                                address,
-                                config.socks_port,
-                                &config.latency_test_url,
-                                verb,
-                                Duration::from_secs(3),
-                            ),
-                            method,
-                        )
-                    }
-                    _ => (
-                        probe::ProbeOutcome::Internal("session selection is missing"),
-                        requested_method,
-                    ),
-                };
-                match outcome {
-                    probe::ProbeOutcome::Reachable(measured) => {
-                        LatencyReading::ok(measured.ms, ProbeRoute::Proxied, measured.method)
-                    }
-                    outcome => LatencyReading::failed(
-                        wire_failure(&outcome),
-                        ProbeRoute::Proxied,
-                        attempted_method,
-                    ),
-                }
+                    method,
+                )
+            }
+            _ => (
+                probe::ProbeOutcome::Internal("session selection is missing"),
+                requested_method,
+            ),
+        })
+    }
+
+    /// Measure the tunnel owned by one profile, recording the reading the GUI
+    /// shows and returning the latency in ms (or `None` on any failure).
+    fn run_session_probe(&self, profile: &str) -> Option<u32> {
+        let reading = match self.session_probe_outcome(profile) {
+            Some((probe::ProbeOutcome::Reachable(measured), _)) => {
+                LatencyReading::ok(measured.ms, ProbeRoute::Proxied, measured.method)
+            }
+            Some((outcome, attempted_method)) => {
+                LatencyReading::failed(wire_failure(&outcome), ProbeRoute::Proxied, attempted_method)
             }
             None => LatencyReading::failed(
                 ProbeFailure::Unknown,
@@ -818,6 +867,10 @@ impl Shared {
             return Ok(None);
         }
         oxidom_core::sync::lock(&self.proxied).remove(profile);
+        // A fresh attempt starts the death streak over, so a couple of misses
+        // remembered from before an explicit reconnect cannot cut the new
+        // tunnel's grace short.
+        oxidom_core::sync::lock(&self.tunnel_failures).remove(profile);
         let probe_label = target.probe_label(profile);
         let probe_job = oxidom_core::sync::lock(&self.probes).start_now(profile, &probe_label);
 
@@ -1102,7 +1155,76 @@ impl Shared {
         oxidom_core::sync::lock(&self.readings).retain(|id, _| alive_servers.contains(id));
         oxidom_core::sync::lock(&self.proxied)
             .retain(|profile, _| alive_profiles.contains(profile));
+        oxidom_core::sync::lock(&self.tunnel_failures)
+            .retain(|profile, _| alive_profiles.contains(profile));
         oxidom_core::sync::lock(&self.probes).retain_alive(&alive_servers, &alive_profiles);
+    }
+
+    /// Fold one liveness probe of a running tunnel into its failure streak and
+    /// report whether the tunnel should now be considered dead.
+    ///
+    /// Only the server's own silence advances the count. A `Reachable` answer —
+    /// however slow — wipes the streak, so a server merely slower than the probe
+    /// budget never trips this. `NoNetwork` is this machine losing its uplink,
+    /// not the server dropping, and a reconnect cannot mend it; `Internal`/`None`
+    /// are our own failure to measure. None of those touch the count.
+    fn note_tunnel_probe(&self, profile: &str, outcome: Option<&probe::ProbeOutcome>) -> bool {
+        let mut failures = oxidom_core::sync::lock(&self.tunnel_failures);
+        match outcome {
+            Some(probe::ProbeOutcome::Timeout | probe::ProbeOutcome::Unreachable) => {
+                let count = failures.entry(profile.to_string()).or_insert(0);
+                *count += 1;
+                if *count >= TUNNEL_DEATH_STRIKES {
+                    failures.remove(profile);
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(probe::ProbeOutcome::Reachable(_)) => {
+                failures.remove(profile);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Revive a session whose server went silent while its core kept running.
+    ///
+    /// `note_core_deaths` only fires when the Xray *process* exits; a server that
+    /// simply stops answering leaves the core alive with its inbound still bound,
+    /// so nothing there would ever notice. This walks the same path by hand — kill
+    /// the wedged core, mark it failed, drop the interface — then hands off to the
+    /// ordinary reconnect loop, which retries with backoff until the server is
+    /// back and `start_interface` re-marks the still-running child's cgroup.
+    fn recover_dead_tunnel(&self, profile: &str) {
+        let target = {
+            let mut engine = oxidom_core::sync::lock(&self.engine);
+            let Some(session) = engine.sessions.get_mut(profile) else {
+                return;
+            };
+            let Some(target) = reconnect_target(session) else {
+                return;
+            };
+            // The core still holds the profile's SOCKS port; a reconnect rebinds
+            // the same port and `ensure_ports_free` refuses while the old inbound
+            // lingers. Kill it before failing so the port is free, and so
+            // `fail` — which leaves the selection intact — is what `begin_reconnect`
+            // then sees.
+            session.core.disconnect();
+            session.core.fail(CORE_EXITED_MESSAGE);
+            session.balancer_info = None;
+            if let Err(error) = engine.stop_interface(profile) {
+                log::warn!(
+                    "could not clean the interface while reviving profile {profile:?}: {error:#}"
+                );
+            }
+            engine.sessions.release_system_proxy(profile);
+            target
+        };
+        if let Some(generation) = self.current_generation(profile) {
+            self.begin_reconnect(profile.to_string(), target, generation);
+        }
     }
 
     /// Periodic re-probe of the active server; keeps the latency reading
@@ -1138,6 +1260,53 @@ impl Shared {
                     // The queue refuses a profile already running or waiting,
                     // so a slow session cannot pile up copies of itself.
                     shared.enqueue_session_probe(profile, label);
+                }
+            }
+        });
+    }
+
+    /// Counterpart to `spawn_active_probe_loop`: it refuses to tear a connection
+    /// down, this one does — but only for a resilient session (an `oxidom run`
+    /// cgroup, or the global `reconnect`), and only after `TUNNEL_DEATH_STRIKES`
+    /// unbroken failures prove the server is gone rather than slow.
+    fn spawn_tunnel_watchdog(&self) {
+        let shared = self.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(ACTIVE_PROBE_INTERVAL);
+                let watched = {
+                    let mut engine = oxidom_core::sync::lock(&shared.engine);
+                    let reconnect_all = engine.registry.config.reconnect;
+                    let profiles = engine
+                        .sessions
+                        .iter()
+                        .map(|(profile, _)| profile.to_string())
+                        .collect::<Vec<_>>();
+                    let mut watched = Vec::new();
+                    for profile in profiles {
+                        let Some(session) = engine.sessions.get_mut(&profile) else {
+                            continue;
+                        };
+                        if session.status() == Status::Connected
+                            && session.is_alive()
+                            && (reconnect_all || session_has_run_cgroup(session))
+                        {
+                            watched.push(profile);
+                        }
+                    }
+                    watched
+                };
+                for profile in watched {
+                    let outcome = shared
+                        .session_probe_outcome(&profile)
+                        .map(|(outcome, _)| outcome);
+                    if shared.note_tunnel_probe(&profile, outcome.as_ref()) {
+                        log::warn!(
+                            "profile {profile:?} stopped answering while its core is alive; \
+                             reviving it"
+                        );
+                        shared.recover_dead_tunnel(&profile);
+                    }
                 }
             }
         });
@@ -2244,6 +2413,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
         options.system_bus,
     );
     shared.spawn_active_probe_loop();
+    shared.spawn_tunnel_watchdog();
     shared.spawn_pool_status_loop();
     spawn_core_supervisor(shared.clone());
 
@@ -2655,6 +2825,114 @@ mod tests {
                 .map(|session| session.status()),
             Some(Status::Error(message)) if message == CORE_EXITED_MESSAGE
         ));
+        Ok(())
+    }
+
+    fn reachable() -> probe::ProbeOutcome {
+        probe::ProbeOutcome::Reachable(probe::Measurement {
+            ms: 42,
+            method: LatencyMethod::HttpGet,
+        })
+    }
+
+    #[test]
+    fn a_dead_tunnel_is_declared_only_after_an_unbroken_run_of_failures() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("tunnel-strikes")?;
+        let service = for_test();
+        let shared = &service.shared;
+
+        // One short of the threshold never fires.
+        for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
+            assert!(!shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::Timeout)));
+        }
+        // A single reachable answer — however slow — wipes the streak, so the
+        // count has to start over from scratch.
+        assert!(!shared.note_tunnel_probe("default", Some(&reachable())));
+        for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
+            assert!(!shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::Unreachable)));
+        }
+        // The strike that reaches the threshold is the one that declares it dead.
+        assert!(shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::Unreachable)));
+        // And the counter is cleared on the way out, so the next run starts fresh.
+        assert!(!shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::Timeout)));
+        Ok(())
+    }
+
+    #[test]
+    fn neither_a_dead_network_nor_our_own_failure_counts_as_a_dead_server() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("tunnel-not-the-server")?;
+        let service = for_test();
+        let shared = &service.shared;
+
+        // A machine with no uplink, our own inability to measure, and a vanished
+        // session are none of them the server going quiet: a reconnect cannot
+        // mend them, so they must never advance toward a teardown, even repeated
+        // well past the threshold.
+        for _ in 0..TUNNEL_DEATH_STRIKES + 2 {
+            assert!(!shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::NoNetwork)));
+            assert!(
+                !shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::Internal("no core")))
+            );
+            assert!(!shared.note_tunnel_probe("default", None));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_oxidom_run_session_is_resilient_even_with_reconnect_off() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("run-is-resilient")?;
+        let service = for_test();
+        let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+        engine.registry.config.reconnect = false;
+
+        mark_active(&mut engine, "runner", "srv")?;
+        // No cgroup yet: a plain connect keeps the deliberate off-by-default.
+        assert!(!resilient(&engine, "runner"));
+
+        engine.attach_run_cgroup_for_test("runner", 1000)?;
+        // Carrying a run child is itself the opt-in.
+        assert!(resilient(&engine, "runner"));
+
+        // The global flag still turns it on for everyone else.
+        mark_active(&mut engine, "plain", "srv")?;
+        assert!(!resilient(&engine, "plain"));
+        engine.registry.config.reconnect = true;
+        assert!(resilient(&engine, "plain"));
+        Ok(())
+    }
+
+    #[test]
+    fn reviving_a_live_but_dead_tunnel_fails_the_core_and_keeps_the_selection() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("revive-live-tunnel")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            // reconnect off and no cgroup, so the handoff to begin_reconnect is a
+            // no-op and the test stays hermetic — we assert only the local half.
+            engine.registry.config.reconnect = false;
+            mark_active(&mut engine, "default", "silent-server")?;
+            let session = engine.default_session_mut().context("default session")?;
+            *oxidom_core::sync::lock(&session.core.status) = Status::Connected;
+        }
+
+        service.shared.recover_dead_tunnel("default");
+
+        let engine = oxidom_core::sync::lock(&service.shared.engine);
+        let session = engine.sessions.get("default").context("default session")?;
+        assert!(matches!(
+            session.status(),
+            Status::Error(message) if message == CORE_EXITED_MESSAGE
+        ));
+        // The selection has to survive so begin_reconnect can aim at the same
+        // server once it is reachable again.
+        assert_eq!(
+            session.selection,
+            Some(SessionSelection::Server("silent-server".to_string()))
+        );
         Ok(())
     }
 

@@ -1177,6 +1177,45 @@ impl Engine {
         Ok(slice)
     }
 
+    /// Test seam: plant a minimal `oxidom run` cgroup on a session's interface
+    /// so cross-crate tests can exercise resilient recovery without standing up
+    /// a real TUN device. Production installs the mark through `mark_cgroup`
+    /// once a live interface is up; this shortcut never touches the kernel.
+    #[doc(hidden)]
+    pub fn attach_run_cgroup_for_test(&mut self, profile: &str, uid: u32) -> Result<()> {
+        let slice = crate::run::user_slice(profile, uid)?;
+        let session = self
+            .sessions
+            .get_mut(profile)
+            .context("attaching a test cgroup to an absent session")?;
+        session.interface = Some(Interface {
+            profile: profile.to_string(),
+            device: format!("oxi-{profile}"),
+            address: Ipv4Addr::UNSPECIFIED,
+            mtu: 1500,
+            table: 0,
+            mark: 0,
+            routes: RouteMode::Manual,
+            created: false,
+            tun2socks: Tun2socks::new(String::new()),
+            nft_binary: String::new(),
+            cgroup: Some(slice),
+            nft_active: false,
+            plan: RoutePlan {
+                private: Vec::new(),
+                system: Vec::new(),
+                rule: crate::tun::plan::RuleSpec {
+                    mark: 0,
+                    table: 0,
+                    priority: 0,
+                },
+            },
+            up: false,
+            fresh: false,
+        });
+        Ok(())
+    }
+
     /// Apply an already planned interface after the session's SOCKS inbound
     /// has proved it can carry traffic.
     pub fn start_interface(&mut self, profile: &str) -> Result<()> {
