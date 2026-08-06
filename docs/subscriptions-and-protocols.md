@@ -86,6 +86,28 @@ The first one is common and usually means the User-Agent. Panels routinely gate
 the response on it; change **Settings › Advanced › Client preset** (or
 `subscription_user_agent`) and refresh.
 
+## The User-Agent decides the format
+
+The same URL commonly answers with a *different format* per client string, so
+the User-Agent is not only about being recognized — it selects what you get.
+A Remnawave panel, for example, may answer `v2rayNG` with an array of complete
+Xray configs (one balanced profile per country) and answer `v2rayN` with a plain
+share-link list of the same nodes. Both parse, but they are not equivalent:
+
+| Response | What you see |
+| --- | --- |
+| Share-link list | one server per node, each with a share link, poolable, pingable |
+| Array of balanced Xray configs | one `xray + balanced (N)` server per config, no share link, not poolable |
+
+So a subscription that shows far fewer normal servers than you expect — most of
+them labelled `xray + balanced (…)` — is usually answering the wrong format
+rather than hiding nodes. Try a different client string and refresh.
+
+Because providers disagree about which client gets what, the value is settable
+**per subscription**: open the subscription and use **Fetching › User-Agent
+override**. Leave it empty to inherit **Settings › Advanced › Client preset**.
+The new value applies on the next update, so press **Update** afterwards.
+
 ## Quota and expiry
 
 If the response carries a `subscription-userinfo` header, oxidom reads upload,

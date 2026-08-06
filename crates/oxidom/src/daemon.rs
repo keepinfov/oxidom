@@ -1763,6 +1763,30 @@ impl Service {
         engine.save().map_err(failed)
     }
 
+    /// Set or clear one subscription's User-Agent override. An empty string
+    /// clears it, so the global `subscription_user_agent` applies again.
+    ///
+    /// This does not refetch: a panel keys its response format on the
+    /// User-Agent, so the new value has to be in place *before* the next
+    /// refresh, and refreshing here would hide which of the two actions failed.
+    fn set_subscription_user_agent(
+        &self,
+        subscription_id: String,
+        user_agent: String,
+    ) -> fdo::Result<()> {
+        let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        let Some(subscription) = engine
+            .registry
+            .subscriptions
+            .iter_mut()
+            .find(|subscription| subscription.id == subscription_id)
+        else {
+            return Err(failed(format!("unknown subscription {subscription_id:?}")));
+        };
+        subscription.user_agent = oxidom_core::subscription::user_agent_override(&user_agent);
+        engine.save().map_err(failed)
+    }
+
     fn connect(&self, server_id: String) -> fdo::Result<()> {
         // Bare Connect predates profiles and must keep working for a user who
         // has no `default.toml`: it is read here only to learn whether an

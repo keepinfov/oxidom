@@ -22,6 +22,8 @@ pub struct SubscriptionCallbacks {
     pub remove: Rc<dyn Fn(String)>,
     pub remove_server: Rc<dyn Fn(String)>,
     pub hwid: Rc<dyn Fn(String, bool)>,
+    /// Set one subscription's User-Agent override, or clear it when empty.
+    pub user_agent: Rc<dyn Fn(String, String)>,
     /// Names of the groups that would lose a server if it were deleted.
     /// A group is the only thing in this app that holds a server by id, so a
     /// deletion is the one moment a user can be told before it is too late.
@@ -632,6 +634,32 @@ fn show_subscription_details(
         .build();
     details.add(&server_count);
 
+    // The User-Agent belongs next to the subscription and not only in Settings,
+    // because it selects the *format* the panel answers with, and providers
+    // disagree about which client gets what. One that returns a bundled Xray
+    // profile per country to `v2rayNG` and a plain share-link list to everything
+    // else needs a different value than the rest of your subscriptions — and the
+    // global preset can only be right for one of them.
+    let fetching = adw::PreferencesGroup::builder()
+        .title("Fetching")
+        .description(
+            "Panels usually pick the response format from the User-Agent. \
+             Leave this empty to use the global preset from Settings › Advanced. \
+             Changing it takes effect on the next update.",
+        )
+        .build();
+    let user_agent = adw::EntryRow::builder()
+        .title("User-Agent override")
+        .text(subscription.user_agent.clone().unwrap_or_default())
+        .show_apply_button(true)
+        .build();
+    let ua_id = subscription.id.clone();
+    let ua_callback = callbacks.user_agent.clone();
+    user_agent.connect_apply(move |row| {
+        ua_callback(ua_id.clone(), row.text().to_string());
+    });
+    fetching.add(&user_agent);
+
     let privacy = adw::PreferencesGroup::builder()
         .title("Privacy")
         .description("HWID is never sent unless this switch is enabled.")
@@ -657,6 +685,7 @@ fn show_subscription_details(
 
     let groups = gtk::Box::new(gtk::Orientation::Vertical, 24);
     groups.append(&details);
+    groups.append(&fetching);
     groups.append(&privacy);
     groups.append(&danger);
     let content = scrollable_dialog_content(&groups);

@@ -371,6 +371,20 @@ impl DaemonClient {
             .map_err(friendly)
     }
 
+    /// Override the User-Agent for one subscription. An empty `user_agent`
+    /// clears the override so the global config value applies again — D-Bus has
+    /// no `Option`, and "empty means inherit" is how the rest of the config
+    /// spells the same thing.
+    pub fn set_subscription_user_agent(
+        &self,
+        subscription_id: &str,
+        user_agent: &str,
+    ) -> Result<()> {
+        self.proxy
+            .call("SetSubscriptionUserAgent", &(subscription_id, user_agent))
+            .map_err(friendly)
+    }
+
     pub fn connect_server(&self, server_id: &str) -> Result<()> {
         self.proxy.call("Connect", &(server_id,)).map_err(friendly)
     }

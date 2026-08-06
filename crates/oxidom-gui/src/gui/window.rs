@@ -1708,6 +1708,14 @@ impl Controller {
                     }
                 })
             },
+            user_agent: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id, user_agent| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.set_subscription_user_agent(id, user_agent);
+                    }
+                })
+            },
             groups_holding: {
                 let weak = Rc::downgrade(self);
                 Rc::new(move |id: String| {
@@ -2541,6 +2549,20 @@ impl Controller {
             |controller, result| {
                 if let Err(error) = result {
                     controller.show_message(&format!("Could not save HWID preference: {error}"));
+                }
+                controller.rebuild_views();
+            },
+        );
+    }
+
+    fn set_subscription_user_agent(self: &Rc<Self>, subscription_id: String, user_agent: String) {
+        let work_id = subscription_id;
+        self.client_job(
+            UiOperation::new(UiOperationKind::ApplySettings),
+            move |client| client.set_subscription_user_agent(&work_id, &user_agent),
+            |controller, result| {
+                if let Err(error) = result {
+                    controller.show_message(&format!("Could not save the User-Agent: {error}"));
                 }
                 controller.rebuild_views();
             },

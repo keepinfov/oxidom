@@ -141,6 +141,17 @@ fn require_https(url: &str) -> Result<()> {
     )
 }
 
+/// Normalize a per-subscription User-Agent override as a user typed it.
+///
+/// Blank means "inherit the global setting", which is how the value is spelled
+/// everywhere it can be edited: D-Bus has no `Option`, and an emptied entry row
+/// in the GUI has to clear the override rather than send a literal empty
+/// User-Agent — which would make the panel choose a format on its own.
+pub fn user_agent_override(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// Fetch into an existing Subscription, updating servers/userinfo/name/timestamp.
 pub fn refresh(sub: &mut Subscription, user_agent: &str, hwid: Option<&str>) -> Result<()> {
     let ua = sub.user_agent.as_deref().unwrap_or(user_agent);
@@ -235,8 +246,24 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
 
-    use super::{fetch, preserve_server_identity, require_https};
+    use super::{fetch, preserve_server_identity, require_https, user_agent_override};
     use crate::link::parse_link;
+
+    /// A blank override must clear the field rather than be stored. An empty
+    /// string reaching `refresh` would be sent as the literal User-Agent, and a
+    /// panel that picks its response format from the header answers a stranger
+    /// with whatever it likes — which is the bug this setting exists to fix.
+    #[test]
+    fn a_blank_user_agent_override_means_inherit_the_global_one() {
+        for blank in ["", "   ", "\t", "\n "] {
+            assert_eq!(user_agent_override(blank), None, "{blank:?}");
+        }
+        assert_eq!(
+            user_agent_override("  v2rayN/6.45  "),
+            Some("v2rayN/6.45".to_string()),
+            "surrounding whitespace is an editing artifact, not part of the header"
+        );
+    }
 
     #[test]
     fn plaintext_subscriptions_are_refused_off_loopback() {

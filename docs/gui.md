@@ -85,8 +85,11 @@ Two per-subscription settings worth knowing:
 
 - **Send HWID** — off by default, and off is the whole point. See
   [subscriptions-and-protocols.md](subscriptions-and-protocols.md#privacy-and-hwid).
-- A per-subscription **User-Agent** override, for panels that gate the response on
-  it.
+- **Fetching › User-Agent override** — for panels that choose the *response
+  format* from the client string, so one provider can need a different value
+  than the rest. Empty inherits **Settings › Advanced › Client preset**; the new
+  value applies on the next **Update**. See
+  [subscriptions-and-protocols.md](subscriptions-and-protocols.md#the-user-agent-decides-the-format).
 
 Locally pasted share links live in a built-in group called **My servers**.
 
