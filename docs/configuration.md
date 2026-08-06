@@ -69,7 +69,7 @@ system_proxy = false
 reconnect = false
 latency_method = "http_get"
 latency_test_url = "https://www.gstatic.com/generate_204"
-subscription_user_agent = "v2rayNG/1.9.5"
+subscription_user_agent = "v2rayN/6.45"
 xray_binary = ""
 tun2socks_binary = ""
 nft_binary = ""
@@ -83,7 +83,7 @@ nft_binary = ""
 | `reconnect` | bool | `false` | Redial when the core exits **unexpectedly** — never after you asked for `down`. Opt-in on purpose: a tunnel that silently comes back is a tunnel you cannot turn off. |
 | `latency_method` | enum | `"http_get"` | One of `icmp`, `tcp`, `http_head`, `http_get`. |
 | `latency_test_url` | string | `https://www.gstatic.com/generate_204` | Target for the HTTP probe methods. |
-| `subscription_user_agent` | string | `"v2rayNG/1.9.5"` | Sent when fetching subscriptions. Many panels serve a different body — or a web page — depending on it. |
+| `subscription_user_agent` | string | `"v2rayN/6.45"` | Sent when fetching subscriptions. Many panels serve a different body — or a different *format*, or a web page — depending on it. See [the format it selects](subscriptions-and-protocols.md#the-user-agent-decides-the-format). |
 | `xray_binary` | path | `""` | Empty falls through to the env var, then `PATH`. |
 | `tun2socks_binary` | path | `""` | Same. Needed only for TUN mode. |
 | `nft_binary` | path | `""` | Same. Needed only for `oxidom run`. |
@@ -102,7 +102,7 @@ one.
 ### User-Agent presets
 
 The GUI offers these, and the free-text field remains the source of truth:
-`v2rayNG/1.9.5`, `Happ/3.13.0`, `v2rayN/6.45`, `Streisand`, `Hiddify/2.0.5`,
+`v2rayN/6.45`, `v2rayNG/1.9.5`, `Happ/3.13.0`, `Streisand`, `Hiddify/2.0.5`,
 `NekoBox/1.3.5`, `Shadowrocket/2.2.9`, `clash-verge/1.7.7`, `SFA/1.10.0`.
 
 ## Advanced core settings

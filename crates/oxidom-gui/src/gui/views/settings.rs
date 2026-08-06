@@ -190,9 +190,9 @@ pub struct SettingsView {
 /// User-Agent field; the field itself stays the source of truth so users can
 /// still type a value not listed here.
 const UA_PRESETS: &[(&str, &str)] = &[
+    ("v2rayN", "v2rayN/6.45"),
     ("v2rayNG", "v2rayNG/1.9.5"),
     ("Happ", "Happ/3.13.0"),
-    ("v2rayN", "v2rayN/6.45"),
     ("Streisand", "Streisand"),
     ("Hiddify", "Hiddify/2.0.5"),
     ("NekoBox", "NekoBox/1.3.5"),

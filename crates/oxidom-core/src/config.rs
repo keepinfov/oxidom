@@ -57,7 +57,7 @@ impl Default for Config {
             reconnect: false,
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".to_string(),
-            subscription_user_agent: "v2rayNG/1.9.5".to_string(),
+            subscription_user_agent: "v2rayN/6.45".to_string(),
             xray_binary: String::new(),
             tun2socks_binary: String::new(),
             nft_binary: String::new(),

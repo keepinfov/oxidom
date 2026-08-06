@@ -8,7 +8,14 @@ use crate::subscription_format;
 
 /// Fallback User-Agent when neither the subscription nor config specify one.
 /// Panels commonly gate the response on a recognized client string.
-const DEFAULT_USER_AGENT: &str = "v2rayNG/1.9.5";
+///
+/// `v2rayN` rather than `v2rayNG`: both are recognized everywhere, but panels
+/// routinely map `v2rayNG` to a client-specific *structured* body — Remnawave
+/// answers it with an array of whole Xray configs, one balanced profile per
+/// country — while `v2rayN` gets the plain share-link list of the same nodes.
+/// The link list is what oxidom does most with: one server per node, each with
+/// a share link, poolable and individually measurable.
+const DEFAULT_USER_AGENT: &str = "v2rayN/6.45";
 
 /// Overall cap on a subscription fetch. ureq's default agent has *no* read
 /// timeout, so a panel that completes the handshake and then goes quiet would
