@@ -2606,18 +2606,37 @@ impl Controller {
             move |client| {
                 let outcome = client.apply_settings(&config)?;
                 // Applying can move the Xray path or be refused outright; ask
-                // the daemon what it ended up with instead of assuming.
-                Ok((outcome, client.runtime_info().ok()))
+                // the daemon what it ended up with instead of assuming. The
+                // stored config is the authority on what was accepted — the
+                // page used to mark the *request* applied and then sat clean
+                // holding values the daemon had reverted.
+                Ok((outcome, client.settings().ok(), client.runtime_info().ok()))
             },
             move |controller, result| {
                 match result {
-                    Ok((outcome, runtime)) => {
-                        controller.settings.mark_applied(values.clone());
+                    Ok((outcome, stored, runtime)) => {
+                        match stored.as_ref() {
+                            Some(config) => controller
+                                .settings
+                                .adopt_applied(&values, SettingsValues::from(config)),
+                            // An older daemon has no GetSettings; accepting the
+                            // request is what this code always did, and is still
+                            // better than leaving the page permanently dirty.
+                            None => controller.settings.mark_applied(values.clone()),
+                        }
                         controller.settings.set_runtime_info(runtime.as_ref());
                         if !outcome.ignored_ports.is_empty() {
                             controller.show_message(&format!(
                                 "{} left unchanged — fixed by the system service unit",
                                 outcome.ignored_ports.join(" and ")
+                            ));
+                        }
+                        if !outcome.ignored_paths.is_empty() {
+                            // Not the service unit: a privileged daemon spawns
+                            // what these name, so it resolves them itself.
+                            controller.show_message(&format!(
+                                "{} left unchanged — the system service chooses its own core binaries",
+                                outcome.ignored_paths.join(" and ")
                             ));
                         }
                         if let Some(error) = outcome.reconnect_error {

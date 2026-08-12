@@ -487,6 +487,31 @@ impl SettingsView {
         refresh_state(&self.widgets, &self.model);
     }
 
+    /// Completes an apply with what the daemon **stored**, which is not always
+    /// what was sent: a system daemon reverts binary paths, and a service unit
+    /// pins ports. Marking the submitted draft applied instead left the page
+    /// clean while holding values that exist nowhere.
+    ///
+    /// A field the daemon refused is snapped back in the widget too, so the row
+    /// shows the truth rather than an edit that will never take. Fields it
+    /// accepted are left alone, which keeps the promise of [`Self::mark_applied`]:
+    /// an edit made *while* the apply was in flight stays dirty.
+    pub fn adopt_applied(&self, submitted: &SettingsValues, effective: SettingsValues) {
+        let draft = {
+            let mut model = self.model.borrow_mut();
+            let mut draft = model.draft.clone();
+            refuse(submitted, &effective, &mut draft);
+            model.draft = draft.clone();
+            model.mark_applied(effective);
+            draft
+        };
+        self.updating_widgets.set(true);
+        self.widgets.set_values(&draft);
+        sync_preset(&self.widgets);
+        self.updating_widgets.set(false);
+        refresh_state(&self.widgets, &self.model);
+    }
+
     /// Completes a failed/cancelled asynchronous apply without accepting the
     /// draft, allowing the user to try again.
     pub fn set_apply_in_progress(&self, applying: bool) {
@@ -561,6 +586,22 @@ impl SettingsView {
             }
         }
 
+        // A system daemon reverts these three to its own values, so leaving
+        // them editable meant typing into a field whose text the next Apply
+        // would silently drop — and the page would still call itself applied.
+        const PATH_LOCKED: &str =
+            "Set by the system service — a privileged daemon does not run a path chosen here";
+        for row in [
+            &widgets.xray_binary,
+            &widgets.tun2socks_binary,
+            &widgets.nft_binary,
+        ] {
+            row.set_sensitive(!info.binary_paths_locked);
+        }
+        widgets
+            .xray_binary
+            .set_tooltip_text(info.binary_paths_locked.then_some(PATH_LOCKED));
+
         if info.socks_port_locked || info.http_port_locked {
             let mut model = self.model.borrow_mut();
             let SettingsModel { applied, draft, .. } = &mut *model;
@@ -603,6 +644,34 @@ fn validation_label() -> gtk::Label {
         .css_classes(["error"])
         .visible(false)
         .build()
+}
+
+/// Copies into `draft` every field the daemon changed on the way in — that is,
+/// every field where what came back differs from what was sent. Compared field
+/// by field rather than by the labels in `ApplySettingsResult`, so a refusal the
+/// daemon forgets to name still shows up, and an unrelated edit made while the
+/// apply was in flight survives.
+fn refuse(submitted: &SettingsValues, effective: &SettingsValues, draft: &mut SettingsValues) {
+    macro_rules! adopt {
+        ($($field:ident),+ $(,)?) => {$(
+            if submitted.$field != effective.$field {
+                draft.$field = effective.$field.clone();
+            }
+        )+};
+    }
+    adopt!(
+        socks_port,
+        http_port,
+        system_proxy,
+        reconnect,
+        latency_method,
+        latency_test_url,
+        subscription_user_agent,
+        xray_binary,
+        tun2socks_binary,
+        nft_binary,
+        core,
+    );
 }
 
 fn preset_for_user_agent(user_agent: &str) -> u32 {
@@ -821,6 +890,36 @@ mod tests {
         model.reset();
         assert_eq!(model.draft, model.applied);
         assert!(!model.state().dirty);
+    }
+
+    /// The page used to mark the *request* applied, so a system daemon that
+    /// reverted a binary path left the row clean holding a path that existed
+    /// nowhere. It now adopts what came back — but only for the fields the
+    /// daemon actually changed, so an edit made while the apply was in flight
+    /// is not thrown away.
+    #[test]
+    fn a_refused_field_snaps_back_and_an_unrelated_edit_survives() {
+        let submitted = SettingsValues {
+            xray_binary: "/home/me/xray".into(),
+            ..values()
+        };
+        let effective = SettingsValues {
+            // The daemon kept its own core and its unit-pinned port.
+            xray_binary: "/nix/store/xray/bin/xray".into(),
+            socks_port: 20172,
+            ..submitted.clone()
+        };
+        // Typed after Apply was pressed, before the answer arrived.
+        let mut draft = SettingsValues {
+            latency_test_url: "https://example.test/204".into(),
+            ..submitted.clone()
+        };
+
+        refuse(&submitted, &effective, &mut draft);
+
+        assert_eq!(draft.xray_binary, "/nix/store/xray/bin/xray");
+        assert_eq!(draft.socks_port, 20172);
+        assert_eq!(draft.latency_test_url, "https://example.test/204");
     }
 
     #[test]
