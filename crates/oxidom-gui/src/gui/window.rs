@@ -58,6 +58,23 @@ fn is_busy(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Busy>().is_some()
 }
 
+/// The single thing a status strip offers to do about the state it reports.
+/// Absent for `Disconnected`, and for `Connecting` — which resolves on its own
+/// in seconds and has nothing to stop that has started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusAction {
+    Disconnect,
+    ShowError,
+}
+
+fn status_action_for(status: &Status) -> Option<StatusAction> {
+    match status {
+        Status::Connected => Some(StatusAction::Disconnect),
+        Status::Error(_) => Some(StatusAction::ShowError),
+        Status::Disconnected | Status::Connecting => None,
+    }
+}
+
 /// What was last handed to the tray. The poll tick runs twice a second and
 /// most ticks change nothing, so the icon is only woken when one of these does.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -183,6 +200,8 @@ struct Controller {
     header_status_flag: gtk::Box,
     header_status_label: gtk::Label,
     header_status_spinner: gtk::Spinner,
+    header_status_action: gtk::Button,
+    header_status_action_icon: gtk::Image,
     profile_switcher: gtk::MenuButton,
     profile_switcher_label: gtk::Label,
     profile_switcher_popover: gtk::Popover,
@@ -199,6 +218,9 @@ struct Controller {
     sidebar_status: gtk::Button,
     sidebar_status_icon: gtk::Image,
     sidebar_status_label: gtk::Label,
+    sidebar_status_spinner: gtk::Spinner,
+    sidebar_status_action: gtk::Button,
+    sidebar_status_action_icon: gtk::Image,
     sidebar_list: gtk::ListBox,
     servers: ServersView,
     sessions: SessionsView,
@@ -224,6 +246,9 @@ struct Controller {
     /// `reconcile_system_proxy` runs on every poll tick, so the message is kept
     /// here to say it once instead of twice a second.
     system_proxy_failure: RefCell<Option<String>>,
+    /// What the status action button currently promises, so pressing it does
+    /// what its icon said rather than what the state has since become.
+    status_action: Cell<Option<StatusAction>>,
     /// Last (active, connecting) pair pushed to the cards, to avoid an
     /// O(cards) pass on every poll tick.
     applied_connection: RefCell<CardConnection>,
@@ -591,11 +616,20 @@ fn build(
     header_status_content.append(&header_status_label);
     let header_status = gtk::Button::builder()
         .child(&header_status_content)
-        .tooltip_text("Connection status")
+        .tooltip_text("Show connections")
         .visible(false)
         .css_classes(["header-status"])
         .build();
-    header_status.update_property(&[gtk::accessible::Property::Label("Connection status")]);
+    header_status.update_property(&[gtk::accessible::Property::Label("Show connections")]);
+    // The compact half of the sidebar's status strip, and split the same way:
+    // the chip reports, this acts. Exactly one of the two strips is on screen
+    // at a time, so the two never disagree about where Disconnect lives.
+    let header_status_action_icon = gtk::Image::builder().pixel_size(16).build();
+    let header_status_action = gtk::Button::builder()
+        .child(&header_status_action_icon)
+        .visible(false)
+        .css_classes(["flat", "header-icon-button"])
+        .build();
 
     let profile_switcher_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Single)
@@ -634,6 +668,7 @@ fn build(
     header.pack_start(&sidebar_toggle);
     header.pack_start(&search_toggle);
     header.pack_start(&header_status);
+    header.pack_start(&header_status_action);
     header.pack_start(&profile_switcher);
     header.pack_start(&search);
     // The filter used to be packed here, sixth in a row of six, on the theory
@@ -716,6 +751,8 @@ fn build(
         header_status_flag,
         header_status_label,
         header_status_spinner,
+        header_status_action,
+        header_status_action_icon,
         profile_switcher,
         profile_switcher_label,
         profile_switcher_popover,
@@ -730,6 +767,9 @@ fn build(
         sidebar_status: sidebar.status_button,
         sidebar_status_icon: sidebar.status_icon,
         sidebar_status_label: sidebar.status_label,
+        sidebar_status_spinner: sidebar.status_spinner,
+        sidebar_status_action: sidebar.status_action,
+        sidebar_status_action_icon: sidebar.status_action_icon,
         sidebar_list: sidebar.list,
         servers,
         sessions,
@@ -744,6 +784,7 @@ fn build(
         tray_pushed: RefCell::new(TrayState::default()),
         proxy_applied: Cell::new(gui_proxy_marker_exists()),
         system_proxy_failure: RefCell::new(None),
+        status_action: Cell::new(None),
         applied_proxy_endpoint: Cell::new(None),
         applied_connection: RefCell::new(CardConnection::default()),
         poll_in_flight: Arc::new(AtomicBool::new(false)),
@@ -1047,14 +1088,29 @@ impl Controller {
                 }
             }
         });
-        self.header_status.connect_clicked({
-            let weak = Rc::downgrade(self);
-            move |_| {
-                if let Some(controller) = weak.upgrade() {
-                    controller.handle_status_clicked();
+        // Both status strips do the same one thing, in every state: show the
+        // page that owns connections. What there is to *do* about the state
+        // lives on the action button beside them.
+        for strip in [&self.header_status, &self.sidebar_status] {
+            strip.connect_clicked({
+                let weak = Rc::downgrade(self);
+                move |_| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.navigate_to(Page::Sessions);
+                    }
                 }
-            }
-        });
+            });
+        }
+        for action in [&self.header_status_action, &self.sidebar_status_action] {
+            action.connect_clicked({
+                let weak = Rc::downgrade(self);
+                move |_| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.handle_status_action();
+                    }
+                }
+            });
+        }
         // On the list, not on each row: `GtkListBoxRow::activate` is the
         // keyboard action signal and a mouse click never emits it — the row
         // would highlight and nothing else would happen. `row-activated` is
@@ -1081,14 +1137,6 @@ impl Controller {
             move |_| {
                 if let Some(controller) = weak.upgrade() {
                     controller.navigate_to(Page::Sessions);
-                }
-            }
-        });
-        self.sidebar_status.connect_clicked({
-            let weak = Rc::downgrade(self);
-            move |_| {
-                if let Some(controller) = weak.upgrade() {
-                    controller.handle_status_clicked();
                 }
             }
         });
@@ -3317,7 +3365,6 @@ impl Controller {
         latency_stale: bool,
     ) {
         self.header_status_spinner.set_spinning(false);
-        self.header_status_spinner.set_visible(false);
         self.header_status_icon.set_visible(false);
         while let Some(child) = self.header_status_flag.first_child() {
             self.header_status_flag.remove(&child);
@@ -3329,7 +3376,6 @@ impl Controller {
         set_status_tone(&self.header_status, StatusTone::Neutral);
         self.header_status
             .set_visible(self.compact.get() && !matches!(status, Status::Disconnected));
-        self.header_status.set_sensitive(false);
 
         let state = self.state.borrow();
         let pool_name = self.active_pool_name(&state);
@@ -3341,15 +3387,15 @@ impl Controller {
             Status::Disconnected => {}
             Status::Connecting => {
                 set_status_tone(&self.header_status, StatusTone::Working);
-                self.header_status_spinner.set_visible(true);
-                self.header_status_spinner.set_spinning(true);
-                let tooltip = pool_name.as_deref().or(name.as_deref()).map_or_else(
+                self.header_status_icon
+                    .set_icon_name(Some("network-transmit-receive-symbolic"));
+                self.header_status_icon.set_visible(true);
+                let summary = pool_name.as_deref().or(name.as_deref()).map_or_else(
                     || "Connecting…".to_string(),
                     |name| format!("Connecting · {name}"),
                 );
-                self.header_status.set_tooltip_text(Some(&tooltip));
                 self.header_status
-                    .update_property(&[gtk::accessible::Property::Label(&tooltip)]);
+                    .set_tooltip_text(Some(&format!("{summary} — show connections")));
             }
             Status::Connected => {
                 set_status_tone(&self.header_status, StatusTone::Connected);
@@ -3369,26 +3415,26 @@ impl Controller {
                         self.header_status_label.add_css_class("latency-stale");
                     }
                 }
-                let tooltip = format!(
-                    "{} — click to disconnect",
-                    pool_name
-                        .as_deref()
-                        .or(name.as_deref())
-                        .unwrap_or("Connected")
-                );
-                self.header_status.set_tooltip_text(Some(&tooltip));
-                self.header_status.set_sensitive(true);
+                // Names the destination, not the state: Disconnect is the
+                // button to the right, and a chip that promised it was how one
+                // click came to mean three different things.
+                let summary = pool_name
+                    .as_deref()
+                    .or(name.as_deref())
+                    .unwrap_or("Connected");
                 self.header_status
-                    .update_property(&[gtk::accessible::Property::Label("Disconnect VPN")]);
+                    .set_tooltip_text(Some(&format!("{summary} — show connections")));
             }
-            Status::Error(error) => {
+            // The text is not put in the tooltip any more: it was the only
+            // place it lived, and a tooltip is unreachable by keyboard. The
+            // action button beside the chip opens it in full.
+            Status::Error(_) => {
                 set_status_tone(&self.header_status, StatusTone::Error);
                 self.header_status_icon
                     .set_icon_name(Some("dialog-warning-symbolic"));
                 self.header_status_icon.set_visible(true);
-                self.header_status.set_tooltip_text(Some(error));
                 self.header_status
-                    .update_property(&[gtk::accessible::Property::Label("Connection error")]);
+                    .set_tooltip_text(Some("Connection error — show connections"));
             }
         }
     }
@@ -3396,22 +3442,25 @@ impl Controller {
     fn update_sidebar_connection_status(&self, state: &AppState) {
         let status = selected_status(&state.ui);
         let (active_latency, latency_stale) = active_latency_for(&state.ui);
-        self.sidebar_status.set_sensitive(false);
         self.sidebar_status_label.remove_css_class("latency-stale");
-        match status {
+        // The strip is always sensitive because it always does the same thing.
+        // It used to be insensitive except when connected, which is how the
+        // "show the failure" branch below became unreachable: the one state
+        // that needed the click was the one that could not be clicked.
+        let summary = match status {
             Status::Disconnected => {
                 set_status_tone(&self.sidebar_status, StatusTone::Neutral);
                 self.sidebar_status_icon
                     .set_icon_name(Some("network-vpn-symbolic"));
                 self.sidebar_status_label.set_label("Ready");
-                self.sidebar_status.set_tooltip_text(Some("Ready"));
+                "Ready".to_string()
             }
             Status::Connecting => {
                 set_status_tone(&self.sidebar_status, StatusTone::Working);
                 self.sidebar_status_icon
                     .set_icon_name(Some("network-transmit-receive-symbolic"));
                 self.sidebar_status_label.set_label("Connecting…");
-                self.sidebar_status.set_tooltip_text(Some("Connecting"));
+                "Connecting".to_string()
             }
             Status::Connected => {
                 set_status_tone(&self.sidebar_status, StatusTone::Connected);
@@ -3428,58 +3477,96 @@ impl Controller {
                 if active_latency.is_some() && latency_stale {
                     self.sidebar_status_label.add_css_class("latency-stale");
                 }
-                self.sidebar_status.set_tooltip_text(Some("Disconnect VPN"));
-                self.sidebar_status.set_sensitive(true);
-                self.sidebar_status
-                    .update_property(&[gtk::accessible::Property::Label("Disconnect VPN")]);
+                label
             }
-            Status::Error(ref error) => {
+            Status::Error(_) => {
                 set_status_tone(&self.sidebar_status, StatusTone::Error);
                 self.sidebar_status_icon
                     .set_icon_name(Some("dialog-warning-symbolic"));
                 self.sidebar_status_label.set_label("Connection error");
-                self.sidebar_status.set_tooltip_text(Some(error));
+                "Connection error".to_string()
             }
-        }
+        };
+        // Names the destination, not the state, because that is what the click
+        // does. The state is already the label an inch to the left.
+        self.sidebar_status
+            .set_tooltip_text(Some(&format!("{summary} — show connections")));
+        self.set_status_action(status_action_for(&status));
     }
 
+    /// The one thing there is to do about the current state, on both strips.
+    /// `None` hides the button entirely rather than greying it: a dead control
+    /// is still a control to read past.
+    fn set_status_action(&self, action: Option<StatusAction>) {
+        self.status_action.set(action);
+        let Some(action) = action else {
+            self.sidebar_status_action.set_visible(false);
+            self.header_status_action.set_visible(false);
+            return;
+        };
+        // Both checked against the shipped theme by eye, not by name: Adwaita 50
+        // draws `dialog-information-symbolic` as a *light bulb* — a hint, not a
+        // message — while `help-about-symbolic` is the circled "i" this wants.
+        let (icon, tooltip) = match action {
+            StatusAction::Disconnect => ("system-shutdown-symbolic", "Disconnect"),
+            StatusAction::ShowError => ("help-about-symbolic", "Show the full error"),
+        };
+        for (button, image) in [
+            (
+                &self.sidebar_status_action,
+                &self.sidebar_status_action_icon,
+            ),
+            (&self.header_status_action, &self.header_status_action_icon),
+        ] {
+            image.set_icon_name(Some(icon));
+            button.set_tooltip_text(Some(tooltip));
+            button.update_property(&[gtk::accessible::Property::Label(tooltip)]);
+            button.set_visible(true);
+        }
+        // Only ever one strip on screen; the header half follows the same rule
+        // as the chip beside it.
+        self.header_status_action.set_visible(self.compact.get());
+        self.sidebar_status_action.set_visible(!self.compact.get());
+    }
+
+    /// Background work spins beside the status; it no longer rewrites it.
+    ///
+    /// The label used to be replaced with "Checking latency · 12" for as long
+    /// as the sweep ran — minutes, on a large subscription — while the click
+    /// still disconnected. The strip now keeps answering the one question it
+    /// exists for, and the running work says so with a spinner and its tooltip.
     fn refresh_activity_status(&self) {
         let state = self.state.borrow();
-        match (state.ui.operation.as_ref(), state.ui.checking.len()) {
-            (Some(operation), _) => {
-                set_status_tone(&self.sidebar_status, StatusTone::Working);
-                self.sidebar_status_icon
-                    .set_icon_name(Some("view-refresh-symbolic"));
-                self.sidebar_status_label.set_label(operation.label());
-            }
-            (None, 1) => {
-                set_status_tone(&self.sidebar_status, StatusTone::Working);
-                self.sidebar_status_icon
-                    .set_icon_name(Some("network-transmit-receive-symbolic"));
-                self.sidebar_status_label.set_label("Checking latency…");
-            }
-            (None, count) if count > 1 => {
-                set_status_tone(&self.sidebar_status, StatusTone::Working);
-                self.sidebar_status_icon
-                    .set_icon_name(Some("network-transmit-receive-symbolic"));
-                self.sidebar_status_label
-                    .set_label(&format!("Checking latency · {count}"));
-            }
-            (None, _) => self.update_sidebar_connection_status(&state),
+        let activity = match (state.ui.operation.as_ref(), state.ui.checking.len()) {
+            (Some(operation), _) => Some(operation.label().to_string()),
+            (None, 0) => None,
+            (None, 1) => Some("Checking latency…".to_string()),
+            (None, count) => Some(format!("Checking latency · {count}")),
+        };
+        for spinner in [&self.sidebar_status_spinner, &self.header_status_spinner] {
+            spinner.set_visible(activity.is_some());
+            spinner.set_spinning(activity.is_some());
+            spinner.set_tooltip_text(activity.as_deref());
         }
+        self.update_sidebar_connection_status(&state);
     }
 
-    /// The status buttons double as the only always-visible carrier of a
-    /// failure: the detail otherwise lives in a tooltip, which is unreachable
-    /// by keyboard and hidden entirely in wide mode.
-    fn handle_status_clicked(self: &Rc<Self>) {
-        let status = {
-            let state = self.state.borrow();
-            selected_status(&state.ui)
-        };
-        match status {
-            Status::Error(error) => self.show_error_details("Connection error", &error),
-            _ => self.disconnect_if_active(),
+    /// Does what the button's icon promised when it was painted, rather than
+    /// re-deriving an action from a state that may have moved since.
+    fn handle_status_action(self: &Rc<Self>) {
+        match self.status_action.get() {
+            Some(StatusAction::Disconnect) => self.disconnect_if_active(),
+            Some(StatusAction::ShowError) => {
+                let error = {
+                    let state = self.state.borrow();
+                    match selected_status(&state.ui) {
+                        Status::Error(error) => error,
+                        _ => return,
+                    }
+                };
+                self.show_error_details("Connection error", &error);
+            }
+            None => {}
         }
     }
 
@@ -3791,6 +3878,10 @@ fn install_css() {
         .sidebar-status.status-connected { color: @success_color; background: alpha(@success_color, 0.12); }
         .sidebar-status.status-error { color: @error_color; background: alpha(@error_color, 0.14); }
         .sidebar-status-icon { color: currentColor; -gtk-icon-size: 18px; }
+        /* Its own target beside the strip, not part of it: a hover that lit the
+           whole strip would say the text and the action were one button, which
+           is the confusion the two-target split exists to end. */
+        .sidebar-status-action { padding: 6px; min-width: 28px; min-height: 28px; }
 
         .server-card {
             border: none;
@@ -3868,8 +3959,8 @@ mod tests {
     use oxidom_core::xray::core::Status;
 
     use super::{
-        ResponsiveMode, SearchState, desired_system_proxy_endpoint, responsive_mode_for_width,
-        summarize_error,
+        ResponsiveMode, SearchState, StatusAction, desired_system_proxy_endpoint,
+        responsive_mode_for_width, status_action_for, summarize_error,
     };
 
     #[test]
@@ -3904,6 +3995,24 @@ mod tests {
         assert_eq!(
             desired_system_proxy_endpoint(true, &Status::Connected, &dead, 1, 2),
             None
+        );
+    }
+
+    /// The strip reports and the button acts, so the button exists only where
+    /// there is an act. `Connecting` deliberately offers nothing: the connect
+    /// job holds the operation slot, and a Disconnect sent into it is refused
+    /// and used to come back looking like the tunnel had failed.
+    #[test]
+    fn a_status_offers_an_action_only_where_there_is_one() {
+        assert_eq!(status_action_for(&Status::Disconnected), None);
+        assert_eq!(status_action_for(&Status::Connecting), None);
+        assert_eq!(
+            status_action_for(&Status::Connected),
+            Some(StatusAction::Disconnect)
+        );
+        assert_eq!(
+            status_action_for(&Status::Error("no such file".into())),
+            Some(StatusAction::ShowError)
         );
     }
 

@@ -35,6 +35,17 @@ impl Page {
     }
 }
 
+/// The status strip at the foot of the sidebar.
+///
+/// It is two targets, not one. `status_button` carries the text and always does
+/// the same thing — open the page that owns connections. `status_action` is the
+/// one thing there is to *do* about the current state, and it only exists when
+/// there is one.
+///
+/// It used to be a single button whose meaning changed with the state:
+/// connected meant disconnect, failed meant show the error, anything else meant
+/// nothing. Worse, background work rewrote its label without touching what the
+/// click did, so a strip reading "Checking latency…" disconnected the VPN.
 pub struct Sidebar {
     pub root: gtk::Box,
     /// Exposed so the window can move the selection programmatically, e.g.
@@ -43,6 +54,12 @@ pub struct Sidebar {
     pub status_button: gtk::Button,
     pub status_icon: gtk::Image,
     pub status_label: gtk::Label,
+    /// Spins beside the text while something runs. Deliberately not a second
+    /// label: the strip answers "am I connected", and the work that is running
+    /// is shown on the page doing it.
+    pub status_spinner: gtk::Spinner,
+    pub status_action: gtk::Button,
+    pub status_action_icon: gtk::Image,
 }
 
 impl Sidebar {
@@ -115,20 +132,36 @@ impl Sidebar {
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
+        let status_spinner = gtk::Spinner::new();
+        status_spinner.set_visible(false);
         let status_content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         status_content.append(&status_icon);
+        status_label.set_hexpand(true);
         status_content.append(&status_label);
+        status_content.append(&status_spinner);
         let status_button = gtk::Button::builder()
             .child(&status_content)
-            .tooltip_text("Connection status")
+            .hexpand(true)
+            .tooltip_text("Show connections")
             .css_classes(["flat", "sidebar-status"])
             .focus_on_click(true)
             .build();
-        status_button.update_property(&[gtk::accessible::Property::Label("Connection status")]);
-        status_button.set_margin_top(12);
-        status_button.set_margin_bottom(14);
-        status_button.set_margin_start(14);
-        status_button.set_margin_end(14);
+        status_button.update_property(&[gtk::accessible::Property::Label("Show connections")]);
+
+        let status_action_icon = gtk::Image::builder().pixel_size(16).build();
+        let status_action = gtk::Button::builder()
+            .child(&status_action_icon)
+            .css_classes(["flat", "circular", "sidebar-status-action"])
+            .visible(false)
+            .build();
+
+        let status_strip = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        status_strip.append(&status_button);
+        status_strip.append(&status_action);
+        status_strip.set_margin_top(12);
+        status_strip.set_margin_bottom(14);
+        status_strip.set_margin_start(14);
+        status_strip.set_margin_end(14);
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.set_width_request(230);
@@ -136,7 +169,7 @@ impl Sidebar {
         root.append(&brand);
         root.append(&list);
         list.set_vexpand(true);
-        root.append(&status_button);
+        root.append(&status_strip);
 
         Self {
             root,
@@ -144,6 +177,9 @@ impl Sidebar {
             status_button,
             status_icon,
             status_label,
+            status_spinner,
+            status_action,
+            status_action_icon,
         }
     }
 }
