@@ -816,9 +816,11 @@ impl Shared {
             Some((probe::ProbeOutcome::Reachable(measured), _)) => {
                 LatencyReading::ok(measured.ms, ProbeRoute::Proxied, measured.method)
             }
-            Some((outcome, attempted_method)) => {
-                LatencyReading::failed(wire_failure(&outcome), ProbeRoute::Proxied, attempted_method)
-            }
+            Some((outcome, attempted_method)) => LatencyReading::failed(
+                wire_failure(&outcome),
+                ProbeRoute::Proxied,
+                attempted_method,
+            ),
             None => LatencyReading::failed(
                 ProbeFailure::Unknown,
                 ProbeRoute::Proxied,
@@ -2897,7 +2899,8 @@ mod tests {
         for _ in 0..TUNNEL_DEATH_STRIKES + 2 {
             assert!(!shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::NoNetwork)));
             assert!(
-                !shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::Internal("no core")))
+                !shared
+                    .note_tunnel_probe("default", Some(&probe::ProbeOutcome::Internal("no core")))
             );
             assert!(!shared.note_tunnel_probe("default", None));
         }
