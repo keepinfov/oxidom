@@ -83,9 +83,6 @@ struct GroupUi {
 type BrowseCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 /// Set on every rebuild, read long afterwards by the filter popover.
 type PoolCallback = Rc<RefCell<Option<Rc<dyn Fn(PoolQuery)>>>>;
-/// Filled in once its dialog exists, so widgets built before the dialog can
-/// still ask it to re-check whether Save means anything.
-type Revalidate = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 /// Server id to its checkbox, in the order the picker laid them out.
 type PickerChecks = Rc<RefCell<Vec<(String, gtk::CheckButton)>>>;
 /// The handles a picker's checkboxes write into. Shared with whoever will save
@@ -110,7 +107,7 @@ enum FilterField {
     Subscription,
 }
 
-/// What the filter dialog is editing, before Apply writes it to the page.
+/// What the selection editor is editing, before Apply writes it to the page.
 ///
 /// A copy rather than the live fields: a modal dialog hides the list it would be
 /// changing, so applying each tick was work nobody could watch — and a form that
@@ -124,6 +121,77 @@ struct FilterDraft {
     /// Servers named by hand. Non-empty means the rule is not in force at all —
     /// the same precedence `pool::resolve` gives a list over a rule.
     members: Vec<String>,
+}
+
+impl FilterDraft {
+    /// How many of the rule's fields are set. The hand-picked members are not
+    /// one of them: they are the other answer to the same question, not a
+    /// narrower rule.
+    fn rule_fields(&self) -> usize {
+        [
+            self.countries.is_empty(),
+            self.protocols.is_empty(),
+            self.subscriptions.is_empty(),
+            self.exclude.is_empty(),
+        ]
+        .into_iter()
+        .filter(|empty| !empty)
+        .count()
+    }
+
+    /// Which kind of group this selection would be saved as.
+    ///
+    /// Derived rather than asked. It used to be a radio, on the reasoning that
+    /// "these forty-two, frozen" and "whatever is German, forever" are different
+    /// intents only the user knows — which is true, and is exactly what the form
+    /// above already says: servers named by hand are frozen because naming them
+    /// is what freezing means, and a rule with no members keeps matching because
+    /// that is all a rule can do. The radio asked for the answer a second time,
+    /// in the vocabulary of how groups are stored, as the first step of making
+    /// one.
+    fn kind(&self) -> GroupKind {
+        if self.members.is_empty() {
+            GroupKind::Rule
+        } else {
+            GroupKind::List
+        }
+    }
+
+    fn to_query(&self, name: String, kind: GroupKind) -> PoolQuery {
+        match kind {
+            // Frozen exactly as chosen, in the order the picker shows them.
+            GroupKind::List => PoolQuery {
+                name,
+                members: self.members.clone(),
+                ..PoolQuery::default()
+            },
+            GroupKind::Rule => PoolQuery {
+                name,
+                countries: self.countries.clone(),
+                protocols: self.protocols.clone(),
+                subscriptions: self.subscriptions.clone(),
+                exclude: self.exclude.clone(),
+                ..PoolQuery::default()
+            },
+        }
+    }
+}
+
+/// Why the selection editor was opened.
+///
+/// There is one editor; this decides only what it starts holding and which of
+/// its buttons is the obvious one. Three doors used to lead to two dialogs that
+/// asked overlapping questions in different words, and which of the two you got
+/// decided whether your answer could be saved at all.
+enum SelectionIntent {
+    /// Narrow what the page is showing.
+    Filter,
+    /// The same editor, opened by "New group": it starts with the name focused,
+    /// because the name is the part the user came here to fill in.
+    Name,
+    /// Change a group that already exists. Boxed only to keep the three
+    /// variants the same size; one of these exists at a time.
+    Edit(Box<ServerGroup>),
 }
 
 #[derive(Clone)]
@@ -394,7 +462,7 @@ impl ServersView {
         view.build_connect_button();
         view.filter_button.connect_clicked({
             let view = view.clone();
-            move |_| view.present_filter_dialog()
+            move |_| view.present_selection_dialog(SelectionIntent::Filter)
         });
         view
     }
@@ -913,7 +981,7 @@ impl ServersView {
         add.update_property(&[gtk::accessible::Property::Label("New group")]);
         add.connect_clicked({
             let view = self.clone();
-            move |_| view.save_as_group_dialog(None)
+            move |_| view.present_selection_dialog(SelectionIntent::Name)
         });
         self.chip_bar.append(&add);
 
@@ -996,7 +1064,7 @@ impl ServersView {
             let popover = popover.clone();
             move |_| {
                 popover.popdown();
-                view.save_as_group_dialog(Some(group.clone()));
+                view.present_selection_dialog(SelectionIntent::Edit(Box::new(group.clone())));
             }
         });
         list.append(&edit);
@@ -1015,14 +1083,26 @@ impl ServersView {
             let popover = popover.clone();
             move |_| {
                 popover.popdown();
-                let members =
-                    filtered_ids(&view.current_filter.borrow(), &view.subscriptions.borrow());
+                // A list takes the servers on screen; a rule takes the filters
+                // that put them there, because a rule that froze them would stop
+                // being a rule.
+                let query = match group.kind {
+                    GroupKind::List => PoolQuery {
+                        name: group.name.clone(),
+                        members: filtered_ids(
+                            &view.current_filter.borrow(),
+                            &view.subscriptions.borrow(),
+                        ),
+                        ..PoolQuery::default()
+                    },
+                    GroupKind::Rule => view.rule_from_filters(group.name.clone()),
+                };
                 view.save_group(
                     Some(group.clone()),
                     group.name.clone(),
                     group.icon.clone(),
                     group.kind,
-                    members,
+                    query,
                 );
             }
         });
@@ -1118,7 +1198,7 @@ impl ServersView {
         });
         self.connect_save.connect_clicked({
             let view = self.clone();
-            move |_| view.save_as_group_dialog(None)
+            move |_| view.present_selection_dialog(SelectionIntent::Name)
         });
         let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
         list.set_margin_top(6);
@@ -1294,43 +1374,94 @@ impl ServersView {
         self.connect_bar.set_visible(true);
     }
 
-    /// The filter as its own dialog, built fresh each time it is opened.
+    /// One editor for what is selected, whether or not it ends up with a name.
     ///
-    /// It was a popover, and the `Except` picker inside it was a second popover
-    /// parented to the first. GTK4 gives an autohide popover a grab; opening
-    /// another one inside it takes that grab away and leaves the outer popover
-    /// believing it is still shown, so its button silently refuses to open it
-    /// ever again. Measured behaviour, and the reason this is a dialog: a dialog
-    /// is an ordinary widget tree, so `Except` becomes a pushed page with a
-    /// slide animation instead of a popover inside a popover.
+    /// There used to be two dialogs. "Filter" said which servers to show, in the
+    /// language of a rule plus a hand-picked list; "Save as group" said the same
+    /// thing again with its own second picker, plus a name, an icon and a
+    /// List/Rule radio. Which door you came through decided which half of the
+    /// vocabulary you got: picking five servers by hand in the filter left them
+    /// unsaveable, and naming a group meant first finding a control that did
+    /// something else. They are now the same form, and a name is simply an
+    /// optional field on it.
     ///
-    /// The dialog edits a **draft** and commits on Apply. Nothing behind a modal
-    /// dialog can be watched changing, so applying each tick was work the user
-    /// could not see; a form with one commit can also be abandoned.
-    fn present_filter_dialog(&self) {
+    /// It is a dialog rather than a popover because the `Except` picker inside
+    /// it was a second popover parented to the first. GTK4 gives an autohide
+    /// popover a grab; opening another one inside it takes that grab away and
+    /// leaves the outer popover believing it is still shown, so its button
+    /// silently refuses to open it ever again. Measured behaviour — and as a
+    /// dialog the pickers become pushed pages with a slide animation instead.
+    ///
+    /// The dialog edits a **draft** and commits on Apply or Save. Nothing behind
+    /// a modal dialog can be watched changing, so applying each tick was work the
+    /// user could not see; a form with one commit can also be abandoned.
+    fn present_selection_dialog(&self, intent: SelectionIntent) {
         let subscriptions = self.subscriptions.borrow().clone();
+        let editing = match &intent {
+            SelectionIntent::Edit(group) => Some((**group).clone()),
+            _ => None,
+        };
+        // Favourites is where the star puts servers, so it can hold nothing but
+        // a list. The radio never excluded it: converting it to a rule left the
+        // star writing members into a group that also had filters, which
+        // `Profile::validate` refuses — so connecting to it failed afterwards.
+        let list_only = editing
+            .as_ref()
+            .is_some_and(|group| group.id == FAVOURITES_ID);
+
         // Hand-picked servers are part of the draft, not a separate mode: this is
-        // the whole selection — a rule, or a list, exactly as `PoolQuery` puts it
-        // — so a scope that *is* a list can be opened and edited here rather than
-        // greying the dialog out and sending the user to look for another door.
-        let draft = Rc::new(RefCell::new(FilterDraft {
-            countries: self.filter_countries.borrow().clone(),
-            protocols: self.filter_protocols.borrow().clone(),
-            subscriptions: self.filter_subscriptions.borrow().clone(),
-            exclude: self.filter_exclude.borrow().clone(),
-            members: self.scope_members.borrow().clone(),
+        // the whole selection — a rule, or a list, exactly as `PoolQuery` puts it.
+        let draft = Rc::new(RefCell::new(match editing.as_ref() {
+            // A rule's members are whatever it happens to match today, so
+            // loading them would turn every edit of a rule into a freeze.
+            Some(group) => FilterDraft {
+                countries: group.query.countries.clone(),
+                protocols: group.query.protocols.clone(),
+                subscriptions: group.query.subscriptions.clone(),
+                exclude: group.query.exclude.clone(),
+                members: match group.kind {
+                    GroupKind::List => group_member_ids(group, &subscriptions),
+                    GroupKind::Rule => Vec::new(),
+                },
+            },
+            None => FilterDraft {
+                countries: self.filter_countries.borrow().clone(),
+                protocols: self.filter_protocols.borrow().clone(),
+                subscriptions: self.filter_subscriptions.borrow().clone(),
+                exclude: self.filter_exclude.borrow().clone(),
+                members: self.starting_members(&intent, &subscriptions),
+            },
         }));
 
         let dialog = adw::Dialog::builder()
-            .title("Filter")
+            .title(match editing.as_ref() {
+                Some(group) => group.name.as_str(),
+                None => "Selection",
+            })
             .content_width(420)
-            .content_height(560)
+            .content_height(620)
             .build();
         let navigation = adw::NavigationView::new();
 
+        // Save is the obvious button where a group is being changed, Apply where
+        // the page is. Both are always present: the whole point of one editor is
+        // that naming a selection is not a different errand.
+        let suggest = |wanted: bool| -> Vec<&str> {
+            if wanted {
+                vec!["suggested-action"]
+            } else {
+                Vec::new()
+            }
+        };
+        let editing_group = editing.is_some();
         let apply = gtk::Button::builder()
             .label("Apply")
-            .css_classes(["suggested-action"])
+            .tooltip_text("Show this selection on the page, without saving it")
+            .css_classes(suggest(!editing_group))
+            .build();
+        let save = gtk::Button::builder()
+            .label("Save")
+            .css_classes(suggest(editing_group))
             .build();
         let cancel = gtk::Button::with_label("Cancel");
         let header = adw::HeaderBar::builder()
@@ -1338,6 +1469,7 @@ impl ServersView {
             .show_start_title_buttons(false)
             .build();
         header.pack_start(&cancel);
+        header.pack_end(&save);
         header.pack_end(&apply);
 
         let body = gtk::Box::new(gtk::Orientation::Vertical, 18);
@@ -1356,11 +1488,68 @@ impl ServersView {
             .css_classes(["boxed-list"])
             .build();
 
+        // One line where the match count and the List/Rule radio used to be two
+        // controls saying overlapping things. It reports what is selected *and*
+        // what saving it would mean, which is the answer the radio was asking
+        // the user to supply.
         let matches = gtk::Label::builder()
             .xalign(0.0)
             .hexpand(true)
-            .css_classes(["dim-label"])
+            .wrap(true)
+            .max_width_chars(44)
+            .css_classes(["dim-label", "caption"])
             .build();
+
+        // Optional, and first: a selection with a name is a group, and one
+        // without is a filter. That is the whole difference, so it is one field
+        // rather than a second dialog.
+        let name_row = adw::EntryRow::builder().title("Name (optional)").build();
+        // Just "Icon": the six presets take most of the row's width, so a longer
+        // title ellipsises — and "optional" is already established by the field
+        // above it.
+        let icon_row = adw::EntryRow::builder().title("Icon").build();
+        // A chip row of five identically shaped words is hard to aim at. One
+        // glyph in front makes each one findable at a glance, which is the only
+        // job a chip has. Free text, not a fixed palette: the presets are a
+        // shortcut, not the vocabulary.
+        let presets = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        presets.set_valign(gtk::Align::Center);
+        for preset in ["★", "⚡", "🌍", "🏠", "🔒", "🎬"] {
+            let button = gtk::Button::builder()
+                .label(preset)
+                .tooltip_text(format!("Use {preset}"))
+                .css_classes(["flat", "circular"])
+                .build();
+            button.connect_clicked({
+                let icon_row = icon_row.clone();
+                // Pressing the one already chosen clears it, so a group can get
+                // back to having no icon without selecting the text by hand.
+                move |_| {
+                    let next = if icon_row.text() == preset {
+                        ""
+                    } else {
+                        preset
+                    };
+                    icon_row.set_text(next);
+                }
+            });
+            presets.append(&button);
+        }
+        icon_row.add_suffix(&presets);
+        match editing.as_ref() {
+            Some(group) => {
+                name_row.set_text(&group.name);
+                icon_row.set_text(&group.icon);
+            }
+            // Only where the user asked for a group: prefilling a name on the
+            // filter would offer to save something nobody set out to save.
+            None if matches!(intent, SelectionIntent::Name) => {
+                name_row.set_text(&suggested_group_name(
+                    &draft.borrow().to_query(String::new(), GroupKind::Rule),
+                ));
+            }
+            None => {}
+        }
 
         let checks: Rc<RefCell<Vec<(FilterField, String, gtk::CheckButton)>>> =
             Rc::new(RefCell::new(Vec::new()));
@@ -1400,7 +1589,8 @@ impl ServersView {
         let syncing = Rc::new(Cell::new(false));
 
         // One closure both directions of the sync go through, so the subtitles,
-        // the match count and the draft cannot describe different things.
+        // the summary, the draft and whether Save means anything cannot describe
+        // different things.
         let refresh: Rc<dyn Fn()> = Rc::new({
             let checks = checks.clone();
             let field_rows = field_rows.clone();
@@ -1411,6 +1601,8 @@ impl ServersView {
             let draft = draft.clone();
             let subscriptions = subscriptions.clone();
             let view = self.clone();
+            let name_row = name_row.clone();
+            let save = save.clone();
             move || {
                 let borrowed = checks.borrow();
                 for (field, row) in field_rows.borrow().iter() {
@@ -1438,11 +1630,15 @@ impl ServersView {
                 // Named servers win over a rule wherever this is resolved, so the
                 // rule is disabled rather than left writable and ignored.
                 let by_hand = !draft.members.is_empty();
-                rows.set_sensitive(!by_hand);
-                rows.set_tooltip_text(by_hand.then_some(
-                    "These servers are named by hand, so no filter applies. Clear them to \
-                     go back to a rule.",
-                ));
+                rows.set_sensitive(!by_hand && !list_only);
+                rows.set_tooltip_text(if list_only {
+                    Some("Favourites holds the servers you star, so it has no rule.")
+                } else {
+                    by_hand.then_some(
+                        "These servers are named by hand, so no filter applies. Clear them to \
+                         go back to a rule.",
+                    )
+                });
                 // The same computation the page will do on Apply, so the number
                 // promised here is the number that appears.
                 let count = if by_hand {
@@ -1466,11 +1662,26 @@ impl ServersView {
                     );
                     filtered_ids(&query, &subscriptions).len()
                 };
-                matches.set_label(&match count {
-                    1 => "1 server matches".to_string(),
-                    count => format!("{count} servers match"),
-                });
+                matches.set_label(&selection_summary(&draft, count, list_only));
+                // A greyed-out Save says "not ready yet"; a live one that
+                // silently does nothing says the app is broken. An unnamed
+                // selection is a filter, and an empty rule would mean every
+                // server on the machine — which the "All" chip already is.
+                // Favourites is exempt: it exists whether or not anything is
+                // starred, so its icon and name are editable at any time.
+                let named = !name_row.text().trim().is_empty();
+                let anything = by_hand || draft.rule_fields() > 0 || list_only;
+                save.set_sensitive(named && anything);
+                save.set_tooltip_text(Some(match (named, anything) {
+                    (false, _) => "Give the selection a name to keep it as a group",
+                    (_, false) => "Pick some servers or set a filter first",
+                    _ => "Keep this selection as a group in the chip row",
+                }));
             }
+        });
+        name_row.connect_changed({
+            let refresh = refresh.clone();
+            move |_| refresh()
         });
 
         // Read every box rather than tracking the one that moved: the boxes are
@@ -1564,6 +1775,10 @@ impl ServersView {
             field_rows.borrow_mut().push((field, row));
         }
 
+        let naming = adw::PreferencesGroup::new();
+        naming.add(&name_row);
+        naming.add(&icon_row);
+        body.append(&naming);
         body.append(&section_title("Matching"));
         body.append(&rows);
         body.append(&section_title("Or name them"));
@@ -1667,8 +1882,8 @@ impl ServersView {
         toolbar.add_bottom_bar(&footer);
         navigation.add(
             &adw::NavigationPage::builder()
-                .title("Filter")
-                .tag("filter")
+                .title(dialog.title().as_str())
+                .tag("selection")
                 .child(&toolbar)
                 .build(),
         );
@@ -1686,26 +1901,80 @@ impl ServersView {
             let draft = draft.clone();
             move |_| {
                 dialog.close();
+                view.show_selection(&draft.borrow());
+            }
+        });
+        save.connect_clicked({
+            let view = self.clone();
+            let dialog = dialog.clone();
+            let draft = draft.clone();
+            let name_row = name_row.clone();
+            let icon_row = icon_row.clone();
+            move |_| {
+                let name = name_row.text().trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                dialog.close();
                 let draft = draft.borrow();
-                view.filter_countries
-                    .borrow_mut()
-                    .clone_from(&draft.countries);
-                view.filter_protocols
-                    .borrow_mut()
-                    .clone_from(&draft.protocols);
-                view.filter_subscriptions
-                    .borrow_mut()
-                    .clone_from(&draft.subscriptions);
-                view.filter_exclude.borrow_mut().clone_from(&draft.exclude);
-                view.scope_members.borrow_mut().clone_from(&draft.members);
-                // The saved scope is kept, not cleared: narrowing "Germany" is a
-                // narrowed view of Germany, which the chip marks with a "·" and
-                // offers to save.
-                view.apply_filter();
+                let kind = if list_only {
+                    GroupKind::List
+                } else {
+                    draft.kind()
+                };
+                view.save_group(
+                    editing.clone(),
+                    name.clone(),
+                    icon_row.text().trim().to_string(),
+                    kind,
+                    draft.to_query(name, kind),
+                );
             }
         });
         (*refresh)();
         dialog.present(Some(&self.root));
+        // The name is what "New group" came for; everything else on the form
+        // already holds what the page was showing.
+        if matches!(intent, SelectionIntent::Name) {
+            name_row.grab_focus();
+        }
+    }
+
+    /// What a fresh selection starts holding when it is not editing a group.
+    ///
+    /// A search box has no equivalent in a rule, so a selection made with one in
+    /// force is frozen into a list instead — otherwise a group saved from
+    /// "de" on screen would quietly be every German node *and* every node whose
+    /// name happens to contain those letters, forever. This is the honest half
+    /// of what the List/Rule radio used to convey by disabling itself.
+    fn starting_members(
+        &self,
+        intent: &SelectionIntent,
+        subscriptions: &[Subscription],
+    ) -> Vec<String> {
+        if matches!(intent, SelectionIntent::Name) && !self.query.borrow().is_empty() {
+            return filtered_ids(&self.current_filter.borrow(), subscriptions);
+        }
+        self.scope_members.borrow().clone()
+    }
+
+    /// Put a selection on the page without saving it anywhere.
+    fn show_selection(&self, draft: &FilterDraft) {
+        self.filter_countries
+            .borrow_mut()
+            .clone_from(&draft.countries);
+        self.filter_protocols
+            .borrow_mut()
+            .clone_from(&draft.protocols);
+        self.filter_subscriptions
+            .borrow_mut()
+            .clone_from(&draft.subscriptions);
+        self.filter_exclude.borrow_mut().clone_from(&draft.exclude);
+        self.scope_members.borrow_mut().clone_from(&draft.members);
+        // The saved scope is kept, not cleared: narrowing "Germany" is a
+        // narrowed view of Germany, which the chip marks with a "·" and
+        // offers to save.
+        self.apply_filter();
     }
 
     /// Load a saved scope, or clear back to "All".
@@ -1789,266 +2058,6 @@ impl ServersView {
             .borrow_mut()
             .clone_from(&query.subscriptions);
         self.filter_exclude.borrow_mut().clone_from(&query.exclude);
-    }
-
-    /// Ask for a name, which servers, and whether the group should be a list or
-    /// a rule.
-    ///
-    /// The list/rule choice is the whole point and cannot be inferred: the same
-    /// forty-two servers are either "these forty-two, frozen" or "whatever is
-    /// German and VLESS, forever". Only the user knows which they meant.
-    ///
-    /// The servers are picked *here*, not on the page behind the dialog.
-    /// Requiring the list to be narrowed first meant the way to make a group
-    /// was to find a control that did something else, which is how testing
-    /// found people stuck: they knew what they wanted a group to hold and had
-    /// nowhere to say it.
-    fn save_as_group_dialog(&self, editing: Option<ServerGroup>) {
-        let subscriptions = self.subscriptions.borrow().clone();
-        let rule = self.rule_from_filters(String::new());
-        // A frozen list is the only honest option for a selection that came
-        // from a search box: the text has no equivalent in a rule, so a rule
-        // saved here would quietly be wider than what is on screen. An empty
-        // rule is refused for the opposite reason — it would mean every server
-        // on the machine, which is what the "All" chip already is.
-        let rule_available = self.scope_members.borrow().is_empty()
-            && self.query.borrow().is_empty()
-            && self.active_filter_fields() > 0;
-
-        // Editing starts from what the group holds; a new group starts from
-        // whatever the page is showing, which is nothing at all when the filter
-        // is clear.
-        let members: Vec<String> = match editing.as_ref() {
-            Some(group) => group_member_ids(group, &subscriptions),
-            None if self.active_filter_fields() > 0 || !self.query.borrow().is_empty() => {
-                filtered_ids(&self.current_filter.borrow(), &subscriptions)
-            }
-            None => Vec::new(),
-        };
-        let chosen = Rc::new(RefCell::new(members));
-
-        let name_row = adw::EntryRow::builder().title("Name").build();
-        name_row.set_text(
-            &editing
-                .as_ref()
-                .map(|group| group.name.clone())
-                .unwrap_or_else(|| suggested_group_name(&rule)),
-        );
-        // A chip row of five identically shaped words is hard to aim at. One
-        // glyph in front makes each one findable at a glance, which is the only
-        // job a chip has. Free text, not a fixed palette: the presets below are
-        // a shortcut, not the vocabulary.
-        let icon_row = adw::EntryRow::builder().title("Icon (optional)").build();
-        icon_row.set_text(
-            &editing
-                .as_ref()
-                .map(|group| group.icon.clone())
-                .unwrap_or_default(),
-        );
-        let presets = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        presets.set_valign(gtk::Align::Center);
-        for preset in ["★", "⚡", "🌍", "🏠", "🔒", "🎬"] {
-            let button = gtk::Button::builder()
-                .label(preset)
-                .tooltip_text(format!("Use {preset}"))
-                .css_classes(["flat", "circular"])
-                .build();
-            button.connect_clicked({
-                let icon_row = icon_row.clone();
-                // Pressing the one already chosen clears it, so a group can get
-                // back to having no icon without selecting the text by hand.
-                move |_| {
-                    let next = if icon_row.text() == preset {
-                        ""
-                    } else {
-                        preset
-                    };
-                    icon_row.set_text(next);
-                }
-            });
-            presets.append(&button);
-        }
-        icon_row.add_suffix(&presets);
-
-        let count_label = gtk::Label::builder()
-            .xalign(0.0)
-            .css_classes(["dim-label", "caption"])
-            .build();
-        let list_choice = gtk::CheckButton::with_label("List — frozen, chosen by hand");
-        list_choice.set_tooltip_text(Some(
-            "New servers will not join on their own. A server that goes away leaves.",
-        ));
-        let rule_choice = gtk::CheckButton::with_label(&format!("Rule — {}", describe_rule(&rule)));
-        rule_choice.set_group(Some(&list_choice));
-        rule_choice.set_sensitive(rule_available);
-        rule_choice.set_tooltip_text(Some(if rule_available {
-            "Servers added by a future subscription refresh will join on their own."
-        } else if self.active_filter_fields() == 0 {
-            "Set a filter first: a rule with nothing in it would mean every server."
-        } else {
-            "The search text has no equivalent in a rule, so this selection can only be frozen."
-        }));
-
-        // Set once the dialog exists, then called by everything that can change
-        // whether Save means anything. A greyed-out Save says "not ready yet";
-        // a live one that silently does nothing says the app is broken.
-        let revalidate: Revalidate = Rc::new(RefCell::new(None));
-
-        let picker = server_picker(
-            &subscriptions,
-            &self.search_texts.borrow(),
-            chosen.clone(),
-            Rc::new({
-                let count_label = count_label.clone();
-                let revalidate = revalidate.clone();
-                move |values: &[String]| {
-                    count_label.set_label(&picked_label(values.len()));
-                    if let Some(revalidate) = revalidate.borrow().as_ref() {
-                        revalidate();
-                    }
-                }
-            }),
-        );
-        // This dialog is a form with the picker as one field among several, so the
-        // picker gets a window onto the list rather than the whole dialog's
-        // height. The Except page, which is nothing but the picker, does not cap
-        // it.
-        picker.scroll.set_propagate_natural_height(true);
-        picker.scroll.set_max_content_height(320);
-        (picker.fill)();
-        count_label.set_label(&picked_label(chosen.borrow().len()));
-
-        // Bulk buttons act on what the search left on screen, not on everything:
-        // "select all" after typing "de" is the shortest honest way to say
-        // "every German node", and it is the reason the search is here at all.
-        let bulk = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        bulk.set_halign(gtk::Align::End);
-        for (label, wanted) in [("Select all shown", true), ("Clear", false)] {
-            let button = gtk::Button::builder()
-                .label(label)
-                .css_classes(["flat"])
-                .build();
-            button.connect_clicked({
-                let checks = picker.checks.clone();
-                move |_| {
-                    for (_, check) in checks.borrow().iter() {
-                        if check.get_visible() {
-                            check.set_active(wanted);
-                        }
-                    }
-                }
-            });
-            bulk.append(&button);
-        }
-
-        let servers_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        servers_section.append(&section_title("Servers"));
-        servers_section.append(&picker.root);
-        servers_section.append(&count_label);
-        servers_section.append(&bulk);
-        // A rule does not have members, so leaving the checkboxes live under it
-        // would show a selection that is not what gets saved.
-        rule_choice.connect_toggled({
-            let servers_section = servers_section.clone();
-            let revalidate = revalidate.clone();
-            move |choice| {
-                servers_section.set_sensitive(!choice.is_active());
-                if let Some(revalidate) = revalidate.borrow().as_ref() {
-                    revalidate();
-                }
-            }
-        });
-
-        let saved_kind = editing.as_ref().map(|group| group.kind);
-        if saved_kind == Some(GroupKind::Rule) && rule_available {
-            rule_choice.set_active(true);
-            servers_section.set_sensitive(false);
-        } else {
-            list_choice.set_active(true);
-        }
-
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        let rows = adw::PreferencesGroup::new();
-        rows.add(&name_row);
-        rows.add(&icon_row);
-        body.append(&rows);
-        body.append(&servers_section);
-        body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        body.append(&list_choice);
-        body.append(&rule_choice);
-
-        let parent = self.root.root().and_downcast::<gtk::Window>();
-        let dialog = adw::AlertDialog::new(
-            Some(if editing.is_some() {
-                "Edit group"
-            } else {
-                "Save as group"
-            }),
-            Some("A group narrows the list. Connecting to one makes it a pool."),
-        );
-        dialog.set_extra_child(Some(&body));
-        dialog.add_responses(&[("cancel", "Cancel"), ("save", "Save")]);
-        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("save"));
-        dialog.set_close_response("cancel");
-
-        // Weak: this closure is reached from the dialog's own checkboxes, so a
-        // strong handle here would make the dialog keep itself alive for good.
-        let weak_dialog = dialog.downgrade();
-        *revalidate.borrow_mut() = Some(Box::new({
-            let name_row = name_row.clone();
-            let rule_choice = rule_choice.clone();
-            let chosen = chosen.clone();
-            move || {
-                let Some(dialog) = weak_dialog.upgrade() else {
-                    return;
-                };
-                let named = !name_row.text().trim().is_empty();
-                // A rule carries no members, so an empty selection only blocks a
-                // list. An unnamed group blocks either: the chip is the name.
-                let has_servers = rule_choice.is_active() || !chosen.borrow().is_empty();
-                dialog.set_response_enabled("save", named && has_servers);
-            }
-        }));
-        name_row.connect_changed({
-            let revalidate = revalidate.clone();
-            move |_| {
-                if let Some(revalidate) = revalidate.borrow().as_ref() {
-                    revalidate();
-                }
-            }
-        });
-        if let Some(check) = revalidate.borrow().as_ref() {
-            check();
-        }
-
-        dialog.connect_response(None, {
-            let view = self.clone();
-            let chosen = chosen.clone();
-            move |dialog, response| {
-                if response != "save" {
-                    return;
-                }
-                let name = name_row.text().trim().to_string();
-                if name.is_empty() {
-                    return;
-                }
-                let kind = if rule_choice.is_active() {
-                    GroupKind::Rule
-                } else {
-                    GroupKind::List
-                };
-                view.save_group(
-                    editing.clone(),
-                    name,
-                    icon_row.text().trim().to_string(),
-                    kind,
-                    chosen.borrow().clone(),
-                );
-                dialog.close();
-            }
-        });
-        dialog.present(parent.as_ref());
     }
 
     /// Names of the groups that currently hold `server_id`. The subscriptions
@@ -2171,33 +2180,24 @@ impl ServersView {
         }
     }
 
-    /// `members` is passed in rather than re-derived from `current_filter`:
-    /// the New group dialog picks servers with its own checkboxes, and reading
-    /// the page's filter here instead would save something the dialog never
-    /// showed.
+    /// `query` is passed in rather than re-derived from the page: the editor
+    /// commits a draft that the page has not necessarily been shown, so reading
+    /// the live filters here would save something the dialog never displayed.
+    ///
+    /// A group stores *which servers*, and nothing else. `expected` is
+    /// deliberately absent even though the Connect bar sets it: the rotation
+    /// width is an intent about the run, chosen where Connect is pressed and
+    /// visible at that moment, and giving the group a second copy of it is how
+    /// the two come to disagree — the same reason the profile dialog stopped
+    /// carrying a pool editor.
     fn save_group(
         &self,
         editing: Option<ServerGroup>,
         name: String,
         icon: String,
         kind: GroupKind,
-        members: Vec<String>,
+        query: PoolQuery,
     ) {
-        // A group stores *which servers*, and nothing else. `expected` is
-        // deliberately left at 0 here even though the Connect bar sets it: the
-        // rotation width is an intent about the run, chosen where Connect is
-        // pressed and visible at that moment, and giving the group a second
-        // copy of it is how the two come to disagree — the same reason the
-        // profile dialog stopped carrying a pool editor.
-        let query = match kind {
-            // Freeze exactly what was chosen, in the order it is shown.
-            GroupKind::List => PoolQuery {
-                name: name.clone(),
-                members,
-                ..PoolQuery::default()
-            },
-            GroupKind::Rule => self.rule_from_filters(name.clone()),
-        };
         let group = ServerGroup {
             id: editing
                 .map(|group| group.id)
@@ -2893,6 +2893,38 @@ fn group_chip_tooltip(group: &ServerGroup, matched: usize) -> String {
     }
 }
 
+/// What the form on screen adds up to, in one line.
+///
+/// This is what became of the List/Rule radio. The radio asked the user to
+/// classify their own selection before they had made it, in words about how
+/// groups are stored; the same fact is readable off the form, so it is reported
+/// instead — including the part the radio only ever conveyed by greying itself
+/// out, which is that a frozen list does not grow and a rule does.
+fn selection_summary(draft: &FilterDraft, matched: usize, list_only: bool) -> String {
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    if !draft.members.is_empty() {
+        let picked = draft.members.len();
+        return format!(
+            "{picked} server{} chosen by hand — frozen, so servers added later do not join.",
+            plural(picked)
+        );
+    }
+    if list_only {
+        // A group that can only ever hold a list is empty, not universal. The
+        // rule branch below would have called it "every server", which is the
+        // one thing an empty Favourites is not.
+        return "No servers yet — star one on a card, or pick some here.".to_string();
+    }
+    if draft.rule_fields() == 0 {
+        return format!("Every server — {matched} right now.");
+    }
+    format!(
+        "{}: {matched} server{} right now, and matching servers added later join on their own.",
+        describe_rule(&draft.to_query(String::new(), GroupKind::Rule)),
+        plural(matched)
+    )
+}
+
 /// A name the user will probably keep, so saving a scope is one click and a
 /// confirmation rather than a blank field to invent something for.
 fn suggested_group_name(rule: &PoolQuery) -> String {
@@ -2944,21 +2976,14 @@ fn rotation_summary(value: usize, available: usize) -> String {
 
 /// A searchable checkbox per server, grouped by the subscription it came from.
 ///
-/// One implementation behind two callers — the "Except: N servers" row and the
-/// New group dialog — because a second copy of this is exactly how the two
+/// One implementation behind both pages of the selection editor — "Except" and
+/// "Only these servers" — because a second copy of this is exactly how the two
 /// would come to disagree about what a server is called or which ones can be
 /// pooled at all.
 struct ServerPicker {
     root: gtk::Box,
-    /// The list's scroller, so a caller that cannot give the picker a whole page
-    /// can cap its height instead of being made as tall as the server list.
-    scroll: gtk::ScrolledWindow,
     /// Builds the rows. Safe to call more than once; only the first does work.
     fill: Rc<dyn Fn()>,
-    /// Every checkbox by server id, populated by `fill`. A caller offering
-    /// "select all shown" reads visibility off these rather than keeping its
-    /// own idea of what the search left on screen.
-    checks: PickerChecks,
 }
 
 fn server_picker(
@@ -2992,9 +3017,35 @@ fn server_picker(
     root.set_margin_end(6);
     root.set_vexpand(true);
     root.append(&search);
-    root.append(&scroll);
 
     let checks: PickerChecks = Rc::new(RefCell::new(Vec::new()));
+    // Directly under the search, because they act on what the search left on
+    // screen and nothing else: "select all shown" after typing "de" is the
+    // shortest honest way to say "every German node", and it is the reason the
+    // search is here at all. It lives in the picker rather than beside one
+    // caller's copy of it, so both pages get it.
+    let bulk = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    bulk.set_halign(gtk::Align::End);
+    for (label, wanted) in [("Select all shown", true), ("Clear", false)] {
+        let button = gtk::Button::builder()
+            .label(label)
+            .css_classes(["flat"])
+            .build();
+        button.connect_clicked({
+            let checks = checks.clone();
+            move |_| {
+                for (_, check) in checks.borrow().iter() {
+                    if check.get_visible() {
+                        check.set_active(wanted);
+                    }
+                }
+            }
+        });
+        bulk.append(&button);
+    }
+    root.append(&bulk);
+    root.append(&scroll);
+
     let filled = Rc::new(Cell::new(false));
     // The search matches the same text the page's search box matches — name,
     // transport, protocol, address and country — so typing "de" here finds the
@@ -3089,12 +3140,7 @@ fn server_picker(
         }
     });
 
-    ServerPicker {
-        root,
-        scroll,
-        fill,
-        checks,
-    }
+    ServerPicker { root, fill }
 }
 
 fn picked_label(count: usize) -> String {
@@ -3279,9 +3325,70 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ROTATION_CHOICES, collapse_would_shift, columns_for_width,
-        columns_for_width_with_hysteresis, distribute_columns, rotation_summary, sorted_by_latency,
+        FilterDraft, GroupKind, ROTATION_CHOICES, collapse_would_shift, columns_for_width,
+        columns_for_width_with_hysteresis, distribute_columns, rotation_summary, selection_summary,
+        sorted_by_latency,
     };
+
+    /// The List/Rule radio is gone, so this is the whole of what replaced it:
+    /// naming servers by hand freezes the selection, and leaving them unnamed
+    /// keeps the rule matching. Nothing else decides it, which is why no dialog
+    /// asks.
+    #[test]
+    fn the_kind_of_a_group_follows_from_the_form_rather_than_a_radio() {
+        let by_hand = FilterDraft {
+            countries: vec!["de".into()],
+            members: vec!["a".into(), "b".into()],
+            ..FilterDraft::default()
+        };
+        assert_eq!(by_hand.kind(), GroupKind::List);
+        // Hand-picked servers win over the rule wherever this is resolved, so
+        // the saved query must carry only them — a query with both is what
+        // `Profile::validate` refuses.
+        let query = by_hand.to_query("Mine".into(), by_hand.kind());
+        assert_eq!(query.members, vec!["a".to_string(), "b".to_string()]);
+        assert!(query.countries.is_empty());
+
+        let rule = FilterDraft {
+            countries: vec!["de".into()],
+            ..FilterDraft::default()
+        };
+        assert_eq!(rule.kind(), GroupKind::Rule);
+        let query = rule.to_query("DE".into(), rule.kind());
+        assert!(query.members.is_empty());
+        assert_eq!(query.countries, vec!["de".to_string()]);
+    }
+
+    /// The line under the form is the only place the difference is stated now,
+    /// so it has to state it: frozen does not grow, a rule does.
+    #[test]
+    fn the_summary_says_whether_the_selection_will_keep_growing() {
+        let by_hand = FilterDraft {
+            members: vec!["a".into()],
+            ..FilterDraft::default()
+        };
+        let text = selection_summary(&by_hand, 1, false);
+        assert!(text.starts_with("1 server chosen by hand"), "{text}");
+        assert!(text.contains("do not join"), "{text}");
+
+        let rule = FilterDraft {
+            countries: vec!["de".into(), "nl".into()],
+            ..FilterDraft::default()
+        };
+        let text = selection_summary(&rule, 12, false);
+        assert!(text.starts_with("DE, NL: 12 servers"), "{text}");
+        assert!(text.contains("join on their own"), "{text}");
+
+        // An empty rule would mean every server on the machine. Saving it is
+        // refused, but the line still has to say what is on screen.
+        let text = selection_summary(&FilterDraft::default(), 42, false);
+        assert_eq!(text, "Every server — 42 right now.");
+
+        // Favourites with nothing starred holds nothing — the one group for
+        // which "every server" would be exactly backwards.
+        let text = selection_summary(&FilterDraft::default(), 42, true);
+        assert!(text.starts_with("No servers yet"), "{text}");
+    }
 
     #[test]
     fn the_rotation_label_never_promises_more_nodes_than_the_pool_has() {
