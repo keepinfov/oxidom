@@ -216,6 +216,10 @@ enum ClickPlan {
     Ignore,
     ToggleDetails,
     Activate,
+    /// The card's actions, as a list. Right-click used to be a third spelling
+    /// of "expand", which made it the one pointer gesture that did nothing a
+    /// left click did not already do.
+    ContextMenu,
 }
 
 #[derive(Clone)]
@@ -376,21 +380,6 @@ impl ServerCard {
         });
         header.add_controller(primary_click);
 
-        let secondary_click = gtk::GestureClick::new();
-        secondary_click.set_button(gtk::gdk::BUTTON_SECONDARY);
-        secondary_click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        secondary_click.connect_released({
-            let on_select = on_select.clone();
-            move |_, n_press, _, _| {
-                if click_plan_for_press(gtk::gdk::BUTTON_SECONDARY, n_press)
-                    == ClickPlan::ToggleDetails
-                {
-                    on_select();
-                }
-            }
-        });
-        header.add_controller(secondary_click);
-
         let keyboard = gtk::EventControllerKey::new();
         keyboard.connect_key_pressed({
             let on_select = on_select.clone();
@@ -518,6 +507,61 @@ impl ServerCard {
         action_spacer.set_hexpand(true);
         action_row.append(&action_spacer);
         action_row.append(&connect_button);
+
+        // Right-click used to be a second way to expand the card, which made it
+        // the only pointer gesture in the app that did nothing a left click did
+        // not already do. The actions it now offers are the buttons above,
+        // driven by `emit_clicked` rather than re-implemented: a menu that
+        // copied their logic would be a second place for it to drift, and this
+        // way each item inherits its source button's sensitivity for free.
+        let context_menu: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
+        let secondary_click = gtk::GestureClick::new();
+        secondary_click.set_button(gtk::gdk::BUTTON_SECONDARY);
+        secondary_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        secondary_click.connect_pressed({
+            let context_menu = context_menu.clone();
+            let header = header.clone();
+            let connect_button = connect_button.clone();
+            let favourite_button = favourite_button.clone();
+            let edit_alias = edit_alias.clone();
+            let copy_button = copy_button.clone();
+            let ping_button = ping_button.clone();
+            move |_, n_press, x, y| {
+                if click_plan_for_press(gtk::gdk::BUTTON_SECONDARY, n_press)
+                    != ClickPlan::ContextMenu
+                {
+                    return;
+                }
+                let mut slot = context_menu.borrow_mut();
+                let popover = slot.get_or_insert_with(|| {
+                    // Built on first use: a card is recreated on every rebuild,
+                    // and a subscription of six hundred servers should not pay
+                    // for six hundred popovers nobody opens.
+                    let popover = context_popover(&[
+                        (&connect_button, None),
+                        (favourite_button.upcast_ref(), None),
+                        (&edit_alias, None),
+                        (&copy_button, Some("Copy share-link")),
+                        (&ping_button, None),
+                    ]);
+                    popover.set_parent(&header);
+                    popover
+                });
+                sync_context_labels(
+                    popover,
+                    &[
+                        (&connect_button, None),
+                        (favourite_button.upcast_ref(), None),
+                        (&edit_alias, None),
+                        (&copy_button, Some("Copy share-link")),
+                        (&ping_button, None),
+                    ],
+                );
+                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover.popup();
+            }
+        });
+        header.add_controller(secondary_click);
 
         let metadata = gtk::Box::new(gtk::Orientation::Vertical, 6);
         metadata.append(&full_name);
@@ -1092,11 +1136,82 @@ pub fn alias_validation(alias: &str) -> Option<&'static str> {
     (!oxidom_core::alias::is_valid(alias)).then_some(ALIAS_ERROR)
 }
 
+/// A source button, and the wording its menu item should carry.
+///
+/// `None` takes the wording from the button itself, which is what dynamic items
+/// need: Connect becomes Disconnect, the star becomes an unstar. A fixed label
+/// is for buttons whose tooltip explains a *refusal* rather than naming the
+/// action — a disabled menu row must still say what it would have done.
+type ContextItem<'a> = (&'a gtk::Button, Option<&'static str>);
+
+/// One menu item per source button, activating that very button.
+///
+/// The items carry no behaviour of their own: a context menu that re-implemented
+/// Connect or Copy would be a second copy of rules that already live on the card
+/// — including which of them are available at all, which the items inherit by
+/// mirroring `sensitive`.
+fn context_popover(sources: &[ContextItem<'_>]) -> gtk::Popover {
+    let items = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    for (source, _) in sources {
+        let item = gtk::Button::builder()
+            .css_classes(["flat", "server-context-item"])
+            .child(&gtk::Label::builder().xalign(0.0).build())
+            .build();
+        item.connect_clicked({
+            let source = (*source).clone();
+            move |item| {
+                if let Some(popover) = item
+                    .ancestor(gtk::Popover::static_type())
+                    .and_downcast::<gtk::Popover>()
+                {
+                    popover.popdown();
+                }
+                source.emit_clicked();
+            }
+        });
+        items.append(&item);
+    }
+    gtk::Popover::builder()
+        .child(&items)
+        .has_arrow(false)
+        .css_classes(["menu"])
+        .build()
+}
+
+/// A card's buttons change wording with its state — Connect becomes Disconnect,
+/// the star becomes an unstar — so the menu takes its text at open time rather
+/// than at build time.
+fn sync_context_labels(popover: &gtk::Popover, sources: &[ContextItem<'_>]) {
+    let Some(items) = popover.child().and_downcast::<gtk::Box>() else {
+        return;
+    };
+    let mut item = items.first_child();
+    for (source, fixed) in sources {
+        let Some(current) = item else { return };
+        if let Some(label) = current.first_child().and_downcast::<gtk::Label>() {
+            let text = fixed.map(str::to_string).unwrap_or_else(|| {
+                source
+                    .label()
+                    .filter(|label| !label.is_empty())
+                    .or_else(|| source.tooltip_text())
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            label.set_label(&text);
+        }
+        // Carries the refusal when there is one: the row says what it would do,
+        // the tooltip says why it will not.
+        current.set_tooltip_text(source.tooltip_text().as_deref());
+        current.set_sensitive(source.is_sensitive());
+        item = current.next_sibling();
+    }
+}
+
 fn click_plan_for_press(button: u32, n_press: i32) -> ClickPlan {
     match (button, n_press) {
         (gtk::gdk::BUTTON_PRIMARY, 1) => ClickPlan::ToggleDetails,
         (gtk::gdk::BUTTON_PRIMARY, 2) => ClickPlan::Activate,
-        (gtk::gdk::BUTTON_SECONDARY, 1) => ClickPlan::ToggleDetails,
+        (gtk::gdk::BUTTON_SECONDARY, 1) => ClickPlan::ContextMenu,
         _ => ClickPlan::Ignore,
     }
 }
@@ -1153,7 +1268,7 @@ mod tests {
     };
 
     #[test]
-    fn primary_click_toggles_and_double_click_activates() {
+    fn primary_click_toggles_double_click_activates_and_secondary_opens_the_menu() {
         assert_eq!(
             click_plan_for_press(gtk::gdk::BUTTON_PRIMARY, 1),
             ClickPlan::ToggleDetails
@@ -1164,7 +1279,7 @@ mod tests {
         );
         assert_eq!(
             click_plan_for_press(gtk::gdk::BUTTON_SECONDARY, 1),
-            ClickPlan::ToggleDetails
+            ClickPlan::ContextMenu
         );
         assert_eq!(
             click_plan_for_press(gtk::gdk::BUTTON_PRIMARY, 3),

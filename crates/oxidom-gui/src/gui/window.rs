@@ -3883,6 +3883,10 @@ fn install_css() {
            is the confusion the two-target split exists to end. */
         .sidebar-status-action { padding: 6px; min-width: 28px; min-height: 28px; }
 
+        /* Menu rows, not toolbar buttons: full width, text left, so the popover
+           reads as a list of actions rather than a strip of pills. */
+        .server-context-item { padding: 6px 12px; min-height: 32px; }
+
         .server-card {
             border: none;
             border-radius: 12px;
