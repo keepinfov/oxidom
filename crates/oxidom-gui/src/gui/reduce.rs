@@ -1317,6 +1317,13 @@ pub(super) fn session_rows(
                 latency_parts(state.proxied.get(&entry.name), now_unix_ms);
 
             let mut details = Vec::new();
+            // First, because a failure is what the row was expanded for. The
+            // headline carries the same text, but a subtitle ellipsises and
+            // cannot be selected — so the one thing worth pasting into a bug
+            // report was the one thing unreachable.
+            if let Some(error) = session.and_then(|session| session.error.as_ref()) {
+                details.push(SessionDetail::new("Error", error.clone()).copyable());
+            }
             if let Some(session) = session {
                 details.push(
                     SessionDetail::new(
@@ -2757,6 +2764,30 @@ mod tests {
         assert_eq!(rows[0].state, SessionRowState::Connected);
         assert!(rows[0].toggle_on);
         assert!(!rows[0].busy);
+    }
+
+    /// The headline carries the same text, but a subtitle ellipsises and cannot
+    /// be selected, so the failure was the one thing a bug report could not
+    /// quote.
+    #[test]
+    fn a_failed_session_offers_its_error_as_a_copyable_detail() {
+        let work = profile("work", "shared");
+        let mut state = state();
+        let mut failed = session("work", "error", "shared");
+        failed.error = Some("spawning xray (xray): No such file or directory".to_string());
+        state.sessions = vec![failed];
+
+        let rows = session_rows(&[work], &state, NOW_MS);
+        let error = rows[0]
+            .details
+            .iter()
+            .find(|detail| detail.label == "Error")
+            .expect("the failure is a detail row, not only a subtitle");
+        assert_eq!(
+            error.value,
+            "spawning xray (xray): No such file or directory"
+        );
+        assert!(error.copyable);
     }
 
     #[test]
