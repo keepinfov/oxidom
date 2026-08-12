@@ -9,6 +9,11 @@ use oxidom_core::ipc::RuntimeInfo;
 
 use super::core_editor::{CoreEditor, CoreLevel};
 
+/// Restored by [`SettingsView::set_system_proxy_failure`], so the row has one
+/// place that owns its normal wording.
+const SYSTEM_PROXY_SUBTITLE: &str =
+    "Send the whole desktop's traffic through oxidom while connected (GNOME)";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsValues {
     pub socks_port: u16,
@@ -216,7 +221,7 @@ impl SettingsView {
         http.set_value(f64::from(applied.http_port));
         let system_proxy = adw::SwitchRow::builder()
             .title("System proxy")
-            .subtitle("Send the whole desktop's traffic through oxidom while connected (GNOME)")
+            .subtitle(SYSTEM_PROXY_SUBTITLE)
             .active(applied.system_proxy)
             .build();
         let reconnect = adw::SwitchRow::builder()
@@ -485,6 +490,24 @@ impl SettingsView {
     pub fn mark_applied(&self, values: SettingsValues) {
         self.model.borrow_mut().mark_applied(values);
         refresh_state(&self.widgets, &self.model);
+    }
+
+    /// Reports whether the desktop proxy could actually be installed. The
+    /// switch used to stay on and look applied on a session where `gsettings`
+    /// is not there to apply it, which made this the one setting that could be
+    /// on and doing nothing with no way to tell.
+    pub fn set_system_proxy_failure(&self, reason: Option<&str>) {
+        let row = &self.widgets.system_proxy;
+        match reason {
+            Some(reason) => {
+                row.set_subtitle(reason);
+                row.add_css_class("error");
+            }
+            None => {
+                row.set_subtitle(SYSTEM_PROXY_SUBTITLE);
+                row.remove_css_class("error");
+            }
+        }
     }
 
     /// Completes an apply with what the daemon **stored**, which is not always

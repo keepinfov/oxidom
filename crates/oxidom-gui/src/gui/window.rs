@@ -191,6 +191,10 @@ struct Controller {
     /// `proxy_applied == true` means it came from a crash marker and must be
     /// reconciled even if a connection is already up.
     applied_proxy_endpoint: Cell<Option<(std::net::Ipv4Addr, u16, u16)>>,
+    /// Why the desktop proxy could not be installed, as last reported.
+    /// `reconcile_system_proxy` runs on every poll tick, so the message is kept
+    /// here to say it once instead of twice a second.
+    system_proxy_failure: RefCell<Option<String>>,
     /// Last (active, connecting) pair pushed to the cards, to avoid an
     /// O(cards) pass on every poll tick.
     applied_connection: RefCell<CardConnection>,
@@ -709,6 +713,7 @@ fn build(
         tray_commands,
         tray_pushed: RefCell::new((String::new(), Vec::new())),
         proxy_applied: Cell::new(gui_proxy_marker_exists()),
+        system_proxy_failure: RefCell::new(None),
         applied_proxy_endpoint: Cell::new(None),
         applied_connection: RefCell::new(CardConnection::default()),
         poll_in_flight: Arc::new(AtomicBool::new(false)),
@@ -3001,7 +3006,7 @@ impl Controller {
     /// The GNOME system proxy is a session concern, so the GUI (not the
     /// daemon, which may run as a system service) applies and clears it. A
     /// marker file survives crashes so the next start can undo a stale proxy.
-    fn reconcile_system_proxy(&self) {
+    fn reconcile_system_proxy(self: &Rc<Self>) {
         let applied_settings = self.settings.applied();
         let desired = {
             let state = self.state.borrow();
@@ -3020,17 +3025,47 @@ impl Controller {
                 // replacing it fails partway through.
                 self.clear_system_proxy();
             }
-            if !self.proxy_applied.get() && sysproxy::apply(address, socks_port, http_port).is_ok()
-            {
-                self.proxy_applied.set(true);
-                self.applied_proxy_endpoint.set(Some(endpoint));
-                if let Some(marker) = gui_proxy_marker() {
-                    let _ = std::fs::write(marker, b"1");
+            if !self.proxy_applied.get() {
+                // The one setting that could be on and doing nothing: this ran
+                // twice a second and dropped the error every time, so a session
+                // without `gsettings` left the switch looking applied.
+                match sysproxy::apply(address, socks_port, http_port) {
+                    Ok(()) => {
+                        self.proxy_applied.set(true);
+                        self.applied_proxy_endpoint.set(Some(endpoint));
+                        if let Some(marker) = gui_proxy_marker() {
+                            let _ = std::fs::write(marker, b"1");
+                        }
+                        self.report_system_proxy(None);
+                    }
+                    Err(error) => self.report_system_proxy(Some(format!("{error:#}"))),
                 }
             }
         } else {
             self.clear_system_proxy();
+            // Turning it off, or disconnecting, makes any earlier complaint
+            // moot — the row should not keep accusing a switch that is idle.
+            self.report_system_proxy(None);
         }
+    }
+
+    /// Says once, not on every tick, that the desktop proxy could not be
+    /// installed. Keyed on the message so a changing failure still speaks, and
+    /// so recovering clears the row rather than leaving a stale red subtitle.
+    fn report_system_proxy(self: &Rc<Self>, failure: Option<String>) {
+        if *self.system_proxy_failure.borrow() == failure {
+            return;
+        }
+        match failure.as_deref() {
+            Some(error) => {
+                self.settings.set_system_proxy_failure(Some(
+                    "Could not be applied on this desktop — traffic is not going through it",
+                ));
+                self.show_error("Could not set the system proxy", error);
+            }
+            None => self.settings.set_system_proxy_failure(None),
+        }
+        *self.system_proxy_failure.borrow_mut() = failure;
     }
 
     /// Point the session back at a direct connection. Idempotent, and safe to
