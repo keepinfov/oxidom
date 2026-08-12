@@ -353,6 +353,12 @@ fn apply_row(controls: &RowControls, row: &SessionRow) {
     controls.syncing_toggle.set(true);
     controls.toggle.set_active(row.toggle_on);
     controls.syncing_toggle.set(false);
+    // A switch asserts a position. Against a state this build cannot read there
+    // is no position to assert, and an off switch would claim the session is
+    // down. The rest of the row stays usable — Edit profile… still applies.
+    controls
+        .toggle
+        .set_sensitive(row.state != SessionRowState::Unknown);
 }
 
 fn set_details(controls: &RowControls, details: &[SessionDetail]) {
@@ -418,6 +424,9 @@ fn set_state_label(label: &gtk::Label, state: SessionRowState) {
         SessionRowState::Connecting => ("Connecting", "status-working"),
         SessionRowState::Connected => ("Connected", "status-connected"),
         SessionRowState::Error => ("Error", "status-error"),
+        // Deliberately not "Stopped": this build cannot read the state, and
+        // saying "stopped" would answer a question it did not understand.
+        SessionRowState::Unknown => ("Unknown", "status-neutral"),
     };
     label.set_label(text);
     label.add_css_class(class);

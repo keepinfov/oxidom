@@ -3586,6 +3586,7 @@ fn session_row_tone(state: SessionRowState) -> StatusTone {
         SessionRowState::Connecting => StatusTone::Working,
         SessionRowState::Connected => StatusTone::Connected,
         SessionRowState::Error => StatusTone::Error,
+        SessionRowState::Unknown => StatusTone::Neutral,
     }
 }
 
@@ -3595,6 +3596,7 @@ fn session_row_state_label(state: SessionRowState) -> &'static str {
         SessionRowState::Connecting => "Connecting",
         SessionRowState::Connected => "Connected",
         SessionRowState::Error => "Error",
+        SessionRowState::Unknown => "Unknown",
     }
 }
 

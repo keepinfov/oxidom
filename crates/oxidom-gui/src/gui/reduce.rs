@@ -1120,6 +1120,10 @@ pub(super) enum SessionRowState {
     Connecting,
     Connected,
     Error,
+    /// A state string this build does not know. Kept apart from `Stopped`
+    /// because it is a different claim: "stopped" with the switch off is a
+    /// definite answer, and a newer daemon would have been given it wrongly.
+    Unknown,
 }
 
 /// Something about a session the user must see without expanding the row.
@@ -1141,7 +1145,11 @@ fn session_row_state(session: Option<&SessionInfo>) -> SessionRowState {
         Some("connected") => SessionRowState::Connected,
         Some("connecting") => SessionRowState::Connecting,
         Some("error") => SessionRowState::Error,
-        _ => SessionRowState::Stopped,
+        // No session for this profile is the one honest "stopped": the daemon
+        // is not running it. A session carrying a word this build never heard
+        // of is not stopped, it is unread.
+        Some("stopped") | None => SessionRowState::Stopped,
+        Some(_) => SessionRowState::Unknown,
     }
 }
 
@@ -2764,6 +2772,30 @@ mod tests {
         assert_eq!(rows[0].state, SessionRowState::Connected);
         assert!(rows[0].toggle_on);
         assert!(!rows[0].busy);
+    }
+
+    /// A newer daemon may name a state this build has never heard of. Folding
+    /// it into `Stopped` answered a question the build did not understand, and
+    /// the switch then claimed the session was down.
+    #[test]
+    fn an_unreadable_session_state_is_unknown_rather_than_stopped() {
+        let work = profile("work", "shared");
+        let mut state = state();
+
+        state.sessions = vec![session("work", "suspended", "shared")];
+        let rows = session_rows(std::slice::from_ref(&work), &state, NOW_MS);
+        assert_eq!(rows[0].state, SessionRowState::Unknown);
+        assert!(!rows[0].toggle_on);
+
+        // The two honest stops still read as stopped: the daemon saying so,
+        // and the daemon carrying no session for this profile at all.
+        state.sessions = vec![session("work", "stopped", "shared")];
+        let rows = session_rows(std::slice::from_ref(&work), &state, NOW_MS);
+        assert_eq!(rows[0].state, SessionRowState::Stopped);
+
+        state.sessions = Vec::new();
+        let rows = session_rows(&[work], &state, NOW_MS);
+        assert_eq!(rows[0].state, SessionRowState::Stopped);
     }
 
     /// The headline carries the same text, but a subtitle ellipsises and cannot
