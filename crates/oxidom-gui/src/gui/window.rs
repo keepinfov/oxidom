@@ -58,6 +58,15 @@ fn is_busy(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Busy>().is_some()
 }
 
+/// What was last handed to the tray. The poll tick runs twice a second and
+/// most ticks change nothing, so the icon is only woken when one of these does.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct TrayState {
+    text: String,
+    sessions: Vec<(String, bool)>,
+    failed: bool,
+}
+
 type SettingsCallback = Rc<dyn Fn(SettingsValues)>;
 type ShortcutHandler = Box<dyn Fn(&Rc<Controller>)>;
 
@@ -203,8 +212,8 @@ struct Controller {
     quit_after_close: Cell<bool>,
     tray: RefCell<Option<ksni::blocking::Handle<OxidomTray>>>,
     tray_commands: mpsc::Receiver<TrayCommand>,
-    /// Last (text, sessions) pushed to the tray, to skip no-op updates.
-    tray_pushed: RefCell<(String, Vec<(String, bool)>)>,
+    /// Last state pushed to the tray, to skip no-op updates.
+    tray_pushed: RefCell<TrayState>,
     /// True while this GUI holds the GNOME system proxy applied.
     proxy_applied: Cell<bool>,
     /// Endpoint the applied GNOME proxy points at. `None` with
@@ -665,6 +674,7 @@ fn build(
         let tray = OxidomTray {
             sessions: Vec::new(),
             status_text: "Disconnected".to_string(),
+            failed: false,
             commands: tray_sender,
         };
         match tray.spawn() {
@@ -731,7 +741,7 @@ fn build(
         quit_after_close: Cell::new(false),
         tray: RefCell::new(tray_handle),
         tray_commands,
-        tray_pushed: RefCell::new((String::new(), Vec::new())),
+        tray_pushed: RefCell::new(TrayState::default()),
         proxy_applied: Cell::new(gui_proxy_marker_exists()),
         system_proxy_failure: RefCell::new(None),
         applied_proxy_endpoint: Cell::new(None),
@@ -3225,13 +3235,30 @@ impl Controller {
             }
         };
         let sessions = self.tray_sessions();
-        if *self.tray_pushed.borrow() == (text.clone(), sessions.clone()) {
+        // Any session in error, not just the selected profile's: the icon is
+        // the only channel a hidden window has, and "one of your tunnels is
+        // down" is worth an attention state whichever one it is.
+        let failed = matches!(status, Status::Error(_))
+            || self
+                .state
+                .borrow()
+                .ui
+                .sessions
+                .iter()
+                .any(|session| session.state == "error");
+        let pushed = TrayState {
+            text: text.clone(),
+            sessions: sessions.clone(),
+            failed,
+        };
+        if *self.tray_pushed.borrow() == pushed {
             return;
         }
-        *self.tray_pushed.borrow_mut() = (text.clone(), sessions.clone());
+        *self.tray_pushed.borrow_mut() = pushed;
         handle.update(move |tray| {
             tray.status_text = text.clone();
             tray.sessions.clone_from(&sessions);
+            tray.failed = failed;
         });
     }
 

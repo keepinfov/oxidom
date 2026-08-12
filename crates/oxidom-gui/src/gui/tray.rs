@@ -15,6 +15,11 @@ pub enum TrayCommand {
 pub struct OxidomTray {
     pub sessions: Vec<(String, bool)>,
     pub status_text: String,
+    /// A tunnel is down and said why. Toasts do not reach a hidden window —
+    /// they are recorded and dropped — so with a constant icon a tunnel that
+    /// died in the background left no sign at all outside the tooltip nobody
+    /// hovers.
+    pub failed: bool,
     pub commands: Sender<TrayCommand>,
 }
 
@@ -29,6 +34,21 @@ impl ksni::Tray for OxidomTray {
 
     fn icon_name(&self) -> String {
         oxidom_core::APP_ID.to_string()
+    }
+
+    /// `NeedsAttention` rather than a second icon asset: it is the protocol's
+    /// own word for this, and every StatusNotifier host already renders it
+    /// distinctly without oxidom shipping an error variant of its logo.
+    fn status(&self) -> ksni::Status {
+        if self.failed {
+            ksni::Status::NeedsAttention
+        } else {
+            ksni::Status::Active
+        }
+    }
+
+    fn attention_icon_name(&self) -> String {
+        "dialog-warning-symbolic".to_string()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
