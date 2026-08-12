@@ -38,6 +38,26 @@ use super::views::settings::{SettingsValues, SettingsView};
 use super::views::subscriptions::SubscriptionsView;
 use oxidom_core::client::{ConnectStage, DaemonClient, DaemonSource};
 
+/// The refusal `client_job` hands to a completion handler when another
+/// operation is already in flight. It is a state of this window, not a failure
+/// of a server or of the daemon, and it is a distinct type so handlers can tell
+/// the difference: dressed as a connect failure it reddened a card and blamed a
+/// node the daemon was never asked about.
+#[derive(Debug)]
+struct Busy;
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("another operation is still running")
+    }
+}
+
+impl std::error::Error for Busy {}
+
+fn is_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Busy>().is_some()
+}
+
 type SettingsCallback = Rc<dyn Fn(SettingsValues)>;
 type ShortcutHandler = Box<dyn Fn(&Rc<Controller>)>;
 
@@ -2008,6 +2028,13 @@ impl Controller {
                 selected_status(&state.ui),
             )
         };
+        // A connect job still in flight owns the operation slot, so a Disconnect
+        // sent now is refused as busy — and the refusal used to arrive looking
+        // like the tunnel itself had failed. There is nothing to stop yet.
+        if matches!(status, Status::Connecting) && self.state.borrow().ui.operation.is_some() {
+            self.show_message("Still connecting — wait for it to finish or fail");
+            return;
+        }
         if matches!(status, Status::Connecting | Status::Connected) {
             if profile == "default" {
                 self.disconnect();
@@ -2170,6 +2197,23 @@ impl Controller {
             move |client| client.connect_server(&work_id),
             move |controller, result| {
                 if let Err(error) = result {
+                    // Refused before the click reached the daemon, so the
+                    // server never answered and must not be shown as failing.
+                    // Dropping the optimistic pin is the whole rollback: the
+                    // next poll restores the daemon's own view of what is up.
+                    if is_busy(&error) {
+                        controller.state.borrow_mut().ui.clear_pin();
+                        controller.set_cards_connection(CardConnection {
+                            active: controller.state.borrow().ui.connected_id.clone(),
+                            profiles: controller.state.borrow().ui.connected_profiles.clone(),
+                            connecting: None,
+                            failed: None,
+                        });
+                        controller.rebuild_sessions();
+                        controller.refresh_status();
+                        controller.show_message(&format!("Still busy — {error}"));
+                        return;
+                    }
                     let message = format!("{error:#}");
                     {
                         let mut state = controller.state.borrow_mut();
@@ -2180,8 +2224,8 @@ impl Controller {
                         );
                         state.ui.connected_id = None;
                         // Named here rather than left to the daemon: a refused
-                        // bus call, or a job rejected while another is running,
-                        // never reached it, so it has no failure to report.
+                        // bus call never reached it, so it has no failure to
+                        // report.
                         state.ui.failed_id = Some(failed_id.clone());
                     }
                     controller.set_cards_connection(CardConnection {
@@ -2711,7 +2755,7 @@ impl Controller {
                 // the settings spinner, dropping a queued close, rolling back
                 // the optimistic "connecting" card — and skipping it leaves
                 // the UI stuck in a state the user cannot undo.
-                complete(self, Err(anyhow!("another operation is still running")));
+                complete(self, Err(anyhow!(Busy)));
                 return;
             }
             state.ui.operation = Some(operation.clone());
