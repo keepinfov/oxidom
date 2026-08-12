@@ -1207,14 +1207,18 @@ impl Controller {
                 }
                 Ok(Err(error)) => {
                     if let Some(controller) = weak.upgrade() {
-                        controller.show_message(&format!("Could not refresh profiles: {error}"));
+                        controller.show_error("Could not refresh profiles", &format!("{error:#}"));
                     }
                     glib::ControlFlow::Break
                 }
                 Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if let Some(controller) = weak.upgrade() {
-                        controller.show_message("Profile refresh stopped unexpectedly");
+                        controller.show_error(
+                            "Profile refresh stopped unexpectedly",
+                            "The worker ended without reporting a result. The profile list on \
+                             screen may be out of date.",
+                        );
                     }
                     glib::ControlFlow::Break
                 }
@@ -2162,7 +2166,7 @@ impl Controller {
             self.servers.set_latency_state(&id, latency_state);
         }
         self.refresh_activity_status();
-        self.show_message(&format!("Could not check latency: {error}"));
+        self.show_error("Could not check latency", &format!("{error:#}"));
     }
 
     fn connect_server(self: &Rc<Self>, server_id: String) {
@@ -2266,7 +2270,7 @@ impl Controller {
             |client| client.disconnect(),
             |controller, result| {
                 if let Err(error) = result {
-                    controller.show_message(&format!("Could not disconnect: {error}"));
+                    controller.show_error("Could not disconnect", &format!("{error:#}"));
                 }
                 controller.reconcile_system_proxy();
             },
@@ -2288,11 +2292,11 @@ impl Controller {
                     controller.state.borrow_mut().profiles = profiles;
                     controller.rebuild_views();
                     if let Err(error) = operation {
-                        controller.show_message(&format!("Could not save profile: {error}"));
+                        controller.show_error("Could not save profile", &format!("{error:#}"));
                     }
                 }
                 Err(error) => {
-                    controller.show_message(&format!("Could not save profile: {error}"));
+                    controller.show_error("Could not save profile", &format!("{error:#}"));
                 }
             },
         );
@@ -2313,11 +2317,11 @@ impl Controller {
                     controller.state.borrow_mut().profiles = profiles;
                     controller.rebuild_views();
                     if let Err(error) = operation {
-                        controller.show_message(&format!("Could not remove profile: {error}"));
+                        controller.show_error("Could not remove profile", &format!("{error:#}"));
                     }
                 }
                 Err(error) => {
-                    controller.show_message(&format!("Could not remove profile: {error}"));
+                    controller.show_error("Could not remove profile", &format!("{error:#}"));
                 }
             },
         );
@@ -2431,7 +2435,10 @@ impl Controller {
                 // worker read after the call lands immediately after this
                 // handler and paints whichever of the two it actually is.
                 self.mark_error_notified(&format!("{error:#}"));
-                self.show_message(&format!("Could not bring up «{name}»: {error}"));
+                self.show_error(
+                    &format!("Could not bring up «{name}»"),
+                    &format!("{error:#}"),
+                );
             }
         }
         self.reconcile_system_proxy();
@@ -2477,9 +2484,10 @@ impl Controller {
                     }
                     Err(error) => {
                         controller.rebuild_sessions();
-                        controller.show_message(&format!(
-                            "Could not disconnect «{message_name}»: {error}"
-                        ));
+                        controller.show_error(
+                            &format!("Could not disconnect «{message_name}»"),
+                            &format!("{error:#}"),
+                        );
                     }
                 }
             },
@@ -2543,7 +2551,7 @@ impl Controller {
                     }
                     controller.show_message(&message);
                 }
-                Err(error) => controller.show_message(&format!("Could not import: {error}")),
+                Err(error) => controller.show_error("Could not import", &format!("{error:#}")),
             },
         );
     }
@@ -2559,7 +2567,7 @@ impl Controller {
 
     fn finish_subscription_change(self: &Rc<Self>, action: &str, result: Result<()>) {
         if let Err(error) = result {
-            self.show_message(&format!("Could not {action}: {error}"));
+            self.show_error(&format!("Could not {action}"), &format!("{error:#}"));
             return;
         }
         self.rebuild_views();
@@ -2586,7 +2594,7 @@ impl Controller {
                 }
                 self.rebuild_views();
             }
-            Err(error) => self.show_message(&format!("Could not {action}: {error}")),
+            Err(error) => self.show_error(&format!("Could not {action}"), &format!("{error:#}")),
         }
     }
 
@@ -2597,7 +2605,7 @@ impl Controller {
             move |client| client.set_hwid(&work_id, enabled),
             |controller, result| {
                 if let Err(error) = result {
-                    controller.show_message(&format!("Could not save HWID preference: {error}"));
+                    controller.show_error("Could not save HWID preference", &format!("{error:#}"));
                 }
                 controller.rebuild_views();
             },
@@ -2611,7 +2619,7 @@ impl Controller {
             move |client| client.set_subscription_user_agent(&work_id, &user_agent),
             |controller, result| {
                 if let Err(error) = result {
-                    controller.show_message(&format!("Could not save the User-Agent: {error}"));
+                    controller.show_error("Could not save the User-Agent", &format!("{error:#}"));
                 }
                 controller.rebuild_views();
             },
@@ -2625,7 +2633,7 @@ impl Controller {
             |controller, result| match result {
                 Ok(()) => controller.rebuild_views(),
                 Err(error) => {
-                    controller.show_message(&format!("Could not set alias: {error}"));
+                    controller.show_error("Could not set alias", &format!("{error:#}"));
                 }
             },
         );
@@ -2842,7 +2850,11 @@ impl Controller {
                         controller.bump_epoch();
                         controller.sessions.set_operation(None);
                         controller.subscriptions.set_operation(None);
-                        controller.show_message("Background operation stopped unexpectedly");
+                        controller.show_error(
+                            "Background operation stopped unexpectedly",
+                            "The worker ended without reporting a result. Nothing was \
+                             cancelled, but what is on screen may be out of date.",
+                        );
                         controller.refresh_status();
                     }
                     glib::ControlFlow::Break
@@ -3444,9 +3456,14 @@ impl Controller {
         }
     }
 
-    /// A failure the user did not directly trigger, or one too long for a
-    /// toast: one line, the full text behind Details, and a shortcut to the
-    /// place that can fix it when the message names one.
+    /// **Every failure that carries text from the daemon or the system.** One
+    /// line, the full text behind Details, and a shortcut to the place that can
+    /// fix it when the message names one.
+    ///
+    /// The rule matters because the alternative used to be arbitrary: a failed
+    /// `Connect` got this treatment while a failed `up` on the same profile got
+    /// a plain toast, so whether the full error was reachable at all depended on
+    /// which button had been pressed.
     fn show_error(self: &Rc<Self>, title: &str, detail: &str) {
         let toast = adw::Toast::new(&summarize_error(title, detail));
         toast.set_priority(adw::ToastPriority::High);
@@ -3517,6 +3534,9 @@ impl Controller {
         }
     }
 
+    /// Neutral news: a success, a refusal already stated in full, a fact the
+    /// user should notice. Never a failure carrying an error string — that is
+    /// [`Self::show_error`], which keeps the untruncated text reachable.
     fn show_message(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
