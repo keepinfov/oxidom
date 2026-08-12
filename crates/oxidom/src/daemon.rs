@@ -661,6 +661,9 @@ impl Shared {
             http_port_locked: self.http_port_locked,
             socks_port: engine.registry.config.socks_port,
             http_port: engine.registry.config.http_port,
+            // Same rule `set_settings` applies below, published so the GUI can
+            // grey the rows instead of accepting text the daemon will revert.
+            binary_paths_locked: self.system_bus,
         }
     }
 
@@ -2196,10 +2199,14 @@ impl Service {
         // daemon runs as its own user and spawns whatever path this names, so
         // callers do not get to choose it. There the core comes from the unit's
         // environment or the on-disk config, both of which need root to touch.
-        let mut ignored_settings = Vec::new();
+        // Two lists, because the two refusals have different reasons and the
+        // GUI has to name the right one: a port is pinned by the service unit,
+        // a path is refused outright on the system bus.
+        let mut ignored_ports = Vec::new();
+        let mut ignored_paths = Vec::new();
         if raw.get("xray_binary").is_none() || self.shared.system_bus {
             if self.shared.system_bus && config.xray_binary != engine.registry.config.xray_binary {
-                ignored_settings.push("Xray binary path".to_string());
+                ignored_paths.push("Xray binary path".to_string());
             }
             config.xray_binary = engine.registry.config.xray_binary.clone();
         }
@@ -2219,13 +2226,13 @@ impl Service {
             if self.shared.system_bus
                 && config.tun2socks_binary != engine.registry.config.tun2socks_binary
             {
-                ignored_settings.push("tun2socks binary path".to_string());
+                ignored_paths.push("tun2socks binary path".to_string());
             }
             config.tun2socks_binary = engine.registry.config.tun2socks_binary.clone();
         }
         if raw.get("nft_binary").is_none() || self.shared.system_bus {
             if self.shared.system_bus && config.nft_binary != engine.registry.config.nft_binary {
-                ignored_settings.push("nft binary path".to_string());
+                ignored_paths.push("nft binary path".to_string());
             }
             config.nft_binary = engine.registry.config.nft_binary.clone();
         }
@@ -2252,11 +2259,11 @@ impl Service {
         // anything pointed at the old port in the meantime.
         if self.shared.socks_port_locked && config.socks_port != engine.registry.config.socks_port {
             config.socks_port = engine.registry.config.socks_port;
-            ignored_settings.push("SOCKS port".to_string());
+            ignored_ports.push("SOCKS port".to_string());
         }
         if self.shared.http_port_locked && config.http_port != engine.registry.config.http_port {
             config.http_port = engine.registry.config.http_port;
-            ignored_settings.push("HTTP port".to_string());
+            ignored_ports.push("HTTP port".to_string());
         }
 
         let ports_changed = engine.registry.config.socks_port != config.socks_port
@@ -2352,7 +2359,8 @@ impl Service {
         }
         json(&ApplySettingsResult {
             reconnect_error,
-            ignored_ports: ignored_settings,
+            ignored_ports,
+            ignored_paths,
         })
     }
 

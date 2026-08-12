@@ -301,6 +301,13 @@ pub struct ApplySettingsResult {
     /// Human labels of ports the daemon refused to change because its service
     /// unit pins them on the command line.
     pub ignored_ports: Vec<String>,
+    /// Human labels of binary paths a **system** daemon refused to change. Kept
+    /// apart from `ignored_ports` because the reason is different and the GUI
+    /// used to report both as "fixed by the service unit", which is true of the
+    /// ports and false of the paths: a path names what the privileged daemon
+    /// executes, so no caller gets to choose it. An older daemon leaves this
+    /// empty and reports paths in `ignored_ports` — mislabelled, but not lost.
+    pub ignored_paths: Vec<String>,
 }
 
 /// Daemon-side facts the GUI cannot work out locally: the two run in separate
@@ -322,6 +329,13 @@ pub struct RuntimeInfo {
     /// daemon refuses the write and the GUI locks the row.
     pub socks_port_locked: bool,
     pub http_port_locked: bool,
+    /// Set by a **system** daemon, which resolves its own core binaries. The
+    /// GUI locks those rows for the same reason it locks a pinned port: an
+    /// editable field that the daemon silently reverts is a field that lies.
+    /// Defaults to `false`, so a session daemon and an older one both stay
+    /// editable — which is correct for the session daemon and unchanged
+    /// behaviour for the old one.
+    pub binary_paths_locked: bool,
     /// The ports actually in use. Only meaningful when the matching
     /// `*_locked` flag is set — otherwise these default to 0 on an old daemon.
     pub socks_port: u16,

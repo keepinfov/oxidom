@@ -225,8 +225,21 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
-            r#"{"xray_path":"/nix/store/xray/bin/xray","xray_error":null,"xray_source":"config","socks_port_locked":false,"http_port_locked":false,"socks_port":0,"http_port":0}"#
+            r#"{"xray_path":"/nix/store/xray/bin/xray","xray_error":null,"xray_source":"config","socks_port_locked":false,"http_port_locked":false,"binary_paths_locked":false,"socks_port":0,"http_port":0}"#
         );
+    }
+
+    /// The point of freezing the shape above is that a *reader* keeps working,
+    /// not that the struct never grows. `binary_paths_locked` was added after
+    /// the fact, so the version that predates it must still parse — and get
+    /// `false`, which is the answer that leaves rows editable.
+    #[test]
+    fn runtime_info_without_the_binary_lock_still_parses() {
+        let older = r#"{"xray_path":"/usr/bin/xray","socks_port_locked":true,"socks_port":1080}"#;
+        let info: crate::ipc::RuntimeInfo = serde_json::from_str(older).unwrap();
+        assert_eq!(info.xray_path.as_deref(), Some("/usr/bin/xray"));
+        assert!(info.socks_port_locked);
+        assert!(!info.binary_paths_locked);
     }
 
     #[test]
