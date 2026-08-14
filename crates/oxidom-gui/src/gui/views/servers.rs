@@ -67,8 +67,8 @@ pub struct CardCallbacks {
 /// shared row heights, and a card's slot changes only on repack (rebuild,
 /// filter, sort, column-count change), never on selection.
 #[derive(Clone)]
-struct GroupUi {
-    /// Subscription id. The group's own actions address it by id rather than by
+struct SubscriptionBlock {
+    /// Subscription id. The block's own actions address it by id rather than by
     /// position, because reordering moves the position out from under them.
     id: String,
     root: gtk::Widget,
@@ -202,7 +202,7 @@ pub struct ServersView {
     /// scope change actually replaces, and therefore the only part that fades.
     servers_area: gtk::Box,
     cards: Rc<RefCell<HashMap<String, ServerCard>>>,
-    groups: Rc<RefCell<Vec<GroupUi>>>,
+    blocks: Rc<RefCell<Vec<SubscriptionBlock>>>,
     subscriptions: Rc<RefCell<Vec<Subscription>>>,
     /// Lowercased "name transport protocol address:port country" per server.
     /// The search matches this, never transient widget text like the
@@ -245,7 +245,7 @@ pub struct ServersView {
     /// the callbacks that carried it went out of scope.
     on_create_pool: PoolCallback,
     on_connect_pool: PoolCallback,
-    /// The row of saved scopes, above the subscription groups.
+    /// The row of saved scopes, above the subscription blocks.
     chip_bar: gtk::Box,
     chip_scroll: gtk::ScrolledWindow,
     /// One line under the chip row, shown only until the first group exists.
@@ -293,7 +293,7 @@ pub struct ServersView {
     /// Invoked by the "no servers yet" page; the window routes it to the
     /// Subscriptions page.
     on_browse_subscriptions: BrowseCallback,
-    /// Which subscription groups are collapsed, persisted to disk so it
+    /// Which subscription blocks are collapsed, persisted to disk so it
     /// survives restarts.
     prefs: Rc<RefCell<GuiPrefs>>,
 }
@@ -437,7 +437,7 @@ impl ServersView {
             on_connect_pool: Rc::new(RefCell::new(None)),
             on_browse_subscriptions: Rc::new(RefCell::new(None)),
             cards: Rc::new(RefCell::new(HashMap::new())),
-            groups: Rc::new(RefCell::new(Vec::new())),
+            blocks: Rc::new(RefCell::new(Vec::new())),
             subscriptions: Rc::new(RefCell::new(subscriptions.to_vec())),
             search_texts: Rc::new(RefCell::new(HashMap::new())),
             query: Rc::new(RefCell::new(String::new())),
@@ -505,8 +505,8 @@ impl ServersView {
         }
         self.columns.set(count);
         self.pending_columns.set(count);
-        for group in self.groups.borrow().iter() {
-            repack_group(group, count);
+        for block in self.blocks.borrow().iter() {
+            repack_block(block, count);
         }
         self.refresh_expanded_height();
         self.schedule_expanded_remeasure();
@@ -542,7 +542,7 @@ impl ServersView {
         }
         self.servers_area.set_opacity(1.0);
         self.cards.borrow_mut().clear();
-        self.groups.borrow_mut().clear();
+        self.blocks.borrow_mut().clear();
         *self.subscriptions.borrow_mut() = subscriptions.to_vec();
         self.search_texts.borrow_mut().clear();
         *self.on_create_pool.borrow_mut() = Some(callbacks.create_pool.clone());
@@ -620,7 +620,7 @@ impl ServersView {
                 .css_classes(["flat", "circular", "server-action"])
                 .build();
             update.update_property(&[gtk::accessible::Property::Label("Update subscription")]);
-            // The local "My servers" group has no URL to re-fetch.
+            // The local "My servers" subscription has no URL to re-fetch.
             update.set_visible(!subscription.url.is_empty());
             update.connect_clicked({
                 let cb = callbacks.refresh.clone();
@@ -654,16 +654,16 @@ impl ServersView {
             sort.connect_clicked({
                 let view = self.clone();
                 let subscription_id = subscription.id.clone();
-                move |_| view.sort_group(&subscription_id)
+                move |_| view.sort_subscription(&subscription_id)
             });
             let reorder = gtk::MenuButton::builder()
                 .icon_name("view-more-symbolic")
-                .tooltip_text("Move this group")
+                .tooltip_text("Move subscription")
                 .valign(gtk::Align::Center)
                 .css_classes(["flat", "circular", "server-action"])
                 .build();
-            reorder.update_property(&[gtk::accessible::Property::Label("Move this group")]);
-            reorder.set_popover(Some(&self.reorder_popover(&subscription.id)));
+            reorder.update_property(&[gtk::accessible::Property::Label("Move subscription")]);
+            reorder.set_popover(Some(&self.move_subscription_menu(&subscription.id)));
             let collapsed = Rc::new(Cell::new(
                 self.prefs
                     .borrow()
@@ -692,10 +692,10 @@ impl ServersView {
             title_box.set_hexpand(true);
             title_box.append(&heading);
             title_box.append(&description);
-            // The name and the quota line are the group's whole width minus four
-            // icon buttons, and hitting a 24px chevron to fold a group away was
-            // the only way to do it. They become the expander instead; the
-            // chevron stays because it is what says the group folds at all.
+            // The name and the quota line are the block's whole width minus four
+            // icon buttons, and hitting a 24px chevron to fold a subscription away
+            // was the only way to do it. They become the expander instead; the
+            // chevron stays because it is what says the block folds at all.
             let title_toggle = gtk::Button::builder()
                 .child(&title_box)
                 .hexpand(true)
@@ -723,7 +723,7 @@ impl ServersView {
                 .visible(!collapsed.get())
                 .build();
             // One toggle behind two widgets, so the chevron and the title can
-            // never disagree about whether the group is folded.
+            // never disagree about whether the block is folded.
             let toggle: Rc<dyn Fn()> = {
                 let collapsed = collapsed.clone();
                 let columns_box = columns_box.clone();
@@ -762,7 +762,7 @@ impl ServersView {
             });
             collapse_toggle.connect_clicked(move |_| toggle());
 
-            let mut group_cards: Vec<(String, gtk::Widget)> = Vec::new();
+            let mut block_cards: Vec<(String, gtk::Widget)> = Vec::new();
             for server in &subscription.servers {
                 let id = server.id.clone();
                 let latency_state = latency_states
@@ -844,31 +844,31 @@ impl ServersView {
                     )
                     .to_lowercase(),
                 );
-                group_cards.push((id.clone(), card.root.clone().upcast::<gtk::Widget>()));
+                block_cards.push((id.clone(), card.root.clone().upcast::<gtk::Widget>()));
                 self.cards.borrow_mut().insert(server.id.clone(), card);
             }
 
-            let group = gtk::Box::new(gtk::Orientation::Vertical, 12);
-            group.set_hexpand(true);
-            group.append(&header);
-            group.append(&columns_box);
-            self.servers_area.append(&group);
-            let group_ui = GroupUi {
+            let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            root.set_hexpand(true);
+            root.append(&header);
+            root.append(&columns_box);
+            self.servers_area.append(&root);
+            let block = SubscriptionBlock {
                 id: subscription.id.clone(),
-                root: group.upcast::<gtk::Widget>(),
+                root: root.upcast::<gtk::Widget>(),
                 columns_box,
                 column_boxes: Rc::new(RefCell::new(Vec::new())),
                 display_order: Rc::new(RefCell::new(
-                    group_cards.iter().map(|(id, _)| id.clone()).collect(),
+                    block_cards.iter().map(|(id, _)| id.clone()).collect(),
                 )),
-                cards: group_cards,
+                cards: block_cards,
                 sort_button: sort,
                 sort_generation: Rc::new(Cell::new(0)),
             };
-            repack_group(&group_ui, self.columns.get());
-            self.groups.borrow_mut().push(group_ui);
+            repack_block(&block, self.columns.get());
+            self.blocks.borrow_mut().push(block);
         }
-        // Last child, so it sits below the groups it stands in for.
+        // Last child, so it sits below the blocks it stands in for.
         self.servers_area.append(&self.no_matches);
         self.apply_filter();
         if let Some(server_id) = selected_id {
@@ -949,11 +949,11 @@ impl ServersView {
         // chip has a menu, which was itself only there to stop five identical
         // buttons appearing in a row.
         let manage = gtk::MenuButton::builder()
-            .tooltip_text("What to do with the scope on screen")
+            .tooltip_text("What to do with the selection on screen")
             .css_classes(["flat", "group-chip-menu"])
             .build();
         manage.set_child(Some(&gtk::Image::from_icon_name("view-more-symbolic")));
-        manage.update_property(&[gtk::accessible::Property::Label("Scope actions")]);
+        manage.update_property(&[gtk::accessible::Property::Label("Selection actions")]);
         // Never insensitive, because it no longer means "the selected group": it
         // acts on the scope that is on screen, saved or not, and making a profile
         // out of that is exactly what somebody looking at an unsaved filter wants.
@@ -1362,7 +1362,7 @@ impl ServersView {
         self.connect_button.set_sensitive(visible > 0);
         self.connect_button
             .set_tooltip_text(Some(&match (visible, choice.as_ref()) {
-                (0, _) => "Nothing to connect: this scope shows no servers.".to_string(),
+                (0, _) => "Nothing to connect: this selection shows no servers.".to_string(),
                 (_, Some(choice)) => format!(
                     "Point the selected profile at these {visible} servers. {} {}",
                     choice.label, choice.detail
@@ -2370,16 +2370,16 @@ impl ServersView {
         let selected = self.selected.borrow().clone();
         let mut total_visible = 0usize;
         {
-            for group in self.groups.borrow().iter() {
+            for block in self.blocks.borrow().iter() {
                 let mut visible = 0;
-                for (id, card) in &group.cards {
+                for (id, card) in &block.cards {
                     let matches = filtered.contains(id);
                     card.set_visible(matches);
                     if matches {
                         visible += 1;
                     }
                 }
-                group.root.set_visible(visible > 0);
+                block.root.set_visible(visible > 0);
                 total_visible += visible;
             }
         }
@@ -2409,8 +2409,8 @@ impl ServersView {
                 card.collapse_immediately();
             }
         }
-        for group in self.groups.borrow().iter() {
-            repack_group(group, self.columns.get());
+        for block in self.blocks.borrow().iter() {
+            repack_block(block, self.columns.get());
         }
         // Keep the selected card's expansion in sync with its visibility, so a
         // filtered-out card doesn't stay tall and highlighted off-grid, and
@@ -2580,12 +2580,12 @@ impl ServersView {
 
     /// (group index, index within the group's ordered visible cards).
     fn position_of(&self, server_id: &str) -> Option<(usize, usize)> {
-        let groups = self.groups.borrow();
-        for (group_index, group) in groups.iter().enumerate() {
-            let display_order = group.display_order.borrow();
+        let blocks = self.blocks.borrow();
+        for (block_index, block) in blocks.iter().enumerate() {
+            let display_order = block.display_order.borrow();
             let mut visible_index = 0;
             for id in display_order.iter() {
-                let Some((_, widget)) = group.cards.iter().find(|(card_id, _)| card_id == id)
+                let Some((_, widget)) = block.cards.iter().find(|(card_id, _)| card_id == id)
                 else {
                     continue;
                 };
@@ -2593,7 +2593,7 @@ impl ServersView {
                     continue;
                 }
                 if id == server_id {
-                    return Some((group_index, visible_index));
+                    return Some((block_index, visible_index));
                 }
                 visible_index += 1;
             }
@@ -2624,10 +2624,10 @@ impl ServersView {
     }
 
     fn column_fallback_width(&self) -> Option<i32> {
-        let groups = self.groups.borrow();
-        let total = groups
+        let blocks = self.blocks.borrow();
+        let total = blocks
             .iter()
-            .map(|group| group.columns_box.allocated_width())
+            .map(|block| block.columns_box.allocated_width())
             .find(|width| *width > 0)?;
         let columns = self.columns.get().max(1) as i32;
         Some(
@@ -2668,12 +2668,12 @@ impl ServersView {
     /// Reorders the widgets in place instead of rebuilding: a rebuild would
     /// throw away every card's expansion, latency badge and running animation
     /// to express a change that is three `reorder_child_after` calls.
-    fn move_group(&self, subscription_id: &str, delta: isize) {
+    fn move_subscription(&self, subscription_id: &str, delta: isize) {
         let visible: Vec<String> = self
-            .groups
+            .blocks
             .borrow()
             .iter()
-            .map(|group| group.id.clone())
+            .map(|block| block.id.clone())
             .collect();
         let order = moved_in_order(&visible, subscription_id, delta);
         if order == visible {
@@ -2681,22 +2681,22 @@ impl ServersView {
         }
 
         {
-            let mut groups = self.groups.borrow_mut();
-            groups.sort_by_key(|group| {
+            let mut blocks = self.blocks.borrow_mut();
+            blocks.sort_by_key(|block| {
                 order
                     .iter()
-                    .position(|id| id == &group.id)
+                    .position(|id| id == &block.id)
                     .unwrap_or(usize::MAX)
             });
             // `content` also holds the chip row and the connect bar above the
-            // groups and the "no matches" page below them. Re-seating starts
+            // blocks and the "no matches" page below them. Re-seating starts
             // after the connect bar by name rather than at `first_child`, so
-            // the first group cannot slip in front of it.
+            // the first block cannot slip in front of it.
             let mut previous = Some(self.connect_bar.clone().upcast::<gtk::Widget>());
-            for group in groups.iter() {
+            for block in blocks.iter() {
                 self.content
-                    .reorder_child_after(&group.root, previous.as_ref());
-                previous = Some(group.root.clone());
+                    .reorder_child_after(&block.root, previous.as_ref());
+                previous = Some(block.root.clone());
             }
         }
 
@@ -2739,7 +2739,7 @@ impl ServersView {
         self.build_chip_bar();
     }
 
-    fn reorder_popover(&self, subscription_id: &str) -> gtk::Popover {
+    fn move_subscription_menu(&self, subscription_id: &str) -> gtk::Popover {
         let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
         list.set_margin_top(6);
         list.set_margin_bottom(6);
@@ -2763,7 +2763,7 @@ impl ServersView {
                 let popover = popover.clone();
                 move |_| {
                     popover.popdown();
-                    view.move_group(&subscription_id, delta);
+                    view.move_subscription(&subscription_id, delta);
                 }
             });
             list.append(&button);
@@ -2773,35 +2773,35 @@ impl ServersView {
 
     /// Manually capture and apply a latency order. Later measurements update only
     /// their badges until the user presses sort again.
-    pub fn sort_group(&self, subscription_id: &str) {
-        let Some(group) = self
-            .groups
+    pub fn sort_subscription(&self, subscription_id: &str) {
+        let Some(block) = self
+            .blocks
             .borrow()
             .iter()
-            .find(|group| group.id == subscription_id)
+            .find(|block| block.id == subscription_id)
             .cloned()
         else {
             return;
         };
-        let sorted = sorted_by_latency(&group.display_order.borrow(), &self.latencies.borrow());
-        let generation = group.sort_generation.get().wrapping_add(1);
-        group.sort_generation.set(generation);
-        group.sort_button.set_sensitive(false);
+        let sorted = sorted_by_latency(&block.display_order.borrow(), &self.latencies.borrow());
+        let generation = block.sort_generation.get().wrapping_add(1);
+        block.sort_generation.set(generation);
+        block.sort_button.set_sensitive(false);
 
-        if !adw::is_animations_enabled(&group.columns_box) {
-            *group.display_order.borrow_mut() = sorted;
-            repack_group(&group, self.columns.get());
-            group.sort_button.set_sensitive(true);
+        if !adw::is_animations_enabled(&block.columns_box) {
+            *block.display_order.borrow_mut() = sorted;
+            repack_block(&block, self.columns.get());
+            block.sort_button.set_sensitive(true);
             return;
         }
 
         let target = adw::CallbackAnimationTarget::new({
-            let columns_box = group.columns_box.clone();
+            let columns_box = block.columns_box.clone();
             move |value| columns_box.set_opacity(value)
         });
         let animation = adw::TimedAnimation::new(
-            &group.columns_box,
-            group.columns_box.opacity(),
+            &block.columns_box,
+            block.columns_box.opacity(),
             0.0,
             90,
             target,
@@ -2809,25 +2809,25 @@ impl ServersView {
         animation.set_easing(adw::Easing::EaseInCubic);
         animation.connect_done({
             let view = self.clone();
-            let group = group.clone();
+            let block = block.clone();
             move |_| {
-                if group.sort_generation.get() != generation {
+                if block.sort_generation.get() != generation {
                     return;
                 }
-                *group.display_order.borrow_mut() = sorted.clone();
-                repack_group(&group, view.columns.get());
+                *block.display_order.borrow_mut() = sorted.clone();
+                repack_block(&block, view.columns.get());
 
                 let target = adw::CallbackAnimationTarget::new({
-                    let columns_box = group.columns_box.clone();
+                    let columns_box = block.columns_box.clone();
                     move |value| columns_box.set_opacity(value)
                 });
-                let fade_in = adw::TimedAnimation::new(&group.columns_box, 0.0, 1.0, 130, target);
+                let fade_in = adw::TimedAnimation::new(&block.columns_box, 0.0, 1.0, 130, target);
                 fade_in.set_easing(adw::Easing::EaseOutCubic);
                 fade_in.connect_done({
-                    let group = group.clone();
+                    let block = block.clone();
                     move |_| {
-                        if group.sort_generation.get() == generation {
-                            group.sort_button.set_sensitive(true);
+                        if block.sort_generation.get() == generation {
+                            block.sort_button.set_sensitive(true);
                         }
                     }
                 });
@@ -2838,7 +2838,7 @@ impl ServersView {
     }
 }
 
-/// A stable id for a new group: a slug of its name, suffixed until free.
+/// A stable id for a new block: a slug of its name, suffixed until free.
 ///
 /// The id outlives renames, so it cannot simply *be* the name; and it is only
 /// ever compared against this machine's own list, so it does not need to be a
@@ -3181,35 +3181,35 @@ fn collapse_would_shift(prev: (usize, usize), next: (usize, usize), columns: usi
 /// Lay the group's visible cards out into its column boxes. Skips all widget
 /// churn when the assignment already matches, so running height animations
 /// and keyboard focus survive unrelated calls.
-fn repack_group(group: &GroupUi, columns: usize) {
+fn repack_block(block: &SubscriptionBlock, columns: usize) {
     let columns = columns.max(1);
     {
-        let mut boxes = group.column_boxes.borrow_mut();
+        let mut boxes = block.column_boxes.borrow_mut();
         if boxes.len() != columns {
-            for (_, card) in &group.cards {
+            for (_, card) in &block.cards {
                 if let Some(parent) = card.parent().and_downcast::<gtk::Box>() {
                     parent.remove(card);
                 }
             }
-            while let Some(child) = group.columns_box.first_child() {
-                group.columns_box.remove(&child);
+            while let Some(child) = block.columns_box.first_child() {
+                block.columns_box.remove(&child);
             }
             boxes.clear();
             for _ in 0..columns {
                 let column = gtk::Box::new(gtk::Orientation::Vertical, CARD_ROW_SPACING);
                 column.set_hexpand(true);
-                group.columns_box.append(&column);
+                block.columns_box.append(&column);
                 boxes.push(column);
             }
         }
     }
 
-    let boxes = group.column_boxes.borrow();
-    let display_order = group.display_order.borrow();
+    let boxes = block.column_boxes.borrow();
+    let display_order = block.display_order.borrow();
     // Index once: this runs on every resize and every expand/collapse, and a
     // linear scan per id turns a large subscription into O(cards²) work in
     // the middle of an animation.
-    let by_id: HashMap<&str, &gtk::Widget> = group
+    let by_id: HashMap<&str, &gtk::Widget> = block
         .cards
         .iter()
         .map(|(id, card)| (id.as_str(), card))
@@ -3235,7 +3235,7 @@ fn repack_group(group: &GroupUi, columns: usize) {
         return;
     }
 
-    for (_, card) in &group.cards {
+    for (_, card) in &block.cards {
         if let Some(parent) = card.parent().and_downcast::<gtk::Box>() {
             parent.remove(card);
         }
