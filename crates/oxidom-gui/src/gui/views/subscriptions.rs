@@ -9,7 +9,7 @@ use oxidom_core::engine::LOCAL_ID;
 use oxidom_core::link;
 use oxidom_core::model::{Subscription, UserInfo};
 
-use super::super::group::{format_bytes, subscription_description};
+use super::super::group::{format_bytes, skipped_note, subscription_description};
 use super::{dialog_content, icon_button, set_transient_parent, set_validation, validation_label};
 
 /// Callbacks the subscriptions view invokes.
@@ -633,6 +633,21 @@ fn show_subscription_details(
         .subtitle(subscription.servers.len().to_string())
         .build();
     details.add(&server_count);
+    // Only when there is something to say. A row reading "none" on every
+    // healthy subscription would be four words of furniture for the case that
+    // needs no explaining.
+    if let Some(note) = skipped_note(&subscription) {
+        let skipped = adw::ActionRow::builder()
+            .title("Skipped")
+            .subtitle(format!(
+                "{note}. This build reads {}. The panel offered the rest to \
+                 clients that speak them.",
+                link::supported_scheme_list()
+            ))
+            .subtitle_lines(4)
+            .build();
+        details.add(&skipped);
+    }
 
     // The User-Agent belongs next to the subscription and not only in Settings,
     // because it selects the *format* the panel answers with, and providers
