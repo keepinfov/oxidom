@@ -90,7 +90,7 @@ const DEST_OVERRIDES: &[DestOverride] =
     &[DestOverride::Http, DestOverride::Tls, DestOverride::Quic];
 const DEST_OVERRIDE_LABELS: &[&str] = &["HTTP", "TLS", "QUIC"];
 
-const MUX_POOL_WARNING: &str = "One connection carries everything, so a pool stops spreading \
+const MUX_POOL_WARNING: &str = "One connection carries everything, so a group stops spreading \
     activity across its exit addresses.";
 const SNIFFING_HINT: &str = "Off means domain rules stop matching: the core only ever sees the \
     address the application already resolved.";

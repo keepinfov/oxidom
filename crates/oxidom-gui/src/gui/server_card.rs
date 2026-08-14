@@ -784,7 +784,7 @@ impl ServerCard {
                 "Disconnected"
             }
             CardConnectionState::ConnectedHere => "Connected",
-            CardConnectionState::InPool => "In a running pool",
+            CardConnectionState::InPool => "One of several servers in use",
             CardConnectionState::Connecting => "Connecting",
             CardConnectionState::Failed => "Connection failed",
         };
@@ -812,7 +812,7 @@ impl ServerCard {
                 self.root.add_css_class("active-server");
             }
             CardConnectionState::InPool => {
-                self.status.set_label("In pool");
+                self.status.set_label("In use");
                 self.status.add_css_class("status-neutral");
                 self.status.set_visible(true);
                 self.latency_display.set_visible(true);

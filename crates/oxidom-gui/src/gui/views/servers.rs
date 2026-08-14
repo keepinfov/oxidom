@@ -1031,8 +1031,8 @@ impl ServersView {
         // a *profile*, which is what it now says.
         let create_pool = item(
             "New profile from this…",
-            "Create a connection profile whose pool is the visible selection. Connect only \
-             re-points the profile already chosen; this makes a new one.",
+            "Create a connection profile whose servers are the visible selection. Connect \
+             only re-points the profile already chosen; this makes a new one.",
         );
         create_pool.connect_clicked({
             let view = self.clone();

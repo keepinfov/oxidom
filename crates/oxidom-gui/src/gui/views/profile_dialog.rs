@@ -30,8 +30,8 @@ const HEALTH_BLIND_WARNING: &str = "This strategy keeps unreachable nodes in the
     the dead one. Use leastLoad to rotate only across nodes the core can still reach.";
 const LEAST_PING_WARNING: &str = "leastPing concentrates traffic on one node and works against \
     spreading activity across IPs.";
-const NEW_CONNECTIONS_HINT: &str = "Pool switching affects only new connections; existing \
-    connections do not migrate.";
+const NEW_CONNECTIONS_HINT: &str = "Switching between the group's servers affects only new \
+    connections; existing connections do not migrate.";
 const POOL_FROM_GROUPS_HINT: &str = "To run several servers at once, save a group on the Servers \
     page and press Connect on it.";
 const LIST_MEMBERSHIP_HINT: &str = "A fixed list. New servers do not join it on their own. Change \
@@ -220,13 +220,13 @@ pub fn show_profile_dialog(
         .build();
     profile_group.add(&description_entry);
 
-    // "Pool" is offered only to a profile that already has one. An empty pool
+    // "Group" is offered only to a profile that already has one. An empty one
     // is not a starting point the user can fill in here any more — it is an
     // unfiltered rule, i.e. every server on the machine — so the entry point
     // for making one is the group chips, where the servers actually are.
     let has_pool = initial.pool.is_some();
     let selection_labels = if has_pool {
-        gtk::StringList::new(&["Single server", "Pool"])
+        gtk::StringList::new(&["Single server", "Group"])
     } else {
         gtk::StringList::new(&["Single server"])
     };
@@ -277,7 +277,10 @@ pub fn show_profile_dialog(
 
     let initial_pool = initial.pool.clone().unwrap_or_default();
     let pool_group = adw::PreferencesGroup::builder()
-        .title("Pool")
+        .title("Group")
+        // The one place the stored name is worth saying: somebody reading the
+        // profile file or the CLI meets `pool` there and has to know it is this.
+        .description("Written as `pool` in the profile file, and called that by the CLI")
         .visible(initial.pool.is_some())
         .build();
     let strategy_labels = gtk::StringList::new(&["leastLoad", "roundRobin", "random", "leastPing"]);
@@ -312,7 +315,7 @@ pub fn show_profile_dialog(
 
     let pool_max = adw::SpinRow::with_range(0.0, profile::MAX_POOL_MEMBERS as f64, 1.0);
     pool_max.set_title("Maximum nodes");
-    pool_max.set_subtitle("0 means no query limit; activation still caps a pool at 64 nodes");
+    pool_max.set_subtitle("0 means no query limit; activation still caps a group at 64 nodes");
     pool_max.set_value(initial_pool.max as f64);
     pool_group.add(&pool_max);
     let pool_expected = adw::SpinRow::with_range(0.0, profile::MAX_POOL_MEMBERS as f64, 1.0);

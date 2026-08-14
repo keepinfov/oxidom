@@ -1108,7 +1108,7 @@ fn rotation_help(strategy: &str) -> &'static str {
              another node becomes faster."
         }
         _ => {
-            "How many of the pool's nodes the core is currently willing to send \
+            "How many of the group's servers the core is currently willing to send \
              traffic through."
         }
     }
@@ -1214,7 +1214,7 @@ pub(super) fn pool_short_label(selection: &SelectionInfo) -> String {
         _ => count.to_string(),
     };
     if selection.name.is_empty() {
-        format!("pool ({inner})")
+        format!("group ({inner})")
     } else {
         format!("{} ({inner})", selection.name)
     }
@@ -1229,9 +1229,9 @@ fn pool_headline(selection: &SelectionInfo) -> String {
     let count = selection.members.len();
     let nodes = if count == 1 { "node" } else { "nodes" };
     let name = if selection.name.is_empty() {
-        "Pool".to_string()
+        "Group".to_string()
     } else {
-        format!("Pool “{}”", selection.name)
+        format!("Group “{}”", selection.name)
     };
     if let Some(selecting) = selection.selecting.as_deref() {
         // Only a strategy that settles on one node, or an explicit override,
@@ -1309,7 +1309,7 @@ pub(super) fn session_rows(
 
             let selection = match running_pool {
                 Some(selection) => pool_headline(selection),
-                None if is_pool => "Pool".to_string(),
+                None if is_pool => "Group".to_string(),
                 None => session
                     .and_then(|session| {
                         session
@@ -1372,7 +1372,7 @@ pub(super) fn session_rows(
                 let count = selection.members.len();
                 let mut nodes = match rotation_count(selection) {
                     Some(live) => format!("{live} of {count} in rotation"),
-                    None => format!("{count} in the pool"),
+                    None => format!("{count} in the group"),
                 };
                 // The pool's least honest number, and only worth a line when it
                 // is smaller than the node count: a provider that lists one host
@@ -2625,8 +2625,11 @@ mod tests {
 
         let rows = session_rows(&[work.clone()], &state, NOW_MS);
         assert!(rows[0].pool);
-        assert_eq!(rows[0].headline, "Pool · 1 of 2 active");
-        assert_eq!(pool_short_label(&state.sessions[0].selection), "pool (1/2)");
+        assert_eq!(rows[0].headline, "Group · 1 of 2 active");
+        assert_eq!(
+            pool_short_label(&state.sessions[0].selection),
+            "group (1/2)"
+        );
         let warning = rows[0].warning.as_ref().expect("a stale pool warns");
         assert_eq!(warning.text, "stale");
         assert_eq!(
@@ -2670,18 +2673,18 @@ mod tests {
             member.in_rotation = None;
         }
         let rows = session_rows(&[work], &state, NOW_MS);
-        assert_eq!(rows[0].headline, "Pool · 2 nodes · now two");
+        assert_eq!(rows[0].headline, "Group · 2 nodes · now two");
         assert!(
             !rows[0].headline.contains("active"),
             "unknown health under a picking strategy must not become dead nodes"
         );
         // …and the short label cannot invent a rotation it was not told about.
-        assert_eq!(pool_short_label(&state.sessions[0].selection), "pool (2)");
+        assert_eq!(pool_short_label(&state.sessions[0].selection), "group (2)");
         assert!(
             rows[0]
                 .details
                 .iter()
-                .any(|detail| detail.label == "Nodes" && detail.value == "2 in the pool")
+                .any(|detail| detail.label == "Nodes" && detail.value == "2 in the group")
         );
         assert!(nodes(&rows).contains("One node carries traffic"));
     }
@@ -2716,7 +2719,7 @@ mod tests {
             ..SessionInfo::default()
         }];
         let rows = session_rows(&[work], &state, NOW_MS);
-        assert_eq!(rows[0].headline, "Pool “Germany” · 4 of 6 active");
+        assert_eq!(rows[0].headline, "Group “Germany” · 4 of 6 active");
         assert_eq!(
             pool_short_label(&state.sessions[0].selection),
             "Germany (4/6)"

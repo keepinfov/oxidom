@@ -1917,13 +1917,13 @@ impl Controller {
         };
 
         let title = if replaces_pool {
-            format!("Replace «{profile_name}» pool with {server_name}?")
+            format!("Replace the group in «{profile_name}» with {server_name}?")
         } else {
             format!("Point «{profile_name}» at {server_name}?")
         };
         let body = if replaces_pool {
-            "This replaces the saved pool with one server. The running pool will reconnect and \
-             existing connections will close."
+            "This replaces the saved group with one server. The running connection will \
+             reconnect and existing connections will close."
                 .to_string()
         } else {
             format!(
@@ -1936,7 +1936,7 @@ impl Controller {
             (
                 "repoint",
                 if replaces_pool {
-                    "Replace Pool and Connect"
+                    "Replace Group and Connect"
                 } else {
                     "Repoint and Connect"
                 },
