@@ -260,7 +260,8 @@ impl Registry {
     /// Returns how many new servers were added (duplicates are skipped) and
     /// how many lines used an unsupported scheme.
     pub fn import_links(&mut self, text: &str) -> Result<(usize, usize)> {
-        let (parsed, unsupported) = link::parse_links_counting(text);
+        let (parsed, skipped) = link::parse_links_reporting(text);
+        let unsupported = skipped.lines;
         if parsed.is_empty() {
             if unsupported > 0 {
                 return Err(anyhow!(

@@ -4,7 +4,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::link::{b64_decode, parse_links};
+use crate::link::{Skipped, b64_decode, parse_links_reporting};
 use crate::model::{
     Hysteria2Obfs, Hysteria2Settings, OutboundSpec, PortRange, Protocol, Server, StreamSettings,
     country_from_name, normalize_pin_sha256, parse_bandwidth_mbps, transport_label,
@@ -12,17 +12,19 @@ use crate::model::{
 
 /// Parse the response formats commonly selected by subscription panels from the
 /// User-Agent: share-link lists, full Xray configs, sing-box JSON, and Clash YAML.
-pub fn parse(body: &str) -> Result<Vec<Server>> {
+pub fn parse(body: &str) -> Result<(Vec<Server>, Skipped)> {
     let text = decode_body(body);
-    let links = parse_links(&text);
+    let (links, skipped) = parse_links_reporting(&text);
     if !links.is_empty() {
-        return Ok(links);
+        return Ok((links, skipped));
     }
 
     if let Ok(value) = serde_json::from_str::<Value>(&text) {
         let servers = parse_json(&value);
         if !servers.is_empty() {
-            return Ok(servers);
+            // A config document is all-or-nothing: an outbound this app cannot
+            // read is not a line it skipped, it is a document it misread.
+            return Ok((servers, Skipped::default()));
         }
     }
 
@@ -31,7 +33,7 @@ pub fn parse(body: &str) -> Result<Vec<Server>> {
     {
         let servers = parse_clash(&value);
         if !servers.is_empty() {
-            return Ok(servers);
+            return Ok((servers, Skipped::default()));
         }
     }
 
@@ -980,6 +982,20 @@ mod tests {
     use super::parse;
     use crate::model::{OutboundSpec, PortRange, Protocol};
 
+    /// The reported case: a panel lists more servers than this build can read,
+    /// and the ones it can read arrive with no hint that the rest existed.
+    #[test]
+    fn a_half_readable_list_reports_the_half_it_dropped() {
+        let body = "vless://id@one.example:443#One\n\
+                    tuic://id@two.example:443#Two\n\
+                    tuic://id@three.example:443#Three\n\
+                    ssh://four.example:22#Four\n";
+        let (servers, skipped) = parse(body).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(skipped.lines, 3);
+        assert_eq!(skipped.schemes, ["tuic", "ssh"]);
+    }
+
     #[test]
     fn parses_xray_balanced_profile() {
         let body = r#"[{
@@ -992,7 +1008,7 @@ mod tests {
           "routing":{"rules":[{"type":"field","network":"tcp,udp","balancerTag":"balance"}],"balancers":[{"tag":"balance","selector":["proxy"]}]},
           "burstObservatory":{"subjectSelector":["proxy"]}
         }]"#;
-        let servers = parse(body).unwrap();
+        let (servers, _skipped) = parse(body).unwrap();
         assert_eq!(servers.len(), 1);
         assert!(servers[0].link.is_none());
         assert!(matches!(servers[0].spec, OutboundSpec::XrayProfile { .. }));
@@ -1004,7 +1020,7 @@ mod tests {
           {"type":"selector","tag":"select","outbounds":["node"]},
           {"type":"vless","tag":"node","server":"example.com","server_port":443,"uuid":"id","tls":{"enabled":true,"server_name":"example.com"}}
         ]}"#;
-        let servers = parse(body).unwrap();
+        let (servers, _skipped) = parse(body).unwrap();
         assert_eq!(servers.len(), 1);
         assert!(
             servers[0]
@@ -1026,7 +1042,7 @@ proxies:
     tls: true
     servername: example.com
 "#;
-        let servers = parse(body).unwrap();
+        let (servers, _skipped) = parse(body).unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].address, "example.com");
     }
@@ -1044,7 +1060,7 @@ proxies:
           ],
           "routing": {"balancers": [{"selector": ["proxy"]}]}
         }]"#;
-        let servers = parse(body).unwrap();
+        let (servers, _skipped) = parse(body).unwrap();
         let addresses: Vec<&str> = servers.iter().map(|s| s.address.as_str()).collect();
         assert_eq!(addresses, ["one.example", "two.example"]);
     }
@@ -1062,7 +1078,7 @@ proxies:
     cipher: aes-256-gcm
     password: "pa/ss+word"
 "#;
-        let servers = parse(body).unwrap();
+        let (servers, _skipped) = parse(body).unwrap();
         let link = servers[0].link.as_deref().expect("a canonical share link");
         assert!(
             !link.contains('%'),
@@ -1110,7 +1126,7 @@ proxies:
     hop-interval: 30
     fingerprint: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 "#;
-        let servers = parse(yaml).unwrap();
+        let (servers, _skipped) = parse(yaml).unwrap();
         assert_eq!(servers.len(), 1);
         let server = &servers[0];
         let (auth, s) = hy2(server);
@@ -1139,7 +1155,7 @@ proxies:
           "server_ports":["5000:6000"],"hop_interval":"30s",
           "tls":{"enabled":true,"server_name":"real.example","insecure":true,"alpn":["h3"]}
         }]}"#;
-        let servers = parse(json).unwrap();
+        let (servers, _skipped) = parse(json).unwrap();
         assert_eq!(servers.len(), 1);
         let (auth, s) = hy2(&servers[0]);
 
@@ -1164,7 +1180,7 @@ proxies:
     fn sing_box_accepts_a_bare_string_obfs() {
         let json = r#"{"outbounds":[{"type":"hysteria2","tag":"X","server":"h.example",
           "server_port":443,"password":"pw","obfs":"salamander"}]}"#;
-        let servers = parse(json).unwrap();
+        let (servers, _skipped) = parse(json).unwrap();
         assert_eq!(hy2(&servers[0]).1.obfs.as_ref().unwrap().kind, "salamander");
     }
 
@@ -1179,7 +1195,7 @@ proxies:
                                 "udpHop":{"ports":["443","5000-6000"],"interval":30}},
             "finalmask":{"type":"salamander","settings":{"password":"obfspw"}}}
         }]}"#;
-        let servers = parse(json).unwrap();
+        let (servers, _skipped) = parse(json).unwrap();
         assert_eq!(servers.len(), 1);
         let (auth, s) = hy2(&servers[0]);
         assert_eq!(auth, "secret");
@@ -1214,7 +1230,7 @@ proxies:
     skip-cert-verify: true
     hop-interval: 30
 "#;
-        let imported = &parse(yaml).unwrap()[0];
+        let imported = &parse(yaml).unwrap().0[0];
         let link = imported
             .link
             .as_deref()
@@ -1238,7 +1254,7 @@ proxies:
           "server_port":443,"password":"pw","obfs":{"type":"salamander","password":"o"},
           "up_mbps":100,"down_mbps":50,
           "tls":{"enabled":true,"server_name":"real.example","insecure":true}}]}"#;
-        let server = &parse(json).unwrap()[0];
+        let server = &parse(json).unwrap().0[0];
         assert_eq!(
             server.link.as_deref().unwrap(),
             "hysteria2://pw@h.example:443/?obfs=salamander&obfs-password=o\

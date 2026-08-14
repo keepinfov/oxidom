@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::link::Skipped;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
@@ -331,6 +333,11 @@ pub struct Subscription {
     pub user_agent: Option<String>,
     #[serde(default)]
     pub servers: Vec<Server>,
+    /// What the last refresh could not parse. Stored rather than reported once
+    /// and forgotten: the question it answers ("why are there ten servers
+    /// here?") is asked long after the refresh, and a toast is gone by then.
+    #[serde(default, skip_serializing_if = "Skipped::is_empty")]
+    pub skipped: Skipped,
     pub updated_at: Option<i64>,
 }
 
@@ -345,6 +352,7 @@ impl Subscription {
             send_hwid: false,
             user_agent: None,
             servers: Vec::new(),
+            skipped: Skipped::default(),
             updated_at: None,
         }
     }

@@ -598,6 +598,7 @@ mod tests {
             send_hwid: false,
             user_agent: None,
             servers: vec![server],
+            skipped: Default::default(),
             updated_at: None,
         };
 
@@ -642,6 +643,7 @@ mod tests {
             send_hwid: true,
             user_agent: Some("private override".to_string()),
             servers: Vec::new(),
+            skipped: Default::default(),
             updated_at: Some(5),
         };
         let json = serde_json::to_string(&SubscriptionOutput::all(&[subscription])).unwrap();

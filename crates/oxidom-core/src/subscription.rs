@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::link::b64_decode;
+use crate::link::{Skipped, b64_decode};
 use crate::model::{Server, Subscription, UserInfo};
 use crate::subscription_format;
 
@@ -30,6 +30,10 @@ pub struct FetchResult {
     pub userinfo: Option<UserInfo>,
     pub title: Option<String>,
     pub update_interval: Option<u64>,
+    /// The share links in the response this build cannot parse. A panel lists
+    /// what its own clients understand, so this is routinely non-empty and
+    /// routinely the answer to "where did half my servers go".
+    pub skipped: Skipped,
 }
 
 /// Fetch and parse a subscription.
@@ -102,7 +106,7 @@ pub fn fetch(
     }
 
     let body = resp.into_string().context("reading subscription body")?;
-    let servers = subscription_format::parse(&body)
+    let (servers, skipped) = subscription_format::parse(&body)
         .with_context(|| format!("parsing subscription response for User-Agent \"{ua}\""))?;
 
     Ok(FetchResult {
@@ -110,6 +114,7 @@ pub fn fetch(
         userinfo,
         title,
         update_interval,
+        skipped,
     })
 }
 
@@ -165,6 +170,7 @@ pub fn refresh(sub: &mut Subscription, user_agent: &str, hwid: Option<&str>) -> 
     let mut res = fetch(&sub.url, ua, sub.send_hwid, hwid)?;
     preserve_server_identity(&sub.servers, &mut res.servers);
     sub.servers = res.servers;
+    sub.skipped = res.skipped;
     sub.userinfo = res.userinfo;
     if let Some(t) = res.title {
         sub.name = t;

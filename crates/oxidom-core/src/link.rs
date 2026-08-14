@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use base64::Engine as _;
 use percent_encoding::percent_decode_str;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
@@ -503,15 +504,38 @@ fn split_host_port(s: &str) -> Option<(String, u16)> {
 
 /// Parse a newline list of share links into servers, skipping unrecognized lines.
 pub fn parse_links(text: &str) -> Vec<Server> {
-    parse_links_counting(text).0
+    parse_links_reporting(text).0
 }
 
-/// Like `parse_links`, but also counts lines that look like share links yet
-/// use an unsupported or malformed scheme (tuic://, ssh://, …), so the
+/// What a parse dropped on the floor.
+///
+/// A provider lists what its own clients understand, so a list that oxidom
+/// only half understands is normal — and the half that vanished has to be
+/// reported, or the answer to "why are there ten servers here and twenty in
+/// the app on my phone" is nowhere.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Skipped {
+    /// How many lines were dropped.
+    pub lines: usize,
+    /// The distinct schemes those lines used, lowercased, in the order first
+    /// met. Naming them is what makes the count actionable: `tuic` is a
+    /// protocol oxidom does not speak, while `vless` here would mean a
+    /// malformed link and therefore a bug worth reporting.
+    pub schemes: Vec<String>,
+}
+
+impl Skipped {
+    pub fn is_empty(&self) -> bool {
+        self.lines == 0
+    }
+}
+
+/// Like `parse_links`, but also reports the lines that look like share links
+/// yet use an unsupported or malformed scheme (tuic://, ssh://, …), so the
 /// caller can tell the user instead of dropping servers silently.
-pub fn parse_links_counting(text: &str) -> (Vec<Server>, usize) {
+pub fn parse_links_reporting(text: &str) -> (Vec<Server>, Skipped) {
     let mut servers = Vec::new();
-    let mut unsupported = 0;
+    let mut skipped = Skipped::default();
     for line in text.lines() {
         let line = line.trim().trim_start_matches('\u{feff}').trim();
         if line.is_empty() {
@@ -519,11 +543,23 @@ pub fn parse_links_counting(text: &str) -> (Vec<Server>, usize) {
         }
         match parse_link(line) {
             Some(server) => servers.push(server),
-            None if line.contains("://") => unsupported += 1,
+            // Only a line that names a scheme is a dropped *server*. Anything
+            // else is a comment, a stray header or a fragment of HTML, and
+            // counting those would report a loss that never happened.
+            None if line.contains("://") => {
+                skipped.lines += 1;
+                let scheme = line
+                    .split_once("://")
+                    .map(|(scheme, _)| scheme.trim().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if !scheme.is_empty() && !skipped.schemes.contains(&scheme) {
+                    skipped.schemes.push(scheme);
+                }
+            }
             None => {}
         }
     }
-    (servers, unsupported)
+    (servers, skipped)
 }
 
 #[cfg(test)]
@@ -822,9 +858,10 @@ mod tests {
     #[test]
     fn hysteria_v1_is_not_treated_as_hysteria2() {
         assert!(parse_link("hysteria://pw@h.example:443").is_none());
-        let (servers, unsupported) = parse_links_counting("hysteria://pw@h.example:443");
+        let (servers, skipped) = parse_links_reporting("hysteria://pw@h.example:443");
         assert!(servers.is_empty());
-        assert_eq!(unsupported, 1);
+        assert_eq!(skipped.lines, 1);
+        assert_eq!(skipped.schemes, ["hysteria"]);
     }
 
     #[test]
@@ -835,9 +872,12 @@ mod tests {
              \n\
              not a link at all\n"
         );
-        let (servers, unsupported) = parse_links_counting(&text);
+        let (servers, skipped) = parse_links_reporting(&text);
         assert_eq!(servers.len(), 1);
-        assert_eq!(unsupported, 1, "only the tuic line looks like a link");
+        assert_eq!(skipped.lines, 1, "only the tuic line looks like a link");
+        // Naming it is the difference between "some servers are missing" and
+        // "your provider offers a protocol this app does not speak".
+        assert_eq!(skipped.schemes, ["tuic"]);
     }
 
     fn vmess_link(json: &str) -> String {

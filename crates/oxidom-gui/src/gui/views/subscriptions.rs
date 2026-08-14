@@ -873,7 +873,7 @@ fn validate_share_links(text: &str) -> Option<&'static str> {
     // Validate by parsing rather than by scheme prefix: a `vless://` with no
     // uuid uses a supported scheme but is still not an importable server.
     let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
-    let (parsed, _) = link::parse_links_counting(text);
+    let (parsed, _) = link::parse_links_reporting(text);
     if parsed.len() == lines {
         None
     } else {
