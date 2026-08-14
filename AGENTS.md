@@ -662,7 +662,7 @@ reimplement parsing/Xray logic in the UI layer.
 
 Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
 - **`adw::NavigationSplitView`** (or `OverlaySplitView`) for the adaptive sidebar.
-  - **Sidebar:** app/logo area at top; a nav list — at least "General" (server browser) plus
+  - **Sidebar:** app/logo area at top; a nav list — at least "Servers" (the server browser) plus
     entries for Subscriptions, Settings, Logs; a bottom action row (e.g. connection status /
     quick connect). Collapses in narrow mode with a small toggle button in the header.
   - **Content:** `adw::HeaderBar` with standard window controls; a **search entry** spanning the

@@ -535,7 +535,7 @@ fn build(
         .vexpand(true)
         .hexpand(true)
         .build();
-    stack.add_named(&servers.root, Some(Page::General.stack_name()));
+    stack.add_named(&servers.root, Some(Page::Servers.stack_name()));
     stack.add_named(&sessions.root, Some(Page::Sessions.stack_name()));
     stack.add_named(&subscriptions.root, Some(Page::Subscriptions.stack_name()));
 
@@ -978,7 +978,7 @@ impl Controller {
             }),
         );
         for (index, page) in [
-            Page::General,
+            Page::Servers,
             Page::Sessions,
             Page::Subscriptions,
             Page::Settings,
@@ -999,7 +999,7 @@ impl Controller {
 
     /// Puts the cursor in whichever search entry the current layout uses.
     fn focus_search(self: &Rc<Self>) {
-        self.navigate_to(Page::General);
+        self.navigate_to(Page::Servers);
         if self.compact.get() {
             self.search_toggle.set_active(true);
             let search = self.compact_search.clone();
@@ -1043,7 +1043,7 @@ impl Controller {
                 let Some(controller) = weak.upgrade() else {
                     return;
                 };
-                if !controller.compact.get() || !controller.is_general_page() {
+                if !controller.compact.get() || !controller.is_servers_page() {
                     return;
                 }
                 controller.search_bar.set_search_mode(toggle.is_active());
@@ -1064,7 +1064,7 @@ impl Controller {
                 if controller.search_toggle.is_active() != bar.is_search_mode() {
                     controller.search_toggle.set_active(bar.is_search_mode());
                 }
-                if controller.compact.get() && controller.is_general_page() && !bar.is_search_mode()
+                if controller.compact.get() && controller.is_servers_page() && !bar.is_search_mode()
                 {
                     controller.clear_search();
                 }
@@ -1215,7 +1215,7 @@ impl Controller {
     }
 
     fn show_page(self: &Rc<Self>, page: Page) {
-        if self.is_general_page() {
+        if self.is_servers_page() {
             self.remember_visible_search();
         }
         self.stack.set_visible_child_name(page.stack_name());
@@ -1284,8 +1284,8 @@ impl Controller {
         });
     }
 
-    fn is_general_page(&self) -> bool {
-        self.stack.visible_child_name().as_deref() == Some(Page::General.stack_name())
+    fn is_servers_page(&self) -> bool {
+        self.stack.visible_child_name().as_deref() == Some(Page::Servers.stack_name())
     }
 
     fn handle_search_changed(&self, entry: &gtk::SearchEntry) {
@@ -1331,7 +1331,7 @@ impl Controller {
     }
 
     fn sync_search_chrome(&self) {
-        let general = self.is_general_page();
+        let on_servers = self.is_servers_page();
         let profiles =
             self.stack.visible_child_name().as_deref() == Some(Page::Sessions.stack_name());
         let subscriptions =
@@ -1344,16 +1344,16 @@ impl Controller {
         if self.compact.get() {
             self.sync_search_entry(&self.compact_search);
             self.search.set_visible(false);
-            self.search_toggle.set_visible(general);
-            self.search_bar.set_visible(general);
+            self.search_toggle.set_visible(on_servers);
+            self.search_bar.set_visible(on_servers);
             self.search_bar
-                .set_key_capture_widget(general.then_some(&self.window));
-            if general && !self.compact_search.text().is_empty() {
+                .set_key_capture_widget(on_servers.then_some(&self.window));
+            if on_servers && !self.compact_search.text().is_empty() {
                 self.search_bar.set_search_mode(true);
             }
         } else {
             self.sync_search_entry(&self.search);
-            self.search.set_visible(general);
+            self.search.set_visible(on_servers);
             self.search_toggle.set_visible(false);
             self.search_bar.set_visible(false);
             self.search_bar

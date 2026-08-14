@@ -4,7 +4,7 @@ use oxidom_core::APP_ID;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
-    General,
+    Servers,
     Sessions,
     Subscriptions,
     Settings,
@@ -14,7 +14,7 @@ pub enum Page {
 impl Page {
     pub fn stack_name(self) -> &'static str {
         match self {
-            Self::General => "general",
+            Self::Servers => "servers",
             Self::Sessions => "sessions",
             Self::Subscriptions => "subscriptions",
             Self::Settings => "settings",
@@ -26,7 +26,7 @@ impl Page {
     /// `connect_row_selected`.
     pub fn index(self) -> i32 {
         match self {
-            Self::General => 0,
+            Self::Servers => 0,
             Self::Sessions => 1,
             Self::Subscriptions => 2,
             Self::Settings => 3,
@@ -88,7 +88,7 @@ impl Sidebar {
         list.set_margin_start(8);
         list.set_margin_end(8);
         let pages = [
-            (Page::General, "network-server-symbolic", "General"),
+            (Page::Servers, "network-server-symbolic", "Servers"),
             (Page::Sessions, "network-vpn-symbolic", "Sessions"),
             (
                 Page::Subscriptions,
@@ -115,7 +115,7 @@ impl Sidebar {
                 2 => Page::Subscriptions,
                 3 => Page::Settings,
                 4 => Page::Logs,
-                _ => Page::General,
+                _ => Page::Servers,
             };
             on_page(page);
         });
