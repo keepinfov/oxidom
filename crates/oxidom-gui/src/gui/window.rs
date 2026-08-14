@@ -21,7 +21,7 @@ use oxidom_core::{paths, sysproxy};
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
-    SwitcherItem, active_latency_for, card_action, latency_states, other_sessions_message,
+    SwitcherItem, active_latency_for, card_action, latency_states, other_profiles_message,
     pool_action, pool_for_profile, pool_short_label, reduce, selected_status, session_for,
     session_rows, switcher_items, switcher_visible,
 };
@@ -192,7 +192,7 @@ struct Controller {
     search: gtk::SearchEntry,
     compact_search: gtk::SearchEntry,
     search_bar: gtk::SearchBar,
-    sessions_banner: adw::Banner,
+    profiles_banner: adw::Banner,
     search_toggle: gtk::ToggleButton,
     sidebar_toggle: gtk::Button,
     header_status: gtk::Button,
@@ -536,7 +536,7 @@ fn build(
         .hexpand(true)
         .build();
     stack.add_named(&servers.root, Some(Page::Servers.stack_name()));
-    stack.add_named(&sessions.root, Some(Page::Sessions.stack_name()));
+    stack.add_named(&sessions.root, Some(Page::Profiles.stack_name()));
     stack.add_named(&subscriptions.root, Some(Page::Subscriptions.stack_name()));
 
     let settings_callback: Rc<RefCell<Option<SettingsCallback>>> = Rc::new(RefCell::new(None));
@@ -570,15 +570,15 @@ fn build(
     let search_bar = gtk::SearchBar::builder().show_close_button(true).build();
     search_bar.connect_entry(&compact_search);
     search_bar.set_child(Some(&compact_search));
-    let sessions_banner = adw::Banner::builder()
+    let profiles_banner = adw::Banner::builder()
         .title(
-            other_sessions_message(&initial_status.sessions, "default")
+            other_profiles_message(&initial_status.sessions, "default")
                 .as_deref()
                 .unwrap_or_default(),
         )
-        .revealed(other_sessions_message(&initial_status.sessions, "default").is_some())
+        .revealed(other_profiles_message(&initial_status.sessions, "default").is_some())
         .build();
-    sessions_banner.set_button_label(Some("Sessions"));
+    profiles_banner.set_button_label(Some("Profiles"));
     let search_toggle = gtk::ToggleButton::builder()
         .icon_name("edit-find-symbolic")
         .tooltip_text("Search servers")
@@ -682,7 +682,7 @@ fn build(
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
     content.append(&search_bar);
-    content.append(&sessions_banner);
+    content.append(&profiles_banner);
     content.append(&stack);
 
     let controller_holder = Rc::new(RefCell::new(std::rc::Weak::<Controller>::new()));
@@ -743,7 +743,7 @@ fn build(
         search,
         compact_search,
         search_bar,
-        sessions_banner,
+        profiles_banner,
         search_toggle,
         sidebar_toggle,
         header_status,
@@ -979,7 +979,7 @@ impl Controller {
         );
         for (index, page) in [
             Page::Servers,
-            Page::Sessions,
+            Page::Profiles,
             Page::Subscriptions,
             Page::Settings,
             Page::Logs,
@@ -1096,7 +1096,7 @@ impl Controller {
                 let weak = Rc::downgrade(self);
                 move |_| {
                     if let Some(controller) = weak.upgrade() {
-                        controller.navigate_to(Page::Sessions);
+                        controller.navigate_to(Page::Profiles);
                     }
                 }
             });
@@ -1132,11 +1132,11 @@ impl Controller {
                 }
             }
         });
-        self.sessions_banner.connect_button_clicked({
+        self.profiles_banner.connect_button_clicked({
             let weak = Rc::downgrade(self);
             move |_| {
                 if let Some(controller) = weak.upgrade() {
-                    controller.navigate_to(Page::Sessions);
+                    controller.navigate_to(Page::Profiles);
                 }
             }
         });
@@ -1220,7 +1220,12 @@ impl Controller {
         }
         self.stack.set_visible_child_name(page.stack_name());
         self.sync_search_chrome();
-        if page == Page::Sessions {
+        // Whether the banner belongs on screen is now a function of the page,
+        // so leaving it to the next poll would show it for half a second on the
+        // very page it is redundant on.
+        let sessions = self.state.borrow().ui.sessions.clone();
+        self.update_profiles_banner(&sessions);
+        if page == Page::Profiles {
             self.refresh_profiles_from_daemon();
         }
         if self.split.is_collapsed() {
@@ -1229,7 +1234,7 @@ impl Controller {
     }
 
     /// Profiles are daemon-owned files and can change through the CLI while
-    /// the window stays open, so entering Sessions takes a fresh snapshot
+    /// the window stays open, so entering Profiles takes a fresh snapshot
     /// without making the GTK main loop wait on D-Bus.
     fn refresh_profiles_from_daemon(self: &Rc<Self>) {
         self.with_fresh_profiles(|_| {});
@@ -1333,7 +1338,7 @@ impl Controller {
     fn sync_search_chrome(&self) {
         let on_servers = self.is_servers_page();
         let profiles =
-            self.stack.visible_child_name().as_deref() == Some(Page::Sessions.stack_name());
+            self.stack.visible_child_name().as_deref() == Some(Page::Profiles.stack_name());
         let subscriptions =
             self.stack.visible_child_name().as_deref() == Some(Page::Subscriptions.stack_name());
         let settings =
@@ -1640,7 +1645,7 @@ impl Controller {
         // The banner counts sessions *other than* the selected one, so it has
         // to be recounted here rather than waiting for the next poll.
         let sessions = self.state.borrow().ui.sessions.clone();
-        self.update_sessions_banner(&sessions);
+        self.update_profiles_banner(&sessions);
     }
 
     fn rebuild_views(self: &Rc<Self>) {
@@ -1977,7 +1982,7 @@ impl Controller {
             }
             PoolAction::NoProfile(name) => {
                 self.show_message(&format!(
-                    "«{name}» has no profile to write. Create one on the Sessions page first."
+                    "«{name}» has no profile to write. Create one on the Profiles page first."
                 ));
                 return;
             }
@@ -3009,7 +3014,7 @@ impl Controller {
         let Some(effects) = effects else {
             return;
         };
-        self.update_sessions_banner(&snapshot.status.sessions);
+        self.update_profiles_banner(&snapshot.status.sessions);
         // Collected rather than issued inline: `probe_one` borrows the state the
         // effects were just produced from.
         let mut reprobe = Vec::new();
@@ -3044,13 +3049,20 @@ impl Controller {
         self.refresh_status();
     }
 
-    fn update_sessions_banner(&self, sessions: &[ipc::SessionInfo]) {
+    /// The banner exists to say that something is running out of sight, and its
+    /// button goes to the page that shows it. On that page it is neither: the
+    /// rows it points at are already on screen, and the button leads where the
+    /// user already is.
+    fn update_profiles_banner(&self, sessions: &[ipc::SessionInfo]) {
         let selected_profile = self.state.borrow().ui.selected_profile.clone();
-        if let Some(message) = other_sessions_message(sessions, &selected_profile) {
-            self.sessions_banner.set_title(&message);
-            self.sessions_banner.set_revealed(true);
-        } else {
-            self.sessions_banner.set_revealed(false);
+        let elsewhere =
+            self.stack.visible_child_name().as_deref() != Some(Page::Profiles.stack_name());
+        match other_profiles_message(sessions, &selected_profile).filter(|_| elsewhere) {
+            Some(message) => {
+                self.profiles_banner.set_title(&message);
+                self.profiles_banner.set_revealed(true);
+            }
+            None => self.profiles_banner.set_revealed(false),
         }
     }
 
@@ -3250,7 +3262,7 @@ impl Controller {
     }
 
     /// One `(profile, running)` pair per profile, taken from the very rows the
-    /// Sessions page draws so the tray cannot describe a session differently
+    /// Profiles page draws so the tray cannot describe a session differently
     /// from the window.
     fn tray_sessions(&self) -> Vec<(String, bool)> {
         let state = self.state.borrow();

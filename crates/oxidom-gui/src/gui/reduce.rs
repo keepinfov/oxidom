@@ -1014,7 +1014,7 @@ pub(super) fn selected_status(state: &SnapshotState) -> Status {
         .unwrap_or_else(|| reported_status_for(state, &state.selected_profile))
 }
 
-/// One row on the Sessions page.
+/// One row on the Profiles page.
 ///
 /// The shape is the fix for what the page had become: every fact about a
 /// session was a coloured pill in a `GtkFlowBox` suffix, and a flow box gives
@@ -1258,7 +1258,7 @@ fn session_headline(
     if state == SessionRowState::Error {
         return session
             .and_then(|session| session.error.clone())
-            .unwrap_or_else(|| "The session failed".to_string());
+            .unwrap_or_else(|| "The connection failed".to_string());
     }
     if selection.is_empty() {
         return "No server selected yet".to_string();
@@ -1272,7 +1272,7 @@ fn operation_kind_for(state: &SnapshotState, profile: &str) -> Option<UiOperatio
     (operation.profile.as_deref() == Some(profile)).then_some(operation.kind)
 }
 
-/// Build every row on the Sessions page without asking a widget to interpret
+/// Build every row on the Profiles page without asking a widget to interpret
 /// daemon state.
 pub(super) fn session_rows(
     profiles: &[ProfileEntry],
@@ -1393,7 +1393,7 @@ pub(super) fn session_rows(
             }
             details.extend(latency_detail);
             if session.is_some_and(|session| session.owns_system_proxy) {
-                details.push(SessionDetail::new("System proxy", "Set by this session"));
+                details.push(SessionDetail::new("System proxy", "Set by this connection"));
             }
             if !entry.description.is_empty() {
                 details.push(SessionDetail::new("Description", entry.description.clone()));
@@ -1672,7 +1672,13 @@ pub(super) fn pool_action(
     }
 }
 
-pub(super) fn other_sessions_message(
+/// The banner over every page but Profiles.
+///
+/// Counts the running sessions that are not the selected profile's — the ones
+/// the rest of the window says nothing about. It is phrased in profiles because
+/// that is the only name the user gave any of them; `session` is the daemon's
+/// word for one that happens to be up, and it stays in the CLI and the logs.
+pub(super) fn other_profiles_message(
     sessions: &[SessionInfo],
     selected_profile: &str,
 ) -> Option<String> {
@@ -1682,8 +1688,8 @@ pub(super) fn other_sessions_message(
         .count();
     match count {
         0 => None,
-        1 => Some("1 more session is running".to_string()),
-        count => Some(format!("{count} more sessions are running")),
+        1 => Some("1 more profile is running".to_string()),
+        count => Some(format!("{count} more profiles are running")),
     }
 }
 
@@ -2550,7 +2556,7 @@ mod tests {
                 ("Proxy", "127.91.37.1:10808"),
                 ("Interface", "oxi-work · 198.18.7.1 · manual"),
                 ("Latency", "71 ms · measured 3 min ago"),
-                ("System proxy", "Set by this session"),
+                ("System proxy", "Set by this connection"),
                 ("Description", "Office"),
             ]
         );
@@ -3073,8 +3079,8 @@ mod tests {
             })
         );
         assert_eq!(
-            other_sessions_message(&status.sessions, "home").as_deref(),
-            Some("2 more sessions are running")
+            other_profiles_message(&status.sessions, "home").as_deref(),
+            Some("2 more profiles are running")
         );
     }
 

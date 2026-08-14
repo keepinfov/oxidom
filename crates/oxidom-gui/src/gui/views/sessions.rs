@@ -110,8 +110,8 @@ impl SessionsView {
         self.operation_widgets.borrow_mut().clear();
 
         let list = adw::PreferencesGroup::builder()
-            .title("Sessions")
-            .description("Run and edit named connection profiles shared with the CLI and systemd")
+            .title("Profiles")
+            .description("Named connections, shared with the CLI and systemd")
             .build();
         if self.header_embedded.get() {
             list.set_header_suffix(Some(&self.header.root));
