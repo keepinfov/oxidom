@@ -16,7 +16,7 @@ From nothing to a verified tunnel. Assumes oxidom is
 2. **Add a subscription.** *Subscriptions* → **Add subscription**, paste the URL.
 
    You can also paste plain share links — one, or many at once, one per line.
-   They land in a group called **My servers**.
+   They land in a built-in subscription called **My servers**.
 
    If the panel returns a web page instead of servers, it did not recognise the
    client. Change *Settings › Subscription User-Agent* (there is a **Client

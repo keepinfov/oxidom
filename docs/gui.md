@@ -20,7 +20,7 @@ tray unit behave normally.
 | Page | What it is for |
 |---|---|
 | **Servers** | The server browser: cards, search, filters, groups, and the Connect bar. |
-| **Sessions** | What is running now, one row per session; per-session interface settings. |
+| **Profiles** | Named connections, one row per profile; run them, edit them, set their interface. |
 | **Subscriptions** | Add, refresh, reorder and remove subscriptions; quota and expiry. |
 | **Settings** | Ports, system proxy, reconnect, probe method, subscription User-Agent, core paths. |
 | **Logs** | Recent Xray core output, kept in memory. |
@@ -33,24 +33,33 @@ A multi-column card grid with country flags. A card carries the server's name, a
 transport summary (`vless + xhttp + reality`), and its latency once measured;
 clicking one opens its details inline rather than in a dialog.
 
-Above the grid is a **scope row** — a segmented control over one list, not several
+Above the grid is a **chip row** — a segmented control over one list, not several
 lists. Its head is the `Filter` pill; the rest are your saved groups plus
 `Favourites`.
 
 ### Filters and groups
 
-The `Filter` popover is one list: **Country**, **Protocol** and **Subscription**
-expanders with a checkbox per choice, plus **Except** for excluding individual
-servers (a search, because a provider may have two hundred nodes). Its footer is
-`Reset` and `Save as group…`.
+There is one dialog behind all of them, and a name is the only difference between
+a filter and a group.
+
+It holds an optional **Name** and **Icon**, then **Country**, **Protocol** and
+**Subscription** expanders with a checkbox per choice, then **Except** for
+excluding individual servers (a search, because a provider may have two hundred
+nodes), then a list for picking servers by hand. `Apply` shows the selection
+without saving it; `Save` needs a name. The `Filter` pill, `New group` and
+`⋮ → Edit…` all open this dialog — they differ only in what it opens with.
+
+You are never asked whether you are making a list or a rule. Servers picked by
+hand are frozen, because picking them is what freezing means; a selection made
+only of filters keeps matching, because that is all a filter can do. The line at
+the bottom of the dialog says which one you have made and what it will do next
+week.
 
 A **group is a saved filter**. That is the whole idea: connecting to a group writes
 the filter straight into a profile's [pool](profiles-and-pools.md#pools), so the
-daemon never learns a second concept. Because a group *is* a filter, you edit
-membership where the servers are — the `Filter` pill, or the `⋮` menu beside the
-scope row.
+daemon never learns a second concept.
 
-The `⋮` menu always acts on **the scope currently on screen**, not on some
+The `⋮` menu always acts on **the selection currently on screen**, not on some
 previously selected group. `New profile from this…` lives there and works on an
 unsaved filter too, since it needs no name for the selection. Group-only items
 (`Edit…`, `Update to what's shown`, `Move left/right`, `Delete`) are simply absent
@@ -58,23 +67,27 @@ when no group is selected, rather than present and dead.
 
 ### Connecting
 
-The Connect bar carries a rotation width — how many nodes a pool keeps in rotation
-at once, default 6. It is deliberately not stored on the group: a group answers
+The Connect bar carries a rotation width — how many of a group's servers stay in
+rotation at once, default 6. It is deliberately not stored on the group: a group answers
 *which* servers, the width answers *how many at once, this run*. Changing it
 rewrites without a dialog and says so in a toast.
 
 Per-subscription latency checks and sorting live on this page too.
 
-## Sessions
+## Profiles
 
-One row per running session. A row answers one question — is this up, and where —
-and folds the rest away. Selecting a session makes the header, the cards and the
-tray follow it, so "connected" always means *this* session.
+One row per profile — the same `profiles/*.toml` the CLI and systemd use, running
+or not. A row answers one question, is this up and where, and folds the rest away.
+Selecting a profile makes the header, the cards and the tray follow it, so
+"connected" always means *this* profile.
 
-A pool session shows its live exit rather than naming its first member, because
-the first member is not the exit.
+A profile connected to a group shows its live exit rather than naming the group's
+first server, because the first server is not the exit.
 
-Per-session interface settings are edited from here.
+Per-profile interface settings are edited from here.
+
+A profile that is up is a **session**; that is the word the CLI, systemd and the
+logs use for it.
 
 ## Subscriptions
 
@@ -91,7 +104,7 @@ Two per-subscription settings worth knowing:
   value applies on the next **Update**. See
   [subscriptions-and-protocols.md](subscriptions-and-protocols.md#the-user-agent-decides-the-format).
 
-Locally pasted share links live in a built-in group called **My servers**.
+Locally pasted share links live in a built-in subscription called **My servers**.
 
 Removing a subscription disconnects any session using one of its servers, and a
 refresh that drops the active server disconnects that session rather than silently

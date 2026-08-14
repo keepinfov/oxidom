@@ -494,29 +494,34 @@ empty, so every pool profile written before lists existed still round-trips to t
 The same `PoolQuery` drives the balancer and the GUI's server filter: a filter is a pool
 constructor, not a second search. A **group** in the GUI is a saved `PoolQuery` under a name, so
 connecting one writes it straight into `select.pool` — the daemon never learns a new noun. Group
-membership is therefore edited only where the servers are (the chip row on the Servers page: the
-`Filter` pill at its head, the `⋮` menu beside the scope row, and the New group dialog's own
-server picker); the profile editor reports the pool and edits only `strategy`, `max`,
-`expected` and `probe_interval`, carrying everything about *which* servers through untouched.
+membership is therefore edited only where the servers are, in the Selection dialog on the Servers
+page; the profile editor reports the pool and edits only `strategy`, `max`, `expected` and
+`probe_interval`, carrying everything about *which* servers through untouched. The window says
+**group** for all of this; `pool` stays the word in the TOML, the CLI and the IPC payload, and one
+line in the profile editor says the two are the same thing.
 
-**The filter popover is one boxed list, built once.** Three `AdwExpanderRow`s (Country, Protocol,
-Subscription) hold a checkbox per choice, and `Except` stays an `AdwActionRow` with a popover of
-its own because it is a search over a provider's two hundred nodes, not a handful of choices.
-Nested popovers — a `GtkMenuButton` per filter, each opening over the row it came from — were
-what this replaced. The popover is rebuilt only when `filter_universe` changes, i.e. when a
-subscription refresh changes what could be picked; a filter write goes in through
-`sync_filter_checks`, guarded by `syncing_filter` because GTK emits `toggled` for a programmatic
-`set_active` exactly as for a click. Rebuilding on every write is what previously forced the
-expanded state into a `Cell` and threw away the exclude picker's rows: the click destroyed the
-rows it was meant to be explaining.
+**One dialog says what a selection is; a name is what saves it.** `present_selection_dialog`
+(`SelectionIntent::{Filter, Name, Edit}`) is the only editor: optional `Name` and `Icon` at the
+top, then the matching rows — three `AdwExpanderRow`s (Country, Protocol, Subscription) holding a
+checkbox per choice, `Except` as an `AdwActionRow` with a picker of its own because it is a search
+over a provider's two hundred nodes — then the hand-picked list, then a summary line. `Apply`
+shows the selection without saving it, `Save` needs a name. The `Filter` pill, `New group` and
+`⋮ → Edit…` all open this one dialog, differing only in what it opens with.
 
-**`⋮` acts on the scope on screen, not on the selected group.** It is never insensitive.
+**`GroupKind` is derived, never asked.** Naming servers by hand is what freezing them means, so a
+draft with members saves as `List`; a rule with no members keeps matching, so an empty member list
+saves as `Rule`. The List/Rule radio that used to ask this was the user classifying their own
+selection in storage vocabulary before they had made it, and it could only tell the truth by
+disabling itself. What it conveyed that way is now stated: a selection named while the search box
+is non-empty freezes into a list (search has no rule equivalent), and `Save` refuses a nameless-
+rule-with-no-fields, which would mean every server. Favourites is `list_only`: the star writes
+members, and a Favourites with filters is a pool `Profile::validate` rejects.
+
+**`⋮` acts on the selection on screen, not on the selected group.** It is never insensitive.
 `New profile from this…` lives there — it is the only way to make a *new* profile from the visible
 selection, and it needs no name for that selection, so it works on an unsaved filter too. The
 group-only items (`Edit…`, `Update to what's shown`, `Move left/right`, `Delete`) are simply
-absent when no group is selected, rather than present and dead. The filter popover's footer is
-`Reset` and `Save as group…` and nothing else: three buttons in a footer is a menu pretending to
-be an action bar.
+absent when no group is selected, rather than present and dead.
 
 **A group stores selection; the Connect bar states rotation width.** The bar carries a rotation
 picker defaulting to `pool::DEFAULT_POOL_ROTATION` (6), and `connect_query` writes it into
@@ -575,7 +580,7 @@ Ranking never changes who is in the pool, so a list still gets everyone the user
 named member stays `missing_members`' job.
 
 **The exit count is reported, not only logged.** `SelectionInfo.endpoints` carries it to every
-surface, and both `oxidom status` (`… 42 nodes on 9 exits …`) and the Sessions page's `Nodes` row
+surface, and both `oxidom status` (`… 42 nodes on 9 exits …`) and the Profiles page's `Nodes` row
 (`6 of 42 in rotation · 9 exit addresses`) say it — but only when it is *below* the member count,
 because on a pool where every node is its own host it is one number printed twice. Zero means an
 older daemon did not report it, so nothing renders zero as a count. It is counted inside
@@ -671,17 +676,18 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   (`transport_label`, e.g. "vless + xhttp + reality"), optional **latency badge** (green when
   low). Whole card is a click target → selects that server. Every server carried by a connected
   profile is visually marked; the one-profile case is unchanged.
-- **Scopes (groups):** a chip row above the grid — `All`, one chip per saved group, `+`. A group
-  is a **scope over the one list**, never a second block of cards: rendering it as its own block
+- **Groups:** a chip row above the grid — `All`, one chip per saved group, `+`. A group narrows
+  **the one list**, and is never a second block of cards: rendering it as its own block
   shows the same server two or three times and leaves no way to tell which card is real, and
   "show it only in its highest-priority group" makes a starred server vanish from its
   subscription. Cards stay in their subscription; the chip narrows what is shown. Selecting a
   chip reveals a Connect bar that points the **selected profile** at that group — the same rule a
   card click follows. Favourites is a built-in list; the card's star is what fills it, and it
   cannot be deleted because the star would have nowhere to put things.
-- **Server grid:** a top group of "loose"/favorite servers, then per-**subscription groups**:
-  each group shows its **title** + **description** (name + quota/expiry from userinfo) followed by
-  that subscription's server cards. Multi-column grid in wide mode, single column in narrow
+- **Server grid:** a top block of "loose"/favorite servers, then one **block per subscription**:
+  each block shows its **title** + **description** (name + quota/expiry from userinfo) followed by
+  that subscription's server cards. In the code a block is `SubscriptionBlock` — never a "group",
+  which the window uses only for the saved selections in the chip row. Multi-column grid in wide mode, single column in narrow
   (use `adw::WrapBox`/`FlowBox` with a breakpoint via `adw::Breakpoint`).
 - **Connect control:** a single primary **Connect/Disconnect** toggle in the header for the
   compatibility `default` session. Show its live status (Connecting/Connected/Error) and active

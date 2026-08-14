@@ -206,11 +206,15 @@ A **group** in the GUI is a saved pool query under a name. Connecting to one wri
 it straight into `select.pool`; the daemon never learns a second noun for it.
 
 Because a group *is* a filter, group membership is edited where the servers are —
-on the Servers page, via the `Filter` pill, the `⋮` menu beside the scope row, and
-the New group dialog. The profile editor reports the pool and edits only
+on the Servers page, in the one Selection dialog the `Filter` pill, `New group` and
+`⋮ → Edit…` all open. The profile editor reports the pool and edits only
 `strategy`, `max`, `expected` and `probe_interval`, carrying *which* servers
 through untouched. Two independent editors for one thing is how a saved profile
 comes to disagree with the group it was made from.
+
+The window calls this a **group** everywhere. `pool` is the word in the profile
+file, in the CLI and in `oxidom status`, and one line in the profile editor says
+so — the two are the same thing seen from either side.
 
 The Connect bar carries a rotation width (default 6), written into `expected`. It
 is deliberately not also stored on the group: a group answers "which servers", the
