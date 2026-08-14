@@ -1309,7 +1309,15 @@ pub(super) fn session_rows(
 
             let selection = match running_pool {
                 Some(selection) => pool_headline(selection),
-                None if is_pool => "Group".to_string(),
+                // Stopped, so there is no live membership to count — but the
+                // saved query still knows what it is pointed at, and a bare
+                // "Group" made every stopped group profile look like the same
+                // one.
+                None if is_pool => match entry.pool.as_ref() {
+                    Some(pool) if !pool.name.is_empty() => format!("Group “{}”", pool.name),
+                    Some(pool) => format!("Group · {}", describe_pool(pool)),
+                    None => "Group".to_string(),
+                },
                 None => session
                     .and_then(|session| {
                         session
@@ -2728,6 +2736,26 @@ mod tests {
         // the expanded row is where the spread the pool actually buys is said.
         assert!(rows[0].details.iter().any(|detail| detail.label == "Nodes"
             && detail.value == "4 of 6 in rotation · 2 exit addresses"));
+    }
+
+    /// Two stopped group profiles both read "Group" before this, which is the
+    /// one state where the row has nothing else to tell them apart by.
+    #[test]
+    fn a_stopped_group_profile_still_says_which_group() {
+        let mut named = profile("eu", "");
+        named.pool = Some(PoolQuery {
+            name: "Europe".to_string(),
+            countries: vec!["DE".to_string(), "NL".to_string()],
+            ..PoolQuery::default()
+        });
+        let mut nameless = profile("ad-hoc", "");
+        nameless.pool = Some(PoolQuery {
+            countries: vec!["JP".to_string()],
+            ..PoolQuery::default()
+        });
+        let rows = session_rows(&[named, nameless], &state(), NOW_MS);
+        assert_eq!(rows[0].headline, "Group “Europe”");
+        assert_eq!(rows[1].headline, "Group · JP");
     }
 
     #[test]

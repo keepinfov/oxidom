@@ -256,7 +256,7 @@ impl Registry {
         Ok(())
     }
 
-    /// Import one or more share-links into the local "My servers" group.
+    /// Import one or more share-links into the local "My servers" subscription.
     /// Returns how many new servers were added (duplicates are skipped) and
     /// how many lines used an unsupported scheme.
     pub fn import_links(&mut self, text: &str) -> Result<(usize, usize)> {
