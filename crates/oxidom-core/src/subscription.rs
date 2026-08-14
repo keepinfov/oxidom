@@ -17,6 +17,27 @@ use crate::subscription_format;
 /// a share link, poolable and individually measurable.
 const DEFAULT_USER_AGENT: &str = "v2rayN/6.45";
 
+/// Client strings panels recognise, as `(label, value)`.
+///
+/// Domain knowledge rather than UI chrome, and therefore in one place: the
+/// global setting and a subscription's own override are the same choice made
+/// at two scopes, and a list that existed only beside the global one is why
+/// the override was free text you had to know the spelling for.
+///
+/// The first entry is [`DEFAULT_USER_AGENT`], so "no preference" and "the
+/// first preset" are the same client string rather than two.
+pub const CLIENT_PRESETS: &[(&str, &str)] = &[
+    ("v2rayN", DEFAULT_USER_AGENT),
+    ("v2rayNG", "v2rayNG/1.9.5"),
+    ("Happ", "Happ/3.13.0"),
+    ("Streisand", "Streisand"),
+    ("Hiddify", "Hiddify/2.0.5"),
+    ("NekoBox", "NekoBox/1.3.5"),
+    ("Shadowrocket", "Shadowrocket/2.2.9"),
+    ("Clash Meta", "clash-verge/1.7.7"),
+    ("sing-box", "SFA/1.10.0"),
+];
+
 /// Overall cap on a subscription fetch. ureq's default agent has *no* read
 /// timeout, so a panel that completes the handshake and then goes quiet would
 /// block this thread forever — and the daemon holds its engine lock across

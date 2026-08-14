@@ -8,6 +8,7 @@ use crate::gui::operation::{UiOperation, UiOperationKind};
 use oxidom_core::engine::LOCAL_ID;
 use oxidom_core::link;
 use oxidom_core::model::{Subscription, UserInfo};
+use oxidom_core::subscription;
 
 use super::super::group::{format_bytes, skipped_note, subscription_description};
 use super::{dialog_content, icon_button, set_transient_parent, set_validation, validation_label};
@@ -670,9 +671,18 @@ fn show_subscription_details(
         .build();
     let ua_id = subscription.id.clone();
     let ua_callback = callbacks.user_agent.clone();
-    user_agent.connect_apply(move |row| {
-        ua_callback(ua_id.clone(), row.text().to_string());
+    user_agent.connect_apply({
+        let ua_id = ua_id.clone();
+        let ua_callback = ua_callback.clone();
+        move |row| {
+            ua_callback(ua_id.clone(), row.text().to_string());
+        }
     });
+    // The same presets the global setting offers. Without them this row was a
+    // free-text field for values that have to be spelled exactly — the client
+    // string is matched by the panel, so "v2rayN 6.45" fetches a different
+    // answer than "v2rayN/6.45", and there was nothing here to copy from.
+    user_agent.add_suffix(&preset_menu(&user_agent, &ua_id, &ua_callback));
     fetching.add(&user_agent);
 
     let privacy = adw::PreferencesGroup::builder()
@@ -894,6 +904,57 @@ fn validate_share_links(text: &str) -> Option<&'static str> {
     } else {
         Some("One or more lines is not a supported server share link.")
     }
+}
+
+/// A `⌄` beside the override that fills it with a known client string.
+///
+/// Picking one applies it immediately, exactly as pressing the row's own apply
+/// button does: an entry that silently held an unapplied value is the shape of
+/// bug this whole pass is about.
+fn preset_menu(
+    row: &adw::EntryRow,
+    subscription_id: &str,
+    on_apply: &Rc<dyn Fn(String, String)>,
+) -> gtk::MenuButton {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    list.set_margin_top(6);
+    list.set_margin_bottom(6);
+    list.set_margin_start(6);
+    list.set_margin_end(6);
+    let popover = gtk::Popover::builder().child(&list).build();
+    // "Inherit" first, because clearing the override is the way back to the
+    // global setting and an empty text field does not look like a choice.
+    let entries = std::iter::once(("Use the global setting", ""))
+        .chain(subscription::CLIENT_PRESETS.iter().copied());
+    for (label, value) in entries {
+        // Left-aligned by its own child: a `Button` label centres itself, and
+        // a column of centred text does not read as a list of choices.
+        let button = gtk::Button::builder()
+            .child(&gtk::Label::builder().label(label).xalign(0.0).build())
+            .css_classes(["flat"])
+            .build();
+        button.connect_clicked({
+            let row = row.clone();
+            let popover = popover.clone();
+            let subscription_id = subscription_id.to_string();
+            let on_apply = on_apply.clone();
+            move |_| {
+                popover.popdown();
+                row.set_text(value);
+                on_apply(subscription_id.clone(), value.to_string());
+            }
+        });
+        list.append(&button);
+    }
+    let menu = gtk::MenuButton::builder()
+        .icon_name("pan-down-symbolic")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Known client strings")
+        .css_classes(["flat", "circular"])
+        .build();
+    menu.update_property(&[gtk::accessible::Property::Label("Known client strings")]);
+    menu.set_popover(Some(&popover));
+    menu
 }
 
 fn format_quota(info: Option<&UserInfo>) -> String {

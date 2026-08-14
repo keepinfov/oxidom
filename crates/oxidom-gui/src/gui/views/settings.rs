@@ -6,6 +6,11 @@ use adw::prelude::*;
 use oxidom_core::config::{Config, LatencyMethod};
 use oxidom_core::core_options::CoreOptions;
 use oxidom_core::ipc::RuntimeInfo;
+// Recognized subscription client identifiers: picking one fills the editable
+// User-Agent field, which stays the source of truth so a value not listed here
+// can still be typed. Shared with a subscription's own override, so the two
+// scopes of one choice cannot drift apart.
+use oxidom_core::subscription::CLIENT_PRESETS as UA_PRESETS;
 
 use super::core_editor::{CoreEditor, CoreLevel};
 
@@ -190,21 +195,6 @@ pub struct SettingsView {
     model: Rc<RefCell<SettingsModel>>,
     updating_widgets: Rc<Cell<bool>>,
 }
-
-/// Recognized subscription client identifiers. Picking one fills the editable
-/// User-Agent field; the field itself stays the source of truth so users can
-/// still type a value not listed here.
-const UA_PRESETS: &[(&str, &str)] = &[
-    ("v2rayN", "v2rayN/6.45"),
-    ("v2rayNG", "v2rayNG/1.9.5"),
-    ("Happ", "Happ/3.13.0"),
-    ("Streisand", "Streisand"),
-    ("Hiddify", "Hiddify/2.0.5"),
-    ("NekoBox", "NekoBox/1.3.5"),
-    ("Shadowrocket", "Shadowrocket/2.2.9"),
-    ("Clash Meta", "clash-verge/1.7.7"),
-    ("sing-box", "SFA/1.10.0"),
-];
 
 impl SettingsView {
     /// Builds a settings editor. `on_apply` is called only after the user
