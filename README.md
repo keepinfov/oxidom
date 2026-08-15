@@ -9,6 +9,12 @@ child process (generating its JSON config), and exposes the tunnel as local
 SOCKS5 + HTTP proxies — with an optional GNOME system-proxy toggle, optional TUN
 interfaces, and per-app routing. The GUI runs fully unprivileged.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/servers-connected-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/servers-connected-light.png">
+  <img alt="The server browser with one node connected" src="docs/screenshots/servers-connected-dark.png">
+</picture>
+
 ## Features
 
 - **Subscriptions**: base64 share-link lists, provider-selected Xray JSON,
