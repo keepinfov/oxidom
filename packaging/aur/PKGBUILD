@@ -1,14 +1,14 @@
 # Maintainer: keepinfov <218463407+keepinfov@users.noreply.github.com>
 pkgname=oxidom-git
-pkgver=0.1.0.r0.g0000000
+pkgver=0.1.0.r120.gb92035a
 pkgrel=1
 pkgdesc="Native Linux desktop Xray / v2ray client built with GTK4 + libadwaita in Rust"
 arch=(x86_64 aarch64)
 url="https://github.com/keepinfov/oxidom"
 license=(MIT)
-depends=(gtk4 libadwaita xray)
+depends=(gcc-libs gdk-pixbuf2 glib2 glibc gtk4 hicolor-icon-theme libadwaita pango xray)
 makedepends=(git cargo)
-provides=(oxidom)
+provides=("oxidom=$pkgver")
 conflicts=(oxidom)
 # makepkg's -flto=auto leaks into CFLAGS, and ring's build script hands those to
 # cc(1). GCC then emits slim LTO objects: the C symbols live in .gnu.lto_* IR
@@ -20,7 +20,7 @@ source=("$pkgname::git+$url.git"
         oxidom@.service
         oxidom-git.sysusers)
 sha256sums=('SKIP'
-            'e50c4cde3e6f7c3dad7644001e089147610fc8689419e775871baa913ab02c28'
+            '26f1f9f9c49d5b4f4b58895f8273e7e209b3973ab5ac609eafdcc11a4bbe7389'
             'b61b29eeb2ba5fd43569846144846ce41afaf453b3a5390d33fdfc53edc95785'
             'cfd693db52fc6f98e0c16a3ac2071b6551e0e2d7e500721b6976ab49bfb4ec5a')
 
@@ -34,17 +34,23 @@ pkgver() {
 
 prepare() {
   cd "$pkgname"
+  # A builder with rustup installed otherwise resolves cargo through whatever
+  # toolchain that user last defaulted to, which need not exist here.
+  export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
   cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release
 }
 
 check() {
   cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
   cargo test --frozen --release
 }
 

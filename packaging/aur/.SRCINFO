@@ -1,0 +1,32 @@
+pkgbase = oxidom-git
+	pkgdesc = Native Linux desktop Xray / v2ray client built with GTK4 + libadwaita in Rust
+	pkgver = 0.1.0.r120.gb92035a
+	pkgrel = 1
+	url = https://github.com/keepinfov/oxidom
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = git
+	makedepends = cargo
+	depends = gcc-libs
+	depends = gdk-pixbuf2
+	depends = glib2
+	depends = glibc
+	depends = gtk4
+	depends = hicolor-icon-theme
+	depends = libadwaita
+	depends = pango
+	depends = xray
+	provides = oxidom=0.1.0.r120.gb92035a
+	conflicts = oxidom
+	options = !lto
+	source = oxidom-git::git+https://github.com/keepinfov/oxidom.git
+	source = oxidom.service
+	source = oxidom@.service
+	source = oxidom-git.sysusers
+	sha256sums = SKIP
+	sha256sums = 26f1f9f9c49d5b4f4b58895f8273e7e209b3973ab5ac609eafdcc11a4bbe7389
+	sha256sums = b61b29eeb2ba5fd43569846144846ce41afaf453b3a5390d33fdfc53edc95785
+	sha256sums = cfd693db52fc6f98e0c16a3ac2071b6551e0e2d7e500721b6976ab49bfb4ec5a
+
+pkgname = oxidom-git
