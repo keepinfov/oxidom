@@ -134,9 +134,10 @@ Every provider of an Xray core lives in the AUR rather than the official
 repositories, which is why it is an optional dependency here. Were it a hard
 one, `makepkg -si` would stop at `target not found: xray` and — because pacman
 cancels a transaction whole — install none of gtk4 or libadwaita either. oxidom
-starts without a core and tells you where it looked; only connecting fails.
-Point it at a core you installed by hand under Settings → Xray core, or with
-`$OXIDOM_XRAY_BIN`.
+starts without a core and says so in a banner across the top; connecting and
+checking latency both need one, since a direct latency check measures through a
+core it starts for the purpose. Point oxidom at a core you installed by hand
+under Settings → Xray core, or with `$OXIDOM_XRAY_BIN`.
 
 One more thing the package does not do for you:
 

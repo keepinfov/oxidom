@@ -26,6 +26,11 @@ Timeout | NoNetwork | Internal(&'static str)`. The distinction is the point — 
   crosses the wire as `ProbeFailure::Unknown` plus a `warn` line; blaming the server would be a
   lie, and inventing a fifth wire variant would break older GUIs (`ProbeFailure` has no
   `#[serde(other)]`).
+- A client must keep that distinction on screen (binding). `Unknown` says the check never reached
+  the server, so it may not be drawn as an unresponsive one: a machine with no core fails every
+  probe at once, and rendering that as a subscription of dead servers sends people to replace
+  nodes that work. It renders as its own state, and a whole-subscription sweep reports it once —
+  a sweep stays quiet about a single silent server, whose own card already says so.
 - The hysteria2 ICMP fallback retries only `Unreachable`/`Timeout`. Retrying `NoNetwork` would
   launder it into "server is dead".
 - An HTTP response with an error status still proves the server carried the request: `Reachable`.
