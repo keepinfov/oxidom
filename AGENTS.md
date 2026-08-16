@@ -168,6 +168,18 @@ type(scope)!: what is true after this commit
   before a merge. Configure `user.signingkey` and `commit.gpgsign` locally;
   never commit a key or an identity into a tracked file. If you cannot sign,
   say so rather than merging unsigned.
+
+  Signing is not the same as being able to verify. For GitHub to show a
+  commit as verified, add the same key to your account as a *signing* key —
+  an authentication key does not count. To verify locally, point
+  `gpg.ssh.allowedSignersFile` at a file listing the signers you trust; keep
+  it out of the tree, for instance in `.git/allowed_signers`:
+
+  ```sh
+  echo "you@example.com $(cat ~/.ssh/id_ed25519.pub)" > .git/allowed_signers
+  git config gpg.ssh.allowedSignersFile .git/allowed_signers
+  git log --format='%h %G? %s' -5   # G = verified
+  ```
 - Breaking changes need `!`, a `BREAKING CHANGE:` footer saying what breaks and
   what to do about it, and a changelog entry. Get agreement before writing one.
 
