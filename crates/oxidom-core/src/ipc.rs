@@ -402,6 +402,9 @@ const SETTINGS_HINTS: &[&str] = &[
     // A core too old for the server's protocol is fixed by pointing oxidom at
     // a newer one, which is also a Settings field.
     "Xray 26.1",
+    // No core at all: the latency check reports this without ever naming a
+    // path, since it never got as far as resolving one.
+    "Xray core",
 ];
 
 pub fn error_action(message: &str) -> ErrorAction {
@@ -426,6 +429,8 @@ mod tests {
             "`xray` was not found on $PATH (looked in /bin, /usr/bin) — install xray, or set \
              its full path in Settings",
             "cannot look up `xray` because $PATH is empty — set an absolute path in Settings",
+            // The latency check, which fails before it can name a path.
+            "The check needs an Xray core and could not start one on this machine.",
         ] {
             assert_eq!(
                 error_action(message),
