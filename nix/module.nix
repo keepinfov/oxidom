@@ -116,45 +116,46 @@ in {
         wantedBy = ["multi-user.target"];
         wants = ["network-online.target"];
         after = ["network-online.target" "dbus.service"];
-        serviceConfig = {
-          # D-Bus activation: the unit counts as started once it owns the name,
-          # so a client's first call blocks until the daemon can answer it
-          # rather than falling through to a session daemon of its own.
-          Type = "dbus";
-          BusName = "dev.keepinfov.oxidom.Daemon";
-          ExecStart = lib.concatStringsSep " " [
-            "${daemonCfg.package}/bin/oxidom"
-            "daemon"
-            "--system"
-            "--socks-port"
-            (toString daemonCfg.socksPort)
-            "--http-port"
-            (toString daemonCfg.httpPort)
-          ];
-          User = "oxidom";
-          Group = "oxidom";
-          StateDirectory = "oxidom";
-          Restart = "on-failure";
-          RestartSec = 2;
-          # The Xray cores carry the traffic; the daemon only supervises them.
-          # Under the default control-group killing, a daemon crash takes every
-          # tunnel down with it and the restarted daemon has nothing left to
-          # adopt — including the `default` session that redsocks points at.
-          # Only the main process is signalled, so a crash costs a few seconds
-          # of supervision rather than the connection. A clean stop still tears
-          # the cores down, because the daemon's own SIGTERM handler does it;
-          # anything that does leak is reaped by `recover()` on the next start.
-          KillMode = "process";
-          NoNewPrivileges = true;
-          ProtectHome = true;
-          ProtectSystem = "strict";
-          PrivateTmp = true;
-        }
-        // lib.optionalAttrs daemonCfg.tun.enable {
-          AmbientCapabilities = ["CAP_NET_ADMIN"];
-          CapabilityBoundingSet = ["CAP_NET_ADMIN"];
-          RestrictAddressFamilies = ["AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK"];
-        };
+        serviceConfig =
+          {
+            # D-Bus activation: the unit counts as started once it owns the name,
+            # so a client's first call blocks until the daemon can answer it
+            # rather than falling through to a session daemon of its own.
+            Type = "dbus";
+            BusName = "dev.keepinfov.oxidom.Daemon";
+            ExecStart = lib.concatStringsSep " " [
+              "${daemonCfg.package}/bin/oxidom"
+              "daemon"
+              "--system"
+              "--socks-port"
+              (toString daemonCfg.socksPort)
+              "--http-port"
+              (toString daemonCfg.httpPort)
+            ];
+            User = "oxidom";
+            Group = "oxidom";
+            StateDirectory = "oxidom";
+            Restart = "on-failure";
+            RestartSec = 2;
+            # The Xray cores carry the traffic; the daemon only supervises them.
+            # Under the default control-group killing, a daemon crash takes every
+            # tunnel down with it and the restarted daemon has nothing left to
+            # adopt — including the `default` session that redsocks points at.
+            # Only the main process is signalled, so a crash costs a few seconds
+            # of supervision rather than the connection. A clean stop still tears
+            # the cores down, because the daemon's own SIGTERM handler does it;
+            # anything that does leak is reaped by `recover()` on the next start.
+            KillMode = "process";
+            NoNewPrivileges = true;
+            ProtectHome = true;
+            ProtectSystem = "strict";
+            PrivateTmp = true;
+          }
+          // lib.optionalAttrs daemonCfg.tun.enable {
+            AmbientCapabilities = ["CAP_NET_ADMIN"];
+            CapabilityBoundingSet = ["CAP_NET_ADMIN"];
+            RestrictAddressFamilies = ["AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK"];
+          };
       };
 
       # Template unit: instantiated as `oxidom@<profile>`. It deliberately has
