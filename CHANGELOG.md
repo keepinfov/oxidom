@@ -18,6 +18,10 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- An **Appearance** setting: follow the desktop, or pin the window to light or
+  dark. It applies as it is picked and survives a restart. Until now the app
+  followed the system scheme and offered no way to say otherwise, which leaves
+  nothing to say it on a desktop that has no such setting.
 - A working agreement for contributors and agents ([AGENTS.md](AGENTS.md)), the
   binding implementation contract split into [docs/spec/](docs/spec/), a
   contributor guide, this changelog, a security policy, continuous integration,
