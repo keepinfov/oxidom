@@ -1,0 +1,49 @@
+name: test
+
+# The suite is pure logic — parsers, config generation, reducers — and runs
+# headless. Tests that need a network, a live Xray core, root, or a display are
+# marked #[ignore] and are not run here; AGENTS.md says how to run those by hand.
+
+on:
+  push:
+    branches: [master]
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.github/workflows/test.yml']
+  pull_request:
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.github/workflows/test.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-
+      - name: cargo test
+        run: nix develop -c cargo test --workspace --locked
+
+  lockfile:
+    # A lockfile that no longer matches the manifests breaks every downstream
+    # packager — the AUR build runs --frozen and would fail on it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo.lock is in sync
+        run: cargo metadata --locked --format-version 1 > /dev/null

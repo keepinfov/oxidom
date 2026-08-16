@@ -1,8 +1,8 @@
 # Architecture
 
 How oxidom is put together, and why. For the binding implementation contracts and
-the reasoning behind them, see [`AGENTS.md`](../AGENTS.md) in the repository root —
-this page is the readable summary.
+the reasoning behind them, see [`spec/`](spec/) — this page is the readable
+summary.
 
 ## Contents
 
@@ -171,4 +171,4 @@ somebody's server.
 
 ---
 
-Next: [routing.md](routing.md) · [configuration.md](configuration.md) · [`AGENTS.md`](../AGENTS.md)
+Next: [routing.md](routing.md) · [configuration.md](configuration.md) · [`spec/`](spec/)

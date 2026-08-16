@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Formats what is about to be committed, so no review ever spends a comment on
+# whitespace and no CI run fails on it.
+#
+# Enable it once per clone:
+#     git config core.hooksPath .githooks
+# The dev shell (`nix develop`) does that for you on entry.
+#
+# Only staged files are touched, and only the staged content is re-added, so a
+# partially staged file keeps its unstaged remainder.
+set -uo pipefail
+
+fail=0
+
+staged() { git diff --cached --name-only --diff-filter=ACMR -- "$@"; }
+
+# --- Rust ------------------------------------------------------------------
+mapfile -t rs < <(staged '*.rs')
+if [ ${#rs[@]} -gt 0 ]; then
+  if command -v rustfmt >/dev/null 2>&1; then
+    # Read the edition from the workspace so rustfmt does not fall back to 2015.
+    edition=$(grep -m1 '^edition' Cargo.toml | cut -d'"' -f2)
+    rustfmt --edition "${edition:-2024}" "${rs[@]}" || fail=1
+    git add -- "${rs[@]}"
+  else
+    echo "pre-commit: rustfmt not found — run inside 'nix develop'" >&2
+    fail=1
+  fi
+fi
+
+# --- Nix -------------------------------------------------------------------
+mapfile -t nix < <(staged '*.nix')
+if [ ${#nix[@]} -gt 0 ] && command -v alejandra >/dev/null 2>&1; then
+  alejandra --quiet "${nix[@]}" >/dev/null 2>&1 || fail=1
+  git add -- "${nix[@]}"
+fi
+
+# --- Whitespace ------------------------------------------------------------
+# Catches trailing whitespace and conflict markers in every staged file type,
+# including the docs the formatters above do not look at.
+git diff --cached --check || fail=1
+
+if [ "$fail" -ne 0 ]; then
+  echo >&2
+  echo "pre-commit: refusing the commit — fix the above, or pass --no-verify if you" >&2
+  echo "know why this is wrong (say why in the commit body)." >&2
+  exit 1
+fi
