@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use oxidom_core::ipc::{
     LatencyReading, PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry,
-    SelectionInfo, SessionInfo, StatusInfo,
+    RuntimeInfo, SelectionInfo, SessionInfo, StatusInfo,
 };
 use oxidom_core::model::{OutboundSpec, Subscription};
 use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
@@ -78,6 +78,11 @@ pub(super) struct SnapshotState {
     pub checking: HashMap<String, ProbeWait>,
     /// Ids whose failed probe should raise a toast (explicit per-card ping).
     pub notify_probe: HashSet<String>,
+    /// Ids from a whole-subscription check. These report only failures of this
+    /// machine — no core, no network — because those explain every card at
+    /// once and are invisible otherwise. A single silent server among fifty is
+    /// its card's business, not a toast's.
+    pub notify_local: HashSet<String>,
     pub operation: Option<UiOperation>,
     /// Optimistic status shown while a job is in flight. Written only through
     /// [`SnapshotState::pin_status`], so the deadline below always has a start.
@@ -154,6 +159,7 @@ impl SnapshotState {
             last_active_latency: None,
             checking: HashMap::new(),
             notify_probe: HashSet::new(),
+            notify_local: HashSet::new(),
             operation: None,
             pending_status: None,
             pending_profile: "default".to_string(),
@@ -254,6 +260,10 @@ pub(super) enum Effect {
     Reprobe(String),
     ToastUnreachable,
     ToastNoNetwork,
+    /// The probe never reached the server because something here stopped it.
+    /// Carries an action to Settings, since the usual cause — no Xray core —
+    /// is fixed there and nowhere else.
+    ToastProbeDidNotRun,
     ConnectionError(String),
     /// The daemon is older than the reading contract. Its numbers arrive
     /// undated and unattributed, so the GUI reports nothing rather than
@@ -307,6 +317,7 @@ pub(super) fn reduce(
     let mut effects = Vec::new();
     let mut toast_unreachable = false;
     let mut toast_no_network = false;
+    let mut toast_not_run = false;
     let mut new_error: Option<String> = None;
     state.daemon_status = snapshot.status.to_status();
     state.active_profile = snapshot.status.active_profile.clone();
@@ -377,11 +388,14 @@ pub(super) fn reduce(
             {
                 state.last_active_latency = Some((target, ms));
             }
-            if state.notify_probe.remove(id) && reading.value.is_none() {
-                if reading.failure == Some(ProbeFailure::NoNetwork) {
-                    toast_no_network = true;
-                } else {
-                    toast_unreachable = true;
+            let asked = state.notify_probe.remove(id);
+            let swept = state.notify_local.remove(id);
+            if reading.value.is_none() {
+                match reading.failure {
+                    Some(ProbeFailure::Unknown) if asked || swept => toast_not_run = true,
+                    Some(ProbeFailure::NoNetwork) if asked || swept => toast_no_network = true,
+                    _ if asked => toast_unreachable = true,
+                    _ => {}
                 }
             }
         }
@@ -410,11 +424,14 @@ pub(super) fn reduce(
         {
             state.last_active_latency = Some((target, ms));
         }
-        if state.notify_probe.remove(&id) && reading.value.is_none() {
-            if reading.failure == Some(ProbeFailure::NoNetwork) {
-                toast_no_network = true;
-            } else {
-                toast_unreachable = true;
+        let asked = state.notify_probe.remove(&id);
+        let swept = state.notify_local.remove(&id);
+        if reading.value.is_none() {
+            match reading.failure {
+                Some(ProbeFailure::Unknown) if asked || swept => toast_not_run = true,
+                Some(ProbeFailure::NoNetwork) if asked || swept => toast_no_network = true,
+                _ if asked => toast_unreachable = true,
+                _ => {}
             }
         }
     }
@@ -541,6 +558,9 @@ pub(super) fn reduce(
     }
     if toast_no_network {
         effects.push(Effect::ToastNoNetwork);
+    }
+    if toast_not_run {
+        effects.push(Effect::ToastProbeDidNotRun);
     }
     // Failures the user never triggered — a crashed core, a tunnel torn down by
     // its own latency check — reach the screen only here.
@@ -1686,6 +1706,18 @@ pub(super) fn pool_action(
 /// the rest of the window says nothing about. It is phrased in profiles because
 /// that is the only name the user gave any of them; `session` is the daemon's
 /// word for one that happens to be up, and it stays in the CLI and the logs.
+/// What the banner says when the daemon could not resolve an Xray core.
+///
+/// Without one nothing connects and nothing is measured, yet the only symptom
+/// on the Servers page is that every card refuses to produce a number — which
+/// reads as a dead subscription rather than as a missing program. A daemon too
+/// old to answer `RuntimeInfo` reports `None` here, and stays silent rather
+/// than accusing a core that may well be present.
+pub(super) fn missing_core_message(runtime: Option<&RuntimeInfo>) -> Option<String> {
+    runtime?.xray_error.as_ref()?;
+    Some("No Xray core found — nothing can connect or be measured until one is installed".into())
+}
+
 pub(super) fn other_profiles_message(
     sessions: &[SessionInfo],
     selected_profile: &str,
@@ -1737,6 +1769,12 @@ pub(super) fn latency_state(
         },
         None => match reading.failure {
             Some(ProbeFailure::NoNetwork) => LatencyState::NoNetwork,
+            // `Unknown` is what the daemon sends when the probe never got as
+            // far as the server — no Xray core to build the measuring tunnel
+            // with, no free port, no place to stage its config. Folding it in
+            // with a server that stayed silent is how a machine with no core
+            // reports nine healthy servers as dead.
+            Some(ProbeFailure::Unknown) => LatencyState::NotRun,
             _ => LatencyState::Unreachable,
         },
     }
@@ -3417,6 +3455,105 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::ToastUnreachable))
         );
+    }
+
+    /// The failure a machine with no Xray core produces for every server at
+    /// once. Reporting it as an unresponsive server is how nine working nodes
+    /// come to look dead.
+    fn no_core(id: &str) -> ProbeState {
+        let mut state = idle();
+        let mut reading = LatencyReading::failed(
+            ProbeFailure::Unknown,
+            ProbeRoute::Direct,
+            LatencyMethod::HttpGet,
+        );
+        reading.measured_at_unix_ms = NOW_MS;
+        state.readings.insert(id.to_string(), reading);
+        state
+    }
+
+    #[test]
+    fn a_probe_that_never_ran_is_not_a_verdict_on_the_server() {
+        let mut state = state();
+        let effects = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), no_core("a")),
+            Instant::now(),
+            true,
+        );
+        assert_eq!(
+            latency(&effects, "a"),
+            Some(LatencyState::NotRun),
+            "a check that never left this machine says nothing about the server"
+        );
+    }
+
+    /// A sweep is silent about one quiet server, because its card says so
+    /// already — but a machine that measured nothing at all has to speak,
+    /// since every card looks the same and none of them explains why.
+    #[test]
+    fn a_sweep_reports_a_machine_that_could_not_measure_anything() {
+        let mut state = state();
+        state.notify_local.insert("a".to_string());
+        state.notify_local.insert("b".to_string());
+        let mut probes = no_core("a");
+        let mut second = LatencyReading::failed(
+            ProbeFailure::Unknown,
+            ProbeRoute::Direct,
+            LatencyMethod::HttpGet,
+        );
+        second.measured_at_unix_ms = NOW_MS;
+        probes.readings.insert("b".to_string(), second);
+
+        let effects = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probes),
+            Instant::now(),
+            true,
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::ToastProbeDidNotRun))
+                .count(),
+            1,
+            "two failures of the same machine are one piece of news"
+        );
+    }
+
+    #[test]
+    fn a_sweep_stays_quiet_about_a_server_that_did_not_answer() {
+        let mut state = state();
+        state.notify_local.insert("a".to_string());
+        let effects = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probe(&[], &[("a", None)])),
+            Instant::now(),
+            true,
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ToastUnreachable)),
+            "the card already shows it; a sweep does not narrate every silent node"
+        );
+    }
+
+    #[test]
+    fn the_core_banner_speaks_only_when_the_daemon_found_no_core() {
+        assert_eq!(
+            missing_core_message(None),
+            None,
+            "an older daemon says nothing"
+        );
+        let mut runtime = RuntimeInfo::default();
+        assert_eq!(
+            missing_core_message(Some(&runtime)),
+            None,
+            "a resolved core is not news"
+        );
+        runtime.xray_error = Some("`xray` was not found on $PATH".to_string());
+        assert!(missing_core_message(Some(&runtime)).is_some());
     }
 
     /// An outdated daemon sends numbers that cannot be dated or attributed, so

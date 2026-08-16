@@ -3306,7 +3306,12 @@ fn sort_value(state: LatencyState) -> Option<Option<u32>> {
     match state {
         LatencyState::Reachable { ms, .. } | LatencyState::Tunnel { ms, .. } => Some(Some(ms)),
         LatencyState::Unreachable | LatencyState::NoNetwork => Some(None),
-        LatencyState::Unmeasured | LatencyState::Superseded | LatencyState::Checking => None,
+        // A check that never ran is not a failure to sort last — it is the
+        // absence of a reading, exactly like a server nobody has measured.
+        LatencyState::Unmeasured
+        | LatencyState::Superseded
+        | LatencyState::Checking
+        | LatencyState::NotRun => None,
     }
 }
 
