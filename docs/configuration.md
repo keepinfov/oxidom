@@ -94,7 +94,11 @@ one.
 ### Settings the daemon will refuse to change
 
 - **Pinned ports.** If the unit passes `--socks-port`/`--http-port`, clients cannot
-  change them, and the GUI locks those rows and says why.
+  change them, and the GUI locks those rows and says why. The Arch package
+  deliberately does *not* pass them, so ports come from this file and the GUI can
+  edit them; pin them with `systemctl edit oxidom` on a machine where several
+  people drive one daemon, since moving an inbound moves it for all of them. The
+  NixOS module always passes them, because there the ports are declared options.
 - **The three `*_binary` paths, over the system bus.** Setting a binary path on a
   privileged daemon is a remote-execution primitive, so a system daemon ignores
   those keys from clients entirely. Edit the file, or use `systemctl edit`.

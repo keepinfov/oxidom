@@ -27,7 +27,7 @@ pkgbase = oxidom-git
 	source = oxidom@.service
 	source = oxidom-git.sysusers
 	sha256sums = SKIP
-	sha256sums = 26f1f9f9c49d5b4f4b58895f8273e7e209b3973ab5ac609eafdcc11a4bbe7389
+	sha256sums = c861189be328989176566c943c180ad73fc157a994125357471a2ed6497f3cc4
 	sha256sums = b61b29eeb2ba5fd43569846144846ce41afaf453b3a5390d33fdfc53edc95785
 	sha256sums = cfd693db52fc6f98e0c16a3ac2071b6551e0e2d7e500721b6976ab49bfb4ec5a
 

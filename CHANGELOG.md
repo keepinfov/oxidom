@@ -25,6 +25,15 @@ surface, packaging, or the CLI belongs here.
 - A screenshot of the connected server browser in the README, in both desktop
   colour schemes.
 
+### Changed
+
+- The Arch service unit no longer pins the SOCKS and HTTP ports. A pinned port
+  is one the daemon refuses to change, which left Settings showing a locked row
+  and no way for a desktop user to move their own proxy off 10808. Ports now
+  come from `config.toml`, the file the GUI edits. Pinning remains the right
+  answer where several people drive one daemon, and `systemctl edit oxidom`
+  still does it — `docs/installation.md` says how.
+
 ### Fixed
 
 - The Arch package builds again: the recorded checksum for `oxidom.service` no

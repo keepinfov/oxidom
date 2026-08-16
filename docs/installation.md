@@ -138,6 +138,20 @@ starts without a core and tells you where it looked; only connecting fails.
 Point it at a core you installed by hand under Settings → Xray core, or with
 `$OXIDOM_XRAY_BIN`.
 
+The unit does not pin the proxy ports, so they come from
+`/var/lib/oxidom/config.toml` and Settings can change them. On a machine where
+several people drive the same daemon, pin them instead — moving an inbound moves
+it for everyone:
+
+```sh
+sudo systemctl edit oxidom
+```
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/bin/oxidom daemon --system --socks-port 10808 --http-port 10809
+```
+
 One more thing the package does not do for you:
 
 - **TUN mode needs `tun2socks` and per-app routing needs `nftables`.** Both are
