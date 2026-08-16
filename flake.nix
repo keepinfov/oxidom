@@ -106,6 +106,13 @@
             export OXIDOM_XRAY_BIN=${pkgs.xray}/bin/xray
             export OXIDOM_TUN2SOCKS_BIN=${pkgs.tun2socks}/bin/tun2socks
             export OXIDOM_NFT_BIN=${pkgs.nftables}/bin/nft
+
+            # Format on commit instead of in review. Opt out with
+            # `git config --unset core.hooksPath`.
+            if git rev-parse --git-dir >/dev/null 2>&1 \
+              && [ -z "$(git config --get core.hooksPath || true)" ]; then
+              git config core.hooksPath .githooks
+            fi
           '';
         };
         formatter = pkgs.alejandra;
