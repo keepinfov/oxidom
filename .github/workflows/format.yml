@@ -1,0 +1,43 @@
+name: format
+
+# Deliberately the only workflow that does not install Nix: formatting needs a
+# rustfmt and nothing else, so this answers within a minute while the heavier
+# workflows are still fetching a toolchain. It is the first thing a contributor
+# sees go red, and the cheapest to fix.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: trailing whitespace and conflict markers
+        # Diffing the whole tree against the empty tree makes --check examine
+        # every tracked line, which a shallow checkout still allows.
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
+  nixfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - name: alejandra
+        run: nix run nixpkgs#alejandra -- --check .

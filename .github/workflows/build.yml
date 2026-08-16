@@ -1,0 +1,32 @@
+name: build
+
+# Proves the two artefacts people actually install still build: the wrapped CLI
+# (which the systemd unit runs) and the wrapped GUI (which carries the icon
+# theme and the desktop files). `nix build` also runs the crate tests the flake
+# names, so a green build here is stronger than a green `cargo build`.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    paths: ['crates/**', 'data/**', 'nix/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.github/workflows/build.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - name: nix flake check
+        run: nix flake check --print-build-logs
+      - name: nix build
+        run: nix build .#oxidom-cli .#oxidom-gui --print-build-logs
