@@ -27,6 +27,14 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- Country flags now appear for providers that spell the country in plain
+  letters. Detection accepted only a leading flag emoji, so `DE-2 HYSTERIA2`
+  read as no country at all and every such card showed a globe. A leading
+  two-letter token is now read when it is a real ISO code — only the first
+  token, and only a real code, so `second-ws-stas` does not become Samoa.
+  Names carrying no country still show no flag; nothing is guessed from the
+  address.
+
 - The Arch package builds again: the recorded checksum for `oxidom.service` no
   longer matched the file, which stopped `makepkg` at the validity check before
   it reached a compiler. The package now also declares the libraries it links
