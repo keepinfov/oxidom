@@ -18,6 +18,11 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **Ctrl+V imports what is on the clipboard.** A subscription URL opens Add
+  Subscription, share links open Import Server, both already filled in; opening
+  either dialog by hand fills an empty field the same way. Copying a link and
+  then having to find the right dialog and paste again was the step nobody
+  wanted.
 - A working agreement for contributors and agents ([AGENTS.md](AGENTS.md)), the
   binding implementation contract split into [docs/spec/](docs/spec/), a
   contributor guide, this changelog, a security policy, continuous integration,
