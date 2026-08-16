@@ -107,19 +107,41 @@ ioctls, nftables and systemd — so treat that attribute as vestigial.
 
 ## Arch
 
+oxidom is **not on the AUR yet**, so build it from the `PKGBUILD` in this
+repository:
+
 ```sh
-git clone https://aur.archlinux.org/oxidom-git.git
-cd oxidom-git
+git clone https://github.com/keepinfov/oxidom
+cd oxidom/packaging/aur
 makepkg -si
 sudo systemctl enable --now oxidom.service
 ```
 
-The PKGBUILD lives in this repository at `packaging/aur/PKGBUILD`.
+Then install an **Xray core**, which oxidom needs to connect but does not
+install for you:
 
-Two things it does not do for you:
+```sh
+yay -S xray-bin        # or xray, or xray-git — any AUR provider will do
+```
 
-- **`depends` covers only `gtk4 libadwaita xray`.** TUN mode needs `tun2socks` and
-  per-app routing needs `nftables`. Install them if you use those features.
+No AUR helper? Build one the same way:
+
+```sh
+git clone https://aur.archlinux.org/xray-bin.git && cd xray-bin && makepkg -si
+```
+
+Every provider of an Xray core lives in the AUR rather than the official
+repositories, which is why it is an optional dependency here. Were it a hard
+one, `makepkg -si` would stop at `target not found: xray` and — because pacman
+cancels a transaction whole — install none of gtk4 or libadwaita either. oxidom
+starts without a core and tells you where it looked; only connecting fails.
+Point it at a core you installed by hand under Settings → Xray core, or with
+`$OXIDOM_XRAY_BIN`.
+
+One more thing the package does not do for you:
+
+- **TUN mode needs `tun2socks` and per-app routing needs `nftables`.** Both are
+  listed as optional dependencies; install them if you use those features.
 - **The Arch unit does not grant `CAP_NET_ADMIN`.** For TUN:
 
   ```sh
