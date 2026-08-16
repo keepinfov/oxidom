@@ -54,6 +54,11 @@ system-wide tunnel set `routes = "default"` — see
 
 ## For contributors
 
-[`AGENTS.md`](../AGENTS.md) in the repository root is the authoritative
-implementation spec — binding contracts and the reasoning behind them. These docs
-are the user-facing view of the same system.
+These pages are the user-facing view. Three others describe the project from the
+inside:
+
+| | |
+|---|---|
+| [CONTRIBUTING.md](../CONTRIBUTING.md) | Clone to pull request: the dev shell, the checks, what a reviewer looks for |
+| [AGENTS.md](../AGENTS.md) | The working agreement — testing obligations, commits, releases, safeguards. Binding for humans and agents alike |
+| [spec/](spec/) | The implementation contract: on-disk formats, generated Xray configuration, the CLI surface, probe semantics, interfaces |

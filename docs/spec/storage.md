@@ -1,0 +1,63 @@
+# Files (config & state)
+
+Where oxidom keeps its configuration and state on disk, which daemon owns that store, and the schema of `config.toml`.
+
+Resolve config dir as `$XDG_CONFIG_HOME/oxidom` (`~/.config/oxidom`), data dir as
+`$XDG_DATA_HOME/oxidom` (`~/.local/share/oxidom`). Create parent dirs on write; never panic on
+missing files (treat as defaults/empty).
+
+- `~/.config/oxidom/config.toml` — user settings (see schema).
+- `~/.config/oxidom/profiles/<name>.toml` — named CLI/systemd connection profiles.
+- `~/.local/share/oxidom/subscriptions.json` — cached subscriptions + parsed servers.
+- `~/.local/share/oxidom/state.toml` — ephemeral `[[sessions]]` records: profile, server id,
+  loopback address, fixed SOCKS/HTTP ports, recovery PIDs and the planned interface routes/rule.
+  Interface intent is written before kernel application so crash cleanup may safely over-delete
+  idempotent records but can never forget an applied route. The legacy flat active-server fields
+  are accepted only as migration input.
+- `~/.local/share/oxidom/hwid` — random per-install id (only generated/used if a sub opts in).
+- `~/.cache/oxidom/egress.json` — user-owned 60-second cache for `oxidom ip --egress`, keyed by
+  profile and server id.
+
+## Which daemon owns the store (binding)
+
+A system daemon run from the NixOS module keeps all of the above in its `StateDirectory`
+(`/var/lib/oxidom`) instead of the user's XDG dirs, so **the choice of daemon is the choice of
+database**. The GUI must not make that choice by accident:
+
+- The system daemon is D-Bus **activatable** (`share/dbus-1/system-services/…`, unit `Type=dbus`),
+  so a client that asks for the name starts it and waits instead of racing it.
+- `DaemonClient::connect_any` falls back to a session daemon only after waiting out an installed
+  system daemon (`SYSTEM_DAEMON_GRACE`), and only when the bus says *nobody owns the name*.
+  `AccessDenied` is a final answer — that user is not allowed to drive the system daemon, and a
+  session daemon of their own is the correct answer for them.
+- Losing this race is invisible in the UI except as servers that "vanished", so the fallback is
+  logged, and the connection runs off the main loop behind a startup window that says which step
+  it is on. Never make the user stare at nothing while a daemon is being reached.
+
+## `config.toml` schema (serde)
+
+```toml
+socks_port = 10808            # local SOCKS inbound
+http_port  = 10809            # local HTTP inbound
+system_proxy = false          # toggle GNOME/env system proxy on connect
+reconnect = false             # reconnect after an unexpected core exit; explicit opt-in
+latency_method = "http_get"   # one of: icmp | tcp | http_head | http_get
+latency_test_url = "https://www.gstatic.com/generate_204"
+subscription_user_agent = "v2rayN/6.45"    # panels gate the body *and its format* on this
+xray_binary = ""              # empty: use $OXIDOM_XRAY_BIN, then xray on PATH
+tun2socks_binary = ""         # empty: use $OXIDOM_TUN2SOCKS_BIN, then tun2socks on PATH
+nft_binary = ""               # empty: use $OXIDOM_NFT_BIN, then nft on PATH
+
+[core]                        # machine-wide Xray core settings; a profile's [core] overrides
+log_level = "warning"         # debug | info | warning | error | none
+domain_strategy = "ip_if_non_match"
+noises = []
+[core.sniffing]               # enabled | dest_override (http/tls/quic) | route_only
+[core.mux]                    # enabled | concurrency | xudp_concurrency | xudp_proxy_udp_443
+[core.fragment]               # enabled | packets | length | interval
+[core.dns]                    # server | direct_server | query_strategy
+```
+
+Every `[core]` key is optional at both levels, and an untouched section is not written to the file
+at all. See [Advanced core settings](xray-config.md#advanced-core-settings-binding) for what each
+one generates.

@@ -97,6 +97,14 @@ oxidom ip --egress
 | [Architecture](docs/architecture.md) | Crates, the daemon, the security model |
 | [Troubleshooting](docs/troubleshooting.md) | By symptom, with the real error text |
 
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) takes you from a clone to a pull request;
+[AGENTS.md](AGENTS.md) is the working agreement every change is held to, and
+[docs/spec/](docs/spec/) is the implementation contract behind the behaviour.
+Security problems go through [SECURITY.md](SECURITY.md) rather than the issue
+tracker.
+
 ## Architecture in one paragraph
 
 The Cargo workspace is split into three crates: `oxidom-core` contains the shared
@@ -107,7 +115,7 @@ with a tray icon. Closing the window keeps the connection; the daemon can run as
 system service that starts at boot and survives logout. Launching the GUI without
 a daemon auto-spawns a session one. See
 [docs/architecture.md](docs/architecture.md), and
-[`AGENTS.md`](AGENTS.md) for the full implementation spec.
+[docs/spec/](docs/spec/) for the full implementation contract.
 
 ## Status
 
