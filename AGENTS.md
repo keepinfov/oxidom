@@ -220,7 +220,7 @@ published history is rewritten.
 | Link parsing or a subscription format | `docs/spec/data-model.md`, `docs/subscriptions-and-protocols.md` |
 | Generated Xray JSON or core options | `docs/spec/xray-config.md`, `docs/configuration.md` |
 | Profiles, pools or session semantics | `docs/spec/profiles-and-pools.md`, `docs/profiles-and-pools.md` |
-| Probes or the latency reading contract | `docs/spec/latency.md` |
+| Probes or the latency reading contract | `docs/spec/latency.md`, and the wording in `docs/cli.md`, `docs/gui.md`, `docs/troubleshooting.md` |
 | TUN, routing or per-app routing | `docs/spec/interfaces.md`, `docs/routing.md` |
 | A GUI page, dialog or flow | `docs/spec/gui.md`, `docs/gui.md` |
 | The D-Bus surface | `docs/spec/`, and say so in the PR: old clients must keep working |

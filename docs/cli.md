@@ -204,10 +204,43 @@ drops straight into a script:
 if ms=$(oxidom ping ch-trojan); then echo "alive: ${ms}ms"; fi
 ```
 
-Polls the daemon for up to 30 seconds. Failures are distinguished, because "the
-server is down" and "this laptop has no network" deserve different reactions:
-`server is unreachable`, `probe timed out`, `no network connection`, `probe could
-not run on this machine`.
+The daemon does the measuring; `ping` asks for it and then polls for up to 30
+seconds. Because a request is only queued, not started, that budget covers the
+wait for a free slot as well as the measurement — on a busy queue a probe can
+still be running when the command gives up.
+
+Failures are distinguished, because "the server is down" and "this laptop has no
+network" deserve different reactions. Everything below goes to stderr, and every
+line naming a server is prefixed with its handle:
+
+| Message | Meaning |
+|---|---|
+| `server is unreachable` | The server never answered, or answered and refused. |
+| `probe timed out` | The measurement itself ran out of time. |
+| `no network connection` | This machine has no usable route. Claimed only on evidence — see [spec/latency.md](spec/latency.md). |
+| `probe could not run on this machine` | Something local stopped the check, and the daemon did not say what. |
+
+When the daemon *does* say what stopped it, that reason is printed instead of the
+last line — these come from the probe core's own complaint, so they name a
+condition rather than shrugging:
+
+| Message | Meaning |
+|---|---|
+| `no Xray core, so nothing could be measured` | No core binary was found. `oxidom core show` says where it looked. |
+| `the server's certificate was rejected` | TLS verification failed. `oxidom trust <HANDLE>` shows the certificate. |
+| `the server asks for unverified TLS, which this core removed` | The link wants `allowInsecure`, which Xray 26.x dropped. A pin is the only way through. |
+| `the core refused the generated config` | The core would not start on this server's settings. |
+| `the check could not run on this machine` | A local fault the core did not name. |
+
+Four more are about the exchange rather than the server: `probe for <HANDLE> did
+not finish within 30 seconds`, `daemon finished the probe for <HANDLE> without a
+reading`, `daemon returned an invalid probe reading` (a reading that is neither a
+number nor a failure — a daemon bug), and `daemon probe schema N is older than
+required version M`, which means the running daemon predates this binary and
+should be restarted.
+
+Once queued, a probe cannot be called off: Ctrl-C stops the waiting, not the
+measuring.
 
 ### `oxidom trust <HANDLE> [--trust]`
 

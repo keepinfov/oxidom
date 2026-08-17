@@ -7,6 +7,7 @@ Organised by what you see. Error text is quoted as oxidom actually prints it.
 - [My servers vanished](#my-servers-vanished)
 - [The core will not start](#the-core-will-not-start)
 - [It says connected but nothing works](#it-says-connected-but-nothing-works)
+- [Every server fails its latency check](#every-server-fails-its-latency-check)
 - [Subscriptions](#subscriptions)
 - [TUN and `oxidom run`](#tun-and-oxidom-run)
 - [The GUI](#the-gui)
@@ -119,6 +120,32 @@ Confirm what the world sees:
 ```sh
 oxidom ip --egress --fresh
 ```
+
+## Every server fails its latency check
+
+The `⊘` badge never means "this server is dead". It means the check never reached
+the server, which is this machine's problem — and a machine that cannot measure
+fails *every* server at once, which is why a whole subscription can turn to `⊘`
+in one sweep. Replacing servers will not help.
+
+The badge's tooltip names the condition, and `oxidom ping <HANDLE>` prints the
+same reason on stderr:
+
+| Message | What to do |
+|---|---|
+| `no Xray core, so nothing could be measured` | No core binary was found. `oxidom core show` prints where it looked; install one, or set the path in Settings › Xray core. |
+| `the server's certificate was rejected` | The server's TLS certificate did not verify. `oxidom trust <HANDLE>` shows it, and accepts it with `--trust` if you recognise it. |
+| `the server asks for unverified TLS, which this core removed` | The share link asked for `allowInsecure`, which Xray 26.x dropped. A certificate pin (`pinSHA256`) is the only way through. |
+| `the core refused the generated config` | The core would not start on this server's settings — usually an option this core version does not have. Connecting to the server will show the core's own words; a probe's core is read once and discarded. |
+| `the check could not run on this machine` | A local fault the core did not name: no free port, or an unwritable data directory. |
+| `no network connection` (the badge says `No network — the server was not checked`) | This machine has no usable default route. Claimed only on evidence, never guessed from a DNS failure alone, so it is worth believing. |
+
+A single server showing `⊘` while its neighbours show numbers is the certificate
+or config case, not the missing-core one.
+
+Note that a check runs a **throwaway core of its own** for each server it
+measures directly — so a broken core binary breaks measuring even while an
+already-running tunnel keeps working.
 
 ## Subscriptions
 
