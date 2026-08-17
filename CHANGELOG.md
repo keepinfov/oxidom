@@ -45,6 +45,16 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- A failed latency check now says what went wrong instead of blaming the
+  server. The probe core's log was discarded, so a core that refused to talk to
+  a server — most often because it would not accept the server's certificate —
+  reached the user as "server is unreachable". The core's own words are now
+  read on the failing path and, when they name a condition, reported as one:
+  the certificate was rejected, the server asks for unverified TLS that Xray 26
+  removed, or the core refused the generated config. Probe cores run at `info`
+  for this, because at `warning` the same refusal is reported on one transport
+  and dropped on the next.
+
 - A machine with no Xray core no longer reports every server as unreachable.
   The default latency check measures through a core it starts for the purpose,
   so without one it failed for every server at once — and said so as "server is

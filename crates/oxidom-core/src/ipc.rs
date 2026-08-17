@@ -226,6 +226,53 @@ pub struct LatencyReading {
     pub method: LatencyMethod,
     /// Why there is no `value`. `None` exactly when `value` is `Some`.
     pub failure: Option<ProbeFailure>,
+    /// What went wrong here, when this machine is what went wrong.
+    ///
+    /// Additive and serde-defaulted, so a daemon that sends it and a client
+    /// that has never heard of it still understand each other — which is why
+    /// this is a field rather than a fifth `ProbeFailure`, an enum with no
+    /// `#[serde(other)]` that older clients would fail to parse outright.
+    #[serde(default)]
+    pub detail: Option<ProbeDetail>,
+}
+
+/// Why a probe never reached the server.
+///
+/// A closed set rather than free text: the wording belongs to whichever client
+/// is showing it, and a string neither translates nor matches. `Other` keeps a
+/// client from choking on a reason a newer daemon learned to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeDetail {
+    /// No Xray binary, so nothing could be measured through anything.
+    NoCore,
+    /// The core would not accept the server's certificate.
+    CertificateRejected,
+    /// The server asks for unverified TLS, which Xray 26 removed. Only a
+    /// pinned certificate can accept such a server now.
+    InsecureTlsUnsupported,
+    /// The core refused the configuration generated for this server.
+    ConfigRefused,
+    /// Something else local: no free port, nowhere to stage a config.
+    #[serde(other)]
+    Other,
+}
+
+impl ProbeDetail {
+    /// One line, in the words a user needs. Kept beside the enum so the CLI
+    /// and the GUI cannot drift into describing the same condition
+    /// differently.
+    pub fn message(self) -> &'static str {
+        match self {
+            ProbeDetail::NoCore => "no Xray core, so nothing could be measured",
+            ProbeDetail::CertificateRejected => "the server's certificate was rejected",
+            ProbeDetail::InsecureTlsUnsupported => {
+                "the server asks for unverified TLS, which this core removed"
+            }
+            ProbeDetail::ConfigRefused => "the core refused the generated config",
+            ProbeDetail::Other => "the check could not run on this machine",
+        }
+    }
 }
 
 impl LatencyReading {
@@ -236,6 +283,7 @@ impl LatencyReading {
             route,
             method,
             failure: None,
+            detail: None,
         }
     }
 
@@ -246,6 +294,21 @@ impl LatencyReading {
             route,
             method,
             failure: Some(failure),
+            detail: None,
+        }
+    }
+
+    /// The same, naming what this machine got wrong. Only failures carry one:
+    /// a number needs no excuse.
+    pub fn failed_locally(
+        failure: ProbeFailure,
+        detail: ProbeDetail,
+        route: ProbeRoute,
+        method: LatencyMethod,
+    ) -> Self {
+        LatencyReading {
+            detail: Some(detail),
+            ..LatencyReading::failed(failure, route, method)
         }
     }
 }
@@ -418,6 +481,44 @@ pub fn error_action(message: &str) -> ErrorAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon that predates the field sends readings without it, and those
+    /// must still parse — the whole snapshot is folded in one closure, so one
+    /// failed field freezes the latency of every server at once.
+    #[test]
+    fn a_reading_without_a_detail_still_parses() {
+        let older = r#"{"value":null,"measured_at_unix_ms":1,"route":"direct",
+            "method":"http_get","failure":"timeout"}"#;
+        let reading: LatencyReading = serde_json::from_str(older).expect("parses");
+        assert_eq!(reading.detail, None);
+        assert_eq!(reading.failure, Some(ProbeFailure::Timeout));
+    }
+
+    /// And a client that predates a *reason* must not choke on one it has
+    /// never heard of.
+    #[test]
+    fn an_unknown_detail_reads_as_something_else_local() {
+        let newer = r#"{"value":null,"measured_at_unix_ms":1,"route":"direct",
+            "method":"http_get","failure":"unknown","detail":"invented_later"}"#;
+        let reading: LatencyReading = serde_json::from_str(newer).expect("parses");
+        assert_eq!(reading.detail, Some(ProbeDetail::Other));
+    }
+
+    #[test]
+    fn a_local_failure_carries_its_reason() {
+        let reading = LatencyReading::failed_locally(
+            ProbeFailure::Unknown,
+            ProbeDetail::CertificateRejected,
+            ProbeRoute::Direct,
+            LatencyMethod::HttpGet,
+        );
+        assert_eq!(reading.value, None, "a reason is not a measurement");
+        assert_eq!(reading.detail, Some(ProbeDetail::CertificateRejected));
+        let round_trip: LatencyReading =
+            serde_json::from_str(&serde_json::to_string(&reading).expect("serializes"))
+                .expect("parses");
+        assert_eq!(round_trip.detail, reading.detail);
+    }
 
     #[test]
     fn actionable_errors_point_at_settings() {

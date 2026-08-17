@@ -26,6 +26,21 @@ Timeout | NoNetwork | Internal(&'static str)`. The distinction is the point — 
   crosses the wire as `ProbeFailure::Unknown` plus a `warn` line; blaming the server would be a
   lie, and inventing a fifth wire variant would break older GUIs (`ProbeFailure` has no
   `#[serde(other)]`).
+- **The probe core's own log is read, not discarded (binding).** A core says why it will not work
+  — `tls: failed to verify certificate: x509: …`, or `allowInsecure has been removed` — and it
+  says it on **stdout**, which is where Xray writes its whole log (`xray run -test 2>/dev/null`
+  still prints the error; `1>/dev/null` prints nothing). The probe core is therefore run at
+  `log_level = info` regardless of the machine-wide `[core]`: at `warning` the same rejected
+  certificate is reported on one transport and silently dropped on the next. The log is read only
+  when the probe failed, capped, and never stored.
+- A recognised complaint becomes a `ProbeDetail` on the wire —
+  `certificate_rejected`, `insecure_tls_unsupported`, `config_refused`, `no_core`, `other` — set
+  on `LatencyReading.detail` beside `ProbeFailure::Unknown`. It is a serde-defaulted field with a
+  `#[serde(other)]` fallback, so a daemon that sends a reason and a client that has never heard of
+  it still understand each other; a fifth `ProbeFailure` variant would have made older clients
+  fail to parse the whole snapshot. An **unrecognised** complaint changes nothing: the verdict
+  stays whatever the measurement said, because guessing at a core's wording is how a wrong
+  explanation gets shown with confidence.
 - A client must keep that distinction on screen (binding). `Unknown` says the check never reached
   the server, so it may not be drawn as an unresponsive one: a machine with no core fails every
   probe at once, and rendering that as a subscription of dead servers sends people to replace

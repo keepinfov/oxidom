@@ -3319,7 +3319,7 @@ fn sort_value(state: LatencyState) -> Option<Option<u32>> {
         LatencyState::Unmeasured
         | LatencyState::Superseded
         | LatencyState::Checking
-        | LatencyState::NotRun => None,
+        | LatencyState::NotRun(_) => None,
     }
 }
 

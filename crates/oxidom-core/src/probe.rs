@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{Config, LatencyMethod};
 use crate::core_options::CoreOptions;
+use crate::ipc::ProbeDetail;
 use crate::model::{Protocol, Server};
 use crate::xray::{config as xray_config, resolve};
 use crate::{fsutil, paths};
@@ -25,6 +26,14 @@ const PROBE_CORE_READY_TIMEOUT: Duration = Duration::from_secs(4);
 /// lands around 1.5 s, so a 3 s budget reported working servers as dead often
 /// enough to see it happen twice in a row.
 const REAL_DELAY_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// A local failure worth a log line but not worth its own wire vocabulary:
+/// the user can do nothing specific about a missing port or an unwritable
+/// directory beyond reading the log.
+fn local(reason: &str) -> ProbeOutcome {
+    log::warn!("probe cannot run: {reason}");
+    ProbeOutcome::Internal(ProbeDetail::Other)
+}
 
 /// How a probe should reach the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +68,10 @@ pub enum ProbeOutcome {
     /// Not the server's fault: nothing on this machine can reach anything.
     NoNetwork,
     /// Not the server's fault either, and not the network's: no core binary,
-    /// no free port, no writable data dir.
-    Internal(&'static str),
+    /// no free port, no writable data dir. The detail is what a user is
+    /// eventually shown, so it names conditions rather than call sites; the
+    /// call site logs the specifics it knows.
+    Internal(ProbeDetail),
 }
 
 /// Measure latency for `server` with the configured method, reporting how it
@@ -110,7 +121,7 @@ pub fn measure(server: &Server, config: &Config, route: Route, bind: Ipv4Addr) -
 /// censor gets to see. Cores are torn down as soon as the number is in, and the
 /// daemon's probe queue caps how many run at once.
 fn real_delay(server: &Server, config: &Config, verb: &str) -> ProbeOutcome {
-    let core = match ProbeCore::start(server, config) {
+    let mut core = match ProbeCore::start(server, config) {
         Ok(core) => core,
         Err(outcome) => return outcome,
     };
@@ -124,15 +135,43 @@ fn real_delay(server: &Server, config: &Config, verb: &str) -> ProbeOutcome {
             server.address,
             PROBE_CORE_READY_TIMEOUT.as_secs()
         );
-        return ProbeOutcome::Timeout;
+        return match core.complaint() {
+            Some(complaint) => refused(server, &complaint),
+            None => ProbeOutcome::Timeout,
+        };
     }
-    http_ping(
+    let outcome = http_ping(
         Ipv4Addr::LOCALHOST,
         core.socks_port,
         &config.latency_test_url,
         verb,
         REAL_DELAY_TIMEOUT,
-    )
+    );
+    // A core that bound its inbound and then refused every stream says why on
+    // stderr — a rejected certificate, most often — and that reason is the
+    // difference between "your server is down" and "this build cannot talk to
+    // it".
+    if !matches!(outcome, ProbeOutcome::Reachable(_))
+        && let Some(complaint) = core.complaint()
+    {
+        return refused(server, &complaint);
+    }
+    outcome
+}
+
+/// Log what the core said, and report a local failure when the complaint names
+/// one. An unrecognised complaint leaves the verdict where it was.
+fn refused(server: &Server, complaint: &str) -> ProbeOutcome {
+    match classify_complaint(complaint) {
+        Some(reason) => {
+            log::warn!("probe core for {} refused: {complaint}", server.address);
+            ProbeOutcome::Internal(reason)
+        }
+        None => {
+            log::debug!("probe core for {} said: {complaint}", server.address);
+            ProbeOutcome::Timeout
+        }
+    }
 }
 
 /// A core running for the length of one probe, on ports nothing else uses.
@@ -154,7 +193,7 @@ impl ProbeCore {
                 // Not the server's fault, and worth saying out loud: without a
                 // core nothing can be measured and nothing can be connected.
                 log::warn!("cannot probe through a server without an Xray core: {error:#}");
-                return Err(ProbeOutcome::Internal("no xray core"));
+                return Err(ProbeOutcome::Internal(ProbeDetail::NoCore));
             }
         };
         // Ports of its own, so a probe never collides with the live tunnel or
@@ -162,33 +201,46 @@ impl ProbeCore {
         // to the core leaves a gap where something else could take it; the core
         // exiting immediately is then indistinguishable from an unreachable
         // server, which is why the gap is kept as short as possible.
-        let socks_port = free_port().map_err(|_| ProbeOutcome::Internal("no free port"))?;
-        let http_port = free_port().map_err(|_| ProbeOutcome::Internal("no free port"))?;
+        let socks_port = free_port().map_err(|_| local("no free port for a probe core"))?;
+        let http_port = free_port().map_err(|_| local("no free port for a probe core"))?;
         // The machine-wide `[core]` and nothing else: a probe belongs to a
         // server, not to a profile, and there is no profile here to fold in.
         // It does mean a server that only works with a profile's fragmentation
         // measures as unreachable — which is why fragmentation belongs in
         // `config.toml` when it is the machine that needs it.
-        let core = CoreOptions::resolve(&config.core, &CoreOptions::default());
+        let mut core = CoreOptions::resolve(&config.core, &CoreOptions::default());
+        // A probe core's log has exactly one reader — this probe — and it is
+        // read to find out why a measurement failed. At the default `warning`
+        // the core stays quiet about a rejected certificate on some transports
+        // while reporting it on others, which is the difference between naming
+        // the problem and blaming the server. Nothing here is written to disk
+        // or shown; the process lives for seconds.
+        core.log_level = crate::core_options::LogLevel::Info;
+        let core = core;
         let generated =
             xray_config::generate(server, Ipv4Addr::LOCALHOST, socks_port, http_port, &core);
         let config_path = paths::data_dir()
-            .map_err(|_| ProbeOutcome::Internal("cannot stage a probe config"))?
+            .map_err(|_| local("no data directory to stage a probe config in"))?
             .join(format!("probe-{socks_port}.json"));
         let body = serde_json::to_string(&generated)
-            .map_err(|_| ProbeOutcome::Internal("cannot stage a probe config"))?;
+            .map_err(|_| local("a probe config would not serialize"))?;
         if let Err(error) = fsutil::write_private_atomic(&config_path, body.as_bytes()) {
             log::warn!("could not write a probe config: {error:#}");
-            return Err(ProbeOutcome::Internal("cannot stage a probe config"));
+            return Err(local("a probe config could not be written"));
         }
         match Command::new(&xray.path)
             .arg("run")
             .arg("-c")
             .arg(&config_path)
-            // A probe core's log is nobody's business: piping it would mean
-            // draining two more pipes per server just to throw the bytes away.
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Both are kept: Xray writes its whole log, refusals included, to
+            // **stdout** — `xray run -test 2>/dev/null` still prints the error
+            // and `1>/dev/null` prints nothing — while other builds and the
+            // runtime itself may still use stderr. Discarding these is how "the
+            // certificate was rejected" reaches a user as "server is
+            // unreachable". The core is killed before either is read, so a full
+            // pipe cannot wedge it.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(child) => Ok(ProbeCore {
@@ -202,10 +254,73 @@ impl ProbeCore {
                     xray.path.display()
                 );
                 remove_quietly(&config_path);
-                Err(ProbeOutcome::Internal("cannot start a probe core"))
+                Err(local("a probe core would not start"))
             }
         }
     }
+}
+
+impl ProbeCore {
+    /// Everything the core has said so far, capped, with the process stopped
+    /// first so the read cannot block on a core that is still running.
+    ///
+    /// Called only on the failing paths: a probe that produced a number has
+    /// nothing to explain.
+    fn complaint(&mut self) -> Option<String> {
+        // The core writes its reason as the connection fails, and killing it
+        // the instant the request returns loses the race often enough to see:
+        // the same rejected certificate was reported for one transport and not
+        // the next. Paid only on the failing path.
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        use std::io::Read as _;
+        let mut text = String::new();
+        // stdout first: that is where Xray's log goes. stderr is read too,
+        // because nothing guarantees the next core keeps that habit.
+        if let Some(stdout) = self.child.stdout.take() {
+            let mut buffer = Vec::new();
+            // A core that fails says so in a line or two; a core that is merely
+            // chatty must not be read forever.
+            let _ = stdout.take(8192).read_to_end(&mut buffer);
+            text.push_str(&String::from_utf8_lossy(&buffer));
+        }
+        if let Some(stderr) = self.child.stderr.take() {
+            let mut buffer = Vec::new();
+            let _ = stderr.take(4096).read_to_end(&mut buffer);
+            text.push_str(&String::from_utf8_lossy(&buffer));
+        }
+        // The line that explains something, if there is one — a refusal is not
+        // reliably the last thing a core says, and taking the last line reports
+        // startup chatter as the reason. Falling back to the last line keeps
+        // the log useful when nothing is recognised.
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find(|line| classify_complaint(line).is_some())
+            .or_else(|| text.lines().map(str::trim).rev().find(|l| !l.is_empty()))?
+            .to_string();
+        (!line.is_empty()).then_some(line)
+    }
+}
+
+/// Turn a core's own complaint into something worth putting in front of a user.
+///
+/// Only conditions this machine can act on are named. Anything else stays
+/// unclassified, because guessing at a core's wording is how a wrong
+/// explanation gets shown with confidence.
+fn classify_complaint(complaint: &str) -> Option<ProbeDetail> {
+    let lower = complaint.to_lowercase();
+    if lower.contains("allowinsecure") {
+        return Some(ProbeDetail::InsecureTlsUnsupported);
+    }
+    if lower.contains("certificate") || lower.contains("x509") {
+        return Some(ProbeDetail::CertificateRejected);
+    }
+    if lower.contains("failed to start") || lower.contains("failed to build") {
+        return Some(ProbeDetail::ConfigRefused);
+    }
+    None
 }
 
 impl Drop for ProbeCore {
@@ -347,7 +462,7 @@ pub fn icmp_ping(host: &str) -> ProbeOutcome {
         .output()
     {
         Ok(output) => output,
-        Err(_) => return ProbeOutcome::Internal("ping is not installed"),
+        Err(_) => return local("`ping` is not installed"),
     };
     match output.status.code() {
         Some(1) => return ProbeOutcome::Unreachable,
@@ -385,7 +500,7 @@ pub fn http_ping(
     let proxy_url = format!("socks5://{address}:{socks_port}");
     let proxy = match ureq::Proxy::new(&proxy_url) {
         Ok(proxy) => proxy,
-        Err(_) => return ProbeOutcome::Internal("bad proxy url"),
+        Err(_) => return local("the probe proxy URL would not parse"),
     };
     let agent = ureq::AgentBuilder::new()
         .proxy(proxy)
@@ -548,6 +663,48 @@ mod tests {
     #[test]
     fn nothing_resolved_is_nothing_to_try() {
         assert!(probe_order(Vec::new()).is_empty());
+    }
+
+    /// Verbatim lines from Xray 26.3.27, collected by running it against a
+    /// server whose certificate it would not accept. A reworded core is
+    /// expected to break these, which is the point: the wording is the only
+    /// thing tying a refusal to an explanation.
+    #[test]
+    fn a_core_saying_why_it_refused_is_understood() {
+        let certificate = "2026/08/17 10:52:33 [Error] transport/internet/websocket: failed to \
+             dial to 127.0.0.1:19002 > tls: failed to verify certificate: x509: certificate \
+             signed by unknown authority";
+        assert_eq!(
+            classify_complaint(certificate),
+            Some(ProbeDetail::CertificateRejected)
+        );
+
+        let insecure = "infra/conf: Failed to build TLS config. > common/errors: The feature \
+             \"allowInsecure\" has been removed and migrated to \"pinnedPeerCertSha256\".";
+        assert_eq!(
+            classify_complaint(insecure),
+            Some(ProbeDetail::InsecureTlsUnsupported),
+            "the insecure-TLS case must win over the word certificate in the same line"
+        );
+
+        let refused = "Failed to start: main: failed to load config files: [probe.json]";
+        assert_eq!(
+            classify_complaint(refused),
+            Some(ProbeDetail::ConfigRefused)
+        );
+    }
+
+    /// Ordinary chatter must not be dressed up as a diagnosis: an unrecognised
+    /// line leaves the verdict alone rather than inventing a local cause.
+    #[test]
+    fn ordinary_core_output_explains_nothing() {
+        for line in [
+            "from tcp:127.0.0.1:40302 accepted tcp:www.gstatic.com:443 [socks-in >> proxy]",
+            "Xray 26.3.27 (Xray, Penetrates Everything.)",
+            "",
+        ] {
+            assert_eq!(classify_complaint(line), None, "{line:?}");
+        }
     }
 
     #[test]
