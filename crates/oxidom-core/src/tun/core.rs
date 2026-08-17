@@ -2,25 +2,26 @@
 
 use std::net::SocketAddrV4;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
-use crate::proc::{push_log, spawn_reader, stop_child};
+use crate::logbook::{self, LogSource, Severity};
+use crate::proc::{spawn_reader, stop_child};
 use crate::tun::resolve::{self, Resolved};
 
 pub struct Tun2socks {
     child: Option<Child>,
-    pub logs: Arc<Mutex<Vec<String>>>,
+    /// Profile whose session owns this interface, for tagging its output.
+    profile: String,
     /// Configured path; empty falls back to the environment and then `PATH`.
     pub binary: String,
 }
 
 impl Tun2socks {
-    pub fn new(binary: String) -> Self {
+    pub fn new(profile: String, binary: String) -> Self {
         Self {
             child: None,
-            logs: Arc::new(Mutex::new(Vec::new())),
+            profile,
             binary,
         }
     }
@@ -31,7 +32,6 @@ impl Tun2socks {
 
     pub fn start(&mut self, device: &str, proxy: SocketAddrV4, mtu: u16) -> Result<()> {
         self.stop();
-        crate::sync::lock(&self.logs).clear();
         if let Err(error) = self.try_start(device, proxy, mtu) {
             let message = format!("{error:#}");
             self.note(&message);
@@ -50,10 +50,10 @@ impl Tun2socks {
             .with_context(|| format!("spawning tun2socks ({})", resolved.path.display()))?;
 
         if let Some(out) = child.stdout.take() {
-            spawn_reader(out, self.logs.clone());
+            spawn_reader(out, LogSource::Tun2socks, self.profile.clone());
         }
         if let Some(err) = child.stderr.take() {
-            spawn_reader(err, self.logs.clone());
+            spawn_reader(err, LogSource::Tun2socks, self.profile.clone());
         }
         self.child = Some(child);
         Ok(())
@@ -75,12 +75,20 @@ impl Tun2socks {
         self.child.as_ref().map(Child::id)
     }
 
-    pub fn recent_logs(&self) -> Vec<String> {
-        crate::sync::lock(&self.logs).clone()
-    }
-
+    /// Record an oxidom-side message about this interface.
+    ///
+    /// Filed under [`LogSource::Tun2socks`] so an interface that never came up
+    /// reads as an interface problem. The output used to be redirected into the
+    /// core's buffer, which made the two indistinguishable — and when no
+    /// session existed to redirect it, it went into a buffer nobody read.
     pub fn note(&self, message: &str) {
-        push_log(&self.logs, format!("oxidom: {message}"));
+        logbook::global().push(
+            LogSource::Tun2socks,
+            Severity::Warn,
+            Some(&self.profile),
+            "oxidom::tun",
+            message.to_string(),
+        );
     }
 }
 

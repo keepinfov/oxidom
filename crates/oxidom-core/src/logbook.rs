@@ -291,13 +291,21 @@ impl LogBook {
             .collect()
     }
 
-    /// Every record still held, oldest first. Serves the pre-cursor D-Bus call
-    /// that older clients still make.
-    pub fn all_texts(&self) -> Vec<String> {
+    /// Every record still held, oldest first, flattened back to the shape the
+    /// pre-cursor D-Bus call promised.
+    ///
+    /// Keeps the `"oxidom: "` prefix that used to be baked into the text, so a
+    /// client older than this book still reads its own lines the way it always
+    /// did. New readers use [`Self::since`] and filter on the fields instead.
+    pub fn legacy_lines(&self) -> Vec<String> {
         crate::sync::lock(&self.inner)
             .records
             .iter()
-            .map(|record| record.text.clone())
+            .map(|record| match record.source {
+                LogSource::Oxidom => format!("oxidom: {}", record.text),
+                LogSource::Xray => record.text.clone(),
+                LogSource::Tun2socks => format!("tun2socks: {}", record.text),
+            })
             .collect()
     }
 
