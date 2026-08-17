@@ -209,6 +209,37 @@ server is down" and "this laptop has no network" deserve different reactions:
 `server is unreachable`, `probe timed out`, `no network connection`, `probe could
 not run on this machine`.
 
+### `oxidom trust <HANDLE> [--trust]`
+
+Show the certificate a server presents, and accept it.
+
+Xray 26 removed `allowInsecure`, so a server with a self-signed or otherwise
+untrusted certificate cannot be reached at all until its certificate is
+**pinned**. Providers still put `allowInsecure=1` in share links, where it now
+does nothing.
+
+```console
+$ oxidom trust home-relay
+relay.example.org:443
+SHA-256 55:de:d3:8f:1e:6c:6b:4a:…:ae:a6:c1:0f
+Run again with --trust to accept this certificate for this server.
+
+$ oxidom trust home-relay --trust
+Pinned. Only this certificate will be accepted for this server.
+```
+
+Without `--trust` it only looks. Compare the fingerprint against the server's
+own certificate before accepting it — that comparison is the entire security of
+this feature:
+
+```sh
+openssl x509 -in cert.pem -outform der | openssl dgst -sha256
+```
+
+A pin accepts **one** certificate rather than any certificate, which is why
+this replaced `allowInsecure` rather than restoring it. Pins survive
+subscription refreshes, like aliases.
+
 ### `oxidom alias <HANDLE> <NEW>`
 
 Give a server a stable human handle. Aliases survive subscription refreshes and

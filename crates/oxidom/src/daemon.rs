@@ -1767,6 +1767,65 @@ impl Service {
         engine.save().map_err(failed)
     }
 
+    /// Read the certificate a server presents, without judging it.
+    ///
+    /// Two steps rather than one — inspect, then trust — so the value stored is
+    /// the one the user was shown. Fetching again inside a `trust` call would
+    /// pin whatever the second handshake returned, which is precisely the
+    /// substitution a pin exists to prevent.
+    fn inspect_certificate(&self, server_id: String) -> fdo::Result<String> {
+        let (address, port, sni) = {
+            let engine = oxidom_core::sync::lock(&self.shared.engine);
+            let server = engine
+                .registry
+                .subscriptions
+                .iter()
+                .flat_map(|subscription| subscription.servers.iter())
+                .find(|server| server.id == server_id)
+                .ok_or_else(|| failed("server not found"))?;
+            let sni = server
+                .spec
+                .stream()
+                .and_then(|stream| stream.sni.clone())
+                .filter(|sni| !sni.is_empty());
+            (server.address.clone(), server.port, sni)
+        };
+        // The engine lock is released first: this is a network round trip, and
+        // holding it here would stall every other client for its duration.
+        let presented =
+            oxidom_core::tls_pin::present(&address, port, sni.as_deref()).map_err(failed)?;
+        Ok(presented.sha256)
+    }
+
+    /// Pin `sha256` for this server, so its certificate is accepted from now on
+    /// and no other is.
+    ///
+    /// This is what replaces `allowInsecure`, which Xray 26 removed: that
+    /// accepted any certificate on every connection, while a pin accepts one
+    /// certificate the user looked at.
+    fn trust_certificate(&self, server_id: String, sha256: String) -> fdo::Result<()> {
+        let pin = sha256.trim().to_ascii_lowercase();
+        if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(failed(
+                "a certificate pin is 64 hexadecimal characters (SHA-256 of the certificate)",
+            ));
+        }
+        let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        let server = engine
+            .registry
+            .subscriptions
+            .iter_mut()
+            .flat_map(|subscription| subscription.servers.iter_mut())
+            .find(|server| server.id == server_id)
+            .ok_or_else(|| failed("server not found"))?;
+        let stream = server
+            .spec
+            .stream_mut()
+            .ok_or_else(|| failed("this server has no TLS settings to pin a certificate on"))?;
+        stream.pin_sha256 = Some(pin);
+        engine.save().map_err(failed)
+    }
+
     fn set_hwid(&self, subscription_id: String, enabled: bool) -> fdo::Result<()> {
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
         if let Some(subscription) = engine

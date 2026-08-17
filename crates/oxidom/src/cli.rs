@@ -95,6 +95,18 @@ pub enum Command {
         /// New globally unique alias.
         new: String,
     },
+    /// Show a server's certificate and, with --trust, accept it from now on.
+    ///
+    /// Xray 26 removed `allowInsecure`, so a server with a self-signed
+    /// certificate is unreachable until its certificate is pinned. This is how
+    /// to look at one before deciding.
+    Trust {
+        /// Existing exact alias/id or a unique alias/name substring.
+        handle: String,
+        /// Pin the certificate shown, instead of only printing it.
+        #[arg(long)]
+        trust: bool,
+    },
     /// Manage named connection profiles.
     Profile {
         #[command(subcommand)]

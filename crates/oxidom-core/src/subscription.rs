@@ -222,6 +222,18 @@ fn preserve_server_identity(previous: &[Server], refreshed: &mut [Server]) {
         server.id.clone_from(&previous[index].id);
         server.alias.clone_from(&previous[index].alias);
         server.latency_ms = previous[index].latency_ms;
+        // A pinned certificate is the user's decision about *this* server, not
+        // something the provider sends; a refresh that dropped it would make
+        // the server unreachable again and ask the question a second time.
+        if let Some(pin) = previous[index]
+            .spec
+            .stream()
+            .and_then(|stream| stream.pin_sha256.clone())
+            && let Some(stream) = server.spec.stream_mut()
+            && stream.pin_sha256.is_none()
+        {
+            stream.pin_sha256 = Some(pin);
+        }
     }
 }
 
@@ -416,5 +428,79 @@ mod tests {
         assert_eq!(refreshed[0].alias.as_deref(), Some("saved-handle"));
         assert_eq!(refreshed[0].latency_ms, Some(42));
         assert_eq!(refreshed[0].name, "New");
+    }
+
+    /// A pinned certificate is the user's answer to "do you trust this
+    /// server", not something the provider sends. A refresh that dropped it
+    /// would make the server unreachable again and ask a second time — and the
+    /// provider's fresh copy of the entry never carries a pin, so the value
+    /// has to be carried across deliberately.
+    #[test]
+    fn a_refresh_keeps_a_trusted_certificate() {
+        let mut previous =
+            parse_link("vless://test-id@example.com:443?encryption=none&type=tcp&security=tls#Old")
+                .unwrap();
+        previous
+            .spec
+            .stream_mut()
+            .expect("vless carries a stream")
+            .pin_sha256 = Some("a".repeat(64));
+
+        let mut refreshed = vec![
+            parse_link("vless://test-id@example.com:443?encryption=none&type=tcp&security=tls#New")
+                .unwrap(),
+        ];
+        assert_eq!(
+            refreshed[0]
+                .spec
+                .stream()
+                .and_then(|stream| stream.pin_sha256.clone()),
+            None,
+            "a link never carries a pin, which is why this must be carried over"
+        );
+
+        preserve_server_identity(&[previous], &mut refreshed);
+
+        assert_eq!(
+            refreshed[0]
+                .spec
+                .stream()
+                .and_then(|stream| stream.pin_sha256.clone()),
+            Some("a".repeat(64))
+        );
+    }
+
+    /// A provider that starts sending its own pin is answering the same
+    /// question with better authority, so it is not overwritten.
+    #[test]
+    fn a_pin_from_the_provider_wins_over_a_carried_one() {
+        let mut previous =
+            parse_link("vless://test-id@example.com:443?encryption=none&type=tcp&security=tls#Old")
+                .unwrap();
+        previous
+            .spec
+            .stream_mut()
+            .expect("vless carries a stream")
+            .pin_sha256 = Some("a".repeat(64));
+
+        let mut refreshed = vec![
+            parse_link("vless://test-id@example.com:443?encryption=none&type=tcp&security=tls#New")
+                .unwrap(),
+        ];
+        refreshed[0]
+            .spec
+            .stream_mut()
+            .expect("vless carries a stream")
+            .pin_sha256 = Some("b".repeat(64));
+
+        preserve_server_identity(&[previous], &mut refreshed);
+
+        assert_eq!(
+            refreshed[0]
+                .spec
+                .stream()
+                .and_then(|stream| stream.pin_sha256.clone()),
+            Some("b".repeat(64))
+        );
     }
 }

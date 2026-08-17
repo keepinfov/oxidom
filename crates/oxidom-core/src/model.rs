@@ -198,6 +198,45 @@ pub enum OutboundSpec {
 }
 
 impl OutboundSpec {
+    /// Whether these describe the same connection, ignoring marks the user
+    /// made locally.
+    ///
+    /// A pinned certificate is one such mark: the provider never sends it, so
+    /// comparing it would mean a server stopped matching its own refreshed
+    /// entry the moment someone trusted its certificate — taking the alias and
+    /// the stable id down with the pin. The clone happens only when the cheap
+    /// comparison already failed, and these lists are hundreds of entries at
+    /// most.
+    pub fn same_connection_as(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        let mut left = self.clone();
+        let mut right = other.clone();
+        for spec in [&mut left, &mut right] {
+            if let Some(stream) = spec.stream_mut() {
+                stream.pin_sha256 = None;
+            }
+        }
+        left == right
+    }
+
+    /// The same block, to write to. Only one thing writes to it — pinning a
+    /// certificate the user chose to trust — and that is deliberately a
+    /// separate act from parsing a link.
+    pub fn stream_mut(&mut self) -> Option<&mut StreamSettings> {
+        match self {
+            OutboundSpec::Vless { stream, .. }
+            | OutboundSpec::Vmess { stream, .. }
+            | OutboundSpec::Trojan { stream, .. } => Some(stream),
+            OutboundSpec::Shadowsocks { .. }
+            | OutboundSpec::Socks { .. }
+            | OutboundSpec::Http { .. }
+            | OutboundSpec::Hysteria2 { .. }
+            | OutboundSpec::XrayProfile { .. } => None,
+        }
+    }
+
     /// The transport/security block, for the variants that have one. Lets
     /// callers ask about TLS without matching every variant themselves.
     pub fn stream(&self) -> Option<&StreamSettings> {
@@ -291,7 +330,7 @@ impl Server {
         self.protocol == other.protocol
             && self.address == other.address
             && self.port == other.port
-            && self.spec == other.spec
+            && self.spec.same_connection_as(&other.spec)
     }
 }
 

@@ -18,6 +18,14 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **Trusting a server's certificate.** Xray 26 removed `allowInsecure`, so a
+  server with a self-signed certificate became unreachable no matter what its
+  share link said — and failed with an error that blamed the server. `oxidom
+  trust <server>` now shows the certificate's SHA-256 fingerprint, and
+  `--trust` pins it. A pin accepts one certificate rather than any
+  certificate, which is why it replaces `allowInsecure` instead of restoring
+  it. Pins survive subscription refreshes, like aliases.
+
 - An **Appearance** setting: follow the desktop, or pin the window to light or
   dark. It applies as it is picked and survives a restart. Until now the app
   followed the system scheme and offered no way to say otherwise, which leaves
