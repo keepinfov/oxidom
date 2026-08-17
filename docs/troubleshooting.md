@@ -207,8 +207,23 @@ journalctl -u oxidom.service -f          # system daemon
 journalctl --user -f | grep oxidom       # session daemon
 ```
 
-Recent Xray core output is kept in memory and shown on the GUI's **Logs** page —
-it is not written to a file.
+The GUI's **Logs** page shows the Xray core, the network interface helper and
+oxidom's own reasoning in one stream, each line tagged with which of the three
+said it. Filter by source, hide anything below a chosen severity, or search the
+text. **Save** writes what is on screen — filters included — wherever you choose.
+
+Scroll up and the view stops following; new lines keep arriving below without
+moving what you are reading. The button at the bottom right takes you back to
+live.
+
+The graphical client also keeps its own log on disk, because it detaches from the
+terminal and would otherwise leave nothing behind if it were killed:
+
+```sh
+~/.local/share/oxidom/oxidom-gui.log     # 0600, rotated at 2MB (.log.1 kept)
+```
+
+The daemon has no such file — its stderr already reaches the journal above.
 
 Raise the level with `RUST_LOG`:
 

@@ -168,10 +168,17 @@ core refuses to start rather than quietly not matching. `pkgs.xray` is a wrapper
   `OXIDOM_XRAY_BIN` environment variable (set by the Nix wrapper and the dev shell), then `xray`
   on `PATH`. Resolution is a preflight (`xray::resolve`) that runs before spawning, so a missing
   core is reported as an actionable error naming both the path tried and where it came from.
-  Then spawn `<resolved> run -c <configfile>`. Capture
-  stdout/stderr to an in-memory ring buffer surfaced in a "Logs" view; oxidom's own failure
-  reasons go into the same buffer prefixed `oxidom:`, so the Logs view explains a failure even
-  when xray never started.
+  Then spawn `<resolved> run -c <configfile>`. Capture stdout/stderr into the process log book
+  (`oxidom_core::logbook`), tagged `xray`, parsed for the `[Level]` and subsystem the core prints.
+  `tun2socks` writes to the same book tagged `tun2socks`, and oxidom's own reasoning — the `log`
+  facade as well as `note`/`fail` — is tagged `oxidom`. The Logs view therefore explains a failure
+  even when xray never started, and says which of the three said so.
+- **The book is never cleared on connect (binding).** It is shared by every session, so wiping it
+  for one erases the others. Each run's boundary is a `spawn_seq` watermark taken at the top of
+  `connect`, and callers that diagnose a failure from the core's own words read only records at or
+  after it **and** tagged `xray`. Both halves are required: without the watermark a marker from a
+  previous attempt is read as this attempt's reason, and without the source filter oxidom's own
+  note about an unrecognised obfuscation type matches `UNSUPPORTED_PROTOCOL_MARKERS`.
 - Track state: `Disconnected | Connecting | Connected | Error(msg)`. Consider "Connected" once
   the process is up and a latency probe through the SOCKS inbound succeeds.
 - Stop cleanly on disconnect/app-exit (SIGTERM, then SIGKILL after timeout). The same escalation

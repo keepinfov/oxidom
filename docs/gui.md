@@ -23,7 +23,7 @@ tray unit behave normally.
 | **Profiles** | Named connections, one row per profile; run them, edit them, set their interface. |
 | **Subscriptions** | Add, refresh, reorder and remove subscriptions; quota and expiry. |
 | **Settings** | Ports, system proxy, reconnect, probe method, subscription User-Agent, core paths. |
-| **Logs** | Recent Xray core output, kept in memory. |
+| **Logs** | The Xray core, the interface helper and oxidom itself, filterable by source and severity. |
 
 The sidebar collapses under a width breakpoint, so the window is usable narrow.
 
@@ -155,6 +155,29 @@ repointing it.
 | **Subscription User-Agent** | Free text, plus a **Client preset** list that fills it. |
 | **Advanced › Xray / tun2socks / nft binary** | Ignored by a **system** daemon on purpose — setting a binary path on a privileged daemon would be a remote-execution primitive. |
 | **In use by the daemon** | What the daemon actually resolved, which is not always what you typed. |
+
+## Logs
+
+Three programs report here, and every line says which one it was:
+
+| Source | What it is |
+|---|---|
+| **oxidom** | What the app itself decided, and why — including the reasons a connection was refused before the core ever started. |
+| **Xray** | What the core printed. Its own severity and subsystem are read out of the line. |
+| **Interface** | The `tun2socks` helper. Kept separate from the core because an interface that never came up and a core that refused its config are different problems. |
+
+Narrow the stream with the source switcher, the severity list and the search box;
+under a narrow window the last two fold into a menu. **Copy** and **Save** both
+take what is on screen, filters included. **Clear** empties the view and the
+daemon's buffer.
+
+The view follows new output only while you are at the bottom. Scroll up and it
+stops, so lines arriving below never move what you are reading; the button at the
+bottom right returns you to live. If output arrives faster than it can be
+collected, the missing count is stated in place rather than passed over.
+
+Raise what the core itself reports with **Settings › Core behaviour › Log level**.
+Raise what oxidom reports about itself with `RUST_LOG`, or `oxidom-gui --debug`.
 
 ## Tray
 
