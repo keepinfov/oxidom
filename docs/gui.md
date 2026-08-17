@@ -113,6 +113,25 @@ than ignored.
 
 Locally pasted share links live in a built-in subscription called **My servers**.
 
+### A certificate you have to decide about
+
+Xray 26 removed the setting that skipped certificate verification, so a server
+with a self-signed certificate cannot connect on its own — links that still
+carry `allowInsecure=1` get nothing from it. The first time such a connection
+fails, oxidom shows what the server presented and asks:
+
+> **Trust this certificate?** … SHA-256 97:89:79:cf:… Accepting pins this one
+> certificate for this server. Any other certificate, including a replacement,
+> will be refused until you look again.
+
+Accepting stores the fingerprint and reconnects. It is asked once per server,
+survives subscription refreshes, and can also be done from the command line with
+[`oxidom trust`](cli.md#oxidom-trust-handle---trust) — where you can compare the
+fingerprint against the server's own certificate first.
+
+If a server that is already pinned fails the same way, the dialog does not
+reappear: pinning did not fix it, and asking again in a loop would not either.
+
 Removing a subscription disconnects any session using one of its servers, and a
 refresh that drops the active server disconnects that session rather than silently
 repointing it.

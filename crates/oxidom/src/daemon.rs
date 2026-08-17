@@ -2607,6 +2607,16 @@ fn confirmation_failure(
             oxidom_core::xray::core::HYSTERIA2_CORE_HINT
         );
     }
+    // The core says why it would not carry traffic, in the same words it uses
+    // when a probe asks. Without this the user is told the server "did not pass
+    // its latency check" — true, and useless, when the cause is a certificate
+    // this build was never going to accept.
+    if let Some(detail) = logs
+        .iter()
+        .find_map(|line| oxidom_core::probe::classify_complaint(line))
+    {
+        return detail.message().to_string();
+    }
     if !inbound_ready {
         return "the local SOCKS inbound never came up — the core is not carrying traffic"
             .to_string();

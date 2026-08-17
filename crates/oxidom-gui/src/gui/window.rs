@@ -966,6 +966,17 @@ fn set_window_icon(window: &adw::ApplicationWindow) {
     });
 }
 
+/// What trusting a certificate was for. Trusting is never the goal in itself:
+/// it is asked for because something failed, and that something is what should
+/// happen next.
+#[derive(Debug, Clone)]
+enum AfterTrust {
+    /// The connection that failed, tried again.
+    Reconnect(String),
+    /// Nothing was connecting; a fresh reading replaces the failed one.
+    Measure,
+}
+
 impl Controller {
     /// Keyboard access to everything reachable from the header and sidebar.
     /// GTK needs a `GActionMap` on the window plus app-level accelerators;
@@ -2481,6 +2492,28 @@ impl Controller {
         );
     }
 
+    /// Stop and start one profile, for the case where its session is alive but
+    /// failed and the reason has just been fixed.
+    fn reconnect_profile(self: &Rc<Self>, name: String) {
+        let work_name = name.clone();
+        let finish_name = name.clone();
+        self.client_job(
+            UiOperation::for_profile(UiOperationKind::UpProfile, name),
+            move |client| {
+                // The failure this follows is not a reason to stop: a profile
+                // that was never up is exactly what `up` wants.
+                let _ = client.down_profile(&work_name);
+                Ok(refresh_profiles_after(
+                    client,
+                    client.up_profile(&work_name),
+                ))
+            },
+            move |controller, result| {
+                controller.finish_up_profile(finish_name, result);
+            },
+        );
+    }
+
     fn repoint_and_up(self: &Rc<Self>, name: String, profile: Profile) {
         let work_name = name.clone();
         let finish_name = name.clone();
@@ -3688,7 +3721,40 @@ impl Controller {
         let toast = adw::Toast::new(&summarize_error(title, detail));
         toast.set_priority(adw::ToastPriority::High);
         toast.set_timeout(8);
-        let open_settings = ipc::error_action(detail) == ipc::ErrorAction::OpenSettings;
+        let action = ipc::error_action(detail);
+        // A rejected certificate is the one failure that asks the user a
+        // question, and a question does not belong in a toast that leaves after
+        // eight seconds taking the only way to answer it with it. The dialog
+        // opens instead of the toast.
+        // Only the *first* time: a server that already carries a pin and still
+        // fails was not fixed by pinning, and re-opening the dialog on every
+        // failed attempt would loop. The offer stays reachable on the toast.
+        let unpinned = |controller: &Self, server_id: &str| {
+            controller
+                .state
+                .borrow()
+                .subscriptions
+                .iter()
+                .flat_map(|subscription| subscription.servers.iter())
+                .find(|server| server.id == server_id)
+                .and_then(|server| server.spec.stream())
+                .is_none_or(|stream| stream.pin_sha256.is_none())
+        };
+        if action == ipc::ErrorAction::TrustCertificate
+            && let Some(server_id) = self.state.borrow().ui.failed_id.clone()
+            && unpinned(self, &server_id)
+        {
+            let name = self.server_label(&server_id);
+            // The profile whose connection just failed is the thing to retry;
+            // without one this was a bare measurement, so measure again.
+            let after = match self.state.borrow().ui.selected_profile.clone() {
+                profile if !profile.is_empty() => AfterTrust::Reconnect(profile),
+                _ => AfterTrust::Measure,
+            };
+            self.present_trust_dialog(server_id, name, after);
+            return;
+        }
+        let open_settings = action == ipc::ErrorAction::OpenSettings;
         toast.set_button_label(Some(if open_settings {
             "Open Settings"
         } else {
@@ -3712,6 +3778,158 @@ impl Controller {
             }
         });
         self.toasts.add_toast(toast);
+    }
+
+    /// What to call a server in a sentence. Falls back to the id, which is at
+    /// least something the user can match against a card.
+    fn server_label(&self, server_id: &str) -> String {
+        self.state
+            .borrow()
+            .subscriptions
+            .iter()
+            .flat_map(|subscription| subscription.servers.iter())
+            .find(|server| server.id == server_id)
+            .map(|server| format!("{} ({}:{})", server.name, server.address, server.port))
+            .unwrap_or_else(|| server_id.to_string())
+    }
+
+    /// Show what a server presents and offer to accept it.
+    ///
+    /// Two round trips to the daemon, on a worker thread each: read the
+    /// certificate, then — only if the user says so — pin the value that was
+    /// read. The second call passes the fingerprint that was *displayed*, never
+    /// a fresh one, because pinning whatever a later handshake returns is the
+    /// substitution a pin exists to prevent.
+    fn present_trust_dialog(
+        self: &Rc<Self>,
+        server_id: String,
+        server_name: String,
+        after: AfterTrust,
+    ) {
+        let client = self.state.borrow().client.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let id = server_id.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(client.inspect_certificate(&id));
+        });
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            let Ok(result) = receiver.try_recv() else {
+                return glib::ControlFlow::Continue;
+            };
+            let Some(controller) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            match result {
+                Ok(sha256) => {
+                    controller.ask_to_trust(&server_id, &server_name, &sha256, after.clone())
+                }
+                // Reading the certificate is itself a connection, and it fails
+                // for all the ordinary reasons. Saying so beats a dialog with
+                // an empty fingerprint in it.
+                Err(error) => {
+                    controller.show_error("Could not read the certificate", &format!("{error:#}"))
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn ask_to_trust(
+        self: &Rc<Self>,
+        server_id: &str,
+        server_name: &str,
+        sha256: &str,
+        after: AfterTrust,
+    ) {
+        let readable = sha256
+            .as_bytes()
+            .chunks(16)
+            .map(|line| {
+                line.chunks(2)
+                    .map(|pair| String::from_utf8_lossy(pair).to_string())
+                    .collect::<Vec<_>>()
+                    .join(":")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dialog = adw::AlertDialog::new(
+            Some("Trust this certificate?"),
+            Some(&format!(
+                "{server_name} presents a certificate this build will not accept on its own — \
+                 Xray 26 removed the setting that skipped verification.\n\n\
+                 SHA-256\n{readable}\n\n\
+                 Accepting pins this one certificate for this server. Any other certificate, \
+                 including a replacement, will be refused until you look again.",
+            )),
+        );
+        dialog.set_body_use_markup(false);
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("trust", "Trust");
+        // Not `Suggested`: accepting a certificate nobody checked is the thing
+        // this dialog exists to slow down, so the button does not invite a
+        // reflex.
+        dialog.set_response_appearance("trust", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, {
+            let weak = Rc::downgrade(self);
+            let server_id = server_id.to_string();
+            let sha256 = sha256.to_string();
+            move |dialog, response| {
+                dialog.close();
+                if response != "trust" {
+                    return;
+                }
+                let Some(controller) = weak.upgrade() else {
+                    return;
+                };
+                controller.trust_certificate(&server_id, &sha256, after.clone());
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn trust_certificate(self: &Rc<Self>, server_id: &str, sha256: &str, after: AfterTrust) {
+        let client = self.state.borrow().client.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let id = server_id.to_string();
+        let pin = sha256.to_string();
+        std::thread::spawn(move || {
+            let _ = sender.send(client.trust_certificate(&id, &pin));
+        });
+        let weak = Rc::downgrade(self);
+        let server_id = server_id.to_string();
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            let Ok(result) = receiver.try_recv() else {
+                return glib::ControlFlow::Continue;
+            };
+            let Some(controller) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            match result {
+                Ok(()) => {
+                    controller.show_message("Certificate trusted");
+                    // Trusting is never the goal in itself: it was asked for
+                    // because something failed, and leaving that failure on
+                    // screen makes the user repeat the action they already
+                    // took.
+                    match &after {
+                        // Down first: a session that failed is still *up*, and
+                        // `up` on a live profile refuses rather than redialling
+                        // — which would report the pin as not having helped.
+                        AfterTrust::Reconnect(profile) => {
+                            controller.reconnect_profile(profile.clone())
+                        }
+                        AfterTrust::Measure => controller.probe_one(server_id.clone(), false),
+                    }
+                }
+                Err(error) => {
+                    controller.show_error("Could not trust the certificate", &format!("{error:#}"))
+                }
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     /// Full error text, selectable and dismissible.
