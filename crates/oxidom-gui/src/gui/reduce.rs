@@ -1774,7 +1774,7 @@ pub(super) fn latency_state(
             // with, no free port, no place to stage its config. Folding it in
             // with a server that stayed silent is how a machine with no core
             // reports nine healthy servers as dead.
-            Some(ProbeFailure::Unknown) => LatencyState::NotRun,
+            Some(ProbeFailure::Unknown) => LatencyState::NotRun(reading.detail),
             _ => LatencyState::Unreachable,
         },
     }
@@ -3483,7 +3483,7 @@ mod tests {
         );
         assert_eq!(
             latency(&effects, "a"),
-            Some(LatencyState::NotRun),
+            Some(LatencyState::NotRun(None)),
             "a check that never left this machine says nothing about the server"
         );
     }

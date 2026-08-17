@@ -739,9 +739,7 @@ impl Shared {
                     probe::ProbeOutcome::Reachable(measured) => {
                         LatencyReading::ok(measured.ms, ProbeRoute::Direct, measured.method)
                     }
-                    outcome => {
-                        LatencyReading::failed(wire_failure(&outcome), ProbeRoute::Direct, method)
-                    }
+                    outcome => wire_reading(&outcome, ProbeRoute::Direct, method),
                 }
             }
             // The server was removed between the request and its slot. Nothing
@@ -806,7 +804,7 @@ impl Shared {
                 )
             }
             _ => (
-                probe::ProbeOutcome::Internal("session selection is missing"),
+                probe::ProbeOutcome::Internal(oxidom_core::ipc::ProbeDetail::Other),
                 requested_method,
             ),
         })
@@ -819,11 +817,9 @@ impl Shared {
             Some((probe::ProbeOutcome::Reachable(measured), _)) => {
                 LatencyReading::ok(measured.ms, ProbeRoute::Proxied, measured.method)
             }
-            Some((outcome, attempted_method)) => LatencyReading::failed(
-                wire_failure(&outcome),
-                ProbeRoute::Proxied,
-                attempted_method,
-            ),
+            Some((outcome, attempted_method)) => {
+                wire_reading(&outcome, ProbeRoute::Proxied, attempted_method)
+            }
             None => LatencyReading::failed(
                 ProbeFailure::Unknown,
                 ProbeRoute::Proxied,
@@ -1447,13 +1443,29 @@ fn failed(error: impl std::fmt::Display) -> fdo::Error {
 }
 
 /// Translate the prober's richer local outcome into the stable wire failure.
+/// A failed reading that carries the local reason, when there is one. A
+/// server that simply did not answer has nothing to add; a machine that could
+/// not run the check does, and that is the difference the card shows.
+fn wire_reading(
+    outcome: &probe::ProbeOutcome,
+    route: ProbeRoute,
+    method: LatencyMethod,
+) -> LatencyReading {
+    match outcome {
+        probe::ProbeOutcome::Internal(detail) => {
+            LatencyReading::failed_locally(wire_failure(outcome), *detail, route, method)
+        }
+        _ => LatencyReading::failed(wire_failure(outcome), route, method),
+    }
+}
+
 fn wire_failure(outcome: &probe::ProbeOutcome) -> ProbeFailure {
     match outcome {
         probe::ProbeOutcome::Unreachable => ProbeFailure::Unreachable,
         probe::ProbeOutcome::Timeout => ProbeFailure::Timeout,
         probe::ProbeOutcome::NoNetwork => ProbeFailure::NoNetwork,
-        probe::ProbeOutcome::Internal(reason) => {
-            log::warn!("probe could not run: {reason}");
+        probe::ProbeOutcome::Internal(detail) => {
+            log::warn!("probe could not run: {}", detail.message());
             ProbeFailure::Unknown
         }
         // Only failed outcomes are passed here. Keep this total so an
@@ -2906,10 +2918,12 @@ mod tests {
         // well past the threshold.
         for _ in 0..TUNNEL_DEATH_STRIKES + 2 {
             assert!(!shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::NoNetwork)));
-            assert!(
-                !shared
-                    .note_tunnel_probe("default", Some(&probe::ProbeOutcome::Internal("no core")))
-            );
+            assert!(!shared.note_tunnel_probe(
+                "default",
+                Some(&probe::ProbeOutcome::Internal(
+                    oxidom_core::ipc::ProbeDetail::NoCore
+                ))
+            ));
             assert!(!shared.note_tunnel_probe("default", None));
         }
         Ok(())
@@ -3620,7 +3634,9 @@ mod tests {
     #[test]
     fn a_local_fault_never_blames_the_server() {
         assert_eq!(
-            wire_failure(&probe::ProbeOutcome::Internal("test fault")),
+            wire_failure(&probe::ProbeOutcome::Internal(
+                oxidom_core::ipc::ProbeDetail::Other
+            )),
             ProbeFailure::Unknown
         );
     }

@@ -7,6 +7,7 @@ use gtk::glib;
 use gtk::subclass::prelude::*;
 
 use oxidom_core::config::LatencyMethod;
+use oxidom_core::ipc::ProbeDetail;
 use oxidom_core::model::Server;
 
 use super::views::{
@@ -156,7 +157,7 @@ pub enum LatencyState {
     /// apart from [`LatencyState::Unreachable`] because it says nothing about
     /// the server: reporting a local failure as an unresponsive server sends
     /// people to replace working nodes.
-    NotRun,
+    NotRun(Option<ProbeDetail>),
 }
 
 /// How a reading was taken, for the badge's tooltip.
@@ -747,11 +748,17 @@ impl ServerCard {
             // The offline colour, not the error one: nothing here is the
             // server's doing, and the amber says "this machine" the way the
             // no-network state already does.
-            LatencyState::NotRun => {
-                self.show_label(
-                    "⊘",
-                    "The check could not run on this machine — see Settings › Xray core",
-                );
+            // The daemon names the condition when it knows it — a rejected
+            // certificate is not "see Settings › Xray core", and telling
+            // someone to look at a core that is present and working is worse
+            // than saying nothing.
+            LatencyState::NotRun(detail) => {
+                let tooltip = match detail {
+                    Some(detail) => format!("Not measured: {}", detail.message()),
+                    None => "The check could not run on this machine — see Settings › Xray core"
+                        .to_string(),
+                };
+                self.show_label("⊘", &tooltip);
                 self.latency.add_css_class("latency-offline");
             }
         }

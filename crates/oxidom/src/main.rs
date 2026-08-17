@@ -588,12 +588,16 @@ fn print_probe_result(probes: &ProbeState, sessions: &[SessionInfo], server: &Se
     {
         return print_line(value);
     }
-    let reason = match reading.failure {
-        Some(ProbeFailure::Unreachable) => "server is unreachable",
-        Some(ProbeFailure::Timeout) => "probe timed out",
-        Some(ProbeFailure::NoNetwork) => "no network connection",
-        Some(ProbeFailure::Unknown) => "probe could not run on this machine",
-        None => "daemon returned an invalid probe reading",
+    // The detail, when the daemon sent one, says which local condition it was
+    // — "the server's certificate was rejected" rather than the shrug that
+    // sends people to replace a server that is fine.
+    let reason = match (reading.failure, reading.detail) {
+        (Some(ProbeFailure::Unknown), Some(detail)) => detail.message(),
+        (Some(ProbeFailure::Unreachable), _) => "server is unreachable",
+        (Some(ProbeFailure::Timeout), _) => "probe timed out",
+        (Some(ProbeFailure::NoNetwork), _) => "no network connection",
+        (Some(ProbeFailure::Unknown), None) => "probe could not run on this machine",
+        (None, _) => "daemon returned an invalid probe reading",
     };
     Err(Failure::message(format!(
         "{}: {reason}",
