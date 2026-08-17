@@ -22,6 +22,11 @@ surface, packaging, or the CLI belongs here.
   dark. It applies as it is picked and survives a restart. Until now the app
   followed the system scheme and offered no way to say otherwise, which leaves
   nothing to say it on a desktop that has no such setting.
+- **Ctrl+V imports what is on the clipboard.** A subscription URL opens Add
+  Subscription, share links open Import Server, both already filled in; opening
+  either dialog by hand fills an empty field the same way. Copying a link and
+  then having to find the right dialog and paste again was the step nobody
+  wanted.
 - A working agreement for contributors and agents ([AGENTS.md](AGENTS.md)), the
   binding implementation contract split into [docs/spec/](docs/spec/), a
   contributor guide, this changelog, a security policy, continuous integration,

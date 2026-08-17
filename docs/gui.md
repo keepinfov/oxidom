@@ -104,6 +104,13 @@ Two per-subscription settings worth knowing:
   value applies on the next **Update**. See
   [subscriptions-and-protocols.md](subscriptions-and-protocols.md#the-user-agent-decides-the-format).
 
+**Ctrl+V** anywhere outside a text field takes whatever is on the clipboard and
+opens the dialog it belongs to, filled in: a subscription URL opens *Add
+subscription*, one or more share links open *Import server*. Opening either
+dialog by hand does the same for an empty field, so a link copied a moment ago
+is already there. Nothing importable on the clipboard is said in a toast rather
+than ignored.
+
 Locally pasted share links live in a built-in subscription called **My servers**.
 
 Removing a subscription disconnects any session using one of its servers, and a
