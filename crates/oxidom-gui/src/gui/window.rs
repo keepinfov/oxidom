@@ -21,9 +21,9 @@ use oxidom_core::{paths, sysproxy};
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
-    SwitcherItem, active_latency_for, card_action, latency_states, other_profiles_message,
-    pool_action, pool_for_profile, pool_short_label, reduce, selected_status, session_for,
-    session_rows, switcher_items, switcher_visible,
+    SwitcherItem, active_latency_for, card_action, latency_states, missing_core_message,
+    other_profiles_message, pool_action, pool_for_profile, pool_short_label, reduce,
+    selected_status, session_for, session_rows, switcher_items, switcher_visible,
 };
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
@@ -193,6 +193,8 @@ struct Controller {
     compact_search: gtk::SearchEntry,
     search_bar: gtk::SearchBar,
     profiles_banner: adw::Banner,
+    /// Shown while the daemon cannot resolve an Xray core.
+    core_banner: adw::Banner,
     search_toggle: gtk::ToggleButton,
     sidebar_toggle: gtk::Button,
     header_status: gtk::Button,
@@ -549,6 +551,24 @@ fn build(
         }
     });
     settings.set_runtime_info(initial_runtime.as_ref());
+
+    // Apply the saved scheme before anything is on screen, so a window pinned
+    // to light does not flash the desktop's dark one on the way up.
+    let gui_prefs = servers.prefs();
+    let saved_scheme = gui_prefs.borrow().color_scheme;
+    adw::StyleManager::default().set_color_scheme(saved_scheme.to_adw());
+    settings.set_color_scheme(saved_scheme);
+    settings.connect_color_scheme_changed({
+        let gui_prefs = gui_prefs.clone();
+        move |scheme| {
+            adw::StyleManager::default().set_color_scheme(scheme.to_adw());
+            let mut prefs = gui_prefs.borrow_mut();
+            prefs.color_scheme = scheme;
+            if let Err(error) = prefs.save() {
+                log::warn!("could not save the colour scheme: {error:#}");
+            }
+        }
+    });
     let settings_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     settings_actions.append(&settings.reset_button());
     settings_actions.append(&settings.apply_button());
@@ -579,6 +599,19 @@ fn build(
         .revealed(other_profiles_message(&initial_status.sessions, "default").is_some())
         .build();
     profiles_banner.set_button_label(Some("Profiles"));
+    // A missing core is not a passing condition — nothing connects and nothing
+    // is measured until it is fixed — but its only other symptom is a field
+    // partway down Settings that nobody visits until something already went
+    // wrong.
+    let core_banner = adw::Banner::builder()
+        .title(
+            missing_core_message(initial_runtime.as_ref())
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .revealed(missing_core_message(initial_runtime.as_ref()).is_some())
+        .build();
+    core_banner.set_button_label(Some("Settings"));
     let search_toggle = gtk::ToggleButton::builder()
         .icon_name("edit-find-symbolic")
         .tooltip_text("Search servers")
@@ -682,6 +715,7 @@ fn build(
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
     content.append(&search_bar);
+    content.append(&core_banner);
     content.append(&profiles_banner);
     content.append(&stack);
 
@@ -744,6 +778,7 @@ fn build(
         compact_search,
         search_bar,
         profiles_banner,
+        core_banner,
         search_toggle,
         sidebar_toggle,
         header_status,
@@ -1162,6 +1197,14 @@ impl Controller {
             move |_| {
                 if let Some(controller) = weak.upgrade() {
                     controller.navigate_to(Page::Profiles);
+                }
+            }
+        });
+        self.core_banner.connect_button_clicked({
+            let weak = Rc::downgrade(self);
+            move |_| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.navigate_to(Page::Settings);
                 }
             }
         });
@@ -2180,6 +2223,11 @@ impl Controller {
             for id in ids {
                 if !state.ui.checking.contains_key(&id) {
                     state.ui.checking.insert(id.clone(), ProbeWait::new(now));
+                    // A sweep says nothing about one silent server, but it must
+                    // say when nothing was measured at all: without this, a
+                    // machine with no Xray core marks every card and explains
+                    // none of them.
+                    state.ui.notify_local.insert(id.clone());
                     new_ids.push(id);
                 }
             }
@@ -2239,6 +2287,7 @@ impl Controller {
             for id in ids {
                 if state.ui.checking.remove(id).is_some() {
                     state.ui.notify_probe.remove(id);
+                    state.ui.notify_local.remove(id);
                     // Read after the removal above, so the card falls back to
                     // what it knew rather than to the spinner it is leaving.
                     let latency = state.ui.card_state(id, now_unix_ms);
@@ -2770,6 +2819,9 @@ impl Controller {
                             None => controller.settings.mark_applied(values.clone()),
                         }
                         controller.settings.set_runtime_info(runtime.as_ref());
+                        // Pointing Settings at a core that exists is exactly
+                        // when the banner should go away.
+                        controller.update_core_banner(runtime.as_ref());
                         if !outcome.ignored_ports.is_empty() {
                             controller.show_message(&format!(
                                 "{} left unchanged — fixed by the system service unit",
@@ -3053,6 +3105,11 @@ impl Controller {
                     self.show_message("Server is unreachable or did not respond")
                 }
                 Effect::ToastNoNetwork => self.show_message("No network connection"),
+                Effect::ToastProbeDidNotRun => self.show_error(
+                    "Latency could not be checked",
+                    "The check needs an Xray core and could not start one on this machine. \
+                     The servers themselves were never contacted.",
+                ),
                 Effect::ConnectionError(error) => self.show_error("Connection error", &error),
                 Effect::DaemonOutdated => self.show_message(
                     "The oxidom daemon is older than this app — latency readings are unavailable \
@@ -3088,6 +3145,18 @@ impl Controller {
                 self.profiles_banner.set_revealed(true);
             }
             None => self.profiles_banner.set_revealed(false),
+        }
+    }
+
+    /// Say once, at the top, what every card would otherwise imply nine times
+    /// over: the checks are not failing because the servers are bad.
+    fn update_core_banner(&self, runtime: Option<&ipc::RuntimeInfo>) {
+        match missing_core_message(runtime) {
+            Some(message) => {
+                self.core_banner.set_title(&message);
+                self.core_banner.set_revealed(true);
+            }
+            None => self.core_banner.set_revealed(false),
         }
     }
 

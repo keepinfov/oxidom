@@ -151,6 +151,12 @@ pub enum LatencyState {
     Unreachable,
     /// The probe never left this machine, so the server was not tested at all.
     NoNetwork,
+    /// The check could not run here at all — most often no Xray core, which the
+    /// default HTTP probe needs to build the tunnel it measures through. Kept
+    /// apart from [`LatencyState::Unreachable`] because it says nothing about
+    /// the server: reporting a local failure as an unresponsive server sends
+    /// people to replace working nodes.
+    NotRun,
 }
 
 /// How a reading was taken, for the badge's tooltip.
@@ -736,6 +742,16 @@ impl ServerCard {
             }
             LatencyState::NoNetwork => {
                 self.show_label("⊘", "No network — the server was not checked");
+                self.latency.add_css_class("latency-offline");
+            }
+            // The offline colour, not the error one: nothing here is the
+            // server's doing, and the amber says "this machine" the way the
+            // no-network state already does.
+            LatencyState::NotRun => {
+                self.show_label(
+                    "⊘",
+                    "The check could not run on this machine — see Settings › Xray core",
+                );
                 self.latency.add_css_class("latency-offline");
             }
         }
