@@ -14,7 +14,7 @@ connection uses the configured method.
 ## Probe outcomes (binding)
 
 `probe::measure` returns `ProbeOutcome`, never `Option`: `Reachable(Measurement) | Unreachable |
-Timeout | NoNetwork | Internal(&'static str)`. The distinction is the point — a failure that is
+Timeout | NoNetwork | Internal(ProbeDetail)`. The distinction is the point — a failure that is
 *not the server's fault* must never be drawn as a dead server.
 
 - **`NoNetwork`** is claimed only on evidence: a kernel error that says so
@@ -78,3 +78,24 @@ as `ipc::LatencyReading { value, measured_at_unix_ms, route, method, failure }` 
 Freshness is the GUI's job: `gui::reduce::latency_state` is the **single** mapper from a reading to
 a `LatencyState`, and ages are bucketed to whole minutes so the badge repaints on a bucket change
 rather than once a second.
+
+## The D-Bus surface (binding)
+
+Three methods on `dev.keepinfov.oxidom1` carry probing. They are listed here because a client that
+cannot see the interface has no other place to read what it may call.
+
+| Method | Signature | What it does |
+|---|---|---|
+| `RequestProbe` | `(s server_id) → ()` | Enqueue one server. Returns as soon as it is queued, not when it is measured. |
+| `RequestProbes` | `(as server_ids) → ()` | The same, for a list. One call, so a sweep does not cost one round trip per server. |
+| `ProbeState` | `() → (s json)` | The whole `ProbeState` as JSON. Polled; there is no signal. |
+
+**Requesting is idempotent, not additive.** `ProbeQueue::holds` drops a request for a target already
+running or queued, so pressing a check twice measures once. A client must not treat the second call
+as a second measurement, and must not present it as one.
+
+**There is no way to stop a probe.** A request, once queued, runs to completion — the queue empties
+on its own schedule and the daemon keeps measuring after every client has gone. The per-server
+budget is about ten seconds for the default HTTP method, eight run at once, so a sweep costs
+roughly `ceil(servers / 8) × 10s` and a large subscription occupies the daemon for minutes. This is
+a known gap, not a design decision.

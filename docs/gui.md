@@ -74,6 +74,36 @@ rewrites without a dialog and says so in a toast.
 
 Per-subscription latency checks and sorting live on this page too.
 
+### Latency
+
+Each card carries a badge. It is deliberately small, so its whole vocabulary is
+here:
+
+| Badge | Means |
+|---|---|
+| `84 ms` | A direct measurement. Dimmed, with the age in its tooltip, once it is over a minute old. |
+| `84 ms`, tunnel colour | Measured **through the running tunnel**, not around it. Only the server the tunnel is carrying can read this way. |
+| spinner | Being checked, or waiting for a free slot — eight run at once. |
+| `—` | No number. The tooltip says which kind of nothing: never measured, measured in a context that no longer applies, or the server did not answer. Only the last is drawn in the error colour. |
+| `⊘` | The check never ran. This machine's problem, not the server's — no network, or no core to measure with. The tooltip names the condition when the daemon knows it. |
+
+A dash rather than a cross for an unreachable server is on purpose: a cross reads
+as a verdict, and a failed check leaves no number in exactly the way an unmeasured
+server does. The same reasoning keeps `⊘` in the amber "this machine" colour
+rather than the red one — see [spec/latency.md](spec/latency.md).
+
+The tooltip on a number also names the method actually used, which is not always
+the one configured: a TCP check of a Hysteria2 server falls back to ICMP, because
+Hysteria2 is QUIC over UDP and has no TCP port to open.
+
+Two controls start a check. The card's own ⟳ **Re-check latency** sits in the
+expanded card and in its right-click menu; the subscription header's ⚡ **Check
+latency of all servers** sweeps the whole block. Both are fire-and-forget —
+**there is no way to stop a check once it has started**, and closing the window
+does not stop it either. A sweep of a large subscription can run for minutes.
+
+The method itself is chosen in Settings, once, for the whole application.
+
 ## Profiles
 
 One row per profile — the same `profiles/*.toml` the CLI and systemd use, running
