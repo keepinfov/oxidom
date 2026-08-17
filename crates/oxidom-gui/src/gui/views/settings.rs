@@ -13,6 +13,7 @@ use oxidom_core::ipc::RuntimeInfo;
 use oxidom_core::subscription::CLIENT_PRESETS as UA_PRESETS;
 
 use super::core_editor::{CoreEditor, CoreLevel};
+use super::icon_button;
 
 /// Restored by [`SettingsView::set_system_proxy_failure`], so the row has one
 /// place that owns its normal wording.
@@ -133,6 +134,11 @@ struct SettingsWidgets {
     tun2socks_binary: adw::EntryRow,
     nft_binary: adw::EntryRow,
     xray_effective: adw::ActionRow,
+    /// "Install a core", with the command for this distribution. Hidden while
+    /// a core resolves, because then there is nothing to install.
+    install_hint: adw::ActionRow,
+    /// What the row's copy button puts on the clipboard.
+    install_command: Rc<RefCell<String>>,
     core: CoreEditor,
     ports_error: gtk::Label,
     url_error: gtk::Label,
@@ -312,9 +318,33 @@ impl SettingsView {
                  A system-wide oxidom service cannot read paths under /home.",
             )
             .build();
+        // Shown only while no core is resolved. oxidom does not install one —
+        // fetching and running a binary is the last thing a program carrying
+        // other people's traffic should do casually — but naming the command
+        // the distribution already has costs nothing and is what people asked
+        // for when they asked for a download button.
+        let install_hint = adw::ActionRow::builder()
+            .title("Install a core")
+            .subtitle_selectable(true)
+            .visible(false)
+            .build();
+        let install_command = Rc::new(RefCell::new(String::new()));
+        let copy_install = icon_button("edit-copy-symbolic", "Copy");
+        copy_install.set_tooltip_text(Some("Copy"));
+        copy_install.connect_clicked({
+            let install_command = install_command.clone();
+            move |button| {
+                button
+                    .clipboard()
+                    .set_text(install_command.borrow().as_str());
+            }
+        });
+        install_hint.add_suffix(&copy_install);
+
         xray_group.add(&xray_binary);
         xray_group.add(&xray_error);
         xray_group.add(&xray_effective);
+        xray_group.add(&install_hint);
         let latency_group = adw::PreferencesGroup::builder()
             .title("Latency")
             .description("HTTP checks use the active local SOCKS proxy")
@@ -369,6 +399,8 @@ impl SettingsView {
             tun2socks_binary,
             nft_binary,
             xray_effective,
+            install_hint,
+            install_command,
             core,
             ports_error,
             url_error,
@@ -564,14 +596,27 @@ impl SettingsView {
                     .xray_effective
                     .set_subtitle(&format!("{path}{source}"));
                 widgets.xray_effective.remove_css_class("error");
+                widgets.install_hint.set_visible(false);
             }
             (None, Some(error)) => {
                 widgets.xray_effective.set_subtitle(error);
                 widgets.xray_effective.add_css_class("error");
+                // A distribution that packages a core gets its command; the
+                // rest get the release page, since inventing an `apt install
+                // xray` that fails would be trusted over the documentation.
+                let command = oxidom_core::distro::xray_install_command_here()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "https://github.com/XTLS/Xray-core/releases".to_string());
+                widgets.install_hint.set_subtitle(&command);
+                *widgets.install_command.borrow_mut() = command;
+                widgets.install_hint.set_visible(true);
             }
+            // Nothing resolved and nothing reported: an older daemon that
+            // answers neither. Offering an install command would be a guess.
             (None, None) => {
                 widgets.xray_effective.set_subtitle("Unknown");
                 widgets.xray_effective.remove_css_class("error");
+                widgets.install_hint.set_visible(false);
             }
         }
 
