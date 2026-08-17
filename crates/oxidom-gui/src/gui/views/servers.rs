@@ -471,6 +471,14 @@ impl ServersView {
     /// Driven from window.rs — deriving it from our own allocation would form
     /// a feedback loop with the content's minimum width and deadlock the
     /// window's ability to shrink.
+    /// The one loaded copy of `gui_prefs.toml`, shared rather than re-read.
+    ///
+    /// Every writer saves the whole struct, so a second copy loaded elsewhere
+    /// would silently overwrite anything the first changed after loading.
+    pub fn prefs(&self) -> Rc<RefCell<GuiPrefs>> {
+        self.prefs.clone()
+    }
+
     pub fn set_available_width(&self, width: i32) {
         let usable = width
             .saturating_sub(self.content.margin_start())

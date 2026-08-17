@@ -14,6 +14,7 @@ use oxidom_core::subscription::CLIENT_PRESETS as UA_PRESETS;
 
 use super::core_editor::{CoreEditor, CoreLevel};
 use super::icon_button;
+use crate::gui::prefs::ColorScheme;
 
 /// Restored by [`SettingsView::set_system_proxy_failure`], so the row has one
 /// place that owns its normal wording.
@@ -200,6 +201,14 @@ pub struct SettingsView {
     widgets: SettingsWidgets,
     model: Rc<RefCell<SettingsModel>>,
     updating_widgets: Rc<Cell<bool>>,
+    /// Deliberately outside [`SettingsWidgets`]: everything in there edits the
+    /// daemon's config behind Apply/Reset, while this one is a property of the
+    /// window that takes effect the moment it is picked and has nothing to
+    /// apply.
+    appearance: adw::ComboRow,
+    /// Set while the row is being written to programmatically, so restoring
+    /// the saved choice does not read as the user making it.
+    updating_appearance: Rc<Cell<bool>>,
 }
 
 impl SettingsView {
@@ -364,7 +373,24 @@ impl SettingsView {
         let advanced_group = adw::PreferencesGroup::new();
         advanced_group.add(&advanced);
 
+        let appearance = adw::ComboRow::builder()
+            .title("Appearance")
+            .subtitle("Follow the desktop, or pin this window to one scheme")
+            .model(&gtk::StringList::new(&[
+                "Follow the system",
+                "Light",
+                "Dark",
+            ]))
+            .selected(ColorScheme::default().position())
+            .build();
+        let appearance_group = adw::PreferencesGroup::new();
+        appearance_group.add(&appearance);
+
         let root = adw::PreferencesPage::new();
+        // First, and alone in its group: it is the one row here that takes
+        // effect as it is clicked, and grouping it with the daemon's settings
+        // would promise it the same Apply.
+        root.add(&appearance_group);
         root.add(&proxy_group);
         root.add(&xray_group);
         root.add(&latency_group);
@@ -457,7 +483,28 @@ impl SettingsView {
             widgets,
             model,
             updating_widgets,
+            appearance,
+            updating_appearance: Rc::new(Cell::new(false)),
         }
+    }
+
+    /// Show the saved choice without reporting it back as a new one.
+    pub fn set_color_scheme(&self, scheme: ColorScheme) {
+        self.updating_appearance.set(true);
+        self.appearance.set_selected(scheme.position());
+        self.updating_appearance.set(false);
+    }
+
+    /// Called as the user picks, not on Apply: there is nothing to apply, and
+    /// a theme that waited for a button would look broken.
+    pub fn connect_color_scheme_changed(&self, on_change: impl Fn(ColorScheme) + 'static) {
+        let updating = self.updating_appearance.clone();
+        self.appearance.connect_selected_notify(move |row| {
+            if updating.get() {
+                return;
+            }
+            on_change(ColorScheme::from_position(row.selected()));
+        });
     }
 
     /// A header-bar-ready Apply button. The returned GTK object is a clone
