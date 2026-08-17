@@ -12,6 +12,7 @@ pub mod fsutil;
 pub mod handle;
 pub mod ipc;
 pub mod link;
+pub mod logbook;
 pub mod model;
 pub mod nft;
 pub mod paths;
