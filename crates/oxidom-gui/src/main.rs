@@ -32,7 +32,13 @@ fn main() -> Result<()> {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
             .build();
     let max_level = terminal.filter();
-    oxidom_core::logbook::install_logger(Box::new(terminal), max_level);
+    oxidom_core::logbook::install_logger(
+        Box::new(terminal),
+        max_level,
+        // The sink opens the file per write and starts no thread, so installing
+        // it here — before the fork below — carries nothing across it.
+        oxidom_core::paths::gui_log_file().ok(),
+    );
     if !cli.debug {
         detach();
     }

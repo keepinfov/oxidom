@@ -384,12 +384,60 @@ pub fn global() -> &'static LogBook {
     BOOK.get_or_init(LogBook::new)
 }
 
+/// Bytes one log file grows to before it is rotated.
+const LOG_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Appends log lines to a private file, rotating it when it gets large.
+///
+/// Opened and closed around each write rather than held open. That costs a
+/// syscall per line — the GUI writes few, since the core's output goes to the
+/// daemon — and buys two things worth more: nothing is buffered when the process
+/// is killed, which is the case this file exists for, and no file descriptor or
+/// thread survives into `fork`, which the GUI performs after installing its
+/// logger.
+struct FileSink {
+    path: std::path::PathBuf,
+}
+
+impl FileSink {
+    fn write(&self, line: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        if !parent.exists() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+        // A log line names hosts and addresses. It is meant to be safe to paste
+        // into a bug report, which is not the same as safe for every account on
+        // the machine to read.
+        if std::fs::metadata(&self.path).is_ok_and(|meta| meta.len() >= LOG_FILE_MAX_BYTES) {
+            let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
+        }
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(&self.path)
+        else {
+            return;
+        };
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// A `log` implementation that writes to the terminal *and* to the book.
 ///
 /// Generic over the terminal half so this crate needs no formatter of its own:
 /// each binary hands over the `env_logger::Logger` it already built.
 struct Tee {
     terminal: Box<dyn log::Log>,
+    file: Option<FileSink>,
 }
 
 impl log::Log for Tee {
@@ -404,14 +452,29 @@ impl log::Log for Tee {
         // `env_logger::Logger::log` applies its own filter, so this is not the
         // same as ignoring it.
         self.terminal.log(record);
-        if accepted_by_book(record.metadata()) {
-            global().push(
-                LogSource::Oxidom,
-                record.level().into(),
-                None,
+        if !accepted_by_book(record.metadata()) {
+            return;
+        }
+        let severity: Severity = record.level().into();
+        let text = record.args().to_string();
+        let unix_ms = now_unix_ms();
+        global().push(
+            LogSource::Oxidom,
+            severity,
+            None,
+            record.target(),
+            text.clone(),
+        );
+        // Written after the push and outside it: the book's lock must not be
+        // held across a disk write, or a slow disk stalls whatever was logging.
+        if let Some(file) = &self.file {
+            file.write(&format!(
+                "{} {:<5} {} {}",
+                format_utc(unix_ms),
+                severity.label(),
                 record.target(),
-                record.args().to_string(),
-            );
+                text
+            ));
         }
     }
 
@@ -430,6 +493,35 @@ fn accepted_by_book(metadata: &log::Metadata<'_>) -> bool {
     metadata.level() <= log::Level::Info || metadata.target().starts_with("oxidom")
 }
 
+/// A timestamp for the log file, as `2026-08-17T13:45:02Z`.
+///
+/// UTC and computed here rather than through a date library: the workspace has
+/// none, and a file meant to be pasted into a bug report is better off with an
+/// unambiguous instant than with the reporter's local time and no offset.
+fn format_utc(unix_ms: u64) -> String {
+    let seconds = unix_ms / 1000;
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    let (hour, minute, second) = (rest / 3600, (rest % 3600) / 60, rest % 60);
+    let (year, month, day) = civil_from_days(days as i64);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Days since the Unix epoch to a calendar date, by Howard Hinnant's
+/// `civil_from_days`. The shifted era arithmetic is what avoids a table of
+/// month lengths and a special case for leap years.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
 /// Send this process's `log` output to the terminal and the book both.
 ///
 /// `terminal` is the logger that would otherwise have been installed alone, and
@@ -438,10 +530,17 @@ fn accepted_by_book(metadata: &log::Metadata<'_>) -> bool {
 /// reject it, since `log`'s macros check the level and build the message before
 /// any `Log` method is reached.
 ///
+/// `file`, when given, also appends every accepted record to that path. Only
+/// the GUI passes one: the daemon's stderr already reaches the journal.
+///
 /// Idempotent, and quiet about it. `log` permits exactly one logger per process
 /// and `cargo test` runs many tests in one, so a second call must be a no-op
 /// rather than an error that only shows up under a full test run.
-pub fn install_logger(terminal: Box<dyn log::Log>, max_level: log::LevelFilter) {
+pub fn install_logger(
+    terminal: Box<dyn log::Log>,
+    max_level: log::LevelFilter,
+    file: Option<std::path::PathBuf>,
+) {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     let mut installed = false;
     INSTALLED.get_or_init(|| {
@@ -450,7 +549,11 @@ pub fn install_logger(terminal: Box<dyn log::Log>, max_level: log::LevelFilter) 
     if !installed {
         return;
     }
-    if log::set_boxed_logger(Box::new(Tee { terminal })).is_ok() {
+    let tee = Tee {
+        terminal,
+        file: file.map(|path| FileSink { path }),
+    };
+    if log::set_boxed_logger(Box::new(tee)).is_ok() {
         log::set_max_level(max_level);
     }
 }
@@ -763,6 +866,56 @@ mod tests {
             LEGACY_BOOK_ID,
             "a real book must never collide with the synthetic marker"
         );
+    }
+
+    /// Pinned against literal instants, leap year and century rule included,
+    /// because the calendar arithmetic here replaces a date library.
+    #[test]
+    fn a_file_timestamp_is_an_unambiguous_utc_instant() {
+        assert_eq!(format_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_utc(1_000), "1970-01-01T00:00:01Z");
+        // 2000 is a leap year despite being a century; 2100 is not.
+        assert_eq!(format_utc(951_782_400_000), "2000-02-29T00:00:00Z");
+        assert_eq!(format_utc(4_107_542_400_000), "2100-03-01T00:00:00Z");
+        assert_eq!(format_utc(1_755_437_102_000), "2025-08-17T13:25:02Z");
+    }
+
+    /// The file holds hostnames and addresses. Safe to paste into a bug report
+    /// is not the same as readable by every account on the machine.
+    #[test]
+    fn the_log_file_is_created_private_and_rotates_when_it_grows() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let dir = std::env::temp_dir().join(format!("oxidom-logsink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sink = FileSink {
+            path: dir.join("test.log"),
+        };
+
+        sink.write("first line");
+        let mode = std::fs::metadata(&sink.path)
+            .expect("the sink must create its file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "log files must not be world readable");
+        assert!(
+            std::fs::read_to_string(&sink.path)
+                .unwrap()
+                .contains("first line")
+        );
+
+        // Push it past the rotation threshold, then write once more.
+        std::fs::write(&sink.path, vec![b'x'; LOG_FILE_MAX_BYTES as usize]).unwrap();
+        sink.write("after rotation");
+        let current = std::fs::read_to_string(&sink.path).unwrap();
+        assert_eq!(current.trim(), "after rotation");
+        assert!(
+            sink.path.with_extension("log.1").exists(),
+            "the previous file must be kept, not discarded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A `RUST_LOG=debug` run must not bury oxidom's own reasoning under the

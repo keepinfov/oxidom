@@ -133,7 +133,10 @@ fn main() -> ExitCode {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
             .build();
     let max_level = terminal.filter();
-    oxidom_core::logbook::install_logger(Box::new(terminal), max_level);
+    // No file sink here: the daemon's stderr is its journal, and a second
+    // root-owned copy under STATE_DIRECTORY would be one more thing to rotate
+    // for no reader that journalctl does not already serve.
+    oxidom_core::logbook::install_logger(Box::new(terminal), max_level, None);
     exit_status(dispatch(cli))
 }
 

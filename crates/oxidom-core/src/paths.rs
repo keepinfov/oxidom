@@ -88,6 +88,19 @@ pub fn hwid_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("hwid"))
 }
 
+/// Where the graphical client keeps its own log.
+///
+/// Only the GUI writes one. The daemon's output already reaches the journal, and
+/// `journalctl -u oxidom` is the documented way to read it; the GUI has no such
+/// window, because it detaches from the terminal and points stderr at
+/// `/dev/null`, so without this file a crash leaves nothing behind at all.
+///
+/// Resolved on each write rather than remembered, so `set_test_root` keeps
+/// working for anything that exercises it.
+pub fn gui_log_file() -> Result<PathBuf> {
+    Ok(data_dir()?.join("oxidom-gui.log"))
+}
+
 /// GUI-only display preferences (e.g. collapsed subscription groups). Unlike
 /// `config.toml`/`state.toml`, this file is owned and written directly by the
 /// GUI process itself, never by the daemon.
