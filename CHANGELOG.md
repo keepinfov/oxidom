@@ -79,6 +79,12 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **The Filter button draws its funnel on Arch.** The Arch package installed the
+  two application icons and not the one action icon the application ships,
+  because Adwaita has no filter glyph under any name. On a release build the
+  pill at the head of the chip row was therefore an empty square — the
+  development builds hid this, since a `cargo run` installs the icon into the
+  user's data directory on startup and a packaged build has no such step.
 - **The Logs page no longer throws you back to the top.** Scrolling up to read
   something used to last only until the next line arrived. The daemon handed
   over its whole buffer twice a second and the view worked out the difference by
