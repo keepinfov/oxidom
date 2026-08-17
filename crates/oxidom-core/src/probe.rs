@@ -1,6 +1,6 @@
 use std::error::Error as _;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -279,21 +279,60 @@ fn socks_ready(address: Ipv4Addr, port: u16, timeout: Duration) -> bool {
 }
 
 /// Raw TCP connect latency to host:port.
+///
+/// A name usually resolves to more than one address, and this used to try only
+/// the first. On a machine holding an IPv6 address with no working route — an
+/// ISP handing out v6 that goes nowhere is common — every server whose name has
+/// an `AAAA` record then timed out, and the whole list read as dead while the
+/// same servers worked in any client that tries more than one address.
 pub fn tcp_ping(host: &str, port: u16) -> ProbeOutcome {
-    let address = match (host, port).to_socket_addrs() {
-        Ok(mut addresses) => match addresses.next() {
-            Some(address) => address,
-            None => return dns_failure(),
-        },
+    let addresses = match (host, port).to_socket_addrs() {
+        Ok(addresses) => probe_order(addresses.collect()),
         Err(_) => return dns_failure(),
     };
-    let start = Instant::now();
-    match TcpStream::connect_timeout(&address, TIMEOUT) {
-        Ok(_) => ProbeOutcome::Reachable(Measurement {
-            ms: start.elapsed().as_millis() as u32,
-            method: LatencyMethod::Tcp,
-        }),
-        Err(error) => classify_io_error(error.kind(), error.raw_os_error()),
+    if addresses.is_empty() {
+        return dns_failure();
+    }
+    let mut outcome = None;
+    for address in addresses {
+        let start = Instant::now();
+        match TcpStream::connect_timeout(&address, TIMEOUT) {
+            Ok(_) => {
+                return ProbeOutcome::Reachable(Measurement {
+                    ms: start.elapsed().as_millis() as u32,
+                    method: LatencyMethod::Tcp,
+                });
+            }
+            // Keep the first verdict: it describes the address the resolver
+            // preferred, which is the one ordinary traffic would have used.
+            Err(error) => {
+                outcome
+                    .get_or_insert_with(|| classify_io_error(error.kind(), error.raw_os_error()));
+            }
+        }
+    }
+    outcome.unwrap_or_else(dns_failure)
+}
+
+/// Which addresses to try, in order: the resolver's first choice, then the
+/// first address of the *other* family.
+///
+/// Two attempts, not all of them. One address is not enough — that is the bug
+/// this exists to fix — but a name with eight `A` records must not cost eight
+/// timeouts, and the second family is where the useful difference lies: a host
+/// that refuses one IPv4 address refuses the rest, while a broken v6 path says
+/// nothing about v4.
+fn probe_order(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(&first) = addresses.first() else {
+        return Vec::new();
+    };
+    let other = addresses
+        .iter()
+        .find(|address| address.is_ipv6() != first.is_ipv6())
+        .copied();
+    match other {
+        Some(other) => vec![first, other],
+        None => vec![first],
     }
 }
 
@@ -471,6 +510,45 @@ fn has_default_route(proc_net_route: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn socket(text: &str) -> SocketAddr {
+        text.parse().expect("a literal address")
+    }
+
+    /// The bug this order exists for: a name with both families, on a machine
+    /// whose IPv6 goes nowhere. Trying only the resolver's first answer timed
+    /// out on every such server while IPv4 sat there working.
+    #[test]
+    fn both_families_are_tried_when_a_name_has_both() {
+        let order = probe_order(vec![
+            socket("[2001:db8::1]:443"),
+            socket("[2001:db8::2]:443"),
+            socket("198.51.100.7:443"),
+        ]);
+        assert_eq!(
+            order,
+            vec![socket("[2001:db8::1]:443"), socket("198.51.100.7:443")],
+            "the resolver's choice first, then the other family"
+        );
+    }
+
+    /// Eight A records must not cost eight timeouts: a host that refuses one of
+    /// its IPv4 addresses will refuse the rest, so there is nothing to learn
+    /// from the seventh.
+    #[test]
+    fn one_family_is_tried_once() {
+        let order = probe_order(vec![
+            socket("198.51.100.7:443"),
+            socket("198.51.100.8:443"),
+            socket("198.51.100.9:443"),
+        ]);
+        assert_eq!(order, vec![socket("198.51.100.7:443")]);
+    }
+
+    #[test]
+    fn nothing_resolved_is_nothing_to_try() {
+        assert!(probe_order(Vec::new()).is_empty());
+    }
 
     #[test]
     fn free_ports_are_bindable_and_distinct() {
