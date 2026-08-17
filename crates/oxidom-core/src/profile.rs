@@ -40,6 +40,7 @@ pub const RESERVED_NAMES: &[&str] = &[
     "run",
     "env",
     "tun",
+    "trust",
 ];
 
 static WARNED_RESERVED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
