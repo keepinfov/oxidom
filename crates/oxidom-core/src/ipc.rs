@@ -452,6 +452,10 @@ pub struct UpResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorAction {
     OpenSettings,
+    /// The server presented a certificate this build will not accept. The
+    /// follow-up is to look at it and decide, which is a different act from
+    /// editing a setting — nothing in Settings can fix this one.
+    TrustCertificate,
     None,
 }
 
@@ -471,6 +475,14 @@ const SETTINGS_HINTS: &[&str] = &[
 ];
 
 pub fn error_action(message: &str) -> ErrorAction {
+    // Checked first: "certificate" appears in a message that also names TLS,
+    // and offering Settings there would send someone to a page that cannot
+    // help.
+    if message.contains(ProbeDetail::CertificateRejected.message())
+        || message.contains(ProbeDetail::InsecureTlsUnsupported.message())
+    {
+        return ErrorAction::TrustCertificate;
+    }
     if SETTINGS_HINTS.iter().any(|hint| message.contains(hint)) {
         ErrorAction::OpenSettings
     } else {
@@ -539,6 +551,31 @@ mod tests {
                 "{message:?}"
             );
         }
+    }
+
+    /// A certificate problem has an answer, and it is not in Settings: nothing
+    /// on that page accepts a certificate. Built from the messages the daemon
+    /// actually sends, so rewording one cannot silently send people to a page
+    /// that cannot help them.
+    #[test]
+    fn a_certificate_problem_offers_to_trust_rather_than_to_open_settings() {
+        for detail in [
+            ProbeDetail::CertificateRejected,
+            ProbeDetail::InsecureTlsUnsupported,
+        ] {
+            assert_eq!(
+                error_action(detail.message()),
+                ErrorAction::TrustCertificate,
+                "{}",
+                detail.message()
+            );
+        }
+        // And the reverse: a missing core is still a Settings matter, even
+        // though its message names Xray too.
+        assert_eq!(
+            error_action("the Xray binary from Settings › Xray binary does not exist: /opt/xray"),
+            ErrorAction::OpenSettings
+        );
     }
 
     /// Built from the constant the daemon actually uses, so rewording the hint

@@ -18,6 +18,11 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **The GUI asks about a certificate rather than failing.** A connection that
+  fails because the server's certificate cannot be verified now opens a dialog
+  showing the fingerprint, and accepting it pins the certificate and reconnects
+  — instead of an error that named the server as the problem. Asked once per
+  server; a server that is already pinned and still fails does not ask again.
 - **Trusting a server's certificate.** Xray 26 removed `allowInsecure`, so a
   server with a self-signed certificate became unreachable no matter what its
   share link said — and failed with an error that blamed the server. `oxidom

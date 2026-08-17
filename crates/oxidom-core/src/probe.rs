@@ -306,10 +306,14 @@ impl ProbeCore {
 
 /// Turn a core's own complaint into something worth putting in front of a user.
 ///
+/// Shared with the connect path: a live session's core says the same things in
+/// the same words, and one classifier means a rejected certificate cannot be
+/// explained one way when measuring and another way when connecting.
+///
 /// Only conditions this machine can act on are named. Anything else stays
 /// unclassified, because guessing at a core's wording is how a wrong
 /// explanation gets shown with confidence.
-fn classify_complaint(complaint: &str) -> Option<ProbeDetail> {
+pub fn classify_complaint(complaint: &str) -> Option<ProbeDetail> {
     let lower = complaint.to_lowercase();
     if lower.contains("allowinsecure") {
         return Some(ProbeDetail::InsecureTlsUnsupported);
