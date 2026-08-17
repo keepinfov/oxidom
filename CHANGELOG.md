@@ -18,6 +18,10 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- An **Appearance** setting: follow the desktop, or pin the window to light or
+  dark. It applies as it is picked and survives a restart. Until now the app
+  followed the system scheme and offered no way to say otherwise, which leaves
+  nothing to say it on a desktop that has no such setting.
 - A working agreement for contributors and agents ([AGENTS.md](AGENTS.md)), the
   binding implementation contract split into [docs/spec/](docs/spec/), a
   contributor guide, this changelog, a security policy, continuous integration,
@@ -36,6 +40,13 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- A machine with no Xray core no longer reports every server as unreachable.
+  The default latency check measures through a core it starts for the purpose,
+  so without one it failed for every server at once — and said so as "server is
+  unreachable", which blames working nodes for a missing program. Such a
+  failure now reads as a check that could not run, a whole-subscription check
+  says once that nothing was measured, and a banner names the cause while the
+  core is missing.
 - The Arch package builds again: the recorded checksum for `oxidom.service` no
   longer matched the file, which stopped `makepkg` at the validity check before
   it reached a compiler. The package now also declares the libraries it links

@@ -10,8 +10,8 @@ depends=(gcc-libs gdk-pixbuf2 glib2 glibc gtk4 hicolor-icon-theme libadwaita pan
 # Every provider of an Xray core — xray, xray-bin, xray-git — lives in the AUR,
 # and pacman cancels an entire transaction when one target is missing. As a hard
 # dependency it therefore took gtk4 and libadwaita down with it, and `makepkg -si`
-# failed before it reached a compiler. oxidom starts without a core and reports
-# where it looked; only connecting needs one.
+# failed before it reached a compiler. oxidom starts without a core and says so
+# in a banner; connecting and checking latency both need one.
 optdepends=('xray: the proxy core — nothing can connect without it (AUR)'
             'tun2socks: TUN interface mode'
             'nftables: per-app routing for `oxidom run`')

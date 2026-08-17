@@ -22,7 +22,7 @@ Under an ordinary user daemon:
 |---|---|
 | `~/.config/oxidom/config.toml` | settings, below |
 | `~/.config/oxidom/profiles/<name>.toml` | one file per profile |
-| `~/.config/oxidom/gui_prefs.toml` | GUI-only display state — collapsed groups, ordering, saved groups |
+| `~/.config/oxidom/gui_prefs.toml` | GUI-only display state — colour scheme, collapsed groups, ordering, saved groups |
 | `~/.local/share/oxidom/subscriptions.json` | cached subscriptions and their parsed servers |
 | `~/.local/share/oxidom/state.toml` | live session records, for crash recovery |
 | `~/.local/share/oxidom/hwid` | per-install id, **only created if a subscription opts in** |
