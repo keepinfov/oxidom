@@ -15,6 +15,7 @@ use oxidom_core::ipc::{
     LatencyReading, PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry,
     RuntimeInfo, SelectionInfo, SessionInfo, StatusInfo,
 };
+use oxidom_core::logbook::LogSlice;
 use oxidom_core::model::{OutboundSpec, Subscription};
 use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
 use oxidom_core::profile::RouteMode;
@@ -28,7 +29,9 @@ use super::server_card::{LatencyAge, LatencyState};
 pub(super) struct PolledSnapshot {
     pub status: StatusInfo,
     pub probe: ProbeState,
-    pub logs: Vec<String>,
+    /// Only what the daemon has logged since the cursor sent with this round.
+    /// See [`super::logfeed::LogFeed`].
+    pub logs: LogSlice,
     /// [`SnapshotState::state_epoch`] as it stood *before* the first D-Bus read
     /// of this round. A snapshot whose epoch fell behind describes a world the
     /// user has already changed, and applying it is what makes the connection
@@ -1942,7 +1945,7 @@ mod tests {
         PolledSnapshot {
             status,
             probe,
-            logs: Vec::new(),
+            logs: LogSlice::from_legacy_lines(Vec::new()),
             epoch: 0,
         }
     }

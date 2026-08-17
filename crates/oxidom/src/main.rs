@@ -126,8 +126,17 @@ fn main() -> ExitCode {
     } else {
         "warn"
     };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
-        .init();
+    // `build` rather than `init`: the same lines also go into the process log
+    // book, which is what serves the GUI's Logs view — a daemon's own reasoning
+    // used to reach the journal and nowhere else.
+    let terminal =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+            .build();
+    let max_level = terminal.filter();
+    // No file sink here: the daemon's stderr is its journal, and a second
+    // root-owned copy under STATE_DIRECTORY would be one more thing to rotate
+    // for no reader that journalctl does not already serve.
+    oxidom_core::logbook::install_logger(Box::new(terminal), max_level, None);
     exit_status(dispatch(cli))
 }
 

@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 
 use crate::core_options::ResolvedCore;
+use crate::logbook::{self, LogSource, Severity};
 use crate::model::{OutboundSpec, Server};
-use crate::proc::{push_log, spawn_reader, stop_child};
+use crate::proc::{spawn_reader, stop_child};
 use crate::xray::config;
 use crate::xray::resolve::{self, ResolvedXray};
 use crate::{fsutil, paths};
@@ -42,7 +43,16 @@ pub struct XrayCore {
     /// equally supervised recovered form.
     recovered: Option<(u32, String)>,
     pub status: Arc<Mutex<Status>>,
-    pub logs: Arc<Mutex<Vec<String>>>,
+    /// Profile whose session this core serves. Every line it files is tagged
+    /// with it, because the log book is shared by every session in the process.
+    profile: String,
+    /// First sequence number belonging to the current run.
+    ///
+    /// The book is never cleared on connect, so this is what separates this
+    /// attempt's output from the previous one's. Callers that read the core's
+    /// own words to diagnose a failure must start here: a marker left by an
+    /// earlier attempt would otherwise be read as this attempt's reason.
+    spawn_seq: u64,
     pub socks_port: u16,
     pub http_port: u16,
     /// Configured path to the Xray binary; empty falls back to the environment
@@ -52,12 +62,13 @@ pub struct XrayCore {
 }
 
 impl XrayCore {
-    pub fn new(socks_port: u16, http_port: u16, xray_binary: String) -> Self {
+    pub fn new(profile: String, socks_port: u16, http_port: u16, xray_binary: String) -> Self {
         XrayCore {
             child: None,
             recovered: None,
             status: Arc::new(Mutex::new(Status::Disconnected)),
-            logs: Arc::new(Mutex::new(Vec::new())),
+            profile,
+            spawn_seq: 0,
             socks_port,
             http_port,
             xray_binary,
@@ -73,10 +84,43 @@ impl XrayCore {
         resolve::resolve(&self.xray_binary)
     }
 
-    /// Record an oxidom-side message in the same ring buffer as xray's output,
-    /// so the Logs view can explain a failure even when xray never started.
+    /// Record an oxidom-side message in the same book as xray's output, so the
+    /// Logs view can explain a failure even when xray never started.
+    ///
+    /// Filed under [`LogSource::Oxidom`] rather than prefixed `"oxidom: "`: the
+    /// source is now a field the view filters on, and a note that merely *read*
+    /// as ours used to be indistinguishable from a core line that quoted us.
     pub fn note(&self, message: &str) {
-        push_log(&self.logs, format!("oxidom: {message}"));
+        logbook::global().push(
+            LogSource::Oxidom,
+            Severity::Warn,
+            Some(&self.profile),
+            "oxidom::xray",
+            message.to_string(),
+        );
+    }
+
+    /// Mark where this attempt's output begins, and say so in the log.
+    ///
+    /// Called before anything else a connect does — including
+    /// [`Self::preflight_notes`], whose warnings are part of what a failure is
+    /// later explained by. Taking the watermark any later would leave those
+    /// notes attributed to the previous attempt, and taking it any earlier
+    /// would fold in the previous attempt's dying words.
+    fn open_run(&mut self) {
+        self.spawn_seq = logbook::global().next_seq();
+        logbook::global().push(
+            LogSource::Oxidom,
+            Severity::Info,
+            Some(&self.profile),
+            "oxidom::xray",
+            format!("starting the core for profile {}", self.profile),
+        );
+    }
+
+    /// First sequence number of the current run. See [`Self::spawn_seq`].
+    pub fn spawn_seq(&self) -> u64 {
+        self.spawn_seq
     }
 
     /// Move to a failed state once, recording why. Callers that detect the
@@ -143,7 +187,7 @@ impl XrayCore {
     ) -> Result<()> {
         self.disconnect();
         self.set_status(Status::Connecting);
-        crate::sync::lock(&self.logs).clear();
+        self.open_run();
         match self.try_connect(server, bind, profile, core) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -168,7 +212,7 @@ impl XrayCore {
     ) -> Result<()> {
         self.disconnect();
         self.set_status(Status::Connecting);
-        crate::sync::lock(&self.logs).clear();
+        self.open_run();
         match self.try_connect_pool(spec, bind, api_port, profile, core) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -276,12 +320,12 @@ impl XrayCore {
             .spawn()
             .with_context(|| format!("spawning xray ({})", xray.path.display()))?;
 
-        // Pump stdout and stderr into the ring buffer.
+        // Pump stdout and stderr into the log book.
         if let Some(out) = child.stdout.take() {
-            spawn_reader(out, self.logs.clone());
+            spawn_reader(out, LogSource::Xray, self.profile.clone());
         }
         if let Some(err) = child.stderr.take() {
-            spawn_reader(err, self.logs.clone());
+            spawn_reader(err, LogSource::Xray, self.profile.clone());
         }
 
         self.child = Some(child);
@@ -335,12 +379,19 @@ impl XrayCore {
         }
     }
 
-    pub fn recent_logs(&self) -> Vec<String> {
-        crate::sync::lock(&self.logs).clone()
+    /// What the core itself said during **this** run, and nothing else.
+    ///
+    /// For callers that diagnose a failure by matching the core's own words:
+    /// the book is shared, so it also holds other sessions' lines, the previous
+    /// attempt's, and oxidom's own notes — one of which quotes an unknown
+    /// obfuscation type in wording that [`UNSUPPORTED_PROTOCOL_MARKERS`] would
+    /// match. Not a general log reader; the Logs view goes through the book.
+    pub fn current_run_logs(&self) -> Vec<String> {
+        logbook::global().texts_for(LogSource::Xray, Some(&self.profile), self.spawn_seq)
     }
 
     pub fn clear_logs(&self) {
-        crate::sync::lock(&self.logs).clear();
+        logbook::global().clear();
     }
 }
 
@@ -371,7 +422,7 @@ mod tests {
 
     #[test]
     fn pool_api_port_cannot_alias_a_proxy_inbound() {
-        let core = XrayCore::new(10808, 10809, String::new());
+        let core = XrayCore::new("work".to_string(), 10808, 10809, String::new());
 
         let error = core
             .ensure_ports_free("127.77.1.1".parse().unwrap(), Some(10808))

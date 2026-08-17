@@ -1,12 +1,12 @@
-//! Shared child-process supervision and bounded log capture.
+//! Shared child-process supervision and log capture.
 
 use std::io::{BufRead, BufReader};
 use std::process::Child;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const LOG_CAP: usize = 500;
+use crate::logbook::{self, LogSource};
+
 /// How long a managed child gets to exit on SIGTERM before SIGKILL.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
@@ -73,24 +73,19 @@ fn wait_until_gone(pid: nix::unistd::Pid, timeout: Duration) -> bool {
     }
 }
 
+/// Drain one of a child's pipes into the process log book, tagging every line
+/// with the program that wrote it and the profile whose session owns it.
 pub(crate) fn spawn_reader<R: std::io::Read + Send + 'static>(
     reader: R,
-    logs: Arc<Mutex<Vec<String>>>,
+    source: LogSource,
+    profile: String,
 ) {
     thread::spawn(move || {
         let buf = BufReader::new(reader);
         for line in buf.lines().map_while(Result::ok) {
-            push_log(&logs, line);
+            logbook::global().push_process_line(source, Some(&profile), &line);
         }
     });
-}
-
-pub(crate) fn push_log(logs: &Arc<Mutex<Vec<String>>>, line: String) {
-    let mut logs = crate::sync::lock(logs);
-    if logs.len() >= LOG_CAP {
-        logs.remove(0);
-    }
-    logs.push(line);
 }
 
 /// Read `/proc/<pid>/cmdline` as arguments. Returns `None` when the process is

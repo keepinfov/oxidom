@@ -18,6 +18,24 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **The Logs page tells the three programs apart.** The Xray core, the network
+  interface helper and oxidom itself now each tag their own lines, so an
+  interface that never came up no longer reads exactly like a core that refused
+  its config. Filter by source, hide anything below a chosen severity, or search
+  the text; **Save** writes what is on screen to a file.
+- **oxidom's own reasoning is finally in the app.** Everything the program says
+  about itself used to go to stderr and nowhere else — which for the graphical
+  client meant nowhere at all, since it detaches and sends stderr to
+  `/dev/null`. It is now in the Logs page beside the core's output.
+- **The graphical client keeps a log on disk**, at
+  `~/.local/share/oxidom/oxidom-gui.log` (`0600`, rotated at 2MB), so a crash
+  leaves something to read. The daemon writes no file: its stderr already
+  reaches the journal.
+- `LogsSince` on D-Bus, returning only what follows the caller's cursor.
+  `RecentLogs` and `ClearLogs` are unchanged, so older clients keep working, and
+  `RecentLogs` now answers for every session instead of only `default` — the
+  logs of any other profile were previously unreachable by CLI, GUI and bus
+  alike.
 - **Trust certificate…** on a server card's context menu, for deciding before
   anything fails or after a certificate has changed. Shown only for servers
   using ordinary TLS.
@@ -61,6 +79,25 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **The Logs page no longer throws you back to the top.** Scrolling up to read
+  something used to last only until the next line arrived. The daemon handed
+  over its whole buffer twice a second and the view worked out the difference by
+  comparing text — which stopped working once the 500-line buffer filled, because
+  from then on every new line shifted every other one. The view rebuilt itself
+  instead, and a rebuild resets the scroll position. It broke, in other words,
+  exactly when there was finally enough output to be worth reading. The view now
+  receives only what it has not seen and appends it, and trims old lines only
+  while you are at the bottom.
+- A server the core could speak to perfectly well could be reported as one whose
+  protocol it does not support. oxidom's own warning about an unrecognised
+  obfuscation type was written into the same buffer that was then searched for
+  the core's failure markers, and it contains the words that marker matches.
+- Output from the network interface helper was lost entirely when no session
+  existed to redirect it into, and was indistinguishable from the core's
+  otherwise.
+- The log buffer no longer holds only the last 500 lines, which a core at
+  `debug` filled in seconds — often discarding the reason for a failure before
+  anyone could read it.
 - A failed latency check now says what went wrong instead of blaming the
   server. The probe core's log was discarded, so a core that refused to talk to
   a server — most often because it would not accept the server's certificate —

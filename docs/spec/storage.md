@@ -15,6 +15,9 @@ missing files (treat as defaults/empty).
   idempotent records but can never forget an applied route. The legacy flat active-server fields
   are accepted only as migration input.
 - `~/.local/share/oxidom/hwid` — random per-install id (only generated/used if a sub opts in).
+- `~/.local/share/oxidom/oxidom-gui.log` — the graphical client's own log, `0600`, rotated at 2MB
+  with one `.log.1` kept. Written only by the GUI, which detaches and sends stderr to `/dev/null`
+  and so has no journal; the daemon writes no file because its stderr already reaches one.
 - `~/.cache/oxidom/egress.json` — user-owned 60-second cache for `oxidom ip --egress`, keyed by
   profile and server id.
 
@@ -33,6 +36,22 @@ database**. The GUI must not make that choice by accident:
 - Losing this race is invisible in the UI except as servers that "vanished", so the fallback is
   logged, and the connection runs off the main loop behind a startup window that says which step
   it is on. Never make the user stare at nothing while a daemon is being reached.
+
+## Reading the log over D-Bus (binding)
+
+`LogsSince(after_seq: u64, limit: u32) -> String` returns a JSON `LogSlice`: the records following
+the caller's cursor, plus `book_id`, `first_seq`, `next_seq` and `skipped`. It answers for **every**
+session, not just `default`.
+
+`RecentLogs` and `ClearLogs` keep their names and shapes, so a client older than this daemon still
+works; `RecentLogs` is served from the same book and keeps the `oxidom: ` prefix those clients
+parse. Against a daemon *older* than the client, `logs_since` falls back to `RecentLogs` and marks
+the reconstructed slice with `book_id == 0` (`LEGACY_BOOK_ID`), which a real book never takes — the
+signal that sequence numbers are synthetic, the whole log arrives every call, and the reader must
+replace rather than append.
+
+A reader that sees `book_id` change resets its cursor: the daemon restarted and counts from zero
+again, and a cursor left above every number the new book will issue makes the view go silent.
 
 ## `config.toml` schema (serde)
 

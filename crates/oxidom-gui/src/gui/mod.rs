@@ -9,6 +9,7 @@ use oxidom_core::APP_ID;
 
 mod flags;
 mod group;
+mod logfeed;
 mod operation;
 mod prefs;
 mod reduce;

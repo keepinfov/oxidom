@@ -452,8 +452,8 @@ impl Session {
         core_options: ResolvedCore,
     ) -> Self {
         Self {
+            core: XrayCore::new(profile.clone(), socks_port, http_port, xray_binary),
             profile,
-            core: XrayCore::new(socks_port, http_port, xray_binary),
             address,
             socks_port,
             http_port,
@@ -544,8 +544,10 @@ impl Session {
         self.core.is_alive()
     }
 
-    pub fn recent_logs(&self) -> Vec<String> {
-        self.core.recent_logs()
+    /// See [`XrayCore::current_run_logs`] — for diagnosing this attempt, not
+    /// for showing the user a log.
+    pub fn current_run_logs(&self) -> Vec<String> {
+        self.core.current_run_logs()
     }
 
     pub fn clear_logs(&self) {
@@ -1073,7 +1075,10 @@ impl Engine {
             default_gateway,
             connected,
         })?;
-        let mut tun2socks = Tun2socks::new(self.registry.config.tun2socks_binary.clone());
+        let tun2socks = Tun2socks::new(
+            profile.to_string(),
+            self.registry.config.tun2socks_binary.clone(),
+        );
         tun2socks.resolve_binary()?;
         let previous_created = self
             .sessions
@@ -1087,10 +1092,6 @@ impl Engine {
             .is_some()
         {
             self.stop_interface(profile)?;
-        }
-        // Keep interface diagnostics beside the core output exposed by Logs.
-        if let Some(session) = self.sessions.get(profile) {
-            tun2socks.logs = session.core.logs.clone();
         }
         let interface = Interface {
             profile: profile.to_string(),
@@ -1198,7 +1199,7 @@ impl Engine {
             mark: 0,
             routes: RouteMode::Manual,
             created: false,
-            tun2socks: Tun2socks::new(String::new()),
+            tun2socks: Tun2socks::new(profile.to_string(), String::new()),
             nft_binary: String::new(),
             cgroup: Some(slice),
             nft_active: false,
@@ -2132,7 +2133,7 @@ mod tests {
             mark: 0x6f21,
             routes: RouteMode::List,
             created: true,
-            tun2socks: Tun2socks::new(String::new()),
+            tun2socks: Tun2socks::new("work".to_string(), String::new()),
             nft_binary: String::new(),
             cgroup: Some(crate::run::user_slice("work", 1000)?),
             nft_active: false,

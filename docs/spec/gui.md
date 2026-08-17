@@ -37,7 +37,12 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
 - **Subscriptions view:** add (URL + optional name), update-now, delete; per-sub **"send HWID"**
   switch (default OFF) with a privacy hint.
 - **Settings view:** ports, system-proxy toggle, latency method + test URL.
-- **Logs view:** the core's ring-buffer output.
+- **Logs view:** the process log book, filtered by source (all / oxidom / Xray / interface),
+  minimum severity, and a text search. Records arrive by cursor (`LogsSince`), so a refresh
+  appends and **never rebuilds** — rebuilding is what threw the reader back to the top of the log.
+  A rebuild happens only on a filter change, a clear, or a daemon restart. The buffer is trimmed
+  only while following and never past the first visible line, so a reader who has scrolled up is
+  left alone. Lines the daemon could not hand over are announced in place, not silently dropped.
 
 Responsiveness: a breakpoint (~700px) collapses the split view and switches the grid to a single
 column, exposing the small sidebar toggle button (as annotated in the narrow mockup).

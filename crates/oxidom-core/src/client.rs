@@ -470,9 +470,36 @@ impl DaemonClient {
         self.proxy.call("RecentLogs", &()).map_err(friendly)
     }
 
+    /// Structured records after `after_seq`.
+    ///
+    /// Falls back to `RecentLogs` against a daemon that predates the cursor,
+    /// synthesising a slice from the flat lines it returns. That daemon reports
+    /// no sequence numbers, so the fallback carries `book_id: 0` and a
+    /// `next_seq` of zero, which keeps the caller redrawing exactly as it had to
+    /// before — degraded, but never blank.
+    pub fn logs_since(&self, after_seq: u64, limit: u32) -> Result<crate::logbook::LogSlice> {
+        match self
+            .proxy
+            .call::<_, _, String>("LogsSince", &(after_seq, limit))
+        {
+            Ok(json) => Ok(serde_json::from_str(&json)?),
+            Err(error) if is_unknown_method(&error) => {
+                let lines = self.recent_logs()?;
+                Ok(crate::logbook::LogSlice::from_legacy_lines(lines))
+            }
+            Err(error) => Err(friendly(error)),
+        }
+    }
+
     pub fn clear_logs(&self) -> Result<()> {
         self.proxy.call("ClearLogs", &()).map_err(friendly)
     }
+}
+
+/// Does this daemon simply not have the method we called?
+fn is_unknown_method(error: &zbus::Error) -> bool {
+    matches!(error, zbus::Error::MethodError(name, _, _)
+        if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod")
 }
 
 #[cfg(test)]
