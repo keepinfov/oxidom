@@ -30,6 +30,16 @@ files. None may loosen them.
 - **Say what actually happened.** If a check fails, report the failure and its
   output. Never describe a gate as passing that you did not run, and never
   present an unverified claim as measured.
+- **Point only at what a clone contains.** A commit message, pull request,
+  issue or code comment may cite only files and documents that come with the
+  repository. A gitignored notes directory, a scratch file in your home, a chat
+  transcript, a planning document on your machine — the reader has none of
+  them, so citing one is not evidence, it is a request to take the reasoning on
+  faith. Restate the substance inline, however long that makes the message, or
+  commit the document in the same change. This binds tooling as tightly as
+  people: an agent keeping its own working notes must quote them, never cite
+  them. This file was rewritten once to remove exactly that mistake — it used
+  to send readers to a directory nobody who clones the repository has.
 - **Ask before anything irreversible**: force-pushing, rewriting published
   history, deleting branches or tags, touching a user's live database under
   `~/.local/share/oxidom` or `/var/lib/oxidom`.
