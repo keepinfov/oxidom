@@ -1771,6 +1771,18 @@ impl Controller {
                     }
                 })
             },
+            trust: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id: String| {
+                    if let Some(controller) = weak.upgrade() {
+                        let name = controller.server_label(&id);
+                        // Nothing is connecting: this was reached from the menu
+                        // rather than from a failure, so a fresh reading is
+                        // what shows the pin took effect.
+                        controller.present_trust_dialog(id, name, AfterTrust::Measure);
+                    }
+                })
+            },
             recheck: {
                 let weak = Rc::downgrade(self);
                 Rc::new(move |ids: Vec<String>| {

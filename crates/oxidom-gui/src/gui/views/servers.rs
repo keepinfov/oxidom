@@ -51,6 +51,9 @@ pub struct CardCallbacks {
     pub select: Rc<dyn Fn(String)>,
     pub activate: Rc<dyn Fn(String)>,
     pub ping: Rc<dyn Fn(String)>,
+    /// Look at one server's certificate and decide about it, before anything
+    /// has failed.
+    pub trust: Rc<dyn Fn(String)>,
     pub recheck: Rc<dyn Fn(Vec<String>)>,
     pub refresh: Rc<dyn Fn(String)>,
     pub set_alias: Rc<dyn Fn(String, String)>,
@@ -787,6 +790,11 @@ impl ServersView {
                     let id = id.clone();
                     move || cb(id.clone())
                 };
+                let on_trust = {
+                    let cb = callbacks.trust.clone();
+                    let id = id.clone();
+                    move || cb(id.clone())
+                };
                 let on_activate = {
                     let cb = callbacks.activate.clone();
                     let id = id.clone();
@@ -819,6 +827,7 @@ impl ServersView {
                         select: Rc::new(on_select),
                         activate: Rc::new(on_activate),
                         ping: Rc::new(on_ping),
+                        trust: Rc::new(on_trust),
                         set_alias: Rc::new(on_set_alias),
                         toggle_favourite: {
                             let view = self.clone();
