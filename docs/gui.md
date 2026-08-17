@@ -114,6 +114,7 @@ repointing it.
 
 | Row | Notes |
 |---|---|
+| **Appearance** | Follow the system, Light, or Dark. Applies as you pick it — there is nothing to Apply, because it belongs to this window rather than to the daemon. A choice other than "follow the system" overrides the desktop, which is the point on a desktop that offers no such setting. Stored in `gui_prefs.toml`. |
 | **Local proxy** — SOCKS and HTTP ports | Locked, with an explanation, when the daemon's unit pinned them. |
 | **System proxy** | "Send the whole desktop's traffic through oxidom while connected (GNOME)". See [routing.md](routing.md#gnome-system-proxy). |
 | **Reconnect automatically** | "Reconnect only when Xray exits unexpectedly, never after Disconnect". |

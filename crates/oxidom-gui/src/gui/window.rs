@@ -551,6 +551,24 @@ fn build(
         }
     });
     settings.set_runtime_info(initial_runtime.as_ref());
+
+    // Apply the saved scheme before anything is on screen, so a window pinned
+    // to light does not flash the desktop's dark one on the way up.
+    let gui_prefs = servers.prefs();
+    let saved_scheme = gui_prefs.borrow().color_scheme;
+    adw::StyleManager::default().set_color_scheme(saved_scheme.to_adw());
+    settings.set_color_scheme(saved_scheme);
+    settings.connect_color_scheme_changed({
+        let gui_prefs = gui_prefs.clone();
+        move |scheme| {
+            adw::StyleManager::default().set_color_scheme(scheme.to_adw());
+            let mut prefs = gui_prefs.borrow_mut();
+            prefs.color_scheme = scheme;
+            if let Err(error) = prefs.save() {
+                log::warn!("could not save the colour scheme: {error:#}");
+            }
+        }
+    });
     let settings_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     settings_actions.append(&settings.reset_button());
     settings_actions.append(&settings.apply_button());
