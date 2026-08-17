@@ -132,6 +132,12 @@ fingerprint against the server's own certificate first.
 If a server that is already pinned fails the same way, the dialog does not
 reappear: pinning did not fix it, and asking again in a loop would not either.
 
+The same dialog is on a server card's context menu as **Trust certificate…**,
+for deciding before anything fails — and for a server whose certificate has
+since changed. It appears only for servers using ordinary TLS: REALITY
+authenticates by public key rather than by a certificate chain, and a plain
+protocol presents none at all.
+
 Removing a subscription disconnects any session using one of its servers, and a
 refresh that drops the active server disconnects that session rather than silently
 repointing it.

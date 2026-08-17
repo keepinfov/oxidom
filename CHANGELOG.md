@@ -18,6 +18,9 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **Trust certificate…** on a server card's context menu, for deciding before
+  anything fails or after a certificate has changed. Shown only for servers
+  using ordinary TLS.
 - **The GUI asks about a certificate rather than failing.** A connection that
   fails because the server's certificate cannot be verified now opens a dialog
   showing the fingerprint, and accepting it pins the certificate and reconnects

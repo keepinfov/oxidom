@@ -198,6 +198,10 @@ pub struct CardHandlers {
     pub select: Rc<dyn Fn()>,
     pub activate: Rc<dyn Fn()>,
     pub ping: Rc<dyn Fn()>,
+    /// Look at the server's certificate and decide about it, before anything
+    /// has failed. The failure path opens the same dialog on its own; this is
+    /// for the person who already knows their server is self-signed.
+    pub trust: Rc<dyn Fn()>,
     pub set_alias: Rc<dyn Fn(String)>,
     pub toggle_favourite: Rc<dyn Fn()>,
 }
@@ -269,6 +273,7 @@ impl ServerCard {
             select: on_select,
             activate: on_activate,
             ping: on_ping,
+            trust: on_trust,
             set_alias: on_set_alias,
             toggle_favourite,
         } = handlers;
@@ -483,6 +488,18 @@ impl ServerCard {
             .build();
         ping_button.update_property(&[gtk::accessible::Property::Label("Re-check latency")]);
         ping_button.connect_clicked(move |_| on_ping());
+        // Never shown on the card itself: it exists so the context menu has a
+        // button to borrow, the way every other item there does.
+        let trust_button = gtk::Button::builder().visible(false).build();
+        trust_button.connect_clicked(move |_| on_trust());
+        // Only ordinary TLS has a certificate to pin. REALITY authenticates by
+        // public key and presents a borrowed chain nobody should pin, and a
+        // plain protocol presents nothing — offering the item there would open
+        // a dialog that can only fail.
+        let pinnable = server
+            .spec
+            .stream()
+            .is_some_and(|stream| stream.security == "tls");
         // Starring is the one way into the Favourites group, and Favourites is
         // the answer to "the four servers I actually use are somewhere in six
         // hundred".
@@ -544,25 +561,27 @@ impl ServerCard {
                     // Built on first use: a card is recreated on every rebuild,
                     // and a subscription of six hundred servers should not pay
                     // for six hundred popovers nobody opens.
-                    let popover = context_popover(&[
-                        (&connect_button, None),
-                        (favourite_button.upcast_ref(), None),
-                        (&edit_alias, None),
-                        (&copy_button, Some("Copy share-link")),
-                        (&ping_button, None),
-                    ]);
+                    let popover = context_popover(&items(
+                        &connect_button,
+                        favourite_button.upcast_ref(),
+                        &edit_alias,
+                        &copy_button,
+                        &ping_button,
+                        pinnable.then_some(&trust_button),
+                    ));
                     popover.set_parent(&header);
                     popover
                 });
                 sync_context_labels(
                     popover,
-                    &[
-                        (&connect_button, None),
-                        (favourite_button.upcast_ref(), None),
-                        (&edit_alias, None),
-                        (&copy_button, Some("Copy share-link")),
-                        (&ping_button, None),
-                    ],
+                    &items(
+                        &connect_button,
+                        favourite_button.upcast_ref(),
+                        &edit_alias,
+                        &copy_button,
+                        &ping_button,
+                        pinnable.then_some(&trust_button),
+                    ),
                 );
                 popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
                 popover.popup();
@@ -1173,6 +1192,28 @@ type ContextItem<'a> = (&'a gtk::Button, Option<&'static str>);
 /// Connect or Copy would be a second copy of rules that already live on the card
 /// — including which of them are available at all, which the items inherit by
 /// mirroring `sensitive`.
+/// The menu's contents, in one place: it is built on first use and its labels
+/// are re-synced on every open, and the two lists drifting apart would show one
+/// item and act on another.
+fn items<'a>(
+    connect: &'a gtk::Button,
+    favourite: &'a gtk::Button,
+    alias: &'a gtk::Button,
+    copy: &'a gtk::Button,
+    ping: &'a gtk::Button,
+    trust: Option<&'a gtk::Button>,
+) -> Vec<ContextItem<'a>> {
+    let mut items = vec![
+        (connect, None),
+        (favourite, None),
+        (alias, None),
+        (copy, Some("Copy share-link")),
+        (ping, None),
+    ];
+    items.extend(trust.map(|trust| (trust, Some("Trust certificate…"))));
+    items
+}
+
 fn context_popover(sources: &[ContextItem<'_>]) -> gtk::Popover {
     let items = gtk::Box::new(gtk::Orientation::Vertical, 0);
     for (source, _) in sources {
