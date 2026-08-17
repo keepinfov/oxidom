@@ -79,6 +79,14 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **A stopped profile can be started again from its own row.** The Profiles page
+  was waiting for a word the daemon has never sent. It reads four states off the
+  wire, and the one meaning "stopped" is spelled `disconnected` — so a session
+  the daemon was holding but not running fell through to "Unknown", and an
+  unknown state deliberately greys out the row's switch, on the reasoning that a
+  switch cannot assert a position it does not understand. The reasoning was
+  sound; the state was perfectly well understood. Reachable without any newer
+  daemon: a reconnect that fails to confirm leaves exactly such a session.
 - **The Logs page no longer throws you back to the top.** Scrolling up to read
   something used to last only until the next line arrived. The daemon handed
   over its whole buffer twice a second and the view worked out the difference by

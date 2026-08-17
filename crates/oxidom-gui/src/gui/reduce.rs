@@ -1168,10 +1168,12 @@ fn session_row_state(session: Option<&SessionInfo>) -> SessionRowState {
         Some("connected") => SessionRowState::Connected,
         Some("connecting") => SessionRowState::Connecting,
         Some("error") => SessionRowState::Error,
-        // No session for this profile is the one honest "stopped": the daemon
-        // is not running it. A session carrying a word this build never heard
-        // of is not stopped, it is unread.
-        Some("stopped") | None => SessionRowState::Stopped,
+        // Two honest stops: the daemon holding a session it is not running, and
+        // the daemon holding none at all. The wire word is "disconnected" —
+        // the only one `SessionInfo::state` is documented to carry for this,
+        // and the only one the daemon has ever sent. A session carrying a word
+        // this build never heard of is not stopped, it is unread.
+        Some("disconnected") | None => SessionRowState::Stopped,
         Some(_) => SessionRowState::Unknown,
     }
 }
@@ -2867,13 +2869,43 @@ mod tests {
 
         // The two honest stops still read as stopped: the daemon saying so,
         // and the daemon carrying no session for this profile at all.
-        state.sessions = vec![session("work", "stopped", "shared")];
+        state.sessions = vec![session("work", "disconnected", "shared")];
         let rows = session_rows(std::slice::from_ref(&work), &state, NOW_MS);
         assert_eq!(rows[0].state, SessionRowState::Stopped);
 
         state.sessions = Vec::new();
         let rows = session_rows(&[work], &state, NOW_MS);
         assert_eq!(rows[0].state, SessionRowState::Stopped);
+    }
+
+    /// `SessionInfo::state` documents four words and the daemon sends exactly
+    /// those four; `"stopped"` is not among them and never has been. Waiting
+    /// for it meant the one word the daemon *does* send for a stopped session
+    /// fell through to `Unknown`, which the Profiles page draws as "Unknown"
+    /// and, worse, uses to insensitise the row's switch — so a profile the
+    /// daemon had stopped could not be started again from its own row.
+    ///
+    /// Reachable without a newer daemon: a confirmation that fails on a
+    /// non-`Explicit` origin calls `stop_session`, which keeps the session and
+    /// marks it disconnected, and installs no error override to rename it.
+    #[test]
+    fn every_state_the_daemon_sends_is_a_state_this_build_reads() {
+        let work = profile("work", "shared");
+        let mut state = state();
+
+        for (wire, expected) in [
+            ("disconnected", SessionRowState::Stopped),
+            ("connecting", SessionRowState::Connecting),
+            ("connected", SessionRowState::Connected),
+            ("error", SessionRowState::Error),
+        ] {
+            state.sessions = vec![session("work", wire, "shared")];
+            let rows = session_rows(std::slice::from_ref(&work), &state, NOW_MS);
+            assert_eq!(
+                rows[0].state, expected,
+                "the daemon sends {wire:?}; no state it sends may read as Unknown"
+            );
+        }
     }
 
     /// The headline carries the same text, but a subtitle ellipsises and cannot
