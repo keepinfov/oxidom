@@ -35,7 +35,7 @@ use super::views::profile_dialog::{
 use super::views::servers::{CardConnection, ServersView};
 use super::views::sessions::{SessionCallbacks, SessionsView};
 use super::views::settings::{SettingsValues, SettingsView};
-use super::views::subscriptions::SubscriptionsView;
+use super::views::subscriptions::{Pasted, SubscriptionsView, with_clipboard};
 use oxidom_core::client::{ConnectStage, DaemonClient, DaemonSource};
 
 /// The refusal `client_job` hands to a completion handler when another
@@ -1001,6 +1001,11 @@ impl Controller {
             Box::new(|controller| controller.refresh_all_subscriptions()),
         );
         add(
+            "paste",
+            &["<Control>v"],
+            Box::new(|controller| controller.import_from_clipboard()),
+        );
+        add(
             "quit",
             &["<Control>q"],
             Box::new(|controller| controller.request_quit()),
@@ -1030,6 +1035,26 @@ impl Controller {
         }
 
         self.window.insert_action_group("win", Some(&actions));
+    }
+
+    /// Ctrl+V anywhere but a text field: take whatever is on the clipboard and
+    /// open the dialog it belongs to, filled in.
+    ///
+    /// A subscription link is copied from a browser or a chat and then pasted;
+    /// the app asking the user to first find the right dialog, and paste there,
+    /// is the step being removed. An entry with focus keeps its own Ctrl+V —
+    /// GTK gives the focused widget the key first, and this action never sees
+    /// it.
+    fn import_from_clipboard(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        with_clipboard(&self.window, move |pasted| {
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            if controller.subscriptions.open_for_pasted(pasted) == Pasted::Nothing {
+                controller.show_message("Nothing on the clipboard to import");
+            }
+        });
     }
 
     /// Puts the cursor in whichever search entry the current layout uses.

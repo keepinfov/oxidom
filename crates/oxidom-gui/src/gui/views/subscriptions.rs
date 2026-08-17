@@ -138,6 +138,25 @@ impl SubscriptionsView {
         self.header_embedded.set(embedded);
     }
 
+    /// Open the dialog the clipboard's contents belong to, already filled in.
+    ///
+    /// Returns what it found, so the caller can say something when the answer
+    /// is "nothing importable" — a keyboard shortcut that silently does
+    /// nothing is indistinguishable from one that is broken.
+    pub fn open_for_pasted(&self, pasted: Pasted) -> Pasted {
+        let Some(callbacks) = self.callbacks.borrow().clone() else {
+            return Pasted::Nothing;
+        };
+        match &pasted {
+            Pasted::Subscription(url) => {
+                show_add_subscription(&self.root, callbacks, Some(url.clone()))
+            }
+            Pasted::Servers(text) => show_import_servers(&self.root, callbacks, Some(text.clone())),
+            Pasted::Nothing => {}
+        }
+        pasted
+    }
+
     pub fn rebuild(&self, subscriptions: &[Subscription], callbacks: SubscriptionCallbacks) {
         *self.callbacks.borrow_mut() = Some(callbacks.clone());
 
@@ -372,7 +391,7 @@ fn make_header_controls(
         let Some(callbacks) = callbacks_for_add.borrow().clone() else {
             return;
         };
-        show_add_subscription(&root, callbacks);
+        show_add_subscription(&root, callbacks, None);
     });
 
     let root_weak = root.downgrade();
@@ -386,7 +405,7 @@ fn make_header_controls(
         let Some(callbacks) = callbacks_for_import.borrow().clone() else {
             return;
         };
-        show_import_servers(&root, callbacks);
+        show_import_servers(&root, callbacks, None);
     });
 
     update_all.connect_clicked(move |_| {
@@ -407,7 +426,11 @@ fn make_header_controls(
     }
 }
 
-fn show_add_subscription(parent: &impl IsA<gtk::Widget>, callbacks: SubscriptionCallbacks) {
+fn show_add_subscription(
+    parent: &impl IsA<gtk::Widget>,
+    callbacks: SubscriptionCallbacks,
+    prefill: Option<String>,
+) {
     let window = adw::Window::builder()
         .title("Add Subscription")
         .modal(true)
@@ -470,8 +493,9 @@ fn show_add_subscription(parent: &impl IsA<gtk::Widget>, callbacks: Subscription
     let window_for_cancel = window.clone();
     cancel.connect_clicked(move |_| window_for_cancel.close());
     let window_for_add = window.clone();
+    let url_entry_for_add = url_entry.clone();
     add.connect_clicked(move |_| {
-        let url = url_entry.text().trim().to_string();
+        let url = url_entry_for_add.text().trim().to_string();
         if !is_valid_subscription_url(&url) {
             return;
         }
@@ -483,10 +507,31 @@ fn show_add_subscription(parent: &impl IsA<gtk::Widget>, callbacks: Subscription
         );
         window_for_add.close();
     });
+    // A link already on the clipboard is almost always the reason this dialog
+    // is open. Filling it in is not a guess about intent — the field is empty
+    // and the value validates as the very thing the dialog asks for — and it
+    // stays editable.
+    match prefill {
+        Some(url) => url_entry.set_text(&url),
+        None => {
+            let url_entry = url_entry.clone();
+            with_clipboard(&window, move |pasted| {
+                if url_entry.text().is_empty()
+                    && let Pasted::Subscription(url) = pasted
+                {
+                    url_entry.set_text(&url);
+                }
+            });
+        }
+    }
     window.present();
 }
 
-fn show_import_servers(parent: &impl IsA<gtk::Widget>, callbacks: SubscriptionCallbacks) {
+fn show_import_servers(
+    parent: &impl IsA<gtk::Widget>,
+    callbacks: SubscriptionCallbacks,
+    prefill: Option<String>,
+) {
     let window = adw::Window::builder()
         .title("Import Server")
         .modal(true)
@@ -554,6 +599,22 @@ fn show_import_servers(parent: &impl IsA<gtk::Widget>, callbacks: SubscriptionCa
 
     let window_for_cancel = window.clone();
     cancel.connect_clicked(move |_| window_for_cancel.close());
+    // Same reasoning as the subscription field: links on the clipboard are why
+    // this is open. Writing them in also runs the validator, so the Import
+    // button is live without a second paste.
+    match prefill {
+        Some(text) => buffer.set_text(&text),
+        None => {
+            let buffer = buffer.clone();
+            with_clipboard(&window, move |pasted| {
+                if buffer.char_count() == 0
+                    && let Pasted::Servers(text) = pasted
+                {
+                    buffer.set_text(&text);
+                }
+            });
+        }
+    }
     let window_for_import = window.clone();
     import.connect_clicked(move |_| {
         let (start, end) = buffer.bounds();
@@ -876,6 +937,66 @@ fn scrollable_dialog_content(content: &impl IsA<gtk::Widget>) -> gtk::ScrolledWi
 /// rule the daemon applies in `subscription::require_https`. The daemon refuses
 /// plaintext regardless, since D-Bus clients never reach this function, but
 /// keeping the two in step turns a doomed fetch into a button that never enables.
+/// What the clipboard is holding, as far as this page is concerned.
+///
+/// Someone copying a link and reaching for Ctrl+V has already said what they
+/// want; asking them to also pick the right dialog and paste again is the part
+/// worth removing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Pasted {
+    /// A subscription URL, for the Add Subscription dialog.
+    Subscription(String),
+    /// One or more share links, for the Import Server dialog.
+    Servers(String),
+    /// Nothing importable — ordinary text, or links this build cannot parse.
+    Nothing,
+}
+
+/// Decide which dialog a clipboard payload belongs to.
+///
+/// `http(s)://` is genuinely ambiguous — it is both how a subscription URL is
+/// spelled and how an HTTP-proxy share link is spelled, so `link` parses one
+/// as the other. A single such line is read as a subscription, which is what
+/// it nearly always is; anything it refuses (plain `http:` to a remote host,
+/// say) is reported as nothing rather than offered for import as a proxy
+/// nobody meant. Several lines are share links, so a handful of HTTP proxies
+/// still imports.
+///
+/// Both branches end in the validators the dialogs themselves use, so nothing
+/// is ever offered that the dialog would then refuse.
+pub(crate) fn classify_pasted(text: &str) -> Pasted {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Pasted::Nothing;
+    }
+    let single_line = !trimmed.contains(['\n', ' ']);
+    let web_url = trimmed.starts_with("http://") || trimmed.starts_with("https://");
+    if single_line && web_url {
+        return if is_valid_subscription_url(trimmed) {
+            Pasted::Subscription(trimmed.to_string())
+        } else {
+            Pasted::Nothing
+        };
+    }
+    if validate_share_links(trimmed).is_none() {
+        return Pasted::Servers(trimmed.to_string());
+    }
+    Pasted::Nothing
+}
+
+/// Hand the clipboard's contents to `f`, classified. Reading a clipboard is
+/// asynchronous, so this is the only shape available: a caller cannot ask what
+/// is in it and act on the answer in one breath.
+pub(crate) fn with_clipboard(widget: &impl IsA<gtk::Widget>, f: impl FnOnce(Pasted) + 'static) {
+    widget
+        .as_ref()
+        .clipboard()
+        .read_text_async(None::<&gtk::gio::Cancellable>, move |result| match result {
+            Ok(Some(text)) => f(classify_pasted(&text)),
+            _ => f(Pasted::Nothing),
+        });
+}
+
 fn is_valid_subscription_url(value: &str) -> bool {
     let Ok(parsed) = url::Url::parse(value) else {
         return false;
@@ -984,7 +1105,54 @@ fn format_timestamp(timestamp: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{also_in_groups, groups_losing_servers};
+    use super::{Pasted, also_in_groups, classify_pasted, groups_losing_servers};
+
+    const VLESS: &str = "vless://3f7c1a52-9d84-4b6e-8c21-5ea7f0d93b18@example.net:443\
+        ?encryption=none&security=tls&type=tcp#node";
+
+    #[test]
+    fn a_subscription_url_opens_the_subscription_dialog() {
+        assert_eq!(
+            classify_pasted("  https://panel.example.com/sub?token=abc  "),
+            Pasted::Subscription("https://panel.example.com/sub?token=abc".to_string()),
+            "surrounding whitespace comes with every real copy"
+        );
+    }
+
+    /// A share link is a URL too. Checking share links first is what stops the
+    /// app offering to subscribe to a single server.
+    #[test]
+    fn a_share_link_opens_the_import_dialog_not_the_subscription_one() {
+        assert!(matches!(classify_pasted(VLESS), Pasted::Servers(_)));
+    }
+
+    #[test]
+    fn several_links_are_imported_together() {
+        let two = format!("{VLESS}\n{VLESS}");
+        assert!(matches!(classify_pasted(&two), Pasted::Servers(_)));
+    }
+
+    /// Silence would be indistinguishable from a broken shortcut, so the
+    /// caller needs to be told there was nothing to act on.
+    #[test]
+    fn ordinary_text_is_nothing_to_import() {
+        for text in ["", "   \n ", "hello", "ftp://example.com/x"] {
+            assert_eq!(classify_pasted(text), Pasted::Nothing, "{text:?}");
+        }
+    }
+
+    /// `link` parses a bare `http://host/path` as an HTTP-proxy share link,
+    /// which is the same spelling a subscription URL uses. Offering to import
+    /// a proxy nobody meant is worse than saying nothing, and the subscription
+    /// dialog would refuse a plain-text URL anyway.
+    #[test]
+    fn a_web_url_the_subscription_dialog_would_refuse_is_not_offered_as_a_server() {
+        assert_eq!(
+            classify_pasted("http://example.com/sub"),
+            Pasted::Nothing,
+            "a remote http: URL is neither an acceptable subscription nor a proxy anyone pasted on purpose"
+        );
+    }
 
     #[test]
     fn a_deletion_says_which_groups_would_lose_the_server() {

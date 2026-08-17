@@ -4,11 +4,20 @@ Wants=network-online.target
 After=network-online.target dbus.service
 
 [Service]
-# Passing the ports on the command line pins them: with the daemon reachable
-# over the system bus, an unpinned port is a setting any client can rewrite,
-# which moves the inbound out from under everyone else using it. Edit the
-# numbers here (systemctl edit oxidom) rather than in the GUI.
-ExecStart=/usr/bin/oxidom daemon --system --socks-port 10808 --http-port 10809
+# No --socks-port/--http-port here: passing them pins the ports, and a pinned
+# port is one the daemon refuses to change, so Settings shows the row locked and
+# a desktop user cannot move their own proxy off 10808. The daemon reads
+# /var/lib/oxidom/config.toml instead, which is the file the GUI edits.
+#
+# Pinning is still the right answer on a machine where several people can drive
+# this daemon — everyone in group oxidom or wheel can, per the D-Bus policy —
+# because moving an inbound moves it out from under all of them. Pin it there:
+#
+#   systemctl edit oxidom
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/bin/oxidom daemon --system --socks-port 10808 --http-port 10809
+ExecStart=/usr/bin/oxidom daemon --system
 User=oxidom
 Group=oxidom
 StateDirectory=oxidom

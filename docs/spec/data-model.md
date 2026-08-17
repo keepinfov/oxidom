@@ -62,4 +62,9 @@ struct UserInfo { upload: u64, download: u64, total: u64, expire: Option<i64> }
   `Url::parse` will accept the link. Settings live in `Hysteria2Settings`, not `StreamSettings`.
   Bare `hysteria://` is **v1** and stays unsupported.
 
-Derive `country` from a leading flag emoji or country code in the name when present.
+Derive `country` from a leading flag emoji, or from a leading two-letter token that is an
+assigned ISO 3166-1 alpha-2 code — `🇩🇪 Frankfurt` and `DE-2 HYSTERIA2` both give `DE`. Only the
+**first** token counts, and only a real code (binding): `IS`, `IT`, `NO`, `ME`, `AT` and `WS` are
+countries *and* ordinary words, so matching one anywhere in a name would put wrong flags across
+half a provider's list. A name that says nothing stays `None`; nothing is inferred from the
+address, so a provider whose names carry no country shows no flags.

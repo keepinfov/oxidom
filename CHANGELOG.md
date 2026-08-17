@@ -22,12 +22,26 @@ surface, packaging, or the CLI belongs here.
   dark. It applies as it is picked and survives a restart. Until now the app
   followed the system scheme and offered no way to say otherwise, which leaves
   nothing to say it on a desktop that has no such setting.
+- **Ctrl+V imports what is on the clipboard.** A subscription URL opens Add
+  Subscription, share links open Import Server, both already filled in; opening
+  either dialog by hand fills an empty field the same way. Copying a link and
+  then having to find the right dialog and paste again was the step nobody
+  wanted.
 - A working agreement for contributors and agents ([AGENTS.md](AGENTS.md)), the
   binding implementation contract split into [docs/spec/](docs/spec/), a
   contributor guide, this changelog, a security policy, continuous integration,
   and a formatting hook installed by the dev shell.
 - A screenshot of the connected server browser in the README, in both desktop
   colour schemes.
+
+### Changed
+
+- The Arch service unit no longer pins the SOCKS and HTTP ports. A pinned port
+  is one the daemon refuses to change, which left Settings showing a locked row
+  and no way for a desktop user to move their own proxy off 10808. Ports now
+  come from `config.toml`, the file the GUI edits. Pinning remains the right
+  answer where several people drive one daemon, and `systemctl edit oxidom`
+  still does it — `docs/installation.md` says how.
 
 ### Fixed
 
@@ -38,6 +52,13 @@ surface, packaging, or the CLI belongs here.
   failure now reads as a check that could not run, a whole-subscription check
   says once that nothing was measured, and a banner names the cause while the
   core is missing.
+- Country flags now appear for providers that spell the country in plain
+  letters. Detection accepted only a leading flag emoji, so `DE-2 HYSTERIA2`
+  read as no country at all and every such card showed a globe. A leading
+  two-letter token is now read when it is a real ISO code — only the first
+  token, and only a real code, so `second-ws-stas` does not become Samoa.
+  Names carrying no country still show no flag; nothing is guessed from the
+  address.
 - The Arch package builds again: the recorded checksum for `oxidom.service` no
   longer matched the file, which stopped `makepkg` at the validity check before
   it reached a compiler. The package now also declares the libraries it links

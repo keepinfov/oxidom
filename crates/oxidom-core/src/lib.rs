@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod core_options;
 pub mod distro;
+pub mod country;
 pub mod egress;
 pub mod engine;
 pub mod fsutil;
