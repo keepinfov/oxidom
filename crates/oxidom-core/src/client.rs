@@ -280,6 +280,23 @@ impl DaemonClient {
             .map_err(friendly)
     }
 
+    /// The certificate this server presents, as a SHA-256 hex string. Reads
+    /// it; decides nothing.
+    pub fn inspect_certificate(&self, server_id: &str) -> Result<String> {
+        self.proxy
+            .call("InspectCertificate", &(server_id,))
+            .map_err(friendly)
+    }
+
+    /// Accept exactly this certificate for this server from now on. Pass the
+    /// fingerprint that was shown, not one fetched again — the difference is
+    /// the whole point of a pin.
+    pub fn trust_certificate(&self, server_id: &str, sha256: &str) -> Result<()> {
+        self.proxy
+            .call("TrustCertificate", &(server_id, sha256))
+            .map_err(friendly)
+    }
+
     /// Profiles arrived after the first daemons shipped, so every call below
     /// can meet an `UnknownMethod` from a daemon that predates them. Say so in
     /// those words rather than passing the bus error through.

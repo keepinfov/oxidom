@@ -62,6 +62,13 @@ struct UserInfo { upload: u64, download: u64, total: u64, expire: Option<i64> }
   `Url::parse` will accept the link. Settings live in `Hysteria2Settings`, not `StreamSettings`.
   Bare `hysteria://` is **v1** and stays unsupported.
 
+`StreamSettings.pin_sha256` is a **local mark**, not provider data (binding): it is set only by
+a user trusting a certificate, it is carried across a refresh the way an alias is, and
+`same_connection_as` ignores it when matching a refreshed entry to the one it replaces. Comparing
+it would mean a server stopped matching its own refreshed entry the moment someone trusted its
+certificate, losing the alias and the stable id along with the pin. A pin the provider itself
+sends is not overwritten by a carried one.
+
 Derive `country` from a leading flag emoji, or from a leading two-letter token that is an
 assigned ISO 3166-1 alpha-2 code — `🇩🇪 Frankfurt` and `DE-2 HYSTERIA2` both give `DE`. Only the
 **first** token counts, and only a real code (binding): `IS`, `IT`, `NO`, `ME`, `AT` and `WS` are

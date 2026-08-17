@@ -147,6 +147,7 @@ fn dispatch(cli: Cli) -> CliResult {
         Command::List { target, json } => list(target, json),
         Command::Ping { handle } => ping(&handle),
         Command::Alias { handle, new } => set_alias(&handle, &new),
+        Command::Trust { handle, trust } => trust_certificate(&handle, trust),
         Command::Profile { command } => profile_command(command),
         Command::Core { command } => core_command(command),
         Command::Gui { background, debug } => {
@@ -613,6 +614,36 @@ fn probe_reading_for_server<'a>(
         })
         .and_then(|session| probes.proxied.get(&session.profile))
         .or_else(|| probes.readings.get(server_id))
+}
+
+/// Print what a server presents, and pin it when asked.
+///
+/// Printing first is the point: a pin accepted without being looked at is
+/// `allowInsecure` with extra steps.
+fn trust_certificate(handle: &str, trust: bool) -> CliResult {
+    let client = spawning_client()?;
+    let subscriptions = client.subscriptions().map_err(Failure::error)?;
+    let server = resolve_server(&subscriptions, handle)?;
+    let sha256 = client
+        .inspect_certificate(&server.id)
+        .map_err(Failure::error)?;
+    let readable = sha256
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| String::from_utf8_lossy(pair).to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    println!("{}:{}", server.address, server.port);
+    println!("SHA-256 {readable}");
+    if !trust {
+        println!("Run again with --trust to accept this certificate for this server.");
+        return Ok(());
+    }
+    client
+        .trust_certificate(&server.id, &sha256)
+        .map_err(Failure::error)?;
+    println!("Pinned. Only this certificate will be accepted for this server.");
+    Ok(())
 }
 
 fn set_alias(handle: &str, new: &str) -> CliResult {

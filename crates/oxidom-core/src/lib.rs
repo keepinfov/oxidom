@@ -26,6 +26,7 @@ pub mod subscription;
 pub mod subscription_format;
 pub mod sync;
 pub mod sysproxy;
+pub mod tls_pin;
 pub mod tun;
 pub mod xray;
 
