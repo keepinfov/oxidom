@@ -146,6 +146,57 @@ pub struct LogSlice {
     pub skipped: u64,
 }
 
+/// The `book_id` of a slice reconstructed from a daemon too old to have a book.
+///
+/// A real book never takes it: [`LogBook::new`] rejects zero explicitly. A
+/// reader seeing this knows the sequence numbers are synthetic, that the whole
+/// log arrives on every call, and that it must therefore replace rather than
+/// append.
+pub const LEGACY_BOOK_ID: u64 = 0;
+
+impl LogSlice {
+    /// Rebuild a slice from the flat lines an older daemon returns.
+    ///
+    /// Those lines carry no sequence, no time and no severity, so the source is
+    /// recovered from the prefix [`LogBook::legacy_lines`] writes and everything
+    /// else is left at its least committal value. Numbering restarts at one on
+    /// every call, which is honest: that daemon really does re-send its whole
+    /// buffer, and pretending otherwise would drop lines.
+    pub fn from_legacy_lines(lines: Vec<String>) -> Self {
+        let records: Vec<LogRecord> = lines
+            .into_iter()
+            .zip(1u64..)
+            .map(|(line, seq)| {
+                let (source, text) = match line.strip_prefix("oxidom: ") {
+                    Some(rest) => (LogSource::Oxidom, rest.to_string()),
+                    None => match line.strip_prefix("tun2socks: ") {
+                        Some(rest) => (LogSource::Tun2socks, rest.to_string()),
+                        None => (LogSource::Xray, line),
+                    },
+                };
+                let parsed = parse_process_line(&text);
+                LogRecord {
+                    seq,
+                    unix_ms: 0,
+                    source,
+                    severity: parsed.severity,
+                    profile: None,
+                    target: parsed.target.to_string(),
+                    text: parsed.text.to_string(),
+                }
+            })
+            .collect();
+        let next_seq = records.len() as u64 + 1;
+        LogSlice {
+            records,
+            book_id: LEGACY_BOOK_ID,
+            first_seq: 1,
+            next_seq,
+            skipped: 0,
+        }
+    }
+}
+
 struct Inner {
     records: VecDeque<LogRecord>,
     next_seq: u64,
@@ -176,8 +227,12 @@ impl LogBook {
             }),
             // Enough to tell one run from the next without pulling in a random
             // number generator: two processes cannot share a pid within the
-            // same millisecond.
-            book_id: (now_unix_ms() << 16) ^ u64::from(std::process::id()),
+            // same millisecond. Never zero, which is reserved for
+            // [`LEGACY_BOOK_ID`].
+            book_id: match (now_unix_ms() << 16) ^ u64::from(std::process::id()) {
+                LEGACY_BOOK_ID => 1,
+                id => id,
+            },
         }
     }
 
@@ -680,6 +735,34 @@ mod tests {
         let parsed = parse_process_line("2026/08/17 10:48:03 [Info] failed to dial: timeout");
         assert_eq!(parsed.target, "");
         assert_eq!(parsed.text, "failed to dial: timeout");
+    }
+
+    /// A daemon older than the cursor still has to produce a readable view, and
+    /// its prefixes are the only thing left saying who wrote each line.
+    #[test]
+    fn lines_from_an_older_daemon_recover_their_source_and_are_marked_synthetic() {
+        let slice = LogSlice::from_legacy_lines(vec![
+            "oxidom: starting the core for profile work".to_string(),
+            "tun2socks: could not open the device".to_string(),
+            "2026/08/17 10:48:03 [Error] app/proxyman: refused".to_string(),
+        ]);
+
+        let sources: Vec<LogSource> = slice.records.iter().map(|r| r.source).collect();
+        assert_eq!(
+            sources,
+            [LogSource::Oxidom, LogSource::Tun2socks, LogSource::Xray]
+        );
+        assert_eq!(slice.records[2].severity, Severity::Error);
+        assert_eq!(slice.records[2].text, "refused");
+        assert_eq!(
+            slice.book_id, LEGACY_BOOK_ID,
+            "a synthetic slice must be recognisable as one"
+        );
+        assert_ne!(
+            LogBook::new().book_id(),
+            LEGACY_BOOK_ID,
+            "a real book must never collide with the synthetic marker"
+        );
     }
 
     /// A `RUST_LOG=debug` run must not bury oxidom's own reasoning under the

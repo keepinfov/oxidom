@@ -2449,6 +2449,21 @@ impl Service {
         Ok(oxidom_core::logbook::global().legacy_lines())
     }
 
+    /// Structured log records after `after_seq`, at most `limit` of them.
+    ///
+    /// The cursor is the point: [`Self::recent_logs`] hands over the whole
+    /// buffer every time it is called, so a reader cannot tell new lines from a
+    /// reshuffled log and has to redraw. Passing what it has already seen makes
+    /// a refresh an append.
+    fn logs_since(&self, after_seq: u64, limit: u32) -> fdo::Result<String> {
+        let limit = if limit == 0 {
+            oxidom_core::logbook::DEFAULT_LIMIT
+        } else {
+            (limit as usize).min(oxidom_core::logbook::CAPACITY)
+        };
+        json(&oxidom_core::logbook::global().since(after_seq, limit))
+    }
+
     fn clear_logs(&self) -> fdo::Result<()> {
         oxidom_core::logbook::global().clear();
         Ok(())
