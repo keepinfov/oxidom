@@ -12,12 +12,14 @@ use oxidom_core::APP_ID;
 use oxidom_core::config::Config;
 use oxidom_core::ipc;
 use oxidom_core::ipc::ProfileEntry;
+use oxidom_core::logbook::{self, LogSlice};
 use oxidom_core::model::Subscription;
 use oxidom_core::pool::PoolQuery;
 use oxidom_core::profile::{Profile, ProfileProxy, ProfileSelect};
 use oxidom_core::xray::core::Status;
 use oxidom_core::{paths, sysproxy};
 
+use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
@@ -94,6 +96,12 @@ const SIDEBAR_BREAKPOINT_WIDTH: u32 = 700;
 /// bucket change; sweeping on every tick would be pure waste, and a second
 /// timer for it would be a second thing to keep in step with the poll.
 const AGE_SWEEP_TICKS: u8 = 30;
+
+/// Log records to take from each book per poll.
+///
+/// A quiet tick returns none of them; the cap only matters after the view has
+/// been unable to keep up, and what it drops is reported rather than hidden.
+const LOG_FETCH_LIMIT: u32 = 1000;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +266,9 @@ struct Controller {
     poll_snapshot: Arc<Mutex<Option<PolledSnapshot>>>,
     /// Poll ticks since the last age sweep. See [`AGE_SWEEP_TICKS`].
     sweep_tick: Cell<u8>,
+    /// Merges the daemon's log with this process's own, and remembers how far
+    /// each has been read. See [`LogFeed`].
+    log_feed: RefCell<LogFeed>,
 }
 
 /// How often the main loop looks in on the connection thread.
@@ -825,6 +836,7 @@ fn build(
         poll_in_flight: Arc::new(AtomicBool::new(false)),
         sweep_tick: Cell::new(0),
         poll_snapshot: Arc::new(Mutex::new(None)),
+        log_feed: RefCell::new(LogFeed::new()),
     });
     *controller_holder.borrow_mut() = Rc::downgrade(&controller);
 
@@ -1470,6 +1482,7 @@ impl Controller {
         self.sessions.set_ultra_compact(enabled);
         self.subscriptions.set_ultra_compact(enabled);
         self.settings.set_ultra_compact(enabled);
+        self.logs.set_ultra_compact(enabled);
         self.header.set_show_title(!enabled);
         self.sync_search_chrome();
         self.refresh_status();
@@ -2962,6 +2975,7 @@ impl Controller {
         // exactly the staleness it is supposed to catch.
         let epoch = self.bump_epoch();
         let client = self.state.borrow().client.clone();
+        let log_cursor = self.log_feed.borrow().remote_cursor();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let result = work(&client);
@@ -2975,7 +2989,7 @@ impl Controller {
                 Ok::<PolledSnapshot, anyhow::Error>(PolledSnapshot {
                     status: client.status()?,
                     probe: client.probe_state()?,
-                    logs: client.recent_logs()?,
+                    logs: client.logs_since(log_cursor, LOG_FETCH_LIMIT)?,
                     epoch,
                 })
             })();
@@ -3089,12 +3103,15 @@ impl Controller {
                 drop(state);
                 let slot = controller.poll_snapshot.clone();
                 let in_flight = controller.poll_in_flight.clone();
+                // Likewise read here: the cursor says what this round has
+                // already seen, and it only moves on the main thread.
+                let log_cursor = controller.log_feed.borrow().remote_cursor();
                 std::thread::spawn(move || {
                     let snapshot = (|| {
                         Ok::<PolledSnapshot, anyhow::Error>(PolledSnapshot {
                             status: client.status()?,
                             probe: client.probe_state()?,
-                            logs: client.recent_logs()?,
+                            logs: client.logs_since(log_cursor, LOG_FETCH_LIMIT)?,
                             epoch,
                         })
                     })();
@@ -3168,12 +3185,30 @@ impl Controller {
             // wrong route from turning into a request loop.
             self.probe_one(id, false);
         }
-        self.logs.set_logs(&snapshot.logs);
+        self.absorb_logs(snapshot.logs);
         self.sync_session_rows();
         self.sync_profile_switcher();
         self.sync_connection_cards();
         self.reconcile_system_proxy();
         self.refresh_status();
+    }
+
+    /// Fold one round of the daemon's log into the view, together with whatever
+    /// this process has logged about itself since the last round.
+    ///
+    /// The GUI's own book is read here rather than in the worker because it is
+    /// in this process: there is nothing to wait for, and reading it beside the
+    /// daemon's keeps both streams entering the reorder window together.
+    fn absorb_logs(&self, remote: LogSlice) {
+        let local = logbook::global().since(
+            self.log_feed.borrow().local_cursor(),
+            LOG_FETCH_LIMIT as usize,
+        );
+        let batch = self
+            .log_feed
+            .borrow_mut()
+            .absorb(remote, local, ipc::now_unix_ms());
+        self.logs.append(&batch);
     }
 
     /// The banner exists to say that something is running out of sight, and its
