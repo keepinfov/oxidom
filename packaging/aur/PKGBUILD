@@ -72,6 +72,10 @@ package() {
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.keepinfov.oxidom.svg"
   install -Dm644 data/dev.keepinfov.oxidom-symbolic.svg \
     "$pkgdir/usr/share/icons/hicolor/symbolic/apps/dev.keepinfov.oxidom-symbolic.svg"
+  # Adwaita ships no filter icon under any name, so the funnel travels with the
+  # application. Without it the Filter pill draws an empty square.
+  install -Dm644 data/icons/oxidom-funnel-symbolic.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/actions/oxidom-funnel-symbolic.svg"
   install -Dm644 data/dev.keepinfov.oxidom.metainfo.xml \
     "$pkgdir/usr/share/metainfo/dev.keepinfov.oxidom.metainfo.xml"
   install -Dm644 data/dev.keepinfov.oxidom.Daemon.conf \

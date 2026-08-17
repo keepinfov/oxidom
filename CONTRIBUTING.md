@@ -85,6 +85,10 @@ A maintainer reviews, and the branch is squash-merged.
 - Do not reformat or refactor code your change does not touch.
 - Do not delete or weaken a test to make something pass. If a test is wrong,
   say why in the commit.
+- **Do not point at anything a clone does not contain** — your own notes
+  directory, a local planning file, a chat log, a document only you can open.
+  Whoever reads your commit or pull request cannot follow the link, so write
+  the substance out in full, or commit the document alongside the change.
 
 ## Licence
 
