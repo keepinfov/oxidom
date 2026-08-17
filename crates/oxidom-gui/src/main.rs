@@ -24,8 +24,15 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let default_level = if cli.debug { "debug" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
-        .init();
+    // `build` rather than `init`, because stderr is not where these lines end
+    // up: `detach` below points it at /dev/null, so in an ordinary run every
+    // one of them was destroyed. They go into the process log book as well, and
+    // the Logs view reads that.
+    let terminal =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+            .build();
+    let max_level = terminal.filter();
+    oxidom_core::logbook::install_logger(Box::new(terminal), max_level);
     if !cli.debug {
         detach();
     }

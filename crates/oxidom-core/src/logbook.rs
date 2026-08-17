@@ -329,6 +329,77 @@ pub fn global() -> &'static LogBook {
     BOOK.get_or_init(LogBook::new)
 }
 
+/// A `log` implementation that writes to the terminal *and* to the book.
+///
+/// Generic over the terminal half so this crate needs no formatter of its own:
+/// each binary hands over the `env_logger::Logger` it already built.
+struct Tee {
+    terminal: Box<dyn log::Log>,
+}
+
+impl log::Log for Tee {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        // The book wants everything the global max level lets through, which is
+        // wider than the terminal filter; `log` re-checks against that max
+        // before calling us, so answering true here costs nothing extra.
+        self.terminal.enabled(metadata) || accepted_by_book(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        // `env_logger::Logger::log` applies its own filter, so this is not the
+        // same as ignoring it.
+        self.terminal.log(record);
+        if accepted_by_book(record.metadata()) {
+            global().push(
+                LogSource::Oxidom,
+                record.level().into(),
+                None,
+                record.target(),
+                record.args().to_string(),
+            );
+        }
+    }
+
+    fn flush(&self) {
+        self.terminal.flush();
+    }
+}
+
+/// Which of oxidom's own records the book keeps.
+///
+/// Anything worth a warning is kept whatever wrote it, because a warning from a
+/// dependency is usually about us. Below that, only oxidom's own modules: a
+/// `RUST_LOG=debug` run otherwise fills the Logs view with zbus and rustls
+/// chatter, and the view exists to explain oxidom.
+fn accepted_by_book(metadata: &log::Metadata<'_>) -> bool {
+    metadata.level() <= log::Level::Info || metadata.target().starts_with("oxidom")
+}
+
+/// Send this process's `log` output to the terminal and the book both.
+///
+/// `terminal` is the logger that would otherwise have been installed alone, and
+/// `max_level` is the level it resolved to — passing anything higher would make
+/// every `debug!` in the tree format its arguments before either half could
+/// reject it, since `log`'s macros check the level and build the message before
+/// any `Log` method is reached.
+///
+/// Idempotent, and quiet about it. `log` permits exactly one logger per process
+/// and `cargo test` runs many tests in one, so a second call must be a no-op
+/// rather than an error that only shows up under a full test run.
+pub fn install_logger(terminal: Box<dyn log::Log>, max_level: log::LevelFilter) {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    let mut installed = false;
+    INSTALLED.get_or_init(|| {
+        installed = true;
+    });
+    if !installed {
+        return;
+    }
+    if log::set_boxed_logger(Box::new(Tee { terminal })).is_ok() {
+        log::set_max_level(max_level);
+    }
+}
+
 /// What a child process's line said about itself.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedLine<'a> {
@@ -609,6 +680,23 @@ mod tests {
         let parsed = parse_process_line("2026/08/17 10:48:03 [Info] failed to dial: timeout");
         assert_eq!(parsed.target, "");
         assert_eq!(parsed.text, "failed to dial: timeout");
+    }
+
+    /// A `RUST_LOG=debug` run must not bury oxidom's own reasoning under the
+    /// debug output of every crate it links, but a warning from any of them is
+    /// usually a warning about us and is kept.
+    #[test]
+    fn the_book_keeps_our_own_chatter_and_everyone_elses_warnings() {
+        let accepted = |target: &str, level: log::Level| {
+            accepted_by_book(&log::Metadata::builder().target(target).level(level).build())
+        };
+
+        assert!(accepted("oxidom_core::engine", log::Level::Debug));
+        assert!(accepted("oxidom_gui::gui::window", log::Level::Trace));
+        assert!(accepted("zbus::connection", log::Level::Warn));
+        assert!(accepted("rustls::client", log::Level::Info));
+        assert!(!accepted("zbus::connection", log::Level::Debug));
+        assert!(!accepted("rustls::client", log::Level::Trace));
     }
 
     #[test]
