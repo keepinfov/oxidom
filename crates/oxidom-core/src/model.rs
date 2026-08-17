@@ -387,18 +387,33 @@ pub fn normalize_pin_sha256(raw: &str) -> Option<String> {
     })
 }
 
-/// Extract an ISO 3166-1 alpha-2 code from a leading flag emoji, if present.
+/// Extract an ISO 3166-1 alpha-2 code from a server name.
+///
+/// Two spellings, in this order: a leading flag emoji, and a leading two-letter
+/// token — `🇩🇪 Frankfurt` and `DE-2 HYSTERIA2` both read as `DE`. Only the
+/// first token is considered, and only when it is an assigned code: `IS`, `IT`,
+/// `NO`, `ME` and `AT` are all countries *and* ordinary words, so matching them
+/// anywhere in a name would decorate half a provider's list with the wrong
+/// flags. `second-ws-stas` keeps its `second`, not Samoa.
+///
+/// A name that says nothing about its country stays `None` rather than being
+/// guessed at. Whether the address could be geolocated instead is a separate
+/// question, and a heavier one.
 pub fn country_from_name(name: &str) -> Option<String> {
-    let mut chars = name.chars().peekable();
-    // Skip leading whitespace.
-    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
-        chars.next();
+    let trimmed = name.trim_start();
+    let mut chars = trimmed.chars();
+    if let (Some(a), Some(b)) = (chars.next(), chars.next())
+        && let (Some(ai), Some(bi)) = (
+            regional_indicator_to_letter(a),
+            regional_indicator_to_letter(b),
+        )
+    {
+        return Some(format!("{ai}{bi}"));
     }
-    let a = chars.next()?;
-    let b = chars.next()?;
-    let ai = regional_indicator_to_letter(a)?;
-    let bi = regional_indicator_to_letter(b)?;
-    Some(format!("{ai}{bi}"))
+    let token = trimmed
+        .split(|c: char| c.is_whitespace() || matches!(c, '-' | '_' | '|' | '·' | '.' | '[' | '('))
+        .find(|part| !part.is_empty())?;
+    crate::country::is_alpha2(token).then(|| token.to_ascii_uppercase())
 }
 
 /// Drop a leading flag emoji (and the whitespace after it) from a display name;
@@ -458,6 +473,50 @@ mod tests {
     use super::*;
 
     const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// The reported case: a provider whose names spell the country in ASCII.
+    /// Every one of these read as no country at all, so every card in the list
+    /// showed a globe.
+    #[test]
+    fn a_leading_country_code_is_read_from_an_ordinary_name() {
+        assert_eq!(country_from_name("DE-2 HYSTERIA2").as_deref(), Some("DE"));
+        assert_eq!(country_from_name("DE-2 WS").as_deref(), Some("DE"));
+        assert_eq!(country_from_name("fi_helsinki").as_deref(), Some("FI"));
+        assert_eq!(country_from_name("nl · amsterdam").as_deref(), Some("NL"));
+    }
+
+    #[test]
+    fn a_flag_emoji_still_wins_and_still_reads_uppercase() {
+        assert_eq!(country_from_name("🇳🇱 Node").as_deref(), Some("NL"));
+        assert_eq!(country_from_name("  🇨🇭 Trojan").as_deref(), Some("CH"));
+    }
+
+    /// Two-letter words that are also countries — `IS`, `IT`, `NO`, `ME`, `AT`,
+    /// `WS` — are why only the first token counts. Matching anywhere would put
+    /// Samoa on `second-ws-stas` and Italy on anything mentioning it.
+    #[test]
+    fn a_country_code_elsewhere_in_the_name_is_not_a_country() {
+        for name in [
+            "second-ws-stas",
+            "basa-stas",
+            "petros-main",
+            "jellyfin-hysteria2",
+            "vaultwarden-xray-ws",
+            "node-it-01",
+            "backup no 2",
+        ] {
+            assert_eq!(country_from_name(name), None, "{name}");
+        }
+    }
+
+    /// A leading pair of letters that is not an assigned code stays unknown
+    /// rather than becoming a country nobody can point to on a map.
+    #[test]
+    fn a_leading_non_country_stays_unknown() {
+        for name in ["XX-1 node", "AA gateway", "ab-relay", "zz"] {
+            assert_eq!(country_from_name(name), None, "{name}");
+        }
+    }
 
     fn identity_server(spec: OutboundSpec) -> Server {
         Server {
