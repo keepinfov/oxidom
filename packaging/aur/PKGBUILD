@@ -23,14 +23,13 @@ conflicts=(oxidom)
 # sections instead of the ELF symbol table, so the linker cannot resolve them
 # (undefined ring_core_0_17_14__*). Cargo does its own LTO via [profile.release].
 options=(!lto)
-source=("$pkgname::git+$url.git"
-        oxidom.service
-        oxidom@.service
-        oxidom-git.sysusers)
-sha256sums=('SKIP'
-            'c861189be328989176566c943c180ad73fc157a994125357471a2ed6497f3cc4'
-            'b61b29eeb2ba5fd43569846144846ce41afaf453b3a5390d33fdfc53edc95785'
-            'cfd693db52fc6f98e0c16a3ac2071b6551e0e2d7e500721b6976ab49bfb4ec5a')
+# The units and the sysusers file are not Arch-specific and are not copies: the
+# clone above already carries them, so they are installed from it. Listing them
+# as sources again would mean a second copy in the AUR repository and a checksum
+# that goes stale the moment the tracked file changes — which it once did,
+# stopping makepkg at the validity check before it reached a compiler.
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
 
 pkgver() {
   cd "$pkgname"
@@ -83,10 +82,10 @@ package() {
   install -Dm644 data/dev.keepinfov.oxidom.Daemon.service \
     "$pkgdir/usr/share/dbus-1/system-services/dev.keepinfov.oxidom.Daemon.service"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-  install -Dm644 "$srcdir/oxidom.service" \
+  install -Dm644 packaging/systemd/oxidom.service \
     "$pkgdir/usr/lib/systemd/system/oxidom.service"
-  install -Dm644 "$srcdir/oxidom@.service" \
+  install -Dm644 packaging/systemd/oxidom@.service \
     "$pkgdir/usr/lib/systemd/system/oxidom@.service"
-  install -Dm644 "$srcdir/oxidom-git.sysusers" \
+  install -Dm644 packaging/systemd/oxidom.sysusers \
     "$pkgdir/usr/lib/sysusers.d/oxidom.conf"
 }

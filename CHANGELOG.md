@@ -103,6 +103,13 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- The systemd units and the sysusers file live in `packaging/systemd/` and are
+  installed straight out of the checkout. They were never Arch-specific, and the
+  Arch package carried a second copy of each with a checksum beside it — a
+  checksum that once went stale and stopped `makepkg` at the validity check
+  before it reached a compiler. Anyone installing the assets by hand should read
+  the new paths from `docs/installation.md`.
+
 - The Arch service unit no longer pins the SOCKS and HTTP ports. A pinned port
   is one the daemon refuses to change, which left Settings showing a locked row
   and no way for a desktop user to move their own proxy off 10808. Ports now

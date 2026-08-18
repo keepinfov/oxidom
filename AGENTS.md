@@ -55,7 +55,8 @@ files. None may loosen them.
 | `crates/oxidom-gui/` | The `oxidom-gui` binary: the GTK4/libadwaita client. UI state lives in reducers so it can be tested without a display. |
 | `data/` | Desktop entry, icons, metainfo, D-Bus policy and service files. |
 | `nix/` | The NixOS module. |
-| `packaging/aur/` | The Arch package: `PKGBUILD`, `.SRCINFO`, systemd units, sysusers. |
+| `packaging/systemd/` | The systemd units and the sysusers file, shared by every package. |
+| `packaging/aur/` | The Arch package: `PKGBUILD`, `.SRCINFO`. |
 | `docs/`, `docs/spec/` | User manual; binding implementation contract. |
 
 Parsing, Xray control and routing belong in `oxidom-core`. The GUI must not

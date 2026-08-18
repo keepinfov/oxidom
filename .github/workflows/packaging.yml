@@ -2,8 +2,11 @@ name: packaging
 
 # The AUR package once sat broken because a checksum in PKGBUILD no longer
 # matched the file next to it — makepkg stopped at the validity check before it
-# reached a compiler, and nothing in the repository noticed. These checks are
-# cheap, need no network and no compile, and would have caught exactly that.
+# reached a compiler, and nothing in the repository noticed. The units are now
+# installed straight out of the clone, so there is no second copy to drift and
+# no checksum to go stale. What is left is the generated file that can still
+# disagree with its source, and the linter. Both are cheap, need no network and
+# no compile.
 
 on:
   push:
@@ -29,20 +32,6 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: checksums match the packaged files
-        working-directory: packaging/aur
-        run: |
-          set -euo pipefail
-          status=0
-          for f in oxidom.service oxidom@.service oxidom-git.sysusers; do
-            sum=$(sha256sum "$f" | cut -d' ' -f1)
-            if ! grep -q "$sum" PKGBUILD; then
-              echo "::error file=packaging/aur/PKGBUILD::stale checksum for $f (expected $sum) — run 'updpkgsums' and regenerate .SRCINFO"
-              status=1
-            fi
-          done
-          exit $status
-
       - name: .SRCINFO matches PKGBUILD
         working-directory: packaging/aur
         run: |
@@ -54,6 +43,20 @@ jobs:
             echo "::error file=packaging/aur/.SRCINFO::out of date — run 'makepkg --printsrcinfo > .SRCINFO'"
             exit 1
           fi
+
+      - name: the units the package installs are in the tree
+        run: |
+          set -euo pipefail
+          status=0
+          for f in packaging/systemd/oxidom.service \
+                   packaging/systemd/oxidom@.service \
+                   packaging/systemd/oxidom.sysusers; do
+            if [ ! -f "$f" ]; then
+              echo "::error file=packaging/aur/PKGBUILD::PKGBUILD installs $f, which does not exist"
+              status=1
+            fi
+          done
+          exit $status
 
       - name: namcap
         working-directory: packaging/aur

@@ -366,9 +366,9 @@ builds do not. The full list, mirroring what the packages do:
 | `data/dev.keepinfov.oxidom.metainfo.xml` | `/usr/share/metainfo/` |
 | `data/dev.keepinfov.oxidom.Daemon.conf` | `/usr/share/dbus-1/system.d/` |
 | `data/dev.keepinfov.oxidom.Daemon.service` | `/usr/share/dbus-1/system-services/` |
-| `packaging/aur/oxidom.service` | `/usr/lib/systemd/system/` |
-| `packaging/aur/oxidom@.service` | `/usr/lib/systemd/system/` |
-| `packaging/aur/oxidom-git.sysusers` | `/usr/lib/sysusers.d/oxidom.conf` |
+| `packaging/systemd/oxidom.service` | `/usr/lib/systemd/system/` |
+| `packaging/systemd/oxidom@.service` | `/usr/lib/systemd/system/` |
+| `packaging/systemd/oxidom.sysusers` | `/usr/lib/sysusers.d/oxidom.conf` |
 
 Country flags need no install step — they are compiled into the GUI binary. No
 GSettings schema is shipped either; oxidom only *writes* to the stock
