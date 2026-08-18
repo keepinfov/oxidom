@@ -162,6 +162,29 @@ rules: `geoip:private` has been in the default rule set from the start, and with
 core refuses to start rather than quietly not matching. `pkgs.xray` is a wrapper that sets
 `XRAY_LOCATION_ASSET`; a hand-set `xray_binary` pointing at an unwrapped core will fail at spawn.
 
+**Whether the data is usable is decided by the core, never by looking at the filesystem.** oxidom
+asks with `xray run -test` over a configuration carrying exactly the two references above and
+nothing else — no inbound, so nothing is bound and nothing leaves the machine. This is not
+fastidiousness: that same `pkgs.xray` wrapper exports `XRAY_LOCATION_ASSET` *inside itself*, from a
+store path unrelated to the binary's directory, so read from oxidom's own environment the variable
+is unset and no conventional directory exists. A filesystem check answers "missing" on the platform
+where this has always worked. Asking the core also tells a **corrupt** list from an absent one: a
+truncated file is refused as `code not found in geoip.dat: PRIVATE`.
+
+oxidom keeps its own copy in `data_dir()/assets` and sets `XRAY_LOCATION_ASSET` on the core it
+spawns — both the live one and a probe's — under two conditions, either of which alone would break
+a working machine:
+
+- nothing has already chosen a location. The wrapper reads `${XRAY_LOCATION_ASSET-<store path>}`,
+  so anything oxidom exports *wins*, and overriding a deliberate choice is not oxidom's to make;
+- oxidom holds **both** files. The variable names one directory, so exporting a half-populated one
+  hides whichever list the core would have found for itself.
+
+Otherwise the child's environment is left exactly as it was, and a machine that works today is
+unaffected. Files already present elsewhere — from a distribution package or another client — are
+used where they lie; oxidom offers to copy them into its own directory only because the variable
+names a single directory and another program's may change under it.
+
 ## Xray process supervisor
 
 - Resolve the binary in priority order: the `xray_binary` config key, then the

@@ -18,6 +18,16 @@ missing files (treat as defaults/empty).
 - `~/.local/share/oxidom/oxidom-gui.log` — the graphical client's own log, `0600`, rotated at 2MB
   with one `.log.1` kept. Written only by the GUI, which detaches and sends stderr to `/dev/null`
   and so has no journal; the daemon writes no file because its stderr already reaches one.
+- `~/.local/share/oxidom/assets/{geoip.dat,geosite.dat}` — the geo data the core needs, when
+  oxidom installed it. `0600` in a `0700` directory like every other file here: the core runs as
+  the same user as the daemon that spawns it, so nothing wider is required. Written only when the
+  core cannot already find the lists for itself, and pointed at with `XRAY_LOCATION_ASSET` only
+  when **both** are present — a directory holding one would hide whichever the core would
+  otherwise have found. Which daemon owns the store therefore decides which one the download
+  helps: a system daemon writes `/var/lib/oxidom/assets` and cannot read a user's home at all.
+- `~/.local/share/oxidom/geo-check.json` — transient. The configuration handed to
+  `xray run -test` when asking whether the core can load its lists; removed as soon as the core
+  answers.
 - `~/.cache/oxidom/egress.json` — user-owned 60-second cache for `oxidom ip --egress`, keyed by
   profile and server id.
 

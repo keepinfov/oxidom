@@ -228,7 +228,8 @@ impl ProbeCore {
             log::warn!("could not write a probe config: {error:#}");
             return Err(local("a probe config could not be written"));
         }
-        match Command::new(&xray.path)
+        let mut command = Command::new(&xray.path);
+        command
             .arg("run")
             .arg("-c")
             .arg(&config_path)
@@ -240,9 +241,11 @@ impl ProbeCore {
             // unreachable". The core is killed before either is read, so a full
             // pipe cannot wedge it.
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        // A probe core reads the same lists as the live one, so a measurement
+        // must not fail for want of data the connection would have found.
+        crate::xray::assets::point_at_our_assets(&mut command);
+        match command.spawn() {
             Ok(child) => Ok(ProbeCore {
                 child,
                 config_path,

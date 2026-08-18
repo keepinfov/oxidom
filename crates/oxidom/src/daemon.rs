@@ -326,6 +326,29 @@ pub(crate) struct Shared {
     /// True when serving the system bus, where callers are other users rather
     /// than the person who started the daemon.
     system_bus: bool,
+    /// Everything about the core's geo data: the cached verdict, and whatever a
+    /// running download has reported so far.
+    geo: Arc<Mutex<GeoState>>,
+    /// Set to stop a running download. Outside the mutex on purpose: `Cancel`
+    /// must be reachable while the download thread holds the lock to publish
+    /// progress, or cancelling would wait for the very loop it is stopping.
+    geo_cancel: Arc<oxidom_core::xray::assets::Cancel>,
+}
+
+/// The daemon's memory of the geo data question.
+///
+/// The verdict is cached against the binary it was measured for: answering it
+/// costs a subprocess, and `RuntimeInfo` is fetched on every Settings open.
+#[derive(Default)]
+pub(crate) struct GeoState {
+    /// Which core the verdict below belongs to. A different one invalidates it.
+    probed_for: Option<std::path::PathBuf>,
+    usable: Option<bool>,
+    error: Option<String>,
+    downloading: bool,
+    progress: oxidom_core::xray::assets::Progress,
+    last_error: Option<String>,
+    cancelled: bool,
 }
 
 impl Shared {
@@ -362,6 +385,8 @@ impl Shared {
             socks_port_locked,
             http_port_locked,
             system_bus,
+            geo: Arc::new(Mutex::new(GeoState::default())),
+            geo_cancel: Arc::new(oxidom_core::xray::assets::Cancel::default()),
         }
     }
 
@@ -645,25 +670,228 @@ impl Shared {
     fn runtime_info(&self) -> RuntimeInfo {
         let engine = oxidom_core::sync::lock(&self.engine);
         let resolved = oxidom_core::xray::resolve::resolve(&engine.registry.config.xray_binary);
-        let (xray_path, xray_error, xray_source) = match resolved {
+        let (resolved_path, xray_path, xray_error, xray_source) = match resolved {
             Ok(resolved) => (
+                Some(resolved.path.clone()),
                 Some(resolved.path.display().to_string()),
                 None,
                 Some(resolved.source),
             ),
-            Err(error) => (None, Some(format!("{error:#}")), None),
+            Err(error) => (None, None, Some(format!("{error:#}")), None),
         };
+        // Read the ports out before the lock goes, because the geo check below
+        // spawns a process and holding the engine across `xray run -test` would
+        // stall every other caller behind a subprocess.
+        let socks_port = engine.registry.config.socks_port;
+        let http_port = engine.registry.config.http_port;
+        drop(engine);
         RuntimeInfo {
             xray_path,
             xray_error,
             xray_source,
             socks_port_locked: self.socks_port_locked,
             http_port_locked: self.http_port_locked,
-            socks_port: engine.registry.config.socks_port,
-            http_port: engine.registry.config.http_port,
+            socks_port,
+            http_port,
             // Same rule `set_settings` applies below, published so the GUI can
             // grey the rows instead of accepting text the daemon will revert.
             binary_paths_locked: self.system_bus,
+            geo: self.geo_assets(resolved_path.as_deref()),
+        }
+    }
+
+    /// What this daemon can say about the core's geo data.
+    ///
+    /// The verdict is cached against the binary it was measured for, because
+    /// answering it spawns a process and this is fetched every time Settings
+    /// opens. A download in flight is reported from the same lock, so a caller
+    /// polling this sees progress without a second method.
+    fn geo_assets(&self, xray: Option<&std::path::Path>) -> oxidom_core::ipc::GeoAssets {
+        use oxidom_core::xray::assets;
+
+        let dir = assets::own_dir().unwrap_or_default();
+        let size = |asset: assets::GeoAsset| {
+            std::fs::metadata(dir.join(asset.installed_name()))
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+        };
+        let mut state = oxidom_core::sync::lock(&self.geo);
+        // Only ask the core when there is one and the answer is not already
+        // about it. A download completing clears `probed_for`, which is what
+        // makes the next read re-measure.
+        if let Some(xray) = xray
+            && state.probed_for.as_deref() != Some(xray)
+            && !state.downloading
+        {
+            match Self::geo_scratch() {
+                Ok(scratch) => {
+                    let verdict = assets::probe(xray, None, &scratch);
+                    state.probed_for = Some(xray.to_path_buf());
+                    match verdict {
+                        Ok(()) => {
+                            state.usable = Some(true);
+                            state.error = None;
+                        }
+                        Err(error) => {
+                            log::warn!("the Xray core cannot load its geo data: {error}");
+                            state.usable = Some(false);
+                            state.error = Some(error);
+                        }
+                    }
+                }
+                Err(error) => log::debug!("cannot stage a geo data check: {error:#}"),
+            }
+        }
+        if xray.is_none() {
+            // Nothing to ask. Undetermined rather than false: a missing core is
+            // its own message, and reporting missing data beside it would put
+            // two banners on one cause.
+            state.usable = None;
+            state.error = None;
+            state.probed_for = None;
+        }
+        oxidom_core::ipc::GeoAssets {
+            dir: dir.display().to_string(),
+            usable: state.usable,
+            error: state.error.clone(),
+            geoip_bytes: size(assets::GeoAsset::GeoIp),
+            geosite_bytes: size(assets::GeoAsset::GeoSite),
+            writable: Self::geo_dir_writable(&dir),
+            downloading: state.downloading,
+            current_file: state.progress.file.clone(),
+            done_bytes: state.progress.done_bytes,
+            total_bytes: state.progress.total_bytes,
+            last_error: state.last_error.clone(),
+            cancelled: state.cancelled,
+        }
+    }
+
+    /// Start fetching both lists on a worker thread.
+    ///
+    /// Returns as soon as the thread is running. That is not a convenience: the
+    /// daemon serves D-Bus on a blocking connection whose method tasks share one
+    /// executor, so a method that sat in the download would stall `Status`,
+    /// `ProbeState` and `LogsSince` for its whole duration — and the log stream
+    /// is where the progress lines the user reads come from.
+    fn start_geo_download(&self, through_tunnel: bool) -> Result<(), String> {
+        use oxidom_core::xray::assets;
+
+        let dir = assets::own_dir().map_err(|error| format!("{error:#}"))?;
+        {
+            let mut state = oxidom_core::sync::lock(&self.geo);
+            if state.downloading {
+                return Err("a geo data download is already running".to_string());
+            }
+            state.downloading = true;
+            state.cancelled = false;
+            state.last_error = None;
+            state.progress = assets::Progress::default();
+        }
+        self.geo_cancel.reset();
+
+        // Chosen here rather than taken from the caller: the daemon knows its
+        // own inbounds, and an address supplied over the bus would make this a
+        // "send my traffic wherever you like" primitive.
+        let proxy = through_tunnel.then(|| self.local_socks_proxy()).flatten();
+        // `Shared` is a bundle of `Arc`s, so the clone is the same state.
+        let shared = self.clone();
+        std::thread::spawn(move || {
+            let outcome = shared.run_geo_download(&dir, proxy.as_deref());
+            let mut state = oxidom_core::sync::lock(&shared.geo);
+            state.downloading = false;
+            state.progress = assets::Progress::default();
+            match outcome {
+                Ok(()) => {
+                    state.last_error = None;
+                    // Force the next read to ask the core again: the answer it
+                    // has cached was measured before these files existed.
+                    state.probed_for = None;
+                }
+                Err(error) if error.is::<assets::Cancelled>() => {
+                    state.cancelled = true;
+                    log::info!("the geo data download was cancelled");
+                }
+                Err(error) => {
+                    let text = format!("{error:#}");
+                    log::error!("could not install the geo data: {text}");
+                    state.last_error = Some(text);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn run_geo_download(&self, dir: &std::path::Path, proxy: Option<&str>) -> anyhow::Result<()> {
+        use oxidom_core::xray::assets;
+
+        struct Reporter<'a> {
+            shared: &'a Shared,
+        }
+        impl assets::Sink for Reporter<'_> {
+            fn progress(&self, progress: &assets::Progress) {
+                oxidom_core::sync::lock(&self.shared.geo).progress = progress.clone();
+            }
+            fn cancelled(&self) -> bool {
+                self.shared.geo_cancel.is_cancelled()
+            }
+        }
+        // Safety of the borrow: the thread joins on nothing, but `Reporter`
+        // lives only for this call, which the thread owns.
+        let sink = Reporter { shared: self };
+
+        let agent = assets::agent(proxy)?;
+        if let Some(proxy) = proxy {
+            log::info!("fetching the geo data through {proxy}");
+        }
+        for asset in assets::GeoAsset::ALL {
+            log::info!("fetching {} from {}", asset.installed_name(), asset.url());
+            let path = assets::download(asset, dir, &agent, &sink)?;
+            log::info!("installed {}", path.display());
+        }
+        Ok(())
+    }
+
+    /// The proxy URL of a tunnel that is actually up, if one is.
+    fn local_socks_proxy(&self) -> Option<String> {
+        let engine = oxidom_core::sync::lock(&self.engine);
+        engine
+            .sessions
+            .iter()
+            .find(|(_, session)| session.status() == Status::Connected)
+            // ureq 2.12 rejects the curl-style `socks5h` scheme, but its SOCKS5
+            // transport hands the proxy a domain target rather than resolving
+            // locally -- the same note `egress::request_address` carries.
+            .map(|(_, session)| format!("socks5://{}", session.socks_endpoint()))
+    }
+
+    /// The core this daemon would run, when there is one.
+    fn resolved_xray(&self) -> Option<std::path::PathBuf> {
+        let engine = oxidom_core::sync::lock(&self.engine);
+        let configured = engine.registry.config.xray_binary.clone();
+        drop(engine);
+        oxidom_core::xray::resolve::resolve(&configured)
+            .ok()
+            .map(|resolved| resolved.path)
+    }
+
+    fn geo_scratch() -> anyhow::Result<std::path::PathBuf> {
+        Ok(oxidom_core::paths::data_dir()?.join("geo-check.json"))
+    }
+
+    /// Whether a download could actually be written, asked by creating the
+    /// directory rather than by inspecting a mode: the daemon may be any user,
+    /// and a read-only state directory is a real deployment.
+    fn geo_dir_writable(dir: &std::path::Path) -> bool {
+        if std::fs::create_dir_all(dir).is_err() {
+            return false;
+        }
+        let probe = dir.join(".writable");
+        match std::fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -2445,6 +2673,94 @@ impl Service {
         json(&self.shared.runtime_info())
     }
 
+    /// Start installing the geo data the core needs.
+    ///
+    /// Returns as soon as the worker is running rather than when the files are
+    /// there — 23 MB on the sort of link this program exists for outlives any
+    /// single-call timeout, and a method that blocked would stall every other
+    /// caller on this connection, including the log reads that carry the
+    /// progress a user is watching. Poll [`Self::runtime_info`] for how it is
+    /// getting on.
+    ///
+    /// `through_tunnel` asks for the fetch to go over a tunnel that is already
+    /// up, which is the answer when the release host is blocked on the network
+    /// the user is trying to escape. The *daemon* picks the proxy address from
+    /// its own sessions; a caller-supplied one would be a request to send
+    /// traffic anywhere it liked.
+    ///
+    /// The URLs are constants in `oxidom_core::xray::assets`, not parameters:
+    /// a privileged daemon that fetched whatever address a caller named would
+    /// be a very general tool.
+    ///
+    /// No privilege check beyond the bus policy, which already admits only
+    /// root, `wheel` and `oxidom`. Unlike a binary path — which names something
+    /// the daemon will *execute*, and is refused on a system daemon for that
+    /// reason — this installs data from a fixed address, verified against a
+    /// digest published beside it, that the caller cannot influence.
+    fn download_geo_assets(&self, through_tunnel: bool) -> fdo::Result<String> {
+        self.shared
+            .start_geo_download(through_tunnel)
+            .map_err(fdo::Error::Failed)?;
+        json(&serde_json::json!({ "started": true }))
+    }
+
+    /// Stop a running download. Idempotent: asking twice, or when none is
+    /// running, is not an error.
+    fn cancel_geo_download(&self) -> fdo::Result<String> {
+        self.shared.geo_cancel.cancel();
+        json(&serde_json::json!({ "cancelled": true }))
+    }
+
+    /// Geo data directories on this machine whose contents the core accepts.
+    ///
+    /// Offered before a 23 MB download because many machines already carry
+    /// these files from another client or an unrelated package. Every directory
+    /// returned has been handed to the core and accepted, so this reports what
+    /// is *usable* rather than what merely exists — a truncated list is
+    /// rejected here exactly as it would be at connect time.
+    fn find_geo_assets(&self) -> fdo::Result<String> {
+        use oxidom_core::xray::assets;
+
+        let Some(xray) = self.shared.resolved_xray() else {
+            return Err(fdo::Error::Failed(
+                "there is no Xray core to judge the files with".to_string(),
+            ));
+        };
+        let scratch =
+            Shared::geo_scratch().map_err(|error| fdo::Error::Failed(format!("{error:#}")))?;
+        let dirs = assets::candidate_dirs_here(Some(&xray));
+        json(&assets::usable_candidates(&xray, &dirs, &scratch))
+    }
+
+    /// Install geo data already on this machine, instead of downloading it.
+    ///
+    /// The directory must be one [`Self::find_geo_assets`] offered, re-checked
+    /// here rather than trusted: this is a path from a caller, and a system
+    /// daemon takes them from other users.
+    fn adopt_geo_assets(&self, dir: String) -> fdo::Result<String> {
+        use oxidom_core::xray::assets;
+
+        let Some(xray) = self.shared.resolved_xray() else {
+            return Err(fdo::Error::Failed(
+                "there is no Xray core to judge the files with".to_string(),
+            ));
+        };
+        let source = std::path::PathBuf::from(&dir);
+        let scratch =
+            Shared::geo_scratch().map_err(|error| fdo::Error::Failed(format!("{error:#}")))?;
+        if assets::usable_candidates(&xray, std::slice::from_ref(&source), &scratch).is_empty() {
+            return Err(fdo::Error::Failed(format!(
+                "{dir} does not hold geo data this core will load"
+            )));
+        }
+        let into = assets::own_dir().map_err(|error| fdo::Error::Failed(format!("{error:#}")))?;
+        assets::adopt(&source, &into).map_err(|error| fdo::Error::Failed(format!("{error:#}")))?;
+        log::info!("installed the geo data found in {dir}");
+        // Measured before these files existed, so ask again on the next read.
+        oxidom_core::sync::lock(&self.shared.geo).probed_for = None;
+        json(&serde_json::json!({ "installed": true }))
+    }
+
     /// Kept for clients older than [`Self::logs_since`].
     ///
     /// Now served from the process-wide book, so it finally answers for **every**
@@ -2732,6 +3048,42 @@ mod tests {
             confirmation_failure(&target, true, &[], None),
             "the pool carried no traffic within 20s — none of its 3 nodes answered"
         );
+    }
+
+    /// Two downloads of the same two files would race on the same temp names
+    /// and pull the bytes twice over a link the user may be paying for. The
+    /// second request is refused rather than queued: the first is already doing
+    /// what the caller asked for.
+    #[test]
+    fn a_second_geo_download_is_refused_while_one_is_running() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("geo-busy");
+        let shared = Shared::new(Engine::load(), false, false, false);
+        oxidom_core::sync::lock(&shared.geo).downloading = true;
+        let error = shared
+            .start_geo_download(false)
+            .expect_err("a second request must be refused");
+        assert!(error.contains("already running"), "{error}");
+        drop(root);
+    }
+
+    /// Cancelling is consulted once per chunk by the download loop, which holds
+    /// the state lock to publish progress. The flag therefore lives outside
+    /// that lock — otherwise Cancel would block on the very loop it is meant to
+    /// stop, and a 23 MB download would be uninterruptible.
+    #[test]
+    fn a_download_can_be_cancelled_while_it_holds_the_progress_lock() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("geo-cancel");
+        let shared = Shared::new(Engine::load(), false, false, false);
+        let held = oxidom_core::sync::lock(&shared.geo);
+        shared.geo_cancel.cancel();
+        assert!(
+            shared.geo_cancel.is_cancelled(),
+            "a cancel must not wait for the progress lock"
+        );
+        drop(held);
+        drop(root);
     }
 
     #[test]

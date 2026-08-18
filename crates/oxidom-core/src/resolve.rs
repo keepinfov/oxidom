@@ -225,7 +225,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&info).unwrap(),
-            r#"{"xray_path":"/nix/store/xray/bin/xray","xray_error":null,"xray_source":"config","socks_port_locked":false,"http_port_locked":false,"binary_paths_locked":false,"socks_port":0,"http_port":0}"#
+            r#"{"xray_path":"/nix/store/xray/bin/xray","xray_error":null,"xray_source":"config","socks_port_locked":false,"http_port_locked":false,"binary_paths_locked":false,"socks_port":0,"http_port":0,"geo":{"dir":"","usable":null,"error":null,"geoip_bytes":0,"geosite_bytes":0,"writable":false,"downloading":false,"current_file":null,"done_bytes":0,"total_bytes":0,"last_error":null,"cancelled":false}}"#
         );
     }
 
@@ -240,6 +240,20 @@ mod tests {
         assert_eq!(info.xray_path.as_deref(), Some("/usr/bin/xray"));
         assert!(info.socks_port_locked);
         assert!(!info.binary_paths_locked);
+    }
+
+    /// The same contract for the geo block, which arrived later still. A daemon
+    /// that predates it sends nothing, and `usable` must then read `None` — not
+    /// `Some(false)`, which would have every such client announce missing geo
+    /// data on a machine that is perfectly healthy.
+    #[test]
+    fn runtime_info_without_the_geo_block_still_parses() {
+        let older = r#"{"xray_path":"/usr/bin/xray","socks_port_locked":true,"socks_port":1080}"#;
+        let info: crate::ipc::RuntimeInfo = serde_json::from_str(older).unwrap();
+        assert_eq!(info.geo.usable, None, "silence, not an accusation");
+        assert_eq!(info.geo.error, None);
+        assert!(!info.geo.downloading);
+        assert_eq!(info.geo.dir, "");
     }
 
     #[test]

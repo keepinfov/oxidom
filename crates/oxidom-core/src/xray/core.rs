@@ -311,12 +311,18 @@ impl XrayCore {
         fsutil::write_private_atomic(&path, serde_json::to_string_pretty(&cfg)?.as_bytes())
             .context("writing xray config")?;
 
-        let mut child = Command::new(&xray.path)
+        let mut command = Command::new(&xray.path);
+        command
             .arg("run")
             .arg("-c")
             .arg(&path)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Only when we hold both lists and nothing else has chosen; see
+        // `assets::location_override` for why either condition alone is not
+        // enough.
+        crate::xray::assets::point_at_our_assets(&mut command);
+        let mut child = command
             .spawn()
             .with_context(|| format!("spawning xray ({})", xray.path.display()))?;
 
