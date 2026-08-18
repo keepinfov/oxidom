@@ -253,6 +253,13 @@ pub enum ProbeDetail {
     InsecureTlsUnsupported,
     /// The core refused the configuration generated for this server.
     ConfigRefused,
+    /// The core has no usable `geoip.dat`/`geosite.dat`. Kept apart from
+    /// [`Self::ConfigRefused`] because the core reports it as one: every config
+    /// oxidom generates carries `geoip:private`, so a core without the lists
+    /// rejects the routing section and says "invalid field rule", which reads
+    /// as a config this program built wrongly and sends the user to look at
+    /// their server and their settings. Nothing about the server is at fault.
+    GeoAssetsMissing,
     /// Something else local: no free port, nowhere to stage a config.
     #[serde(other)]
     Other,
@@ -270,6 +277,9 @@ impl ProbeDetail {
                 "the server asks for unverified TLS, which this core removed"
             }
             ProbeDetail::ConfigRefused => "the core refused the generated config",
+            ProbeDetail::GeoAssetsMissing => {
+                "the core has no geo data (geoip.dat, geosite.dat), so it refused the routing rules"
+            }
             ProbeDetail::Other => "the check could not run on this machine",
         }
     }
@@ -472,6 +482,9 @@ const SETTINGS_HINTS: &[&str] = &[
     // No core at all: the latency check reports this without ever naming a
     // path, since it never got as far as resolving one.
     "Xray core",
+    // A core that cannot load its lists is fixed on the same page, which is
+    // where the geo data is reported and offered.
+    "geo data",
 ];
 
 pub fn error_action(message: &str) -> ErrorAction {
@@ -514,6 +527,31 @@ mod tests {
             "method":"http_get","failure":"unknown","detail":"invented_later"}"#;
         let reading: LatencyReading = serde_json::from_str(newer).expect("parses");
         assert_eq!(reading.detail, Some(ProbeDetail::Other));
+    }
+
+    /// The wire name is the compatibility surface: a daemon sends it and a
+    /// client older than the variant must land on `Other` through
+    /// `#[serde(other)]` rather than failing the whole snapshot. Renaming it
+    /// silently downgrades every such client, so the string is pinned here.
+    #[test]
+    fn missing_geo_data_travels_under_a_name_older_clients_can_ignore() {
+        let json = serde_json::to_string(&ProbeDetail::GeoAssetsMissing).expect("serializes");
+        assert_eq!(json, r#""geo_assets_missing""#);
+        assert_eq!(
+            serde_json::from_str::<ProbeDetail>(&json).expect("parses"),
+            ProbeDetail::GeoAssetsMissing
+        );
+    }
+
+    /// The fix is a Settings page away, so the toast must offer to open it.
+    /// The routing is by phrase, so the message and the hint have to keep
+    /// agreeing; this fails if either is reworded alone.
+    #[test]
+    fn a_missing_geo_data_failure_offers_the_page_that_fixes_it() {
+        assert_eq!(
+            error_action(ProbeDetail::GeoAssetsMissing.message()),
+            ErrorAction::OpenSettings
+        );
     }
 
     #[test]
