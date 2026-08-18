@@ -72,7 +72,11 @@ jobs:
               apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev
             fi
           else
-            dnf install -y gcc pkgconf-pkg-config curl ca-certificates git tar xz
+            # `curl` is deliberately absent: AlmaLinux 9 preinstalls curl-minimal,
+            # which provides the same binary and conflicts with the full package,
+            # so asking for it by name fails the whole transaction.
+            dnf install -y gcc pkgconf-pkg-config ca-certificates git tar xz
+            command -v curl >/dev/null || dnf install -y --allowerasing curl
             if [ "${{ matrix.flavour }}" = gui ]; then
               dnf install -y gtk4-devel libadwaita-devel
             fi
