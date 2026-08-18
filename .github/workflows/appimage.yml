@@ -113,11 +113,29 @@ jobs:
         run: |
           set -eu
           app=$(find dist -name '*.AppImage' -type f | head -1)
-          "$app" --appimage-extract-and-run --version > /dev/null
-          d=$(find . -maxdepth 2 -name squashfs-root -type d | head -1)
-          test -n "$d"
+          # --appimage-extract, not extract-and-run: the latter unpacks into a
+          # temporary directory it removes again, so there is nothing left to
+          # look at. This one writes ./squashfs-root and leaves it.
+          "$app" --appimage-extract > /dev/null
+          d=squashfs-root
           ls "$d/bin"
           test -x "$d/bin/oxidom"
+          test -x "$d/bin/oxidom-gui"
           test -x "$d/bin/xray"
           test -f "$d/share/glib-2.0/schemas/gschemas.compiled"
           test -d "$d/share/icons/Adwaita"
+          # The bundled loader is the whole point: an absolute interpreter would
+          # mean the binary is still asking this host for its glibc, which is
+          # exactly what it cannot have. patchelf answers this precisely; the
+          # string sits near the end of the file, so grepping a prefix does not.
+          (apt-get update && apt-get install -y --no-install-recommends patchelf) > /dev/null 2>&1 \
+            || (dnf install -y patchelf > /dev/null 2>&1) || true
+          if command -v patchelf > /dev/null; then
+            interp=$(patchelf --print-interpreter "$d/shared/bin/oxidom-gui")
+            echo "interpreter: $interp"
+            case "$interp" in
+              /*) echo "::error::the interpreter is absolute ($interp), so the bundled glibc is not being used"; exit 1 ;;
+            esac
+          else
+            echo "::warning::patchelf unavailable, interpreter not checked"
+          fi
