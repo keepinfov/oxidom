@@ -1,0 +1,31 @@
+name: version
+
+# `Cargo.toml` is the only place the version is written. flake.nix derives it;
+# the AppStream release entry and the changelog section repeat it in forms that
+# cannot be derived, because both carry hand-written notes. Those are what drift.
+#
+# This runs on every pull request rather than at the tag, which is the whole
+# point: a version that disagrees with itself, discovered while cutting a
+# release, is discovered too late to be cheap.
+
+on:
+  push:
+    branches: [master]
+    paths: ['Cargo.toml', 'flake.nix', 'data/dev.keepinfov.oxidom.metainfo.xml', 'packaging/version.sh', '.github/workflows/version.yml']
+  pull_request:
+    paths: ['Cargo.toml', 'flake.nix', 'data/dev.keepinfov.oxidom.metainfo.xml', 'packaging/version.sh', '.github/workflows/version.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  consistent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: every file that names the version agrees
+        run: packaging/version.sh --check
