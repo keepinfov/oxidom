@@ -1,0 +1,71 @@
+name: appimage
+
+# The AppImage is what serves the distributions that cannot install oxidom-gui:
+# Ubuntu 24.04 LTS and Debian 12, whose libadwaita is 1.5 and 1.2 against a floor
+# of 1.7. That is its whole reason to exist, so the job that matters here is not
+# the build — it is running the result on those two, which is the only thing that
+# proves the approach works at all. See packaging/appimage/build.sh for why this
+# is a `nix bundle` and not linuxdeploy.
+#
+# It bundles the whole GTK closure, so this is the most expensive job in the
+# repository by a wide margin and has no business running on a pull request. It
+# runs on a `v*` tag — a release candidate being the point at which the answer
+# matters — and on demand while the bundling itself is being worked on.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - name: build
+        run: packaging/appimage/build.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
+
+  # The point of the whole exercise. If this fails, the AppImage has no audience
+  # that the .deb does not already serve, and saying so is better than shipping
+  # a file that only works where it was not needed.
+  runs-on-old-distributions:
+    needs: build
+    name: runs on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['ubuntu:24.04', 'debian:12']
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: appimage
+          path: dist
+      - name: how old is this glibc
+        run: |
+          set -eux
+          ldd --version | head -1
+      - name: the AppImage answers
+        run: |
+          set -eux
+          chmod +x dist/*.AppImage
+          # --appimage-extract-and-run avoids needing FUSE, which these images
+          # do not have and which is not what is under test here.
+          ./dist/*.AppImage --appimage-extract-and-run --version
+          ./dist/*.AppImage --appimage-extract-and-run --help > /dev/null
