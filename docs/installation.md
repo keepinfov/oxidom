@@ -102,8 +102,11 @@ versions do not matter, and it carries an Xray core, `tun2socks` and the
 
 Two things to know:
 
-- **It is large**, because a whole GTK stack is inside it. That is the price of
-  running on a glibc older than the one GTK 4.18 was built against.
+- **It is about 400 MB**, because a whole GTK stack, an Xray core and a copy of
+  glibc are inside it. That is the price of running on a distribution whose own
+  glibc is older than the one GTK 4.18 was built against: the bundle brings its
+  own dynamic loader, so the host's version stops mattering. The `.deb` and
+  `.rpm` are a few megabytes and are the better choice wherever they install.
 - **There is no system daemon.** An AppImage installs nothing, so it cannot
   place a systemd unit or a D-Bus policy: it runs a session daemon of its own,
   with its own database under `~/.local/share/oxidom`. Local SOCKS and HTTP
