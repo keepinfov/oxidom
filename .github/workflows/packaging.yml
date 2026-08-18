@@ -52,27 +52,32 @@ jobs:
           # target/release/* is produced by the build, so it is the one source
           # that legitimately does not exist in a checkout.
           srcs=$(grep -h '^  - src:' packaging/nfpm/*.yaml | sed 's/^  - src: *//' | grep -v '^target/release/')
-          for f in $srcs; do
-            if [ ! -e "$f" ]; then
+          printf '%s\n' "$srcs" | while read -r f; do
+            [ -n "$f" ] || continue
+            if [ -e "$f" ]; then
+              echo "found $f"
+            else
               echo "::error::a package manifest installs $f, which is not in the tree"
-              status=1
+              echo bad >> /tmp/missing
             fi
           done
-          echo "$srcs" | sed 's/^/found /'
+          if [ -s /tmp/missing ]; then exit 1; fi
           exit $status
 
       - name: every script a manifest names exists and passes shellcheck
         run: |
           set -eu
           sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
-          status=0
-          for f in $(grep -hE '^\s+(pre|post)(install|remove): ' packaging/nfpm/*.yaml | sed 's/.*: *//'); do
+          grep -hE '^\s+(pre|post)(install|remove): ' packaging/nfpm/*.yaml \
+            | sed 's/.*: *//' > /tmp/scripts
+          while read -r f; do
+            [ -n "$f" ] || continue
             if [ ! -x "$f" ]; then
               echo "::error::a package manifest names $f, which is missing or not executable"
-              status=1
+              echo bad >> /tmp/missing
             fi
-          done
-          [ "$status" = 0 ] || exit $status
+          done < /tmp/scripts
+          if [ -s /tmp/missing ]; then exit 1; fi
           # `find`, not a glob: a glob that matches nothing is passed through
           # literally and shellcheck fails on a file name instead of on shell.
           find packaging -name '*.sh' -print0 | xargs -0 shellcheck

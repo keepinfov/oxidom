@@ -1,0 +1,7 @@
+/usr/bin/oxidom-gui
+/usr/share/applications/dev.keepinfov.oxidom.desktop
+/usr/share/doc/oxidom-gui/LICENSE
+/usr/share/icons/hicolor/scalable/actions/oxidom-funnel-symbolic.svg
+/usr/share/icons/hicolor/scalable/apps/dev.keepinfov.oxidom.svg
+/usr/share/icons/hicolor/symbolic/apps/dev.keepinfov.oxidom-symbolic.svg
+/usr/share/metainfo/dev.keepinfov.oxidom.metainfo.xml
