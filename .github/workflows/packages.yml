@@ -1,0 +1,313 @@
+name: packages
+
+# Builds the .deb and .rpm pairs and proves each one installs.
+#
+# **This does not run on pull requests.** Ten containers, four rustup bootstraps
+# and four release builds is a quarter of an hour of machine time to answer a
+# question almost no pull request changes the answer to. It runs where the answer
+# matters — on a tag, which is what a release candidate is for — and on demand
+# when something here is actually being worked on. The cheap half of the question
+# (do the manifests parse, do the scripts pass shellcheck, do the files they name
+# exist) is in packaging.yml and does run on every pull request.
+#
+# The build host matters more than it looks. glibc compatibility runs forward
+# only, so a binary built against an old one keeps working on newer systems and
+# never the reverse. The headless package is therefore built in the oldest
+# container that can build it, with a toolchain from rustup — which is exactly
+# what docs/installation.md already tells users to do when their distribution is
+# too old. That is what makes the daemon installable on Ubuntu 24.04 LTS and
+# Debian 12, neither of which can build the GUI at all: libadwaita 1.7 is the
+# binding floor and they ship 1.5 and 1.2.
+#
+# The GUI packages link against the distribution's own GTK, so they are built on
+# the oldest distribution that has a new enough one.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NFPM_VERSION: v2.47.0
+
+jobs:
+  build:
+    name: ${{ matrix.flavour }} on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `glibc` is the floor the manifest declares for this pair. It must be
+          # the container's own glibc: lower and the check below fails, higher
+          # and the package needlessly refuses systems that could run it.
+          - flavour: cli
+            image: debian:12
+            family: deb
+            glibc: '2.36'
+          - flavour: cli
+            image: almalinux:9
+            family: rpm
+            glibc: '2.34'
+          - flavour: gui
+            image: debian:trixie
+            family: deb
+            glibc: '2.41'
+          - flavour: gui
+            image: fedora:42
+            family: rpm
+            glibc: '2.41'
+    steps:
+      - name: build dependencies
+        run: |
+          set -eux
+          if command -v apt-get >/dev/null; then
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              build-essential pkg-config curl ca-certificates git xz-utils
+            if [ "${{ matrix.flavour }}" = gui ]; then
+              apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev
+            fi
+          else
+            # `curl` is deliberately absent: AlmaLinux 9 preinstalls curl-minimal,
+            # which provides the same binary and conflicts with the full package,
+            # so asking for it by name fails the whole transaction.
+            dnf install -y gcc pkgconf-pkg-config ca-certificates git tar xz
+            command -v curl >/dev/null || dnf install -y --allowerasing curl
+            if [ "${{ matrix.flavour }}" = gui ]; then
+              dnf install -y gtk4-devel libadwaita-devel
+            fi
+          fi
+
+      - uses: actions/checkout@v4
+
+      # Debian 12 ships Rust 1.63 and AlmaLinux 9 has none; the workspace is
+      # edition 2024 and needs 1.85. rustup is the documented escape hatch.
+      - name: rust toolchain
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: cargo build
+        run: |
+          set -eux
+          if [ "${{ matrix.flavour }}" = cli ]; then
+            cargo build --release --locked -p oxidom
+          else
+            cargo build --release --locked -p oxidom-gui
+          fi
+
+      - name: nfpm
+        run: |
+          set -eux
+          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/${NFPM_VERSION}/nfpm_${NFPM_VERSION#v}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: package
+        run: |
+          set -eux
+          # `cargo pkgid` reads the manifest cargo just built from, so this
+          # cannot disagree with the binary the package is about to carry.
+          VERSION=$(cargo pkgid -p oxidom | sed 's/.*[#@]//')
+          export VERSION
+          mkdir -p dist
+          if [ "${{ matrix.family }}" = deb ]; then
+            export ARCH=amd64
+          else
+            export ARCH=x86_64
+          fi
+          if [ "${{ matrix.flavour }}" = cli ]; then
+            nfpm pkg -f packaging/nfpm/oxidom.yaml -p ${{ matrix.family }} -t dist/
+          else
+            nfpm pkg -f packaging/nfpm/oxidom-gui.yaml -p ${{ matrix.family }} -t dist/
+          fi
+          ls -l dist/
+
+      # nfpm does not run shlibdeps, so the dependency list in the manifest is
+      # hand-written. This is what stops it going stale: whatever the linker
+      # actually needs must be covered by what the package claims.
+      # nfpm does not run rpmbuild's dependency generators, and writes the deb
+      # Depends verbatim, so both floors are hand-written. This is what stops
+      # either going stale: build in an old container, then prove the binary
+      # stayed inside what the package claims.
+      - name: the binary needs no newer glibc than the package requires
+        run: |
+          set -eu
+          if command -v apt-get >/dev/null; then
+            apt-get install -y --no-install-recommends binutils
+          else
+            dnf install -y binutils
+          fi
+          bin=target/release/oxidom
+          if [ "${{ matrix.flavour }}" = gui ]; then bin=target/release/oxidom-gui; fi
+          packaging/nfpm/glibc-floor.sh "$bin" '${{ matrix.glibc }}'
+
+      - name: the declared dependencies cover what the binary links
+        if: matrix.family == 'deb'
+        run: |
+          set -eu
+          apt-get install -y --no-install-recommends dpkg-dev
+          bin=target/release/oxidom
+          if [ "${{ matrix.flavour }}" = gui ]; then bin=target/release/oxidom-gui; fi
+          mkdir -p shlib/debian && touch shlib/debian/control
+          ( cd shlib && dpkg-shlibdeps -O --ignore-missing-info "../$bin" ) > /tmp/needed.txt
+          # Reduce either shape — `shlibs:Depends=a (>= 1), b` or a plain
+          # `Depends` field — to a sorted list of bare package names. The prefix
+          # pattern is anchored on `word:word=` rather than the first `=`,
+          # because a version constraint contains one too, in `>=`. Leading
+          # space is stripped before the cut, or every dependency after the
+          # first becomes an empty line and silently disappears.
+          names() {
+            sed 's/^[a-zA-Z]*:[a-zA-Z-]*=//' \
+              | tr ',' '\n' \
+              | sed 's/^[[:space:]]*//;s/[[:space:](].*//;/^$/d' \
+              | sort -u
+          }
+          names < /tmp/needed.txt > /tmp/needed.names
+          dpkg-deb -f dist/*.deb Depends | names > /tmp/declared.names
+          echo "linker needs:"; cat /tmp/needed.names
+          echo "package declares:"; cat /tmp/declared.names
+          missing=$(comm -23 /tmp/needed.names /tmp/declared.names)
+          if [ -n "$missing" ]; then
+            echo "::error file=packaging/nfpm/oxidom.yaml::the binary links libraries the package does not depend on:"
+            echo "$missing"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.flavour }}-${{ matrix.family }}
+          path: dist/*
+          if-no-files-found: error
+
+  # A package that does not install is not a release asset. The old-glibc claim
+  # in particular is only worth making if it is tested where it matters.
+  install:
+    needs: build
+    name: install ${{ matrix.what }} on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:trixie
+            what: both
+            artifacts: deb
+          - image: ubuntu:25.10
+            what: both
+            artifacts: deb
+          # The two rows docs/installation.md marks as unable to build the GUI.
+          # The daemon is exactly what they should still be able to install.
+          - image: debian:12
+            what: cli
+            artifacts: deb
+          - image: ubuntu:24.04
+            what: cli
+            artifacts: deb
+          - image: fedora:42
+            what: both
+            artifacts: rpm
+          - image: almalinux:9
+            what: cli
+            artifacts: rpm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-${{ matrix.artifacts }}'
+          path: dist
+          merge-multiple: true
+
+      - name: install
+        run: |
+          set -eux
+          ls -l dist/
+          if [ "${{ matrix.artifacts }}" = deb ]; then
+            apt-get update
+            if [ "${{ matrix.what }}" = both ]; then
+              apt-get install -y ./dist/oxidom_*.deb ./dist/oxidom-gui_*.deb
+            else
+              apt-get install -y ./dist/oxidom_*.deb
+            fi
+          else
+            if [ "${{ matrix.what }}" = both ]; then
+              dnf install -y ./dist/oxidom-[0-9]*.rpm ./dist/oxidom-gui-*.rpm
+            else
+              dnf install -y ./dist/oxidom-[0-9]*.rpm
+            fi
+          fi
+
+      - name: the package did what it claims
+        run: |
+          set -eux
+          test -x /usr/bin/oxidom
+          # The binary's own version must match the version in the file name the
+          # package was built under; a mismatch means the wrong binary shipped.
+          pkg_version=$(ls dist/ | sed -n 's/^oxidom[-_]\([0-9][^-_]*\).*/\1/p' | head -1)
+          test "$(oxidom --version)" = "oxidom $pkg_version"
+
+          # The daemon account exists.
+          getent passwd oxidom
+
+          # Everything the manual promises is installed is installed.
+          test -f /usr/lib/systemd/system/oxidom.service
+          test -f /usr/lib/systemd/system/oxidom@.service
+          test -f /usr/lib/sysusers.d/oxidom.conf
+          test -f /usr/share/dbus-1/system.d/dev.keepinfov.oxidom.Daemon.conf
+          test -f /usr/share/dbus-1/system-services/dev.keepinfov.oxidom.Daemon.service
+          test -f /usr/share/doc/oxidom/README.md
+
+          if [ "${{ matrix.what }}" = both ]; then
+            test -x /usr/bin/oxidom-gui
+            test -f /usr/share/applications/dev.keepinfov.oxidom.desktop
+            test -f /usr/share/metainfo/dev.keepinfov.oxidom.metainfo.xml
+            test -f /usr/share/icons/hicolor/scalable/actions/oxidom-funnel-symbolic.svg
+          fi
+
+      # Installing must not have started anything. Enabling the system daemon
+      # moves which database is authoritative, so it is the administrator's
+      # decision and not a side effect of `apt install`.
+      - name: nothing was enabled
+        run: |
+          set -eux
+          ! grep -rq oxidom /etc/systemd/system/multi-user.target.wants/ 2>/dev/null
+          test ! -e /etc/systemd/system/multi-user.target.wants/oxidom.service
+
+      # No Xray core is present in any of these images, which is the state most
+      # users install into. The daemon must start anyway and say so, rather than
+      # refusing — a package whose daemon dies without a core would be useless.
+      - name: the daemon starts without an Xray core
+        run: |
+          set -eux
+          ! command -v xray
+          set +e
+          out=$(oxidom status 2>&1); rc=$?
+          set -e
+          echo "exit $rc: $out"
+          # 4 is "daemon unavailable", the correct answer with nothing running.
+          # Anything else — a panic, a usage error, a hang — is a packaging bug.
+          test "$rc" = 4
+
+      - name: removal keeps the database
+        run: |
+          set -eux
+          mkdir -p /var/lib/oxidom && touch /var/lib/oxidom/state.toml
+          if [ "${{ matrix.artifacts }}" = deb ]; then
+            apt-get purge -y oxidom-gui 2>/dev/null || true
+            apt-get purge -y oxidom
+          else
+            dnf remove -y oxidom-gui 2>/dev/null || true
+            dnf remove -y oxidom
+          fi
+          test -f /var/lib/oxidom/state.toml

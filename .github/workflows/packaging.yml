@@ -23,6 +23,60 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The cheap half of the .deb/.rpm question. Building them needs ten containers
+  # and four release builds, which is a tag-time job (see packages.yml); this is
+  # everything that can be answered in seconds without a compiler, and it catches
+  # the mistakes actually made while editing packaging — a manifest that no
+  # longer parses, a script with a syntax error, a file renamed out from under
+  # the manifest that names it.
+  nfpm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: the manifests parse
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import sys, yaml
+          for f in ("packaging/nfpm/oxidom.yaml", "packaging/nfpm/oxidom-gui.yaml"):
+              with open(f) as fh:
+                  yaml.safe_load(fh)
+              print(f"{f}: ok")
+          PY
+
+      - name: every file a manifest installs exists
+        run: |
+          set -eu
+          status=0
+          # target/release/* is produced by the build, so it is the one source
+          # that legitimately does not exist in a checkout.
+          srcs=$(grep -h '^  - src:' packaging/nfpm/*.yaml | sed 's/^  - src: *//' | grep -v '^target/release/')
+          for f in $srcs; do
+            if [ ! -e "$f" ]; then
+              echo "::error::a package manifest installs $f, which is not in the tree"
+              status=1
+            fi
+          done
+          echo "$srcs" | sed 's/^/found /'
+          exit $status
+
+      - name: every script a manifest names exists and passes shellcheck
+        run: |
+          set -eu
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+          status=0
+          for f in $(grep -hE '^\s+(pre|post)(install|remove): ' packaging/nfpm/*.yaml | sed 's/.*: *//'); do
+            if [ ! -x "$f" ]; then
+              echo "::error::a package manifest names $f, which is missing or not executable"
+              status=1
+            fi
+          done
+          [ "$status" = 0 ] || exit $status
+          # `find`, not a glob: a glob that matches nothing is passed through
+          # literally and shellcheck fails on a file name instead of on shell.
+          find packaging -name '*.sh' -print0 | xargs -0 shellcheck
+
   aur:
     runs-on: ubuntu-latest
     container: archlinux:base-devel

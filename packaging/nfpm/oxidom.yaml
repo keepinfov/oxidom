@@ -1,0 +1,87 @@
+# The headless package: the CLI and the daemon, and no GTK dependency at all.
+# That is the whole reason the workspace is split into two binaries, and it is
+# what makes a server install reasonable.
+#
+# Built with `nfpm pkg -f packaging/nfpm/oxidom.yaml -p deb|rpm`, from binaries
+# produced by `cargo build --release` into target/release. VERSION and ARCH come
+# from the environment — nfpm expands those, but not a path in `src` — see
+# .github/workflows/packages.yml.
+name: oxidom
+version: ${VERSION}
+release: "1"
+arch: ${ARCH}
+platform: linux
+maintainer: keepinfov <218463407+keepinfov@users.noreply.github.com>
+description: |
+  Native Xray / v2ray client — command line and daemon.
+  oxidom manages subscriptions and servers, runs an Xray core for you, and
+  exposes the tunnel as local SOCKS5 and HTTP proxies, with optional TUN
+  interfaces and per-app routing. This package has no graphical interface and
+  no GTK dependency; install oxidom-gui for that.
+vendor: keepinfov
+homepage: https://github.com/keepinfov/oxidom
+license: MIT
+section: net
+priority: optional
+
+# No Xray core is packaged by Debian, Ubuntu, Fedora or RHEL, so this cannot be
+# a dependency and must not be a recommendation either: apt installs Recommends
+# by default and would fail to resolve a package that exists nowhere. oxidom
+# starts without a core and says so in a banner; `oxidom` prints the install
+# command for the running distribution on first install.
+suggests:
+  - xray
+  - tun2socks
+  - nftables
+
+contents:
+  - src: target/release/oxidom
+    dst: /usr/bin/oxidom
+    file_info: {mode: 0755}
+
+  - src: packaging/systemd/oxidom.service
+    dst: /usr/lib/systemd/system/oxidom.service
+    file_info: {mode: 0644}
+  - src: packaging/systemd/oxidom@.service
+    dst: /usr/lib/systemd/system/oxidom@.service
+    file_info: {mode: 0644}
+  - src: packaging/systemd/oxidom.sysusers
+    dst: /usr/lib/sysusers.d/oxidom.conf
+    file_info: {mode: 0644}
+
+  # The system-bus policy is what stops an unprivileged service account on the
+  # same machine driving a daemon that rewrites the machine's proxy settings.
+  - src: data/dev.keepinfov.oxidom.Daemon.conf
+    dst: /usr/share/dbus-1/system.d/dev.keepinfov.oxidom.Daemon.conf
+    file_info: {mode: 0644}
+  - src: data/dev.keepinfov.oxidom.Daemon.service
+    dst: /usr/share/dbus-1/system-services/dev.keepinfov.oxidom.Daemon.service
+    file_info: {mode: 0644}
+
+  - src: LICENSE
+    dst: /usr/share/doc/oxidom/LICENSE
+    file_info: {mode: 0644}
+  - src: packaging/nfpm/README.package.md
+    dst: /usr/share/doc/oxidom/README.md
+    file_info: {mode: 0644}
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.36)
+      - libgcc-s1
+  rpm:
+    # nfpm builds the rpm itself rather than shelling out to rpmbuild, so none of
+    # rpmbuild's automatic dependency generators run and an empty list here means
+    # a package that claims to need nothing at all. It would install on a system
+    # too old to run it and fail at the dynamic linker. The floor is the glibc of
+    # the container this is built in; packaging/nfpm/glibc-floor.sh checks the
+    # binary against it.
+    depends:
+      - glibc >= 2.34
+      - libgcc
+
+scripts:
+  postinstall: packaging/nfpm/scripts/postinstall.sh
+  preremove: packaging/nfpm/scripts/preremove.sh
+  postremove: packaging/nfpm/scripts/postremove.sh
