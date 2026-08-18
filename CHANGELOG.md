@@ -18,6 +18,13 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **Settings offers to install the geo data when the core cannot load it.** The row says whether
+  the core can read `geoip.dat` and `geosite.dat`, and offers to fix it when it cannot: by copying
+  a set already on this machine where one exists, or by downloading. The confirmation names both
+  addresses and both destination paths before anything is fetched, and says plainly that GitHub is
+  blocked on some networks — where a tunnel is already up, the download can go through it. A
+  progress bar reports the transfer and it can be cancelled part-way. A daemon too old to install
+  anything is given the commands to run instead of a button that could not have helped it.
 - **oxidom installs the geo data its core needs.** `geoip.dat` and `geosite.dat` are a
   requirement of every connection, not of some optional routing feature, and the Xray
   release ships neither — so anyone who installed a core by hand had a client that could

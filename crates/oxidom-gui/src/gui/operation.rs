@@ -13,6 +13,8 @@ pub enum UiOperationKind {
     RemoveProfile,
     UpProfile,
     DownProfile,
+    FindGeoAssets,
+    InstallGeoAssets,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +77,11 @@ impl UiOperation {
             UiOperationKind::RemoveProfile => "Removing profile…",
             UiOperationKind::UpProfile => "Connecting…",
             UiOperationKind::DownProfile => "Disconnecting…",
+            // The download itself is not here: it runs on the daemon and
+            // reports through the poll, so it must not hold the single
+            // operation slot -- Cancel has to stay clickable throughout.
+            UiOperationKind::FindGeoAssets => "Looking for geo data…",
+            UiOperationKind::InstallGeoAssets => "Installing geo data…",
         }
     }
 }

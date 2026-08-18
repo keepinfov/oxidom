@@ -23,9 +23,9 @@ use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
-    SwitcherItem, active_latency_for, card_action, latency_states, missing_core_message,
-    other_profiles_message, pool_action, pool_for_profile, pool_short_label, reduce,
-    selected_status, session_for, session_rows, switcher_items, switcher_visible,
+    SwitcherItem, active_latency_for, card_action, human_bytes, latency_states,
+    missing_core_message, other_profiles_message, pool_action, pool_for_profile, pool_short_label,
+    reduce, selected_status, session_for, session_rows, switcher_items, switcher_visible,
 };
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
@@ -234,6 +234,13 @@ struct AppState {
 struct Controller {
     window: adw::ApplicationWindow,
     state: Rc<RefCell<AppState>>,
+    /// The daemon's last answer about itself. Held here as well as pushed into
+    /// Settings because the geo dialogs quote the daemon's own asset directory,
+    /// and guessing one on a system daemon would name the wrong machine's path.
+    runtime: RefCell<Option<ipc::RuntimeInfo>>,
+    /// Whether a download is being followed, so two clicks cannot start two
+    /// timers reading the same state.
+    geo_polling: Cell<bool>,
     split: adw::OverlaySplitView,
     header: adw::HeaderBar,
     stack: gtk::Stack,
@@ -563,6 +570,12 @@ fn build(
     // A daemon older than RuntimeInfo answers UnknownMethod; `None` just
     // leaves the settings rows unlocked and the effective path unknown.
     let initial_runtime = client.runtime_info().ok();
+    // Asked once, here: whether this daemon can install geo data, and which
+    // daemon it is. Together they decide whether the Settings page may offer a
+    // button at all — a system service too old to know the method cannot be
+    // helped by anything this process downloads into the user's home.
+    let daemon_source = client.source();
+    let geo_download_supported = client.supports_geo_download();
     let selected_id = initial_status.active_id.clone();
     let servers = ServersView::new(&subscriptions_snapshot);
     let state = Rc::new(RefCell::new(AppState {
@@ -601,6 +614,7 @@ fn build(
             }
         }
     });
+    settings.set_daemon_capabilities(daemon_source, geo_download_supported);
     settings.set_runtime_info(initial_runtime.as_ref());
 
     // Apply the saved scheme before anything is on screen, so a window pinned
@@ -820,6 +834,8 @@ fn build(
     drop_focus_on_outside_click(&window);
 
     let controller = Rc::new(Controller {
+        runtime: RefCell::new(initial_runtime.clone()),
+        geo_polling: Cell::new(false),
         window: window.clone(),
         state,
         split,
@@ -889,6 +905,15 @@ fn build(
         })
     });
     controller.wire_actions();
+    // The daemon outlives this window, so a download started before it opened
+    // -- or by another client -- is already running. Pick it up rather than
+    // showing a stale offer to start one.
+    if initial_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.geo.downloading)
+    {
+        controller.poll_geo_progress();
+    }
     controller.rebuild_views();
     controller.refresh_status();
     controller.add_breakpoint();
@@ -1136,6 +1161,22 @@ impl Controller {
 
     fn wire_actions(self: &Rc<Self>) {
         self.install_shortcuts();
+        self.settings.geo_install_button().connect_clicked({
+            let weak = Rc::downgrade(self);
+            move |_| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.present_geo_install();
+                }
+            }
+        });
+        self.settings.geo_cancel_button().connect_clicked({
+            let weak = Rc::downgrade(self);
+            move |_| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.cancel_geo_download();
+                }
+            }
+        });
         self.servers.connect_browse_subscriptions({
             let weak = Rc::downgrade(self);
             move || {
@@ -2916,7 +2957,7 @@ impl Controller {
                             // better than leaving the page permanently dirty.
                             None => controller.settings.mark_applied(values.clone()),
                         }
-                        controller.settings.set_runtime_info(runtime.as_ref());
+                        controller.set_runtime_info(runtime.clone());
                         // Pointing Settings at a core that exists is exactly
                         // when the banner should go away.
                         controller.update_core_banner(runtime.as_ref());
@@ -3880,6 +3921,317 @@ impl Controller {
             }
         });
         self.toasts.add_toast(toast);
+    }
+
+    /// Remember what the daemon said about itself and show it.
+    fn set_runtime_info(&self, runtime: Option<ipc::RuntimeInfo>) {
+        self.settings.set_runtime_info(runtime.as_ref());
+        self.update_core_banner(runtime.as_ref());
+        *self.runtime.borrow_mut() = runtime;
+    }
+
+    /// Follow a running download until it stops.
+    ///
+    /// `RuntimeInfo` is deliberately not on the 500 ms status tick — resolving
+    /// the core walks `$PATH` and asking about the geo data spawns a process,
+    /// neither of which belongs on that clock. So progress is followed on its
+    /// own slower timer, and only while something is actually downloading.
+    fn poll_geo_progress(self: &Rc<Self>) {
+        if self.geo_polling.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let inflight = Rc::new(Cell::new(false));
+        glib::timeout_add_local(Duration::from_millis(700), move || {
+            let Some(controller) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            // One read at a time: a slow answer must not queue up behind
+            // itself and leave the bar jumping backwards.
+            if inflight.get() {
+                return glib::ControlFlow::Continue;
+            }
+            inflight.set(true);
+            let client = controller.state.borrow().client.clone();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let _ = sender.send(client.runtime_info().ok());
+            });
+            let weak = weak.clone();
+            let inflight = inflight.clone();
+            glib::timeout_add_local(Duration::from_millis(40), move || {
+                match receiver.try_recv() {
+                    Ok(runtime) => {
+                        inflight.set(false);
+                        let Some(controller) = weak.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        let finished = runtime
+                            .as_ref()
+                            .map(|runtime| !runtime.geo.downloading)
+                            .unwrap_or(true);
+                        let outcome = runtime
+                            .as_ref()
+                            .map(|runtime| (runtime.geo.cancelled, runtime.geo.last_error.clone()));
+                        controller.set_runtime_info(runtime);
+                        if finished {
+                            controller.geo_polling.set(false);
+                            controller.report_geo_outcome(outcome);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        inflight.set(false);
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+            if controller.geo_polling.get() {
+                glib::ControlFlow::Continue
+            } else {
+                glib::ControlFlow::Break
+            }
+        });
+    }
+
+    /// Say how a finished download ended, once.
+    ///
+    /// A cancel is not a failure and does not get an error toast; a failure
+    /// carries the daemon's own words, which name both digests when a checksum
+    /// did not match.
+    fn report_geo_outcome(self: &Rc<Self>, outcome: Option<(bool, Option<String>)>) {
+        match outcome {
+            Some((true, _)) => self.show_message("The geo data download was cancelled"),
+            Some((false, Some(error))) => {
+                self.show_error("Could not download the geo data", &error)
+            }
+            Some((false, None)) => {
+                self.show_message("Geo data installed — the core can load its lists")
+            }
+            None => {}
+        }
+    }
+
+    /// Re-read it after something that would have changed the answer.
+    fn refresh_runtime_info(self: &Rc<Self>) {
+        let client = self.state.borrow().client.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(client.runtime_info().ok());
+        });
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(40), move || {
+            match receiver.try_recv() {
+                Ok(runtime) => {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.set_runtime_info(runtime);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    /// Offer to install the geo data, saying who will be contacted before
+    /// anyone is.
+    ///
+    /// Looks for a copy already on this machine first — that is faster, needs
+    /// no network, and many machines have one from another client. Only if
+    /// there is none does it offer the download, and then the dialog names both
+    /// URLs and both destinations verbatim, because that is the last point at
+    /// which someone can decline.
+    fn present_geo_install(self: &Rc<Self>) {
+        self.client_job(
+            UiOperation::new(UiOperationKind::FindGeoAssets),
+            |client| client.find_geo_assets(),
+            |controller, result| match result {
+                Ok(found) if !found.is_empty() => controller.present_geo_adopt(found),
+                // A daemon that cannot look is not a reason not to offer the
+                // download; it only means we cannot save the user the bytes.
+                Ok(_) => controller.present_geo_download(),
+                Err(error) if is_busy(&error) => {}
+                Err(error) => {
+                    log::debug!("could not look for geo data: {error:#}");
+                    controller.present_geo_download();
+                }
+            },
+        );
+    }
+
+    /// Offer files already on this machine, which beats fetching 23 MB.
+    fn present_geo_adopt(self: &Rc<Self>, found: Vec<oxidom_core::xray::assets::Candidate>) {
+        let first = found[0].clone();
+        let body = format!(
+            "The Xray core accepts the geo data already installed here:\n\n\
+             \u{2003}{}\n\
+             \u{2003}geoip.dat {}\u{2003}geosite.dat {}\n\n\
+             oxidom will copy both files into its own directory, so that a package \
+             upgrade or another program cannot take them away. Nothing is downloaded.",
+            first.dir,
+            human_bytes(first.geoip_bytes),
+            human_bytes(first.geosite_bytes),
+        );
+        let dialog = adw::AlertDialog::new(Some("Use the geo data on this machine?"), Some(&body));
+        dialog.add_responses(&[
+            ("cancel", "Cancel"),
+            ("download", "Download Instead"),
+            ("use", "Use These"),
+        ]);
+        dialog.set_response_appearance("use", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("use"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, {
+            let weak = Rc::downgrade(self);
+            move |dialog, response| {
+                dialog.close();
+                let Some(controller) = weak.upgrade() else {
+                    return;
+                };
+                match response {
+                    "use" => controller.adopt_geo_assets(first.dir.clone()),
+                    "download" => controller.present_geo_download(),
+                    _ => {}
+                }
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    /// The confirmation before anything leaves this machine.
+    ///
+    /// It names GitHub explicitly and says it may be blocked. That is not
+    /// boilerplate for this program in particular: its users are behind exactly
+    /// the filtering that blocks these hosts, and a spinner that fails after
+    /// twenty seconds explains nothing. Where a tunnel is already up, the fetch
+    /// can go through it, which turns "blocked" from a dead end into a
+    /// checkbox.
+    fn present_geo_download(self: &Rc<Self>) {
+        use oxidom_core::xray::assets::GeoAsset;
+
+        let dir = self
+            .runtime
+            .borrow()
+            .as_ref()
+            .map(|runtime| runtime.geo.dir.clone())
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or_else(|| "the daemon's data directory".to_string());
+        // Only offer the tunnel when there is one: a checkbox that cannot work
+        // is worse than no checkbox.
+        let connected = self
+            .state
+            .borrow()
+            .ui
+            .sessions
+            .iter()
+            .any(|session| session.state == "connected");
+
+        let body = format!(
+            "oxidom will contact GitHub over HTTPS and fetch two files:\n\n\
+             \u{2003}{}\n\u{2003}\u{2192} {dir}/geoip.dat\u{2003}about 22 MB\n\n\
+             \u{2003}{}\n\u{2003}\u{2192} {dir}/geosite.dat\u{2003}about 2 MB\n\n\
+             These are the IP and domain lists the core reads to tell your local network \
+             apart from the tunnel. Every configuration oxidom generates needs them.\n\n\
+             GitHub is blocked on some networks and in some countries. If this fails, that \
+             is the likely reason{}\n\n\
+             Each file is checked against the SHA-256 published beside it. That catches a \
+             broken download, not a compromised release \u{2014} there is no signature to \
+             verify. Nothing is executed.",
+            GeoAsset::GeoIp.url(),
+            GeoAsset::GeoSite.url(),
+            if connected {
+                " \u{2014} \"Through the tunnel\" below sends the request over your \
+                 connection instead."
+            } else {
+                ", and connecting first would let oxidom fetch them through the tunnel."
+            },
+        );
+
+        let dialog = adw::AlertDialog::new(Some("Download the geo data?"), Some(&body));
+        dialog.add_responses(&[("cancel", "Cancel"), ("download", "Download")]);
+        if connected {
+            dialog.add_response("tunnel", "Through the Tunnel");
+            dialog.set_response_appearance("tunnel", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("tunnel"));
+        } else {
+            dialog.set_response_appearance("download", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("download"));
+        }
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, {
+            let weak = Rc::downgrade(self);
+            move |dialog, response| {
+                dialog.close();
+                let Some(controller) = weak.upgrade() else {
+                    return;
+                };
+                match response {
+                    "download" => controller.start_geo_download(false),
+                    "tunnel" => controller.start_geo_download(true),
+                    _ => {}
+                }
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    /// Start the download. The daemon returns at once and reports its progress
+    /// through the poll, so this holds no operation slot — Cancel has to stay
+    /// clickable while 23 MB comes down.
+    fn start_geo_download(self: &Rc<Self>, through_tunnel: bool) {
+        let client = self.state.borrow().client.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(client.download_geo_assets(through_tunnel));
+        });
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(40), move || {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    let Some(controller) = weak.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    match result {
+                        Ok(()) => controller.poll_geo_progress(),
+                        Err(error) => controller
+                            .show_error("Could not download the geo data", &format!("{error:#}")),
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    /// Stop one.
+    fn cancel_geo_download(self: &Rc<Self>) {
+        let client = self.state.borrow().client.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = client.cancel_geo_download() {
+                log::debug!("could not cancel the geo download: {error:#}");
+            }
+        });
+    }
+
+    /// Install files already on this machine.
+    fn adopt_geo_assets(self: &Rc<Self>, dir: String) {
+        self.client_job(
+            UiOperation::new(UiOperationKind::InstallGeoAssets),
+            move |client| client.adopt_geo_assets(&dir),
+            |controller, result| match result {
+                Ok(()) => {
+                    controller.show_message("Geo data installed — the core can load its lists");
+                    controller.refresh_runtime_info();
+                }
+                Err(error) if is_busy(&error) => {}
+                Err(error) => {
+                    controller.show_error("Could not install the geo data", &format!("{error:#}"))
+                }
+            },
+        );
     }
 
     /// What to call a server in a sentence. Falls back to the id, which is at

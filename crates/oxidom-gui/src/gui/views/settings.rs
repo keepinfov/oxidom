@@ -12,9 +12,12 @@ use oxidom_core::ipc::RuntimeInfo;
 // scopes of one choice cannot drift apart.
 use oxidom_core::subscription::CLIENT_PRESETS as UA_PRESETS;
 
+use oxidom_core::client::DaemonSource;
+
 use super::core_editor::{CoreEditor, CoreLevel};
 use super::icon_button;
 use crate::gui::prefs::ColorScheme;
+use crate::gui::reduce::{self, GeoOffer};
 
 /// Restored by [`SettingsView::set_system_proxy_failure`], so the row has one
 /// place that owns its normal wording.
@@ -140,6 +143,20 @@ struct SettingsWidgets {
     install_hint: adw::ActionRow,
     /// What the row's copy button puts on the clipboard.
     install_command: Rc<RefCell<String>>,
+    /// What the core says about its geo data, filled from `RuntimeInfo` like
+    /// `xray_effective` and never worked out here: the daemon is a different
+    /// process, often a different user, and on NixOS the location comes from
+    /// inside a wrapper this process cannot see.
+    geo_status: adw::ActionRow,
+    /// Offers the fix: a download, an adoption of files already present, or a
+    /// command when neither can help.
+    geo_action: adw::ActionRow,
+    geo_button: gtk::Button,
+    geo_cancel: gtk::Button,
+    geo_progress: gtk::ProgressBar,
+    /// The manual recipe, for a daemon too old to install anything itself.
+    geo_command: Rc<RefCell<String>>,
+    geo_copy: gtk::Button,
     core: CoreEditor,
     ports_error: gtk::Label,
     url_error: gtk::Label,
@@ -209,6 +226,11 @@ pub struct SettingsView {
     /// Set while the row is being written to programmatically, so restoring
     /// the saved choice does not read as the user making it.
     updating_appearance: Rc<Cell<bool>>,
+    /// Whether the daemon answering this window knows how to install geo data,
+    /// and which daemon it is. Both come from the window, which owns the
+    /// client; together they decide whether a button can help at all.
+    geo_download_supported: Rc<Cell<bool>>,
+    daemon_source: Rc<Cell<DaemonSource>>,
 }
 
 impl SettingsView {
@@ -350,9 +372,58 @@ impl SettingsView {
         });
         install_hint.add_suffix(&copy_install);
 
+        // Between what the daemon resolved and how to install a core: the
+        // order reads as what you asked for, what is in use, what it is
+        // missing, how to get it.
+        let geo_status = adw::ActionRow::builder()
+            .title("Geo data")
+            .subtitle_selectable(true)
+            .visible(false)
+            .build();
+        geo_status.add_css_class("property");
+
+        let geo_action = adw::ActionRow::builder()
+            .title("Install the geo data")
+            .subtitle_selectable(true)
+            .visible(false)
+            .build();
+        let geo_button = gtk::Button::with_label("Download");
+        geo_button.add_css_class("suggested-action");
+        geo_button.set_valign(gtk::Align::Center);
+        let geo_cancel = gtk::Button::with_label("Cancel");
+        geo_cancel.add_css_class("destructive-action");
+        geo_cancel.set_valign(gtk::Align::Center);
+        geo_cancel.set_visible(false);
+        let geo_command = Rc::new(RefCell::new(String::new()));
+        let geo_copy = icon_button("edit-copy-symbolic", "Copy");
+        geo_copy.set_tooltip_text(Some("Copy"));
+        geo_copy.set_visible(false);
+        geo_copy.connect_clicked({
+            let geo_command = geo_command.clone();
+            move |button| {
+                button.clipboard().set_text(geo_command.borrow().as_str());
+            }
+        });
+        geo_action.add_suffix(&geo_copy);
+        geo_action.add_suffix(&geo_cancel);
+        geo_action.add_suffix(&geo_button);
+
+        // The first progress bar in the application. Twenty-three megabytes is
+        // long enough on a slow link that a spinner alone reads as a hang.
+        let geo_progress = gtk::ProgressBar::builder()
+            .visible(false)
+            .show_text(false)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(8)
+            .build();
+
         xray_group.add(&xray_binary);
         xray_group.add(&xray_error);
         xray_group.add(&xray_effective);
+        xray_group.add(&geo_status);
+        xray_group.add(&geo_action);
+        xray_group.add(&geo_progress);
         xray_group.add(&install_hint);
         let latency_group = adw::PreferencesGroup::builder()
             .title("Latency")
@@ -426,6 +497,13 @@ impl SettingsView {
             nft_binary,
             xray_effective,
             install_hint,
+            geo_status,
+            geo_action,
+            geo_button,
+            geo_cancel,
+            geo_progress,
+            geo_command,
+            geo_copy,
             install_command,
             core,
             ports_error,
@@ -485,6 +563,10 @@ impl SettingsView {
             updating_widgets,
             appearance,
             updating_appearance: Rc::new(Cell::new(false)),
+            // Assumed absent until the window says otherwise, so a daemon that
+            // turns out to be too old is never briefly offered a button.
+            geo_download_supported: Rc::new(Cell::new(false)),
+            daemon_source: Rc::new(Cell::new(DaemonSource::Session)),
         }
     }
 
@@ -618,6 +700,136 @@ impl SettingsView {
     ///
     /// `None` means the daemon predates this call — leave everything editable
     /// rather than guessing.
+    /// Tell the page which daemon it is talking to, and whether that daemon can
+    /// install geo data at all. Both are the window's to know: it owns the
+    /// client. Called before the first `set_runtime_info`.
+    pub fn set_daemon_capabilities(&self, source: DaemonSource, can_download: bool) {
+        self.daemon_source.set(source);
+        self.geo_download_supported.set(can_download);
+    }
+
+    /// The manual recipe, for a daemon that cannot install anything itself.
+    ///
+    /// `/usr/local/share/xray` rather than oxidom's own directory on purpose:
+    /// it is in the core's built-in search path, so it needs no environment
+    /// variable and works for a daemon of any age, including the old one that
+    /// prompted the advice.
+    fn manual_install_command() -> String {
+        let geoip = oxidom_core::xray::assets::GeoAsset::GeoIp;
+        let geosite = oxidom_core::xray::assets::GeoAsset::GeoSite;
+        format!(
+            "curl -LO {}\ncurl -Lo geosite.dat {}\n\
+             sudo install -Dm644 geoip.dat   /usr/local/share/xray/geoip.dat\n\
+             sudo install -Dm644 geosite.dat /usr/local/share/xray/geosite.dat",
+            geoip.url(),
+            geosite.url(),
+        )
+    }
+
+    /// Paint the geo rows from a decision the reducer already made.
+    ///
+    /// Nothing is decided here — every branch is a `GeoOffer` variant, which is
+    /// what makes the awkward cases (a system daemon too old to help, a
+    /// directory it cannot write) testable without a display.
+    fn apply_geo_offer(&self, offer: &GeoOffer) {
+        let widgets = &self.widgets;
+        let show = |status: bool, action: bool, progress: bool| {
+            widgets.geo_status.set_visible(status);
+            widgets.geo_action.set_visible(action);
+            widgets.geo_progress.set_visible(progress);
+        };
+        match offer {
+            GeoOffer::Silent => show(false, false, false),
+            GeoOffer::Working => {
+                widgets
+                    .geo_status
+                    .set_subtitle("In use — the core loads geoip.dat and geosite.dat");
+                widgets.geo_status.remove_css_class("error");
+                show(true, false, false);
+            }
+            GeoOffer::Download => {
+                widgets
+                    .geo_status
+                    .set_subtitle("Missing — the core refuses every connection without it");
+                widgets.geo_status.add_css_class("error");
+                widgets
+                    .geo_action
+                    .set_subtitle("Look for a copy on this machine, or download it from GitHub");
+                widgets.geo_button.set_label("Install…");
+                widgets.geo_button.set_visible(true);
+                widgets.geo_button.set_sensitive(true);
+                widgets.geo_cancel.set_visible(false);
+                widgets.geo_copy.set_visible(false);
+                show(true, true, false);
+            }
+            GeoOffer::Running { file, done, total } => {
+                widgets.geo_status.set_subtitle("Installing…");
+                widgets.geo_status.remove_css_class("error");
+                widgets
+                    .geo_action
+                    .set_subtitle(&reduce::geo_progress_text(file, *done, *total));
+                widgets.geo_button.set_visible(false);
+                widgets.geo_cancel.set_visible(true);
+                widgets.geo_copy.set_visible(false);
+                if *total > 0 {
+                    widgets
+                        .geo_progress
+                        .set_fraction(*done as f64 / *total as f64);
+                } else {
+                    // No Content-Length, so there is nothing to divide by. A
+                    // pulse still distinguishes working from wedged.
+                    widgets.geo_progress.pulse();
+                }
+                show(true, true, true);
+            }
+            GeoOffer::Unwritable { dir } => {
+                widgets
+                    .geo_status
+                    .set_subtitle("Missing — the core refuses every connection without it");
+                widgets.geo_status.add_css_class("error");
+                widgets.geo_action.set_subtitle(&format!(
+                    "The daemon cannot write {dir}, so it cannot install this for you"
+                ));
+                widgets.geo_button.set_visible(false);
+                widgets.geo_cancel.set_visible(false);
+                *widgets.geo_command.borrow_mut() = Self::manual_install_command();
+                widgets.geo_copy.set_visible(true);
+                show(true, true, false);
+            }
+            GeoOffer::CommandOnly { session_fallback } => {
+                widgets
+                    .geo_status
+                    .set_subtitle("Missing — the core refuses every connection without it");
+                widgets.geo_status.add_css_class("error");
+                widgets.geo_action.set_subtitle(if *session_fallback {
+                    "This daemon is older than the app and cannot install it. Copy the \
+                     commands, or update oxidom."
+                } else {
+                    // The system service runs as `oxidom` with ProtectHome, so
+                    // nothing this GUI could download would ever be readable by
+                    // it. Only a command helps.
+                    "The system service is older than the app and cannot install it. \
+                     Copy the commands, or update oxidom."
+                });
+                widgets.geo_button.set_visible(false);
+                widgets.geo_cancel.set_visible(false);
+                *widgets.geo_command.borrow_mut() = Self::manual_install_command();
+                widgets.geo_copy.set_visible(true);
+                show(true, true, false);
+            }
+        }
+    }
+
+    /// The button that starts an install, for the window to connect to.
+    pub fn geo_install_button(&self) -> gtk::Button {
+        self.widgets.geo_button.clone()
+    }
+
+    /// The button that stops one.
+    pub fn geo_cancel_button(&self) -> gtk::Button {
+        self.widgets.geo_cancel.clone()
+    }
+
     pub fn set_runtime_info(&self, info: Option<&RuntimeInfo>) {
         let widgets = &self.widgets;
         let Some(info) = info else {
@@ -625,6 +837,7 @@ impl SettingsView {
                 .xray_effective
                 .set_subtitle("Unavailable — this daemon is older than the app");
             widgets.xray_effective.remove_css_class("error");
+            self.apply_geo_offer(&GeoOffer::Silent);
             return;
         };
 
@@ -666,6 +879,12 @@ impl SettingsView {
                 widgets.install_hint.set_visible(false);
             }
         }
+
+        self.apply_geo_offer(&reduce::geo_offer(
+            Some(info),
+            self.geo_download_supported.get(),
+            self.daemon_source.get(),
+        ));
 
         const LOCKED: &str = "Fixed by the system service unit";
         for (locked, port, row, editable) in [

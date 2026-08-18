@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use oxidom_core::client::DaemonSource;
 use oxidom_core::ipc::{
     LatencyReading, PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry,
     RuntimeInfo, SelectionInfo, SessionInfo, StatusInfo,
@@ -1752,8 +1753,112 @@ pub(super) fn pool_action(
 /// old to answer `RuntimeInfo` reports `None` here, and stays silent rather
 /// than accusing a core that may well be present.
 pub(super) fn missing_core_message(runtime: Option<&RuntimeInfo>) -> Option<String> {
-    runtime?.xray_error.as_ref()?;
-    Some("No Xray core found — nothing can connect or be measured until one is installed".into())
+    let runtime = runtime?;
+    // Strict precedence, one banner. A core that could not be resolved was
+    // never asked about its geo data, so reporting both would be two lines
+    // about one cause — and the second would be a guess.
+    if runtime.xray_error.is_some() {
+        return Some(
+            "No Xray core found — nothing can connect or be measured until one is installed".into(),
+        );
+    }
+    // `Some(false)` is the daemon having asked the core and been refused.
+    // `None` is nobody having asked, which an older daemon also reports, and
+    // silence is the only honest answer to that.
+    if runtime.geo.usable == Some(false) {
+        return Some(
+            "The Xray core cannot load its geo data — nothing will connect until geoip.dat \
+             and geosite.dat are installed"
+                .into(),
+        );
+    }
+    None
+}
+
+/// What Settings can offer for the geo data, which is not the same question as
+/// whether the data is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum GeoOffer {
+    /// Say nothing: no core to ask, or a daemon too old to have been asked.
+    Silent,
+    /// The core loads both lists, from wherever it found them.
+    Working,
+    /// The daemon can install them itself.
+    Download,
+    /// A download is under way. `total` is zero when the server sent no
+    /// length, and the bar must then show motion without a denominator.
+    Running { file: String, done: u64, total: u64 },
+    /// The daemon cannot write its own asset directory, so a button would only
+    /// fail on click.
+    Unwritable { dir: String },
+    /// The daemon predates the download, so the only thing that helps is a
+    /// command the user runs. Offering a button here would be offering a fix
+    /// that cannot reach the daemon doing the work.
+    CommandOnly { session_fallback: bool },
+}
+
+/// Decide what the geo rows offer.
+///
+/// `daemon_can_download` is whether the daemon knows the method at all, and
+/// `source` is which daemon answered. The pair matters: files a *session*
+/// fallback download writes into the user's home are invisible to a system
+/// service, which runs as `oxidom` with `ProtectHome=true` — so offering that
+/// button there would be offering something that provably cannot work.
+pub(super) fn geo_offer(
+    runtime: Option<&RuntimeInfo>,
+    daemon_can_download: bool,
+    source: DaemonSource,
+) -> GeoOffer {
+    let Some(runtime) = runtime else {
+        return GeoOffer::Silent;
+    };
+    if runtime.xray_error.is_some() {
+        return GeoOffer::Silent;
+    }
+    if runtime.geo.downloading {
+        return GeoOffer::Running {
+            file: runtime
+                .geo
+                .current_file
+                .clone()
+                .unwrap_or_else(|| "geo data".to_string()),
+            done: runtime.geo.done_bytes,
+            total: runtime.geo.total_bytes,
+        };
+    }
+    match runtime.geo.usable {
+        None => GeoOffer::Silent,
+        Some(true) => GeoOffer::Working,
+        Some(false) if !daemon_can_download => GeoOffer::CommandOnly {
+            session_fallback: source != DaemonSource::System,
+        },
+        Some(false) if !runtime.geo.writable => GeoOffer::Unwritable {
+            dir: runtime.geo.dir.clone(),
+        },
+        Some(false) => GeoOffer::Download,
+    }
+}
+
+/// A byte count as a person reads it, for the line under the progress bar.
+pub(super) fn human_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else {
+        format!("{:.0} kB", bytes as f64 / 1024.0)
+    }
+}
+
+/// What the progress line says while a download runs.
+///
+/// Without a total there is still something true to say — the bytes so far —
+/// and saying it beats a bar that only pulses.
+pub(super) fn geo_progress_text(file: &str, done: u64, total: u64) -> String {
+    if total > 0 {
+        format!("{file} — {} of {}", human_bytes(done), human_bytes(total))
+    } else {
+        format!("{file} — {}", human_bytes(done))
+    }
 }
 
 pub(super) fn other_profiles_message(
@@ -1926,7 +2031,7 @@ pub(super) fn active_latency_for(state: &SnapshotState) -> (Option<u32>, bool) {
 mod tests {
     use super::*;
     use oxidom_core::config::LatencyMethod;
-    use oxidom_core::ipc::{InterfaceInfo, PoolMember, ProbeFailure, ProbeRoute};
+    use oxidom_core::ipc::{GeoAssets, InterfaceInfo, PoolMember, ProbeFailure, ProbeRoute};
     use oxidom_core::link::parse_link;
     use oxidom_core::model::Subscription;
     use oxidom_core::profile::ProfileInterface;
@@ -3702,6 +3807,162 @@ mod tests {
         );
         runtime.xray_error = Some("`xray` was not found on $PATH".to_string());
         assert!(missing_core_message(Some(&runtime)).is_some());
+    }
+
+    /// One banner, and the missing core outranks the missing data: a core that
+    /// could not be resolved was never asked about its geo data, so saying both
+    /// would be two lines about one cause and the second would be invented.
+    #[test]
+    fn the_banner_reports_a_missing_core_before_it_reports_missing_geo_data() {
+        let mut runtime = RuntimeInfo {
+            xray_error: Some("`xray` was not found on $PATH".to_string()),
+            geo: GeoAssets {
+                usable: Some(false),
+                ..GeoAssets::default()
+            },
+            ..RuntimeInfo::default()
+        };
+        let message = missing_core_message(Some(&runtime)).expect("a banner");
+        assert!(message.contains("No Xray core"), "{message}");
+        assert!(!message.contains("geo"), "one cause, one line: {message}");
+
+        runtime.xray_error = None;
+        let message = missing_core_message(Some(&runtime)).expect("a banner");
+        assert!(message.contains("geoip.dat"), "{message}");
+    }
+
+    /// `None` is nobody having asked — an older daemon, or no core to ask — and
+    /// the only honest response is silence. Reporting it as missing data would
+    /// accuse every machine running a daemon that predates the check.
+    #[test]
+    fn the_banner_says_nothing_until_the_daemon_has_determined_whether_the_lists_load() {
+        let mut runtime = RuntimeInfo::default();
+        assert_eq!(runtime.geo.usable, None, "the default is undetermined");
+        assert_eq!(missing_core_message(Some(&runtime)), None);
+        runtime.geo.usable = Some(true);
+        assert_eq!(missing_core_message(Some(&runtime)), None);
+    }
+
+    /// The offer follows the same rule, and adds the one the banner does not
+    /// have to make: whether a button would actually achieve anything.
+    #[test]
+    fn the_download_is_offered_only_when_the_daemon_says_the_lists_will_not_load() {
+        let usable = RuntimeInfo::default();
+        assert_eq!(
+            geo_offer(Some(&usable), true, DaemonSource::Session),
+            GeoOffer::Silent,
+            "undetermined offers nothing"
+        );
+
+        let mut working = RuntimeInfo::default();
+        working.geo.usable = Some(true);
+        assert_eq!(
+            geo_offer(Some(&working), true, DaemonSource::Session),
+            GeoOffer::Working
+        );
+
+        let mut missing = RuntimeInfo::default();
+        missing.geo.usable = Some(false);
+        missing.geo.writable = true;
+        assert_eq!(
+            geo_offer(Some(&missing), true, DaemonSource::Session),
+            GeoOffer::Download
+        );
+
+        // No core resolved: the missing core is the news, and this row is not.
+        let mut coreless = missing.clone();
+        coreless.xray_error = Some("`xray` was not found".to_string());
+        assert_eq!(
+            geo_offer(Some(&coreless), true, DaemonSource::Session),
+            GeoOffer::Silent
+        );
+    }
+
+    /// A daemon that cannot write its own asset directory gets no button. A
+    /// control that fails the moment it is pressed is worse than its absence,
+    /// and the directory is named so the reader can fix it.
+    #[test]
+    fn a_daemon_that_cannot_write_its_directory_is_not_offered_a_button() {
+        let mut runtime = RuntimeInfo::default();
+        runtime.geo.usable = Some(false);
+        runtime.geo.writable = false;
+        runtime.geo.dir = "/var/lib/oxidom/assets".to_string();
+        assert_eq!(
+            geo_offer(Some(&runtime), true, DaemonSource::System),
+            GeoOffer::Unwritable {
+                dir: "/var/lib/oxidom/assets".to_string()
+            }
+        );
+    }
+
+    /// The case that has to be got right, and the reason this is a reducer at
+    /// all. A daemon too old to download is also too old to set
+    /// `XRAY_LOCATION_ASSET` on the core it spawns, so files the GUI writes
+    /// into the user's home help nobody — and against the *system* service they
+    /// are unreadable twice over, since it runs as `oxidom` with
+    /// `ProtectHome=true`. There, only a command helps.
+    #[test]
+    fn a_system_daemon_too_old_to_download_is_offered_a_command_and_not_a_button() {
+        let mut runtime = RuntimeInfo::default();
+        runtime.geo.usable = Some(false);
+        runtime.geo.writable = true;
+
+        assert_eq!(
+            geo_offer(Some(&runtime), false, DaemonSource::System),
+            GeoOffer::CommandOnly {
+                session_fallback: false
+            },
+            "a system service cannot read the home directory the GUI would write to"
+        );
+        for source in [DaemonSource::Session, DaemonSource::Spawned] {
+            assert_eq!(
+                geo_offer(Some(&runtime), false, source),
+                GeoOffer::CommandOnly {
+                    session_fallback: true
+                },
+                "a daemon running as this user could at least read them"
+            );
+        }
+    }
+
+    /// A running download outranks every other state, including one that says
+    /// the lists still will not load — which is exactly what the daemon reports
+    /// mid-download, because the verdict it has cached predates the files.
+    #[test]
+    fn a_running_download_is_reported_as_progress_rather_than_as_a_fresh_offer() {
+        let mut runtime = RuntimeInfo::default();
+        runtime.geo.usable = Some(false);
+        runtime.geo.writable = true;
+        runtime.geo.downloading = true;
+        runtime.geo.current_file = Some("geoip.dat".to_string());
+        runtime.geo.done_bytes = 8 * 1024 * 1024;
+        runtime.geo.total_bytes = 22 * 1024 * 1024;
+        assert_eq!(
+            geo_offer(Some(&runtime), true, DaemonSource::Session),
+            GeoOffer::Running {
+                file: "geoip.dat".to_string(),
+                done: 8 * 1024 * 1024,
+                total: 22 * 1024 * 1024,
+            }
+        );
+    }
+
+    /// A server that sends no `Content-Length` leaves nothing to divide by, and
+    /// the bar then pulses — but the bytes so far are still true and still
+    /// worth printing, because a pulsing bar alone cannot be told from a stall.
+    #[test]
+    fn progress_without_a_total_still_says_how_far_it_has_got() {
+        assert_eq!(
+            geo_progress_text("geoip.dat", 8 * 1024 * 1024, 22 * 1024 * 1024),
+            "geoip.dat — 8.0 MB of 22.0 MB"
+        );
+        assert_eq!(
+            geo_progress_text("geoip.dat", 8 * 1024 * 1024, 0),
+            "geoip.dat — 8.0 MB"
+        );
+        // Below a megabyte the unit changes rather than printing "0.0 MB".
+        assert_eq!(human_bytes(4096), "4 kB");
+        assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MB");
     }
 
     /// An outdated daemon sends numbers that cannot be dated or attributed, so

@@ -36,7 +36,15 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   `oxidom status`.
 - **Subscriptions view:** add (URL + optional name), update-now, delete; per-sub **"send HWID"**
   switch (default OFF) with a privacy hint.
-- **Settings view:** ports, system-proxy toggle, latency method + test URL.
+- **Settings view:** ports, system-proxy toggle, latency method + test URL. The Xray core group also
+  reports whether the core can load its geo data and offers to install it. What the rows offer is a
+  pure decision (`reduce::geo_offer`), not a widget-level one, because the awkward cases are the
+  point: a daemon that predates the download, or one that cannot write its own asset directory,
+  must be given a copyable command rather than a button that fails when pressed. A **system**
+  daemon too old to install gets no download button at all — it runs as `oxidom` with
+  `ProtectHome=true`, so nothing this process writes to the user's home could ever be read by it.
+  The confirmation names the release host and says it may be blocked, and offers to fetch through
+  a tunnel that is already up. Progress is polled off the status tick, only while a download runs.
 - **Logs view:** the process log book, filtered by source (all / oxidom / Xray / interface),
   minimum severity, and a text search. Records arrive by cursor (`LogsSince`), so a refresh
   appends and **never rebuilds** — rebuilding is what threw the reader back to the top of the log.
