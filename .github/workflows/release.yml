@@ -72,12 +72,9 @@ jobs:
     needs: verify
     uses: ./.github/workflows/packages.yml
 
-  # No AppImage in the release yet. The bundle builds, but nix-appimage's AppRun
-  # mounts the store through an unprivileged user namespace, and Ubuntu has
-  # restricted those by default since 23.10 — so it fails on Ubuntu 24.04 LTS,
-  # which is the distribution it exists to serve. Until it is rebuilt on a
-  # bundler that needs no namespaces, a tag should produce the packages rather
-  # than fail on an artifact that would not work for the people asking for it.
+  appimage:
+    needs: verify
+    uses: ./.github/workflows/appimage.yml
 
   # Proves the flake still evaluates and builds at the released commit, which is
   # what NixOS users actually consume. It uploads nothing.
@@ -92,7 +89,7 @@ jobs:
       - run: nix build .#oxidom-cli .#oxidom-gui --print-build-logs
 
   publish:
-    needs: [verify, packages, nix]
+    needs: [verify, packages, appimage, nix]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -113,8 +110,8 @@ jobs:
             -exec mv -t dist/ {} +
           ls -l dist/
           # A release with nothing in it is a failure that looks like a success.
-          # Four is the two packages in each of the two formats.
-          [ "$(find dist -type f | wc -l)" -ge 4 ]
+          # Five is the two packages in each of the two formats, plus the AppImage.
+          [ "$(find dist -type f | wc -l)" -ge 5 ]
           ( cd dist && sha256sum ./* > SHA256SUMS && cat SHA256SUMS )
 
       # For a program that carries other people's traffic, provenance is not

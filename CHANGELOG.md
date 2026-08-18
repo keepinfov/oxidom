@@ -18,8 +18,17 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
-- **A tag publishes a release.** Pushing `vX.Y.Z` builds the packages, checks
-  the tag against the manifest and the changelog, and drafts a
+- **An AppImage**, for desktops whose distribution is too old for the
+  `oxidom-gui` package — above all Ubuntu 24.04 LTS and Debian 12, whose
+  libadwaita is 1.5 and 1.2 against a floor of 1.7. It carries its own GTK,
+  libadwaita, icon theme and glibc, plus an Xray core and the daemon binary, so
+  nothing else needs installing, and it needs no root and no special kernel
+  permission to start. Being an installed-nothing bundle it runs a session
+  daemon only: local proxies and the GNOME system-proxy toggle work, TUN and
+  `oxidom run` need the `.deb` or `.rpm`.
+
+- **A tag publishes a release.** Pushing `vX.Y.Z` builds the packages and the
+  AppImage, checks the tag against the manifest and the changelog, and drafts a
   GitHub release with every asset, a `SHA256SUMS`, and notes taken from the
   changelog section for that version. It is left as a draft for a person to
   publish. Every asset carries a build attestation, so `gh attestation verify

@@ -87,20 +87,36 @@ interface needs Fedora 42 or newer for libadwaita 1.7.
 
 ## AppImage
 
-**Not published yet.** A bundle that carries its own GTK exists and builds, but
-it starts by mounting its contents through an unprivileged user namespace, and
-Ubuntu has restricted those by default since 23.10 — so it does not run on
-Ubuntu 24.04 LTS, which is the release it was made for. It is being rebuilt on a
-mechanism that needs no namespaces; until that works, this section is a promise
-rather than a download.
+For a desktop whose distribution is too old for the `oxidom-gui` package — most
+of all **Ubuntu 24.04 LTS** and **Debian 12**, whose libadwaita is 1.5 and 1.2
+against a floor of 1.7.
 
-Meanwhile, on a distribution too old for the `oxidom-gui` package:
+```sh
+chmod +x oxidom-0.1.0-x86_64.AppImage
+./oxidom-0.1.0-x86_64.AppImage
+```
 
-- the **`oxidom` package installs and works** — the CLI and the daemon, with no
-  GTK dependency at all, tested on Ubuntu 24.04 and Debian 12;
-- for a graphical client, use the [Nix package](#nix-without-nixos), which
-  brings its own GTK stack, or a distribution from the
-  [matrix](#tested-distro-matrix) that can run it.
+It carries its own GTK, libadwaita, icon theme **and glibc**, so the host's
+versions do not matter, and it carries an Xray core and the `oxidom` daemon
+binary — nothing else to install. It needs no root and no special kernel
+permission.
+
+Two things to know:
+
+- **There is no system daemon.** An AppImage installs nothing, so it cannot
+  place a systemd unit or a D-Bus policy: it runs a session daemon of its own,
+  with its own database under `~/.local/share/oxidom`. Local SOCKS and HTTP
+  proxies and the GNOME system-proxy toggle work. TUN interfaces and `oxidom
+  run` do not — both need `CAP_NET_ADMIN`, which only the system daemon can
+  hold. For those, install the `.deb` or `.rpm`.
+- **Where the packages install, prefer them.** They are a few megabytes, they
+  update with the system, and they can run the daemon at boot.
+
+If it will not start, your system may lack a usable FUSE. Run it without:
+
+```sh
+./oxidom-0.1.0-x86_64.AppImage --appimage-extract-and-run
+```
 
 ## NixOS
 
