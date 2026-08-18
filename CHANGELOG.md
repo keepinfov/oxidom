@@ -79,6 +79,14 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **Reading or pinning a server's certificate no longer starts a daemon of its
+  own.** `oxidom trust` was the one command outside `up` and `connect` that
+  would start a private session daemon when none was running. That daemon keeps
+  its own database, so the handle was resolved against a different set of
+  servers than the pin was meant for: the server appeared not to exist, or the
+  pin was written where nothing else would ever read it. `trust` now requires a
+  daemon that is already running and exits 4 without one, like every other
+  command that is not bringing the tunnel up.
 - **A card checking for a long time stops flickering, and giving up on one
   works.** Sweeping a large subscription runs eight checks at a time, so a card
   near the end of the queue can legitimately wait longer than the five-minute
