@@ -43,7 +43,10 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$out"
 
 need() { command -v "$1" >/dev/null || { echo "error: $1 is required" >&2; exit 1; }; }
-need cargo; need patchelf; need curl; need unzip; need mksquashfs; need glib-compile-schemas
+# lib4bin names its own dependencies when it is missing one, but it does so
+# after the build has already run, so check them here where the message costs
+# nothing: file binutils patchelf findutils grep sed coreutils.
+for t in cargo curl unzip mksquashfs glib-compile-schemas patchelf file strip find; do need "$t"; done
 
 echo "== binaries =="
 cargo build --release --locked -p oxidom -p oxidom-gui
