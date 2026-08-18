@@ -62,6 +62,27 @@ jobs:
         run: |
           set -eux
           ldd --version | head -1
+      # The AppImage's AppRun mounts its store through an unprivileged user
+      # namespace, so a host that forbids those cannot run it. That is a real
+      # limitation and the thing this job exists to measure — but a sandbox that
+      # forbids namespaces for its own reasons produces the identical failure,
+      # and a test that cannot tell those apart is worse than no test, because
+      # somebody will eventually wave it through. So say which one it is.
+      - name: can this host create a user namespace at all
+        id: userns
+        run: |
+          set -eu
+          restrict=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)
+          maxns=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0)
+          echo "apparmor_restrict_unprivileged_userns=$restrict max_user_namespaces=$maxns"
+          if unshare --user --map-root-user true 2>/dev/null; then
+            echo "available=yes" >> "$GITHUB_OUTPUT"
+            echo "unprivileged user namespaces work here"
+          else
+            echo "available=no" >> "$GITHUB_OUTPUT"
+            echo "::warning::this host forbids unprivileged user namespaces, so the AppImage cannot start here whatever its contents"
+          fi
+
       - name: the AppImage answers
         run: |
           set -eux
@@ -73,5 +94,17 @@ jobs:
           chmod +x "$app"
           # --appimage-extract-and-run avoids needing FUSE, which these images
           # do not have and which is not what is under test here.
-          "$app" --appimage-extract-and-run --version
-          "$app" --appimage-extract-and-run --help > /dev/null
+          set +e
+          out=$("$app" --appimage-extract-and-run --version 2>&1); rc=$?
+          set -e
+          echo "exit $rc: $out"
+          if [ "$rc" = 0 ]; then
+            "$app" --appimage-extract-and-run --help > /dev/null
+            exit 0
+          fi
+          if [ '${{ steps.userns.outputs.available }}' = no ]; then
+            echo "::error::the AppImage did not start, and this host forbids unprivileged user namespaces. On ${{ matrix.image }} that is the answer, not an accident: the bundle needs a mechanism this distribution does not permit."
+          else
+            echo "::error::the AppImage did not start on a host that does permit user namespaces, so this is the bundle's own fault."
+          fi
+          exit 1
