@@ -18,6 +18,15 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **An AppImage**, for desktops whose distribution is too old for the
+  `oxidom-gui` package — above all Ubuntu 24.04 LTS and Debian 12, whose
+  libadwaita is 1.5 and 1.2 against a floor of 1.7. It carries its own GTK,
+  libadwaita, icon theme and glibc, plus an Xray core and the daemon binary, so
+  nothing else needs installing, and it needs no root and no special kernel
+  permission to start. Being an installed-nothing bundle it runs a session
+  daemon only: local proxies and the GNOME system-proxy toggle work, TUN and
+  `oxidom run` need the `.deb` or `.rpm`.
+
 - **A tag publishes a release.** Pushing `vX.Y.Z` builds the packages and the
   AppImage, checks the tag against the manifest and the changelog, and drafts a
   GitHub release with every asset, a `SHA256SUMS`, and notes taken from the
@@ -37,14 +46,6 @@ surface, packaging, or the CLI belongs here.
   **it installs on Ubuntu 24.04 LTS, Debian 12 and RHEL 9**, none of which can
   build oxidom from their own repositories. The interface still needs
   libadwaita 1.7 and therefore Debian 13, Ubuntu 25.04 or Fedora 42.
-
-- **An AppImage**, for desktops whose distribution is too old for the
-  `oxidom-gui` package — above all Ubuntu 24.04 LTS and Debian 12, whose
-  libadwaita is 1.5 and 1.2 against a floor of 1.7. It carries its own GTK,
-  libadwaita, icon theme and glibc, plus an Xray core, `tun2socks` and the
-  daemon binary, so nothing else needs installing. Being an installed-nothing
-  bundle it runs a session daemon only: local proxies and the GNOME
-  system-proxy toggle work, TUN and `oxidom run` need the `.deb` or `.rpm`.
 
 - **The "Install a core" hint names the exact download for this machine.** Where a
   distribution packages a core it still gives the one command — and now covers Alpine,

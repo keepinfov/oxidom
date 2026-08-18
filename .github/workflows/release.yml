@@ -110,7 +110,8 @@ jobs:
             -exec mv -t dist/ {} +
           ls -l dist/
           # A release with nothing in it is a failure that looks like a success.
-          [ "$(find dist -type f | wc -l)" -ge 4 ]
+          # Five is the two packages in each of the two formats, plus the AppImage.
+          [ "$(find dist -type f | wc -l)" -ge 5 ]
           ( cd dist && sha256sum ./* > SHA256SUMS && cat SHA256SUMS )
 
       # For a program that carries other people's traffic, provenance is not

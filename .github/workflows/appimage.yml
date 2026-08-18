@@ -1,18 +1,17 @@
 name: appimage
 
-# The AppImage is what serves the distributions that cannot install oxidom-gui:
-# Ubuntu 24.04 LTS and Debian 12, whose libadwaita is 1.5 and 1.2 against a floor
-# of 1.7. That is its whole reason to exist, so the job that matters here is not
-# the build — it is running the result on those two, which is the only thing that
-# proves the approach works at all. See packaging/appimage/build.sh for why this
-# is a `nix bundle` and not linuxdeploy.
+# The AppImage serves the desktops that cannot install oxidom-gui: Ubuntu 24.04
+# LTS and Debian 12, whose libadwaita is 1.5 and 1.2 against a floor of 1.7.
 #
-# It bundles the whole GTK closure, so this is the most expensive job in the
-# repository by a wide margin and has no business running on a pull request. It
-# is called by release.yml, which a `v*` tag triggers — a release candidate being
-# the point at which the answer matters — and can be run on demand while the
-# bundling itself is being worked on. Being called rather than separately
-# triggered is what lets the release job collect what it built.
+# It is built on Debian 13 — the oldest distribution carrying libadwaita 1.7, so
+# the bundled glibc is as old as it can be — and packed with sharun, which maps
+# the bundled interpreter in userspace and needs no privileges. An earlier
+# attempt used `nix bundle`, whose AppRun mounts through an unprivileged user
+# namespace; Ubuntu has restricted those since 23.10, so it failed on the exact
+# release it existed for. See packaging/appimage/build.sh.
+#
+# Called by release.yml on a tag, and runnable on demand. Never on a pull
+# request: it compiles the GTK client from scratch.
 
 on:
   workflow_call:
@@ -28,22 +27,43 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container: debian:trixie
     steps:
+      - name: build dependencies
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl ca-certificates git unzip \
+            libgtk-4-dev libadwaita-1-dev \
+            patchelf squashfs-tools libglib2.0-bin \
+            file binutils findutils \
+            locales \
+            adwaita-icon-theme hicolor-icon-theme desktop-file-utils
+
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v27
-        with:
-          extra_nix_config: experimental-features = nix-command flakes
+
+      # Debian 13 ships Rust 1.85.0, exactly the floor. rustup removes the
+      # question of whether the archive has drifted under us.
+      - name: rust toolchain
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: build
         run: packaging/appimage/build.sh dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: appimage
           path: dist/*.AppImage
           if-no-files-found: error
 
-  # The point of the whole exercise. If this fails, the AppImage has no audience
-  # that the .deb does not already serve, and saying so is better than shipping
-  # a file that only works where it was not needed.
+  # The point of the exercise. These two are why the AppImage exists, and an
+  # AppImage that does not start on them has no audience the .deb does not
+  # already serve.
   runs-on-old-distributions:
     needs: build
     name: runs on ${{ matrix.image }}
@@ -58,20 +78,64 @@ jobs:
         with:
           name: appimage
           path: dist
-      - name: how old is this glibc
+
+      - name: how old is this
         run: |
           set -eux
           ldd --version | head -1
+          cat /etc/os-release | grep PRETTY_NAME
+
       - name: the AppImage answers
         run: |
-          set -eux
-          # Resolve to one path rather than running a glob as a command name:
-          # with two matches the shell would run the first and pass the second
-          # as an argument, and the test would quietly mean something else.
+          set -eu
           app=$(find dist -name '*.AppImage' -type f | head -1)
           test -n "$app"
           chmod +x "$app"
-          # --appimage-extract-and-run avoids needing FUSE, which these images
-          # do not have and which is not what is under test here.
-          "$app" --appimage-extract-and-run --version
-          "$app" --appimage-extract-and-run --help > /dev/null
+          # Extraction, not mounting. A bare container has neither a SUID
+          # fusermount nor permission to unshare, and neither says anything
+          # about whether the bundle works — which is the question here. How it
+          # is mounted on a real desktop is a separate matter, and uruntime
+          # prefers fusermount3, which those desktops have.
+          set +e
+          out=$("$app" --appimage-extract-and-run --version 2>&1); rc=$?
+          set -e
+          echo "exit $rc"
+          echo "$out"
+          if [ "$rc" != 0 ]; then
+            echo "::error::the AppImage did not start on ${{ matrix.image }}, which is a distribution it exists to serve"
+            exit 1
+          fi
+          echo "$out" | grep -q '^oxidom-gui '
+
+      # The interface is a thin client: without the daemon beside it and a core
+      # to drive, a bundle that starts is still useless.
+      - name: it carries the daemon and a core
+        run: |
+          set -eu
+          app=$(find dist -name '*.AppImage' -type f | head -1)
+          # --appimage-extract, not extract-and-run: the latter unpacks into a
+          # temporary directory it removes again, so there is nothing left to
+          # look at. This one writes ./squashfs-root and leaves it.
+          "$app" --appimage-extract > /dev/null
+          d=squashfs-root
+          ls "$d/bin"
+          test -x "$d/bin/oxidom"
+          test -x "$d/bin/oxidom-gui"
+          test -x "$d/bin/xray"
+          test -f "$d/share/glib-2.0/schemas/gschemas.compiled"
+          test -d "$d/share/icons/Adwaita"
+          # The bundled loader is the whole point: an absolute interpreter would
+          # mean the binary is still asking this host for its glibc, which is
+          # exactly what it cannot have. patchelf answers this precisely; the
+          # string sits near the end of the file, so grepping a prefix does not.
+          (apt-get update && apt-get install -y --no-install-recommends patchelf) > /dev/null 2>&1 \
+            || (dnf install -y patchelf > /dev/null 2>&1) || true
+          if command -v patchelf > /dev/null; then
+            interp=$(patchelf --print-interpreter "$d/shared/bin/oxidom-gui")
+            echo "interpreter: $interp"
+            case "$interp" in
+              /*) echo "::error::the interpreter is absolute ($interp), so the bundled glibc is not being used"; exit 1 ;;
+            esac
+          else
+            echo "::warning::patchelf unavailable, interpreter not checked"
+          fi

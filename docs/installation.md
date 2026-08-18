@@ -96,22 +96,24 @@ chmod +x oxidom-0.1.0-x86_64.AppImage
 ./oxidom-0.1.0-x86_64.AppImage
 ```
 
-It carries its own GTK, libadwaita, icon theme **and glibc**, so the host's
-versions do not matter, and it carries an Xray core, `tun2socks` and the
-`oxidom` daemon binary — nothing else to install.
+About 45 MB. It carries its own GTK, libadwaita, icon theme **and glibc**, so
+the host's versions do not matter, and it carries an Xray core and the `oxidom`
+daemon binary — nothing else to install. It needs no root and no special kernel
+permission, which is why it works on Ubuntu 24.04, where a bundle that mounted
+itself through a user namespace would not.
 
 Two things to know:
 
-- **It is large**, because a whole GTK stack is inside it. That is the price of
-  running on a glibc older than the one GTK 4.18 was built against.
 - **There is no system daemon.** An AppImage installs nothing, so it cannot
   place a systemd unit or a D-Bus policy: it runs a session daemon of its own,
   with its own database under `~/.local/share/oxidom`. Local SOCKS and HTTP
   proxies and the GNOME system-proxy toggle work. TUN interfaces and `oxidom
   run` do not — both need `CAP_NET_ADMIN`, which only the system daemon can
   hold. For those, install the `.deb` or `.rpm`.
+- **Where the packages install, prefer them.** They are a few megabytes, they
+  update with the system, and they can run the daemon at boot.
 
-If it will not start, your system may lack FUSE 2. Run it without:
+If it will not start, your system may lack a usable FUSE. Run it without:
 
 ```sh
 ./oxidom-0.1.0-x86_64.AppImage --appimage-extract-and-run
