@@ -18,6 +18,15 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **The "Install a core" hint names the exact download for this machine.** Where a
+  distribution packages a core it still gives the one command — and now covers Alpine,
+  Gentoo's GURU overlay and Homebrew alongside Arch and Nix. Where it does not, which is
+  Debian, Ubuntu, Fedora, openSUSE and RHEL, the hint used to be the releases page: eighty
+  assets, and no indication which of them runs on your machine or what to do with it. It is
+  now the archive built for your architecture, with the commands that end in a working
+  `xray version`, a **Copy** button that takes all of them and an **Open** button that
+  visits the download. An architecture upstream publishes no build for is told so rather
+  than sent to a broken link.
 - **Settings offers to install the geo data when the core cannot load it.** The row says whether
   the core can read `geoip.dat` and `geosite.dat`, and offers to fix it when it cannot: by copying
   a set already on this machine where one exists, or by downloading. The confirmation names both

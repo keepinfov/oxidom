@@ -141,8 +141,12 @@ struct SettingsWidgets {
     /// "Install a core", with the command for this distribution. Hidden while
     /// a core resolves, because then there is nothing to install.
     install_hint: adw::ActionRow,
-    /// What the row's copy button puts on the clipboard.
+    /// What the row's copy button puts on the clipboard: the whole recipe
+    /// where there is one, since a bare URL leaves the work undone.
     install_command: Rc<RefCell<String>>,
+    /// What its Open button visits, when the answer is a download.
+    install_link: Rc<RefCell<String>>,
+    open_install: gtk::Button,
     /// What the core says about its geo data, filled from `RuntimeInfo` like
     /// `xray_effective` and never worked out here: the daemon is a different
     /// process, often a different user, and on NixOS the location comes from
@@ -370,6 +374,36 @@ impl SettingsView {
                     .set_text(install_command.borrow().as_str());
             }
         });
+        // Shown only where there is a download to open. A package-manager
+        // answer has no page worth visiting, and a button that opens nothing
+        // is a button that lies.
+        let install_link = Rc::new(RefCell::new(String::new()));
+        // `web-browser-symbolic`, not `external-link-symbolic`: Adwaita ships
+        // no icon under the latter name, and a missing icon draws an empty
+        // square -- the same way the Filter pill did before the funnel started
+        // travelling with the application.
+        let open_install = icon_button("web-browser-symbolic", "Open");
+        open_install.set_tooltip_text(Some("Open the download page"));
+        open_install.set_visible(false);
+        open_install.connect_clicked({
+            let install_link = install_link.clone();
+            move |_| {
+                let uri = install_link.borrow().clone();
+                if uri.is_empty() {
+                    return;
+                }
+                // `gtk::UriLauncher` would read better but arrives with the
+                // `v4_10` feature, and the workspace pins `v4_8`; raising it
+                // for one button is not this change's business.
+                if let Err(error) = gtk::gio::AppInfo::launch_default_for_uri(
+                    &uri,
+                    gtk::gio::AppLaunchContext::NONE,
+                ) {
+                    log::debug!("could not open the download page: {error}");
+                }
+            }
+        });
+        install_hint.add_suffix(&open_install);
         install_hint.add_suffix(&copy_install);
 
         // Between what the daemon resolved and how to install a core: the
@@ -505,6 +539,8 @@ impl SettingsView {
             geo_command,
             geo_copy,
             install_command,
+            install_link,
+            open_install,
             core,
             ports_error,
             url_error,
@@ -862,13 +898,24 @@ impl SettingsView {
                 widgets.xray_effective.set_subtitle(error);
                 widgets.xray_effective.add_css_class("error");
                 // A distribution that packages a core gets its command; the
-                // rest get the release page, since inventing an `apt install
-                // xray` that fails would be trusted over the documentation.
-                let command = oxidom_core::distro::xray_install_command_here()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "https://github.com/XTLS/Xray-core/releases".to_string());
-                widgets.install_hint.set_subtitle(&command);
-                *widgets.install_command.borrow_mut() = command;
+                // rest get the release built for *this* machine, because the
+                // releases page carries eighty assets and choosing between
+                // them is where people came unstuck. Inventing an `apt install
+                // xray` that fails would be trusted over the documentation, so
+                // no distribution is given a command it does not have.
+                let install = oxidom_core::distro::xray_install_here();
+                widgets.install_hint.set_subtitle(&install.summary());
+                *widgets.install_command.borrow_mut() = install.clipboard();
+                match install.link() {
+                    Some(url) => {
+                        *widgets.install_link.borrow_mut() = url.to_string();
+                        widgets.open_install.set_visible(true);
+                    }
+                    None => {
+                        widgets.install_link.borrow_mut().clear();
+                        widgets.open_install.set_visible(false);
+                    }
+                }
                 widgets.install_hint.set_visible(true);
             }
             // Nothing resolved and nothing reported: an older daemon that

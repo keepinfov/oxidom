@@ -265,15 +265,28 @@ works on any distribution.
 oxidom needs an `xray` binary and will not start without one. **Most distributions
 do not package it** — Nix and the AUR are the exceptions.
 
-Download a release from
-[XTLS/Xray-core](https://github.com/XTLS/Xray-core/releases):
+A few distributions do package one — Alpine (edge), Arch (via the AUR), Nix, and
+Gentoo's GURU overlay — and Homebrew packages it on macOS. **Debian, Ubuntu,
+Fedora, openSUSE and RHEL do not**, so most people download a release.
+
+Settings › Xray core names whichever of these applies to your machine, including
+the exact archive for your architecture, with buttons to copy the commands or open
+the page.
+
+By hand, on `x86_64`:
 
 ```sh
 curl -LO https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-unzip Xray-linux-64.zip xray
+unzip -o Xray-linux-64.zip xray
 sudo install -Dm755 xray /usr/local/bin/xray
 xray version
 ```
+
+On `aarch64` the archive is `Xray-linux-arm64-v8a.zip`; the release also publishes
+32-bit, riscv64, ppc64le, mips and s390x builds, and `Xray-macos-64.zip` /
+`Xray-macos-arm64-v8a.zip` for macOS. Pick the one matching `uname -m` — the
+archive holds the binary alone, which is why the geo data below is a separate
+step.
 
 **Use 26.1 or newer** if you have any Hysteria2 servers — that is where the native
 outbound landed, and an older core exits immediately rather than connecting.
