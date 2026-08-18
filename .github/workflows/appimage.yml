@@ -9,12 +9,13 @@ name: appimage
 #
 # It bundles the whole GTK closure, so this is the most expensive job in the
 # repository by a wide margin and has no business running on a pull request. It
-# runs on a `v*` tag — a release candidate being the point at which the answer
-# matters — and on demand while the bundling itself is being worked on.
+# is called by release.yml, which a `v*` tag triggers — a release candidate being
+# the point at which the answer matters — and can be run on demand while the
+# bundling itself is being worked on. Being called rather than separately
+# triggered is what lets the release job collect what it built.
 
 on:
-  push:
-    tags: ['v*']
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -64,8 +65,13 @@ jobs:
       - name: the AppImage answers
         run: |
           set -eux
-          chmod +x dist/*.AppImage
+          # Resolve to one path rather than running a glob as a command name:
+          # with two matches the shell would run the first and pass the second
+          # as an argument, and the test would quietly mean something else.
+          app=$(find dist -name '*.AppImage' -type f | head -1)
+          test -n "$app"
+          chmod +x "$app"
           # --appimage-extract-and-run avoids needing FUSE, which these images
           # do not have and which is not what is under test here.
-          ./dist/*.AppImage --appimage-extract-and-run --version
-          ./dist/*.AppImage --appimage-extract-and-run --help > /dev/null
+          "$app" --appimage-extract-and-run --version
+          "$app" --appimage-extract-and-run --help > /dev/null
