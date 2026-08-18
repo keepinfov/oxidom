@@ -2,6 +2,14 @@ name: packages
 
 # Builds the .deb and .rpm pairs and proves each one installs.
 #
+# **This does not run on pull requests.** Ten containers, four rustup bootstraps
+# and four release builds is a quarter of an hour of machine time to answer a
+# question almost no pull request changes the answer to. It runs where the answer
+# matters — on a tag, which is what a release candidate is for — and on demand
+# when something here is actually being worked on. The cheap half of the question
+# (do the manifests parse, do the scripts pass shellcheck, do the files they name
+# exist) is in packaging.yml and does run on every pull request.
+#
 # The build host matters more than it looks. glibc compatibility runs forward
 # only, so a binary built against an old one keeps working on newer systems and
 # never the reverse. The headless package is therefore built in the oldest
@@ -16,10 +24,7 @@ name: packages
 
 on:
   push:
-    branches: [master]
-    paths: ['packaging/**', 'data/**', 'crates/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/packages.yml']
-  pull_request:
-    paths: ['packaging/**', 'data/**', 'crates/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/packages.yml']
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -157,10 +162,20 @@ jobs:
           if [ "${{ matrix.flavour }}" = gui ]; then bin=target/release/oxidom-gui; fi
           mkdir -p shlib/debian && touch shlib/debian/control
           ( cd shlib && dpkg-shlibdeps -O --ignore-missing-info "../$bin" ) > /tmp/needed.txt
-          sed 's/^shlibs:Default=//' /tmp/needed.txt | tr ',' '\n' \
-            | sed 's/[ (].*//;s/^ *//;/^$/d' | sort -u > /tmp/needed.names
-          dpkg-deb -f dist/*.deb Depends | tr ',' '\n' \
-            | sed 's/[ (].*//;s/^ *//;/^$/d' | sort -u > /tmp/declared.names
+          # Reduce either shape — `shlibs:Depends=a (>= 1), b` or a plain
+          # `Depends` field — to a sorted list of bare package names. The prefix
+          # pattern is anchored on `word:word=` rather than the first `=`,
+          # because a version constraint contains one too, in `>=`. Leading
+          # space is stripped before the cut, or every dependency after the
+          # first becomes an empty line and silently disappears.
+          names() {
+            sed 's/^[a-zA-Z]*:[a-zA-Z-]*=//' \
+              | tr ',' '\n' \
+              | sed 's/^[[:space:]]*//;s/[[:space:](].*//;/^$/d' \
+              | sort -u
+          }
+          names < /tmp/needed.txt > /tmp/needed.names
+          dpkg-deb -f dist/*.deb Depends | names > /tmp/declared.names
           echo "linker needs:"; cat /tmp/needed.names
           echo "package declares:"; cat /tmp/declared.names
           missing=$(comm -23 /tmp/needed.names /tmp/declared.names)
