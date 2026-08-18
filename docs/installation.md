@@ -17,6 +17,7 @@ bundle one.
 - [From source](#from-source)
 - [Tested distro matrix](#tested-distro-matrix)
 - [Getting an Xray core](#getting-an-xray-core)
+  - [Getting the geo data](#getting-the-geo-data)
 - [Optional runtime dependencies](#optional-runtime-dependencies)
 - [Installing the assets by hand](#installing-the-assets-by-hand)
 - [Who may drive the system daemon](#who-may-drive-the-system-daemon)
@@ -281,8 +282,46 @@ If the binary is somewhere unusual, point oxidom at it with the `xray_binary`
 setting or `$OXIDOM_XRAY_BIN` — see
 [configuration.md](configuration.md#finding-helper-binaries).
 
-No geoip/geosite `.dat` files are needed. The only geo reference in the generated
-config is the built-in `geoip:private` rule, which modern Xray resolves itself.
+### Getting the geo data
+
+The core also needs **`geoip.dat` and `geosite.dat`**, and the release above does
+not contain them — the Xray zip ships the binary alone. They are not optional and
+they are not only for routing rules you might add later: every configuration
+oxidom generates carries the built-in `geoip:private` and `geosite:private`
+references, and a core that cannot load the lists **refuses to start at all**:
+
+```
+Failed to start: main: failed to load config files: [...]
+  > infra/conf: failed to build routing configuration
+  > infra/conf: invalid field rule
+  > infra/conf: failed to load GeoIP: private
+  > infra/conf: failed to open file: geoip.dat
+```
+
+Nix and the AUR's `xray-bin` both supply the files, so this bites exactly the
+people who installed a core by hand. Install them where every Xray build looks,
+which needs no environment variable:
+
+```sh
+curl -LO https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+curl -Lo geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+sudo install -Dm644 geoip.dat   /usr/local/share/xray/geoip.dat
+sudo install -Dm644 geosite.dat /usr/local/share/xray/geosite.dat
+```
+
+`geosite.dat` is published under the name `dlc.dat`; the core looks for it by the
+former, so rename it as the command above does. Both releases publish a
+`.sha256sum` beside the file if you want to check the download.
+
+The core searches `$XRAY_LOCATION_ASSET`, then its own directory, then
+`/usr/local/share/xray` and `/usr/share/xray`. To confirm a core can find its
+data before trusting it with a connection:
+
+```sh
+printf '%s' '{"outbounds":[{"protocol":"freedom","tag":"direct"}],
+  "routing":{"rules":[{"type":"field","ip":["geoip:private"],"outboundTag":"direct"}]}}' > /tmp/geo-test.json
+xray run -test -c /tmp/geo-test.json     # "Configuration OK." means the data loaded
+```
 
 ## Optional runtime dependencies
 
