@@ -440,6 +440,64 @@ impl DaemonClient {
         Ok(serde_json::from_str(&json)?)
     }
 
+    /// Ask the daemon to install the geo data its core needs.
+    ///
+    /// Returns when the download has *started*, not when it has finished: the
+    /// files are tens of megabytes and the daemon answers other callers on the
+    /// same connection meanwhile. Watch [`Self::runtime_info`] for progress —
+    /// its `geo` block carries `downloading`, the current file and the byte
+    /// counts — and call [`Self::cancel_geo_download`] to stop.
+    ///
+    /// `through_tunnel` asks for the fetch to go over a tunnel that is already
+    /// up, for a network where the release host is blocked. The daemon chooses
+    /// the proxy from its own sessions.
+    ///
+    /// A daemon older than this method answers `UnknownMethod`; callers must
+    /// degrade rather than treat it as fatal.
+    pub fn download_geo_assets(&self, through_tunnel: bool) -> Result<()> {
+        self.proxy
+            .call::<_, _, String>("DownloadGeoAssets", &(through_tunnel,))
+            .map_err(friendly)?;
+        Ok(())
+    }
+
+    /// Stop a running geo data download. Not an error when none is running.
+    pub fn cancel_geo_download(&self) -> Result<()> {
+        self.proxy
+            .call::<_, _, String>("CancelGeoDownload", &())
+            .map_err(friendly)?;
+        Ok(())
+    }
+
+    /// Directories on the daemon's machine already holding geo data its core
+    /// accepts. Every entry has been offered to the core and taken, so this is
+    /// a list of what is usable rather than of what exists.
+    pub fn find_geo_assets(&self) -> Result<Vec<crate::xray::assets::Candidate>> {
+        let json: String = self.proxy.call("FindGeoAssets", &()).map_err(friendly)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Install the geo data in `dir` instead of downloading it. The daemon
+    /// re-checks the directory before copying anything out of it.
+    pub fn adopt_geo_assets(&self, dir: &str) -> Result<()> {
+        self.proxy
+            .call::<_, _, String>("AdoptGeoAssets", &(dir,))
+            .map_err(friendly)?;
+        Ok(())
+    }
+
+    /// Whether this daemon knows how to install geo data at all.
+    ///
+    /// Distinguishes "asked and refused" from "too old to ask", which the GUI
+    /// needs in order to offer a manual recipe rather than a button that cannot
+    /// work.
+    pub fn supports_geo_download(&self) -> bool {
+        match self.proxy.call::<_, _, String>("CancelGeoDownload", &()) {
+            Ok(_) => true,
+            Err(error) => !is_unknown_method(&error),
+        }
+    }
+
     pub fn settings(&self) -> Result<Config> {
         let json: String = self.proxy.call("GetSettings", &()).map_err(friendly)?;
         Ok(serde_json::from_str(&json)?)

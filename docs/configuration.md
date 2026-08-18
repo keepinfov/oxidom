@@ -278,6 +278,26 @@ came from — not as a core that mysteriously fails to start.
 Three more are invoked by bare name, with no override: `gsettings` (GNOME proxy),
 `ping` (ICMP probes), `systemd-run` (`oxidom run`).
 
+### Geo data
+
+The core additionally needs `geoip.dat` and `geosite.dat`, without which it refuses
+every configuration oxidom generates — see
+[installation.md](installation.md#getting-the-geo-data). oxidom does not guess whether
+they are present: it asks the core with `xray run -test`, which also catches a corrupt
+file, and which is the only method that works where the core is a wrapper supplying the
+location itself.
+
+Where the core cannot find them, Settings offers to install them — by copying a set
+already on this machine when there is one, or by downloading from the addresses in
+[installation.md](installation.md#getting-the-geo-data) and checking each against the
+SHA-256 published beside it. They land in `assets/` beside the rest of the daemon's
+data, `0600`, and the core is pointed at them with `XRAY_LOCATION_ASSET`.
+
+**Which daemon downloads matters.** The system service runs as `oxidom` with
+`ProtectHome=true`, so it installs into `/var/lib/oxidom/assets` and can never read
+files in your home directory. A session daemon installs into
+`~/.local/share/oxidom/assets`, which no system service will see.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -291,6 +311,7 @@ Three more are invoked by bare name, with no override: `gsettings` (GNOME proxy)
 | `OXIDOM_EGRESS_URL` | Override `https://api.ipify.org` for `oxidom ip --egress`. |
 | `EDITOR`, `VISUAL` | Editor for `oxidom profile edit` (then `vi`). |
 | `STATE_DIRECTORY` | Set by systemd. Redirects config **and** data. See [above](#the-two-databases). |
+| `XRAY_LOCATION_ASSET` | Where the **core** looks for `geoip.dat` and `geosite.dat`. Read, not owned: oxidom sets it on the core it spawns only when nothing else has, and only when it holds both files itself. Set it yourself and oxidom leaves it alone. |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` | Base directories. |
 | `XDG_RUNTIME_DIR` | Where `oxidom run` looks for the systemd user socket. |
 

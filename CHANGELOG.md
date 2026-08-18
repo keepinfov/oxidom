@@ -18,6 +18,23 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **oxidom installs the geo data its core needs.** `geoip.dat` and `geosite.dat` are a
+  requirement of every connection, not of some optional routing feature, and the Xray
+  release ships neither — so anyone who installed a core by hand had a client that could
+  not connect. The daemon can now fetch both, verify each against the SHA-256 published
+  beside it, and point the core at them. It reports progress by the byte and can be
+  stopped part-way.
+
+  Files already on the machine are preferred to a download: a set installed by a
+  distribution package or another client is used where it lies. Whether any of it is
+  usable is settled by asking the core itself (`xray run -test`) rather than by looking
+  for filenames — which is also how a **corrupt** list is told from a missing one, and
+  the only method that works where the core is a wrapper that supplies the location
+  itself, as on NixOS.
+
+  The environment the core is spawned with is left untouched unless oxidom holds both
+  files and nothing else has chosen a location, so a machine that works today is
+  unaffected.
 - **The Logs page tells the three programs apart.** The Xray core, the network
   interface helper and oxidom itself now each tag their own lines, so an
   interface that never came up no longer reads exactly like a core that refused

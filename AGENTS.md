@@ -130,7 +130,7 @@ sending an untested change.
   network, no reliance on the developer's own machine. A test that needs a real
   network, a live Xray core, root, or someone's real subscription is marked
   `#[ignore = "<why>"]` with the reason and, in a doc comment, the command that
-  runs it. Three such tests exist; keep the count honest.
+  runs it. Eight such tests exist; keep the count honest.
 - **GUI logic goes in reducers.** UI state changes belong in pure functions
   under `gui::reduce` and friends, tested headlessly. No test constructs a
   widget or initialises GTK.

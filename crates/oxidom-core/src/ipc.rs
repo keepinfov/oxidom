@@ -373,6 +373,46 @@ pub struct ApplySettingsResult {
     pub ignored_paths: Vec<String>,
 }
 
+/// What the daemon knows about the geo data its core needs.
+///
+/// Only the daemon can answer any of it: it resolves the binary, owns the
+/// directory the files go in, and is the process whose environment the core
+/// inherits. A GUI that worked this out locally would be describing its own
+/// machine, which on a system daemon is the wrong one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GeoAssets {
+    /// Where a download would land, so a confirmation can quote the daemon's
+    /// real path rather than guessing one.
+    pub dir: String,
+    /// Whether the core can load both lists. `None` means undetermined — no
+    /// core to ask, or a daemon that predates the check — and is deliberately
+    /// not the same as `Some(false)`: one is silence, the other is an
+    /// accusation.
+    pub usable: Option<bool>,
+    /// The core's own words when it cannot, never a guess of ours.
+    pub error: Option<String>,
+    /// Sizes of the copies oxidom installed, zero when it has none.
+    pub geoip_bytes: u64,
+    pub geosite_bytes: u64,
+    /// Whether the daemon could write its own asset directory. False turns the
+    /// offer off rather than letting it fail on click.
+    pub writable: bool,
+    /// A download is running right now.
+    pub downloading: bool,
+    /// Which file, and how far in. `total_bytes` is zero when the server sent
+    /// no length, so a caller must be able to show motion without a
+    /// denominator.
+    pub current_file: Option<String>,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+    /// How the last download ended: `None` while one has never run or the last
+    /// succeeded.
+    pub last_error: Option<String>,
+    /// The last download was stopped by a caller rather than by a failure.
+    pub cancelled: bool,
+}
+
 /// Daemon-side facts the GUI cannot work out locally: the two run in separate
 /// processes, usually as different users, with different environments.
 ///
@@ -403,6 +443,10 @@ pub struct RuntimeInfo {
     /// `*_locked` flag is set — otherwise these default to 0 on an old daemon.
     pub socks_port: u16,
     pub http_port: u16,
+    /// The geo data the core needs. Absent from an older daemon's payload, and
+    /// `serde(default)` then leaves `usable: None`, which every caller reads as
+    /// "not determined" and says nothing about.
+    pub geo: GeoAssets,
 }
 
 /// One profile in a listing, flattened for CLI and other D-Bus clients.
