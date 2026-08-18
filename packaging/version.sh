@@ -57,10 +57,19 @@ check_release() {
 
     check "$v" || status=1
 
-    [ "$tag" = "v$v" ] || fail "tag $tag does not match version $v"
+    # A release candidate carries the version it is a candidate for, plus a
+    # suffix: v0.1.0-rc.1 rehearses 0.1.0. Requiring the whole tag to equal the
+    # manifest version would reject exactly the tags a rehearsal is made of, so
+    # the suffix is stripped before comparing — but only a suffix, so v0.2.0
+    # against a 0.1.0 manifest is still the mistake it always was.
+    base=${tag#v}
+    base=${base%%-*}
+    [ "$base" = "$v" ] || fail "tag $tag is for version $base, but Cargo.toml says $v"
 
-    # The changelog must have a dated section for it: releasing with everything
-    # still under [Unreleased] is how a release ends up with no notes.
+    # The changelog must have a dated section: releasing with everything still
+    # under [Unreleased] is how a release ends up with no notes. A candidate is
+    # allowed the section of the version it rehearses, since that is the text it
+    # exists to rehearse.
     grep -q "^## \[$v\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]" "$root/CHANGELOG.md" \
         || fail "CHANGELOG.md has no dated [$v] section"
 
