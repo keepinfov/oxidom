@@ -79,6 +79,15 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **A card checking for a long time stops flickering, and giving up on one
+  works.** Sweeping a large subscription runs eight checks at a time, so a card
+  near the end of the queue can legitimately wait longer than the five-minute
+  backstop. When the backstop fired it forgot the card was waiting at all — and
+  the daemon was still naming that check, so the very next poll read it as a new
+  one, put the spinner back and restarted the clock. The card blinked once every
+  five minutes rather than settling, and a daemon that had genuinely lost track
+  of a check kept its card spinning anyway, which is the one thing the backstop
+  is for.
 - **A stopped profile can be started again from its own row.** The Profiles page
   was waiting for a word the daemon has never sent. It reads four states off the
   wire, and the one meaning "stopped" is spelled `disconnected` — so a session

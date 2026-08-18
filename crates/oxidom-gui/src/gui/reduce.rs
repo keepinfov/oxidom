@@ -138,6 +138,11 @@ pub(super) struct ProbeWait {
     /// asks for the probe has even been sent, so a tick landing in that window
     /// would otherwise retire a probe that has not started.
     pub acked: bool,
+    /// Whether the deadline has passed with the daemon still claiming this id.
+    /// The spinner is down and the card has been repainted, but the wait is
+    /// *kept* so the next tick does not read the id as new and raise the
+    /// spinner again. It is dropped once the daemon lets the id go.
+    pub given_up: bool,
 }
 
 impl ProbeWait {
@@ -145,7 +150,13 @@ impl ProbeWait {
         Self {
             since,
             acked: false,
+            given_up: false,
         }
+    }
+
+    /// Whether this wait should still be drawn as a check in progress.
+    fn is_running(&self) -> bool {
+        !self.given_up
     }
 }
 
@@ -230,12 +241,15 @@ impl SnapshotState {
         } else {
             self.readings.get(id)
         };
-        latency_state(
-            reading,
-            self.checking.contains_key(id),
-            is_active,
-            now_unix_ms,
-        )
+        latency_state(reading, self.is_checking(id), is_active, now_unix_ms)
+    }
+
+    /// A card is checking while a wait is live. A wait the deadline has given
+    /// up on is still held — to keep the id from reading as new — but it is no
+    /// longer a check in progress, and drawing it as one is the thing the
+    /// deadline exists to stop.
+    pub(super) fn is_checking(&self, id: &str) -> bool {
+        self.checking.get(id).is_some_and(ProbeWait::is_running)
     }
 
     /// Drop the pin without waiting for the daemon to contradict it. Only for
@@ -284,6 +298,12 @@ pub(super) enum Effect {
 /// keep the last card waiting for over two minutes. This is the absolute
 /// backstop: a daemon that lost track of a probe it still claims to be running
 /// would otherwise keep the card spinning for the session.
+///
+/// Passing it retires the spinner but *keeps* the wait, because the daemon is
+/// still naming the id and a forgotten wait is indistinguishable from a new
+/// one — the next tick would adopt it and put the spinner straight back, which
+/// left the backstop unable to stop anything and the card flickering once a
+/// deadline instead of settling.
 pub(super) const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How long an unacknowledged probe keeps its spinner. Covers the window
@@ -459,6 +479,7 @@ pub(super) fn reduce(
                     ProbeWait {
                         since: now,
                         acked: true,
+                        given_up: false,
                     },
                 );
                 effects.push(Effect::Latency((*id).clone(), LatencyState::Checking));
@@ -469,20 +490,32 @@ pub(super) fn reduce(
     // for it exists. Keying off the reading is what made a card show the number
     // from its previous measurement as if it were the result of the one still
     // waiting in the queue.
-    let finished: Vec<String> = state
-        .checking
-        .iter()
-        .filter(|(id, wait)| {
-            if now.duration_since(wait.since) > PROBE_DEADLINE {
-                return true;
+    //
+    // Two different answers, so two lists. An id the daemon has let go is
+    // *finished*: forget the wait entirely. An id the daemon still claims past
+    // the deadline is *given up on*: take the spinner down but keep the wait,
+    // because forgetting it would let the next tick read the id as new and
+    // raise the spinner all over again — which is what made the backstop
+    // ineffective and the card flicker instead of settling.
+    let mut finished: Vec<String> = Vec::new();
+    let mut given_up: Vec<String> = Vec::new();
+    for (id, wait) in &state.checking {
+        if held.contains(id) {
+            if wait.is_running() && now.duration_since(wait.since) > PROBE_DEADLINE {
+                given_up.push(id.clone());
             }
-            if held.contains(*id) {
-                return false;
-            }
-            wait.acked || now.duration_since(wait.since) > PROBE_ACK_GRACE
-        })
-        .map(|(id, _)| id.clone())
-        .collect();
+            continue;
+        }
+        if wait.acked || now.duration_since(wait.since) > PROBE_ACK_GRACE {
+            finished.push(id.clone());
+        }
+    }
+    for id in given_up {
+        if let Some(wait) = state.checking.get_mut(&id) {
+            wait.given_up = true;
+        }
+        push_card(&mut effects, state, &id, now_unix_ms);
+    }
     for id in finished {
         state.checking.remove(&id);
         // A reading that never arrived leaves the card unmeasured rather than
@@ -492,7 +525,7 @@ pub(super) fn reduce(
     // Cards whose reading did not change but whose *meaning* did, because the
     // tunnel moved out from under it.
     for id in rerouted {
-        if !state.checking.contains_key(&id) {
+        if !state.is_checking(&id) {
             push_card(&mut effects, state, &id, now_unix_ms);
         }
     }
@@ -3427,7 +3460,87 @@ mod tests {
         );
         // No reading was ever taken, so the card must not claim "unreachable".
         assert_eq!(latency(&effects, "a"), Some(LatencyState::Unmeasured));
+        assert!(!state.is_checking("a"));
+    }
+
+    /// The backstop could not stop anything. It removed the wait outright, and
+    /// the daemon was still naming the id — so the very next tick read it as a
+    /// probe it had not seen, raised the spinner and restarted the clock. The
+    /// card flickered once a deadline forever instead of settling, and a daemon
+    /// that had genuinely lost a probe kept its card spinning regardless, which
+    /// is the one thing the deadline exists to prevent.
+    #[test]
+    fn a_probe_given_up_on_does_not_get_its_spinner_back() {
+        let mut state = state();
+        let now = Instant::now();
+        let held = snapshot(StatusInfo::default(), probe(&["a"], &[]));
+        fold(&mut state, &held, now, true);
+        assert!(state.is_checking("a"));
+
+        let past = now + PROBE_DEADLINE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            latency(&fold(&mut state, &held, past, true), "a"),
+            Some(LatencyState::Unmeasured)
+        );
+
+        // The daemon still holds it, and goes on holding it. The spinner must
+        // stay down through every one of those ticks.
+        for tick in 1..=3 {
+            let later = past + std::time::Duration::from_millis(500 * tick);
+            let effects = fold(&mut state, &held, later, true);
+            assert_ne!(
+                latency(&effects, "a"),
+                Some(LatencyState::Checking),
+                "tick {tick} raised the spinner again"
+            );
+            assert!(!state.is_checking("a"), "tick {tick} restarted the wait");
+        }
+
+        // Letting go drops the wait, so a later check starts clean.
+        fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probe(&[], &[])),
+            past + std::time::Duration::from_secs(4),
+            true,
+        );
         assert!(!state.checking.contains_key("a"));
+    }
+
+    /// A wait the deadline gave up on is still in the map, and the strip
+    /// counts that map. Counting it would have the header announce a check
+    /// while every card shows none.
+    #[test]
+    fn a_probe_given_up_on_is_not_counted_as_running() {
+        let mut state = state();
+        let now = Instant::now();
+        let held = snapshot(StatusInfo::default(), probe(&["a", "b"], &[]));
+        fold(&mut state, &held, now, true);
+        assert_eq!(
+            state
+                .checking
+                .keys()
+                .filter(|id| state.is_checking(id))
+                .count(),
+            2
+        );
+
+        fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probe(&["a"], &[])),
+            now + PROBE_DEADLINE + std::time::Duration::from_secs(1),
+            true,
+        );
+        // "b" was let go and forgotten; "a" is held but given up on. Neither is
+        // a check in progress, and the map still remembers one of them.
+        assert!(state.checking.contains_key("a"));
+        assert_eq!(
+            state
+                .checking
+                .keys()
+                .filter(|id| state.is_checking(id))
+                .count(),
+            0
+        );
     }
 
     /// The card the user explicitly pinged is the only one allowed to raise a
