@@ -41,9 +41,14 @@ jobs:
 
       - id: v
         name: the tag, the manifest and the changelog agree
+        # A ${{ }} expression is pasted into the script before the shell parses
+        # it, so a tag name would be shell source rather than data. These go
+        # through the environment instead, here and everywhere below.
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -eu
-          tag='${{ github.event.inputs.tag || github.ref_name }}'
+          tag=$TAG
           packaging/version.sh --check-release "$tag"
           echo "version=$(packaging/version.sh)" >> "$GITHUB_OUTPUT"
           # A hyphen means a pre-release: v0.1.0-rc.1 and friends.
@@ -116,9 +121,12 @@ jobs:
           subject-path: 'dist/*.deb,dist/*.rpm,dist/*.AppImage'
 
       - name: release notes
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          REPO: ${{ github.repository }}
         run: |
           set -eu
-          version='${{ needs.verify.outputs.version }}'
+          version=$VERSION
           # The section for this version, without its own heading and without the
           # next one — the changelog is the release notes, not a second copy.
           # Print from the heading to the end, drop the heading, then cut at the
@@ -127,27 +135,39 @@ jobs:
           escaped=$(printf '%s' "$version" | sed 's/\./\\./g')
           sed -n "/^## \[$escaped\]/,\$p" CHANGELOG.md \
             | tail -n +2 \
-            | sed '/^## \[/,$d' > notes.md
+            | sed -n '/^## \[/q;p' > notes.md
           # An empty section means a release with no notes, which verify should
           # already have caught — but publishing one anyway is worse than failing.
           [ -s notes.md ]
-          printf '\n---\n\nVerify an asset:\n\n```sh\ngh attestation verify <file> --repo %s\n```\n' \
-            '${{ github.repository }}' >> notes.md
+          # An indented code block rather than a backtick fence: backticks in a
+          # quoted shell string read as command substitution to a linter, and
+          # markdown renders four-space indentation as code just the same.
+          {
+            printf '\n---\n\nVerify an asset:\n\n'
+            printf '    gh attestation verify <file> --repo %s\n' "$REPO"
+          } >> notes.md
           cat notes.md
 
       - name: draft the release
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
         run: |
           set -eu
-          gh release create '${{ github.ref_name }}' \
+          flags=""
+          if [ "$PRERELEASE" = true ]; then flags=--prerelease; fi
+          # shellcheck disable=SC2086  # $flags is one optional flag or nothing
+          gh release create "$TAG" \
             --draft \
-            --title '${{ github.ref_name }}' \
+            --title "$TAG" \
             --notes-file notes.md \
-            ${{ needs.verify.outputs.prerelease == 'true' && '--prerelease' || '' }} \
+            $flags \
             dist/*
 
       - name: rehearsal, so nothing is published
         if: github.event_name != 'push'
-        run: echo "would have drafted ${{ github.event.inputs.tag }} with the assets above"
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        run: echo "would have drafted $TAG with the assets above"
