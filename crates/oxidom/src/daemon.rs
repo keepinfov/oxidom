@@ -2748,7 +2748,7 @@ impl Service {
         let source = std::path::PathBuf::from(&dir);
         let scratch =
             Shared::geo_scratch().map_err(|error| fdo::Error::Failed(format!("{error:#}")))?;
-        if assets::usable_candidates(&xray, &[source.clone()], &scratch).is_empty() {
+        if assets::usable_candidates(&xray, std::slice::from_ref(&source), &scratch).is_empty() {
             return Err(fdo::Error::Failed(format!(
                 "{dir} does not hold geo data this core will load"
             )));

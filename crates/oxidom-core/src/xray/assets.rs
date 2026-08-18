@@ -965,7 +965,8 @@ mod live_network {
         let xray = crate::xray::resolve::resolve("")
             .expect("this test needs a real Xray core")
             .path;
-        let scratch = std::env::temp_dir().join(format!("oxidom-live-dl-{}.json", std::process::id()));
+        let scratch =
+            std::env::temp_dir().join(format!("oxidom-live-dl-{}.json", std::process::id()));
         probe(&xray, Some(&into.0), &scratch).expect("the core must accept what was installed");
 
         // And the files are private, like everything else the daemon writes.
@@ -986,8 +987,11 @@ mod live_network {
     #[test]
     fn a_download_that_fails_its_checksum_installs_nothing() {
         let into = Dir::new("live-mismatch");
-        std::fs::write(into.0.join("geoip.dat"), b"the good file that was already here")
-            .expect("seeding");
+        std::fs::write(
+            into.0.join("geoip.dat"),
+            b"the good file that was already here",
+        )
+        .expect("seeding");
         let agent = agent(None).expect("building the agent");
         // Verify against the *wrong* asset's digest by asking for a sidecar
         // that describes a different file.
@@ -997,8 +1001,8 @@ mod live_network {
             .expect("fetching a sidecar")
             .into_string()
             .expect("reading it");
-        let wrong = parse_sha256_sidecar(&text, GeoAsset::GeoSite.published_name())
-            .expect("parsing it");
+        let wrong =
+            parse_sha256_sidecar(&text, GeoAsset::GeoSite.published_name()).expect("parsing it");
         let bytes = b"not the file that digest describes";
         assert_ne!(sha256_hex(bytes), wrong);
         assert_eq!(
