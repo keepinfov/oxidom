@@ -79,6 +79,20 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **A background task that dies no longer takes Settings with it.** If a worker
+  ended without reporting — a panic, or a daemon connection dropped underneath
+  it — the operation was never completed. For **Apply** that meant its spinner
+  stayed up and Apply and Reset stayed insensitive for the rest of the session,
+  with no way back but restarting the app; and if the apply had been asked to
+  close the window afterwards, that request stayed armed and shut the window on
+  some later save instead. The loss is now reported as a failure of whatever was
+  asked for, and says what it does and does not mean: nothing was cancelled, but
+  what is on screen may be out of date.
+- **The certificate dialogs say when they cannot answer.** Reading a
+  certificate and pinning one each wait on a worker, and both read "the worker
+  has gone" as "the worker has not answered yet" — so a failure produced no
+  message at all, and left a timer polling every 50ms for the life of the
+  process.
 - **A card checking for a long time stops flickering, and giving up on one
   works.** Sweeping a large subscription runs eight checks at a time, so a card
   near the end of the queue can legitimately wait longer than the five-minute

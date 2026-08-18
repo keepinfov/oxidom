@@ -60,6 +60,46 @@ fn is_busy(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Busy>().is_some()
 }
 
+/// A worker thread ended without sending its result.
+///
+/// Reported as an ordinary failure of whatever was asked for, so the completion
+/// handler that owns the cleanup runs. It says what is and is not true
+/// afterwards, because "it failed" and "it may or may not have happened" call
+/// for different reactions.
+#[derive(Debug)]
+struct WorkerLost;
+
+impl std::fmt::Display for WorkerLost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "the background worker stopped without reporting a result — nothing was cancelled, \
+             but what is on screen may be out of date",
+        )
+    }
+}
+
+impl std::error::Error for WorkerLost {}
+
+/// What one poll of a worker's channel means.
+///
+/// Named because the distinction is easy to lose: `try_recv` reports "nothing
+/// yet" and "nobody will ever send" as two different errors, and an `else`
+/// branch that treats them alike leaves a timer running for the life of the
+/// process and the user waiting for an answer that cannot arrive.
+enum WorkerPoll<T> {
+    Ready(T),
+    Waiting,
+    Lost,
+}
+
+fn poll_worker<T>(receiver: &mpsc::Receiver<T>) -> WorkerPoll<T> {
+    match receiver.try_recv() {
+        Ok(value) => WorkerPoll::Ready(value),
+        Err(mpsc::TryRecvError::Empty) => WorkerPoll::Waiting,
+        Err(mpsc::TryRecvError::Disconnected) => WorkerPoll::Lost,
+    }
+}
+
 /// The single thing a status strip offers to do about the state it reports.
 /// Absent for `Disconnected`, and for `Connecting` — which resolves on its own
 /// in seconds and has nothing to stop that has started.
@@ -3049,11 +3089,16 @@ impl Controller {
                         controller.bump_epoch();
                         controller.sessions.set_operation(None);
                         controller.subscriptions.set_operation(None);
-                        controller.show_error(
-                            "Background operation stopped unexpectedly",
-                            "The worker ended without reporting a result. Nothing was \
-                             cancelled, but what is on screen may be out of date.",
-                        );
+                        // Hand the loss to the completion handler, for the same
+                        // reason the `Busy` refusal above does: it owns the
+                        // per-call cleanup. Skipping it here left the settings
+                        // spinner up for the rest of the session — `Apply` and
+                        // `Reset` are insensitive until the handler lowers it —
+                        // and left a queued close armed, so a later save shut
+                        // the window without being asked to.
+                        if let Some(complete) = complete.take() {
+                            complete(&controller, Err(anyhow!(WorkerLost)));
+                        }
                         controller.refresh_status();
                     }
                     glib::ControlFlow::Break
@@ -3871,8 +3916,10 @@ impl Controller {
         });
         let weak = Rc::downgrade(self);
         glib::timeout_add_local(Duration::from_millis(50), move || {
-            let Ok(result) = receiver.try_recv() else {
-                return glib::ControlFlow::Continue;
+            let result = match poll_worker(&receiver) {
+                WorkerPoll::Waiting => return glib::ControlFlow::Continue,
+                WorkerPoll::Ready(result) => result,
+                WorkerPoll::Lost => Err(anyhow!(WorkerLost)),
             };
             let Some(controller) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -3958,8 +4005,10 @@ impl Controller {
         let weak = Rc::downgrade(self);
         let server_id = server_id.to_string();
         glib::timeout_add_local(Duration::from_millis(50), move || {
-            let Ok(result) = receiver.try_recv() else {
-                return glib::ControlFlow::Continue;
+            let result = match poll_worker(&receiver) {
+                WorkerPoll::Waiting => return glib::ControlFlow::Continue,
+                WorkerPoll::Ready(result) => result,
+                WorkerPoll::Lost => Err(anyhow!(WorkerLost)),
             };
             let Some(controller) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -4344,9 +4393,45 @@ mod tests {
     use oxidom_core::xray::core::Status;
 
     use super::{
-        ResponsiveMode, SearchState, StatusAction, desired_system_proxy_endpoint,
-        responsive_mode_for_width, status_action_for, summarize_error,
+        ResponsiveMode, SearchState, StatusAction, WorkerPoll, desired_system_proxy_endpoint,
+        poll_worker, responsive_mode_for_width, status_action_for, summarize_error,
     };
+
+    /// `try_recv` reports "nothing yet" and "nobody will ever send" as two
+    /// different errors, and three timers here treated them alike — `let Ok(..)
+    /// else { Continue }` reads as "wait for it", which for a worker that has
+    /// gone is forever. The timer stayed on the main loop for the life of the
+    /// process, and the operation it belonged to was never completed: the
+    /// settings spinner stayed up, leaving Apply and Reset insensitive for the
+    /// rest of the session.
+    #[test]
+    fn a_worker_that_will_never_answer_is_not_something_to_wait_for() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<u8>(1);
+        assert!(matches!(poll_worker(&receiver), WorkerPoll::Waiting));
+
+        sender.send(7).expect("the receiver is alive");
+        assert!(matches!(poll_worker(&receiver), WorkerPoll::Ready(7)));
+
+        // Still alive, still empty: waiting is the honest answer.
+        assert!(matches!(poll_worker(&receiver), WorkerPoll::Waiting));
+
+        // The worker ends — a return, or a panic — and drops its sender.
+        drop(sender);
+        assert!(matches!(poll_worker(&receiver), WorkerPoll::Lost));
+        // And stays lost, so a caller cannot poll its way back to hope.
+        assert!(matches!(poll_worker(&receiver), WorkerPoll::Lost));
+    }
+
+    /// A value already in the channel outlives the sender, and must be read
+    /// rather than mistaken for the loss that follows it.
+    #[test]
+    fn a_result_sent_before_the_worker_ended_is_still_delivered() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<u8>(1);
+        sender.send(3).expect("the receiver is alive");
+        drop(sender);
+        assert!(matches!(poll_worker(&receiver), WorkerPoll::Ready(3)));
+        assert!(matches!(poll_worker(&receiver), WorkerPoll::Lost));
+    }
 
     #[test]
     fn system_proxy_follows_only_a_live_owner() {
