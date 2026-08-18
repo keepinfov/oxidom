@@ -20,8 +20,13 @@ on:
 permissions:
   contents: read
 
+# The group names this file, not ${{ github.workflow }}. In a called workflow
+# that expression is the *caller's* name, so both workflows release.yml calls
+# computed the same group — and the same one as release.yml itself — and with
+# cancel-in-progress they cancelled each other before either started. The first
+# tag produced a release run with no packages and no AppImage in it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: appimage-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
