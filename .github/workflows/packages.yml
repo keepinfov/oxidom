@@ -22,9 +22,13 @@ name: packages
 # The GUI packages link against the distribution's own GTK, so they are built on
 # the oldest distribution that has a new enough one.
 
+# It is called by release.yml on a tag, so that one tag produces one run whose
+# artifacts the release job can collect, rather than three workflows racing each
+# other with no way to gather what they built. workflow_dispatch stays, for
+# working on the packaging itself.
+
 on:
-  push:
-    tags: ['v*']
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -185,6 +189,26 @@ jobs:
             exit 1
           fi
 
+      # A package silently losing a file is invisible until somebody installs
+      # it, and has happened once already — d121d87, where a missing icon showed
+      # up as an empty square several steps away from the packaging change.
+      - name: the package contains exactly the files it should
+        run: |
+          set -eu
+          pkg=oxidom
+          if [ "${{ matrix.flavour }}" = gui ]; then pkg=oxidom-gui; fi
+          if [ "${{ matrix.family }}" = deb ]; then
+            dpkg --contents dist/*.deb | awk '$1 !~ /^d/ {print $6}' \
+              | sed 's|^\./|/|' | sort > /tmp/actual
+          else
+            rpm -qlp dist/*.rpm 2>/dev/null | sort > /tmp/actual
+          fi
+          if ! diff -u "packaging/nfpm/expected/$pkg.txt" /tmp/actual; then
+            echo "::error file=packaging/nfpm/expected/$pkg.txt::the package no longer installs what this list says. If the change was deliberate, regenerate the list; see the README beside it."
+            exit 1
+          fi
+          echo "$pkg installs exactly the expected $(wc -l < /tmp/actual) files"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.flavour }}-${{ matrix.family }}
@@ -254,7 +278,8 @@ jobs:
           test -x /usr/bin/oxidom
           # The binary's own version must match the version in the file name the
           # package was built under; a mismatch means the wrong binary shipped.
-          pkg_version=$(ls dist/ | sed -n 's/^oxidom[-_]\([0-9][^-_]*\).*/\1/p' | head -1)
+          pkg_version=$(find dist -type f -printf '%f\n' \
+            | sed -n 's/^oxidom[-_]\([0-9][^-_]*\).*/\1/p' | head -1)
           test "$(oxidom --version)" = "oxidom $pkg_version"
 
           # The daemon account exists.
@@ -266,7 +291,12 @@ jobs:
           test -f /usr/lib/sysusers.d/oxidom.conf
           test -f /usr/share/dbus-1/system.d/dev.keepinfov.oxidom.Daemon.conf
           test -f /usr/share/dbus-1/system-services/dev.keepinfov.oxidom.Daemon.service
-          test -f /usr/share/doc/oxidom/README.md
+          # Nothing under /usr/share/doc is asserted here. Ubuntu's container
+          # images ship /etc/dpkg/dpkg.cfg.d/excludes with `path-exclude
+          # /usr/share/doc/*`, so those files are in the package and thrown away
+          # on the way in — a property of the image, not of what was built. That
+          # the package *contains* them is checked against the file-list fixture
+          # in the build job, which is where it belongs.
 
           if [ "${{ matrix.what }}" = both ]; then
             test -x /usr/bin/oxidom-gui
@@ -281,8 +311,12 @@ jobs:
       - name: nothing was enabled
         run: |
           set -eux
-          ! grep -rq oxidom /etc/systemd/system/multi-user.target.wants/ 2>/dev/null
-          test ! -e /etc/systemd/system/multi-user.target.wants/oxidom.service
+          # `! cmd` is not a condition, so under `set -e` it never fails the step
+          # — an assertion written that way passes whatever it finds. Use `if`.
+          if [ -e /etc/systemd/system/multi-user.target.wants/oxidom.service ]; then
+            echo "::error::installing enabled oxidom.service, which it must not"
+            exit 1
+          fi
 
       # No Xray core is present in any of these images, which is the state most
       # users install into. The daemon must start anyway and say so, rather than
@@ -290,7 +324,10 @@ jobs:
       - name: the daemon starts without an Xray core
         run: |
           set -eux
-          ! command -v xray
+          if command -v xray; then
+            echo "::error::this image has an Xray core, so the test proves nothing"
+            exit 1
+          fi
           set +e
           out=$(oxidom status 2>&1); rc=$?
           set -e

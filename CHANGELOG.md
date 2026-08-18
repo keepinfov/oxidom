@@ -18,6 +18,14 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **A tag publishes a release.** Pushing `vX.Y.Z` builds the packages and the
+  AppImage, checks the tag against the manifest and the changelog, and drafts a
+  GitHub release with every asset, a `SHA256SUMS`, and notes taken from the
+  changelog section for that version. It is left as a draft for a person to
+  publish. Every asset carries a build attestation, so `gh attestation verify
+  <file> --repo keepinfov/oxidom` says whether a download really came from this
+  repository.
+
 - **`.deb` and `.rpm` packages**, in the same two-package split the project has
   always had: `oxidom` is the CLI and daemon with no GTK dependency at all, and
   `oxidom-gui` is the interface, depending on `oxidom` at exactly the same

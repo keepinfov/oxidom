@@ -1,0 +1,8 @@
+/usr/bin/oxidom
+/usr/lib/systemd/system/oxidom.service
+/usr/lib/systemd/system/oxidom@.service
+/usr/lib/sysusers.d/oxidom.conf
+/usr/share/dbus-1/system-services/dev.keepinfov.oxidom.Daemon.service
+/usr/share/dbus-1/system.d/dev.keepinfov.oxidom.Daemon.conf
+/usr/share/doc/oxidom/LICENSE
+/usr/share/doc/oxidom/README.md

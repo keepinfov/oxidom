@@ -11,6 +11,7 @@ bundle one.
 
 ## Contents
 
+- [Verifying a download](#verifying-a-download)
 - [Debian and Ubuntu](#debian-and-ubuntu)
 - [Fedora, RHEL and derivatives](#fedora-rhel-and-derivatives)
 - [NixOS](#nixos)
@@ -23,6 +24,20 @@ bundle one.
 - [Optional runtime dependencies](#optional-runtime-dependencies)
 - [Installing the assets by hand](#installing-the-assets-by-hand)
 - [Who may drive the system daemon](#who-may-drive-the-system-daemon)
+
+## Verifying a download
+
+Every published `.deb`, `.rpm` and AppImage carries a build attestation, so you
+can check an asset really came from this repository and from the commit it
+claims, rather than trusting the file name:
+
+```sh
+gh attestation verify oxidom_0.1.0-1_amd64.deb --repo keepinfov/oxidom
+```
+
+Each release also has a `SHA256SUMS` beside the assets.
+
+For a program that carries your traffic this is worth the extra command.
 
 ## Debian and Ubuntu
 

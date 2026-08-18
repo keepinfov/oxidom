@@ -1,0 +1,153 @@
+name: release
+
+# Turns a `v*` tag into a draft GitHub release with every artifact attached.
+# AGENTS.md has said "pushing the tag publishes the release" since before
+# anything implemented it; this is that.
+#
+# The result is a **draft**. A human looks at the asset list and presses publish:
+# a release is the one thing in this repository that another commit cannot undo.
+#
+# The package and AppImage builds live in their own workflows and are called
+# from here rather than triggered alongside, so one tag produces one run and the
+# publish job can collect what the others built.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to rehearse against. Builds everything, publishes nothing.'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Cheap, and everything depends on it. A tag that disagrees with the manifest,
+  # or a changelog with nothing written under this version, is a release that
+  # should not start rather than one to be cancelled half-built.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        name: the tag, the manifest and the changelog agree
+        run: |
+          set -eu
+          tag='${{ github.event.inputs.tag || github.ref_name }}'
+          packaging/version.sh --check-release "$tag"
+          echo "version=$(packaging/version.sh)" >> "$GITHUB_OUTPUT"
+          # A hyphen means a pre-release: v0.1.0-rc.1 and friends.
+          case "$tag" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: the lockfile matches the manifests
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: the desktop entry and the AppStream data are valid
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends desktop-file-utils appstream
+          desktop-file-validate data/dev.keepinfov.oxidom.desktop
+          appstreamcli validate --strict data/dev.keepinfov.oxidom.metainfo.xml
+
+  packages:
+    needs: verify
+    uses: ./.github/workflows/packages.yml
+
+  appimage:
+    needs: verify
+    uses: ./.github/workflows/appimage.yml
+
+  # Proves the flake still evaluates and builds at the released commit, which is
+  # what NixOS users actually consume. It uploads nothing.
+  nix:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - run: nix build .#oxidom-cli .#oxidom-gui --print-build-logs
+
+  publish:
+    needs: [verify, packages, appimage, nix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      - name: collect
+        run: |
+          set -eux
+          mkdir -p dist
+          find staging -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+            -exec mv -t dist/ {} +
+          ls -l dist/
+          # A release with nothing in it is a failure that looks like a success.
+          [ "$(find dist -type f | wc -l)" -ge 4 ]
+          ( cd dist && sha256sum ./* > SHA256SUMS && cat SHA256SUMS )
+
+      # For a program that carries other people's traffic, provenance is not
+      # decoration. Anyone can check an asset came from this repository with
+      # `gh attestation verify <file> --repo keepinfov/oxidom`.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/*.deb,dist/*.rpm,dist/*.AppImage'
+
+      - name: release notes
+        run: |
+          set -eu
+          version='${{ needs.verify.outputs.version }}'
+          # The section for this version, without its own heading and without the
+          # next one — the changelog is the release notes, not a second copy.
+          # Print from the heading to the end, drop the heading, then cut at the
+          # next heading; that last step is a no-op for the final section, which
+          # an explicit end address would have mishandled.
+          escaped=$(printf '%s' "$version" | sed 's/\./\\./g')
+          sed -n "/^## \[$escaped\]/,\$p" CHANGELOG.md \
+            | tail -n +2 \
+            | sed '/^## \[/,$d' > notes.md
+          # An empty section means a release with no notes, which verify should
+          # already have caught — but publishing one anyway is worse than failing.
+          [ -s notes.md ]
+          printf '\n---\n\nVerify an asset:\n\n```sh\ngh attestation verify <file> --repo %s\n```\n' \
+            '${{ github.repository }}' >> notes.md
+          cat notes.md
+
+      - name: draft the release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create '${{ github.ref_name }}' \
+            --draft \
+            --title '${{ github.ref_name }}' \
+            --notes-file notes.md \
+            ${{ needs.verify.outputs.prerelease == 'true' && '--prerelease' || '' }} \
+            dist/*
+
+      - name: rehearsal, so nothing is published
+        if: github.event_name != 'push'
+        run: echo "would have drafted ${{ github.event.inputs.tag }} with the assets above"
