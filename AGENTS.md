@@ -276,18 +276,28 @@ A release touches more places than the manifest, and missing one has broken the
 package before:
 
 1. Cut `release/vX.Y.Z` from `master`.
-2. Set the version in `Cargo.toml` (`[workspace.package]`) and in the two
-   `version = ` strings in `flake.nix`; refresh `Cargo.lock`.
+2. Set the version in `Cargo.toml` (`[workspace.package]`); refresh
+   `Cargo.lock`. Nothing else needs editing — `flake.nix` reads the manifest,
+   and `packaging/aur/PKGBUILD` derives `pkgver` from it.
 3. Move the `[Unreleased]` entries into a dated `[X.Y.Z]` section.
-4. Update `packaging/aur/PKGBUILD` and regenerate `.SRCINFO` with
-   `makepkg --printsrcinfo > .SRCINFO`.
-5. Run the whole validation suite.
-6. Commit as `chore(release): release vX.Y.Z`, signed, and verify the
+4. Add a dated `<release>` entry to
+   `data/dev.keepinfov.oxidom.metainfo.xml`, summarising that section. This is
+   what GNOME Software shows, so it is written for a reader who has no changelog.
+5. Regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO` if `PKGBUILD`
+   changed.
+6. Run `packaging/version.sh --check-release vX.Y.Z`, then the whole validation
+   suite.
+7. Commit as `chore(release): release vX.Y.Z`, signed, and verify the
    signature.
-7. Merge, then create a signed annotated tag `vX.Y.Z` on the merge commit.
+8. Merge, then create a signed annotated tag `vX.Y.Z` on the merge commit.
 
 Pushing the tag publishes the release. Confirm the remote and the tag before
 pushing it.
+
+`packaging/version.sh` is the check, not the checklist: it prints the version
+with no arguments, verifies the always-true invariants with `--check` (which CI
+runs on every pull request), and adds the release-only ones — tag matches
+version, changelog section exists and is dated — with `--check-release`.
 
 ## Dependencies and toolchain
 
