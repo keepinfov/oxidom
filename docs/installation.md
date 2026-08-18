@@ -11,6 +11,8 @@ bundle one.
 
 ## Contents
 
+- [Debian and Ubuntu](#debian-and-ubuntu)
+- [Fedora, RHEL and derivatives](#fedora-rhel-and-derivatives)
 - [NixOS](#nixos)
 - [Nix without NixOS](#nix-without-nixos)
 - [Arch](#arch)
@@ -21,6 +23,50 @@ bundle one.
 - [Optional runtime dependencies](#optional-runtime-dependencies)
 - [Installing the assets by hand](#installing-the-assets-by-hand)
 - [Who may drive the system daemon](#who-may-drive-the-system-daemon)
+
+## Debian and Ubuntu
+
+Two packages, from the [releases page]:
+
+```sh
+sudo apt install ./oxidom_0.1.0-1_amd64.deb ./oxidom-gui_0.1.0-1_amd64.deb
+```
+
+`oxidom` is the CLI and daemon; `oxidom-gui` is the interface and depends on it
+at exactly the same version. Install only the first on a server — it has no GTK
+dependency at all.
+
+**The daemon package installs on older releases than the interface does.** It is
+built against glibc 2.36, so it works on Debian 12 and Ubuntu 22.04 onwards. The
+interface links against the distribution's own GTK and needs libadwaita 1.7,
+which lands in Debian 13 and Ubuntu 25.04 — see the [matrix](#tested-distro-matrix).
+On an older release, install `oxidom` alone and use the CLI, or use the
+[Nix package](#nix-without-nixos), which brings its own GTK stack.
+
+Installing does **not** enable the system daemon. That is deliberate and
+explained under [the two databases](configuration.md#the-two-databases): enabling
+it moves your servers from `~/.local/share/oxidom` to `/var/lib/oxidom` and
+limits access to `root`, `wheel` and the `oxidom` group. A desktop client does
+not need it — it starts a session daemon of its own. To run it at boot anyway:
+
+```sh
+sudo systemctl enable --now oxidom.service
+```
+
+Removing the packages leaves `/var/lib/oxidom` and the `oxidom` account behind,
+on `purge` as much as on `remove`. That directory is your subscription database.
+
+## Fedora, RHEL and derivatives
+
+```sh
+sudo dnf install ./oxidom-0.1.0-1.x86_64.rpm ./oxidom-gui-0.1.0-1.x86_64.rpm
+```
+
+Everything above applies unchanged. The daemon package is built against glibc
+2.34, so it installs on RHEL 9 and derivatives as well as on Fedora; the
+interface needs Fedora 42 or newer for libadwaita 1.7.
+
+[releases page]: https://github.com/keepinfov/oxidom/releases
 
 ## NixOS
 
@@ -220,18 +266,33 @@ sudo pacman -S base-devel rust gtk4 libadwaita
 ## Tested distro matrix
 
 What each distribution ships in its own repositories, measured in containers.
-The CLI needs Rust ≥ 1.85; the GUI additionally needs libadwaita ≥ 1.7.
+Building from source needs Rust ≥ 1.85 for the CLI and libadwaita ≥ 1.7 for the
+GUI. The **package** columns are a different question: those binaries are built
+elsewhere, so what matters is only whether the distribution can run them.
 
-| Distribution | Rust | GTK4 | libadwaita | CLI | GUI |
-|---|---|---|---|:--:|:--:|
-| Debian 13 (trixie) | 1.85.0 | 4.18.6 | 1.7.6 | ✅ | ✅ |
-| Ubuntu 25.10 | 1.85.1 | 4.20.1 | 1.8.0 | ✅ | ✅ |
-| Ubuntu 24.04 LTS | 1.75.0 | 4.14.5 | 1.5.0 | ❌ | ❌ |
-| Debian 12 (bookworm) | 1.63.0 | 4.8.3 | 1.2.2 | ❌ | ❌ |
+| Distribution | Rust | GTK4 | libadwaita | build CLI | build GUI | `oxidom` pkg | `oxidom-gui` pkg |
+|---|---|---|---|:--:|:--:|:--:|:--:|
+| Debian 13 (trixie) | 1.85.0 | 4.18.6 | 1.7.6 | ✅ | ✅ | ✅ | ✅ |
+| Ubuntu 25.10 | 1.85.1 | 4.20.1 | 1.8.0 | ✅ | ✅ | ✅ | ✅ |
+| Fedora 42 | not measured | | | | | ✅ | ✅ |
+| Ubuntu 24.04 LTS | 1.75.0 | 4.14.5 | 1.5.0 | ❌ | ❌ | ✅ | ❌ |
+| Debian 12 (bookworm) | 1.63.0 | 4.8.3 | 1.2.2 | ❌ | ❌ | ✅ | ❌ |
+| AlmaLinux 9 / RHEL 9 | not measured | | | | | ✅ | ❌ |
 
-Arch and Fedora were not measured here. Arch is rolling, so it is always current;
-recent Fedora ships GNOME 48 or newer and should clear the libadwaita floor
-comfortably. Check yours before filing a bug:
+The **build** columns are what the distribution ships in its own repositories.
+The **pkg** columns are whether the published package installs and runs, which
+is a weaker requirement and therefore true in more places: those binaries are
+compiled against glibc 2.36 (`.deb`) and 2.34 (`.rpm`) with a rustup toolchain,
+and glibc compatibility runs forward only. Every ✅ in the pkg columns is
+checked on each change to the packaging, by installing the package in the
+container that row names. The ❌ are not tested for failure; they follow from
+the declared dependency on libadwaita 1.7, which those releases cannot satisfy
+and the package manager therefore refuses.
+
+The build columns for Fedora and the RHEL derivatives were never measured, and
+the `oxidom-gui` package is built on Fedora 42, so anything older is untested
+rather than known-bad. Arch is rolling and always current. Check yours before
+filing a bug:
 
 ```sh
 rustc --version
