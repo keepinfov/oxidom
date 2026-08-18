@@ -103,6 +103,25 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **A core with no geo data now says so, instead of blaming the config.** Xray
+  reports a missing `geoip.dat` as `invalid field rule` under "failed to build
+  routing configuration", naming neither the file nor the asset directory — so
+  oxidom repeated it as "the core refused the generated config", which reads as
+  a configuration this program built wrongly and sends the reader to inspect a
+  server that was never at fault. Every latency check and every connection now
+  reports the real cause and offers the Settings page. A corrupt or truncated
+  list is caught the same way: the core rejects it with a different message,
+  and both are recognised.
+- **The manual no longer claims the geo data is optional.** `installation.md`
+  said no `geoip.dat` or `geosite.dat` was needed, on the reasoning that a
+  modern core resolves `geoip:private` by itself. It does not: every
+  configuration oxidom generates carries that rule plus `geosite:private`, and a
+  core that cannot load the lists refuses to start at all, blaming an "invalid
+  field rule" rather than the missing file. Anyone who installed a core by hand
+  followed that sentence into a client that could not connect — the Xray release
+  zip ships the binary alone. Installing the two files is now documented where
+  the core is, the real error text is in the troubleshooting guide so a search
+  finds it, and both explain that upstream publishes `geosite.dat` as `dlc.dat`.
 - **Reading or pinning a server's certificate no longer starts a daemon of its
   own.** `oxidom trust` was the one command outside `up` and `connect` that
   would start a private session daemon when none was running. That daemon keeps

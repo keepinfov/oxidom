@@ -64,6 +64,48 @@ config key, the environment variable, or `PATH`. Fix it at that source. Resoluti
 order is `xray_binary` → `$OXIDOM_XRAY_BIN` → `PATH`; see
 [configuration.md](configuration.md#finding-helper-binaries).
 
+### The core cannot load `geoip.dat`
+
+```
+Failed to start: main: failed to load config files: [...]
+  > infra/conf: failed to build routing configuration
+  > infra/conf: invalid field rule
+  > infra/conf: failed to load GeoIP: private
+  > infra/conf: failed to open file: geoip.dat
+```
+
+Nothing is wrong with the server or with your settings: the core cannot find its
+geo data. Every configuration oxidom generates carries the built-in
+`geoip:private` and `geosite:private` references, so a core without the lists
+refuses **every** connection, not just ones with routing rules.
+
+This happens when the core was installed by hand, because the Xray release zip
+contains the binary and nothing else. Nix and the AUR's `xray-bin` both supply the
+files.
+
+Install them where every Xray build looks:
+
+```sh
+curl -LO https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+curl -Lo geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+sudo install -Dm644 geoip.dat   /usr/local/share/xray/geoip.dat
+sudo install -Dm644 geosite.dat /usr/local/share/xray/geosite.dat
+```
+
+Note the rename: upstream publishes `geosite.dat` under the name `dlc.dat`.
+
+To check a core can load them, without connecting anything:
+
+```sh
+printf '%s' '{"outbounds":[{"protocol":"freedom","tag":"direct"}],
+  "routing":{"rules":[{"type":"field","ip":["geoip:private"],"outboundTag":"direct"}]}}' > /tmp/geo-test.json
+xray run -test -c /tmp/geo-test.json     # "Configuration OK." means the data loaded
+```
+
+If the files are somewhere else, point the core at that directory with
+`XRAY_LOCATION_ASSET`. See
+[installation.md](installation.md#getting-the-geo-data).
+
 ### A port is taken
 
 ```
@@ -137,11 +179,13 @@ same reason on stderr:
 | `the server's certificate was rejected` | The server's TLS certificate did not verify. `oxidom trust <HANDLE>` shows it, and accepts it with `--trust` if you recognise it. |
 | `the server asks for unverified TLS, which this core removed` | The share link asked for `allowInsecure`, which Xray 26.x dropped. A certificate pin (`pinSHA256`) is the only way through. |
 | `the core refused the generated config` | The core would not start on this server's settings — usually an option this core version does not have. Connecting to the server will show the core's own words; a probe's core is read once and discarded. |
+| `the core has no geo data (geoip.dat, geosite.dat), so it refused the routing rules` | The core cannot load `geoip.dat`/`geosite.dat`. Nothing about the server is wrong — every generated config needs the lists. See [The core cannot load `geoip.dat`](#the-core-cannot-load-geoipdat). |
 | `the check could not run on this machine` | A local fault the core did not name: no free port, or an unwritable data directory. |
 | `no network connection` (the badge says `No network — the server was not checked`) | This machine has no usable default route. Claimed only on evidence, never guessed from a DNS failure alone, so it is worth believing. |
 
 A single server showing `⊘` while its neighbours show numbers is the certificate
-or config case, not the missing-core one.
+or config case, not the missing-core one — and never the geo-data one, which
+fails every server at once because the lists are not per-server.
 
 Note that a check runs a **throwaway core of its own** for each server it
 measures directly — so a broken core binary breaks measuring even while an

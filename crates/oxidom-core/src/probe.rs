@@ -324,6 +324,16 @@ pub fn classify_complaint(complaint: &str) -> Option<ProbeDetail> {
     if lower.contains("certificate") || lower.contains("x509") {
         return Some(ProbeDetail::CertificateRejected);
     }
+    // Before the config arm, and that order is the whole point: the real line
+    // contains both. A core with no geo data fails while *building* the routing
+    // section, so it reports "invalid field rule" under "failed to build
+    // routing configuration" and never says "asset" or "missing". The filename
+    // is the only honest marker, and it survives whether the file is absent
+    // ("failed to open file: geoip.dat") or unusable ("code not found in
+    // geoip.dat: PRIVATE").
+    if lower.contains("geoip.dat") || lower.contains("geosite.dat") {
+        return Some(ProbeDetail::GeoAssetsMissing);
+    }
     if lower.contains("failed to start") || lower.contains("failed to build") {
         return Some(ProbeDetail::ConfigRefused);
     }
@@ -698,6 +708,56 @@ mod tests {
         assert_eq!(
             classify_complaint(refused),
             Some(ProbeDetail::ConfigRefused)
+        );
+    }
+
+    /// A core with no geo data blames "invalid field rule", which reads as a
+    /// configuration oxidom generated wrongly and is nothing of the sort. Both
+    /// lines below are literal output from Xray 26.3.27: the first when
+    /// `geoip.dat` is absent, the second when it is present but truncated. The
+    /// filename is the only part either has in common with the truth.
+    #[test]
+    fn a_core_without_geo_data_says_so_instead_of_blaming_the_config() {
+        let absent = "Failed to start: main: failed to load config files: [probe.json] > \
+             infra/conf: failed to build routing configuration > infra/conf: invalid field \
+             rule > infra/conf: failed to load GeoIP: private > infra/conf: failed to open \
+             file: geoip.dat > open /tmp/assets/geoip.dat: no such file or directory";
+        assert_eq!(
+            classify_complaint(absent),
+            Some(ProbeDetail::GeoAssetsMissing)
+        );
+
+        let truncated = "Failed to start: main: failed to load config files: [probe.json] > \
+             infra/conf: failed to build routing configuration > infra/conf: invalid field \
+             rule > infra/conf: failed to load GeoIP: private > infra/conf: code not found \
+             in geoip.dat: PRIVATE";
+        assert_eq!(
+            classify_complaint(truncated),
+            Some(ProbeDetail::GeoAssetsMissing),
+            "a corrupt list is a geo data problem too, not a bad config"
+        );
+
+        // geosite fails through the DNS section rather than routing, and says
+        // "invalid domain rule" where the other says "invalid field rule" --
+        // which is exactly why neither phrase is what this matches on.
+        let geosite = "Failed to start: main: failed to load config files: [probe.json] > \
+             infra/conf: failed to build DNS configuration > infra/conf: failed to build \
+             nameserver > infra/conf: invalid domain rule: geosite:private > infra/conf: \
+             failed to load geosite: PRIVATE > infra/conf: failed to open file: geosite.dat \
+             > open /usr/share/xray/geosite.dat: no such file or directory";
+        assert_eq!(
+            classify_complaint(geosite),
+            Some(ProbeDetail::GeoAssetsMissing)
+        );
+
+        // The generic case must survive: a config the core rejects for any
+        // reason that is not geo data still reads as a refused config.
+        let refused = "Failed to start: main: failed to build routing configuration > \
+             infra/conf: invalid field rule";
+        assert_eq!(
+            classify_complaint(refused),
+            Some(ProbeDetail::ConfigRefused),
+            "only a line naming a geo file may be read as missing geo data"
         );
     }
 
