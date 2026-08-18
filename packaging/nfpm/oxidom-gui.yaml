@@ -1,0 +1,85 @@
+# The graphical package. It depends on the headless one at exactly the same
+# version, because the GUI is a thin client that spawns `oxidom daemon` as a
+# child process — a version-skewed pair is a real bug, not a tolerable one.
+name: oxidom-gui
+version: ${VERSION}
+release: "1"
+arch: ${ARCH}
+platform: linux
+maintainer: keepinfov <218463407+keepinfov@users.noreply.github.com>
+description: |
+  Native Xray / v2ray client — GTK4 / libadwaita interface.
+  Subscriptions, a server browser with country flags and latency sorting,
+  profiles and pools, and an optional GNOME system-proxy toggle. The interface
+  is a thin client: it talks to the oxidom daemon, which this package pulls in.
+vendor: keepinfov
+homepage: https://github.com/keepinfov/oxidom
+license: MIT
+section: net
+priority: optional
+
+contents:
+  - src: target/release/oxidom-gui
+    dst: /usr/bin/oxidom-gui
+    file_info: {mode: 0755}
+
+  - src: data/dev.keepinfov.oxidom.desktop
+    dst: /usr/share/applications/dev.keepinfov.oxidom.desktop
+    file_info: {mode: 0644}
+  - src: data/dev.keepinfov.oxidom.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/dev.keepinfov.oxidom.svg
+    file_info: {mode: 0644}
+  - src: data/dev.keepinfov.oxidom-symbolic.svg
+    dst: /usr/share/icons/hicolor/symbolic/apps/dev.keepinfov.oxidom-symbolic.svg
+    file_info: {mode: 0644}
+  # Adwaita ships no filter icon under any name, so the funnel travels with the
+  # application. Without it the Filter pill draws an empty square.
+  - src: data/icons/oxidom-funnel-symbolic.svg
+    dst: /usr/share/icons/hicolor/scalable/actions/oxidom-funnel-symbolic.svg
+    file_info: {mode: 0644}
+  - src: data/dev.keepinfov.oxidom.metainfo.xml
+    dst: /usr/share/metainfo/dev.keepinfov.oxidom.metainfo.xml
+    file_info: {mode: 0644}
+
+  - src: LICENSE
+    dst: /usr/share/doc/oxidom-gui/LICENSE
+    file_info: {mode: 0644}
+
+overrides:
+  deb:
+    depends:
+      - oxidom (= ${VERSION}-1)
+      - libgtk-4-1 (>= 4.18.0)
+      - libadwaita-1-0 (>= 1.7.0)
+      - libglib2.0-0t64
+      - libgdk-pixbuf-2.0-0
+      - libpango-1.0-0
+      - libcairo2
+      # Built on Debian 13, which is the oldest release carrying libadwaita 1.7.
+      # Nothing older can satisfy the toolkit dependency anyway, so this bound
+      # costs nothing and keeps the package honest about what it needs.
+      - libc6 (>= 2.41)
+      - libgcc-s1
+      - hicolor-icon-theme
+    recommends:
+      - adwaita-icon-theme
+      # The tray icon needs a StatusNotifierItem host. On stock GNOME that means
+      # an AppIndicator extension; without one the window still works, there is
+      # just no icon.
+      - gnome-shell-extension-appindicator
+  rpm:
+    # nfpm writes the rpm itself, so rpmbuild's automatic generators never run
+    # and anything left out here is simply not required at install time.
+    depends:
+      - oxidom = ${VERSION}-1
+      - glibc >= 2.41
+      - libgcc
+      - gtk4 >= 4.18
+      - libadwaita >= 1.7
+      - hicolor-icon-theme
+    recommends:
+      - adwaita-icon-theme
+
+scripts:
+  postinstall: packaging/nfpm/scripts/gui-postinstall.sh
+  postremove: packaging/nfpm/scripts/gui-postremove.sh

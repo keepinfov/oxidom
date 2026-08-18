@@ -18,6 +18,18 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **`.deb` and `.rpm` packages**, in the same two-package split the project has
+  always had: `oxidom` is the CLI and daemon with no GTK dependency at all, and
+  `oxidom-gui` is the interface, depending on `oxidom` at exactly the same
+  version. Installing does not enable the system daemon — that moves which
+  database is authoritative, so it stays the administrator's decision — and
+  removing, or purging, leaves `/var/lib/oxidom` alone.
+
+  The daemon package is built against glibc 2.36 (`.deb`) and 2.34 (`.rpm`), so
+  **it installs on Ubuntu 24.04 LTS, Debian 12 and RHEL 9**, none of which can
+  build oxidom from their own repositories. The interface still needs
+  libadwaita 1.7 and therefore Debian 13, Ubuntu 25.04 or Fedora 42.
+
 - **An AppImage**, for desktops whose distribution is too old for the
   `oxidom-gui` package — above all Ubuntu 24.04 LTS and Debian 12, whose
   libadwaita is 1.5 and 1.2 against a floor of 1.7. It carries its own GTK,
