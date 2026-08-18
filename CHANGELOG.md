@@ -87,6 +87,29 @@ surface, packaging, or the CLI belongs here.
   pin was written where nothing else would ever read it. `trust` now requires a
   daemon that is already running and exits 4 without one, like every other
   command that is not bringing the tunnel up.
+- **Disconnecting while a connection is still proving itself no longer leaves
+  an interface behind.** A tunnel is confirmed on its own thread, and that
+  thread asked "is this attempt still the current one?" *before* taking the
+  lock it needed to act on the answer. A disconnect landing in the gap was
+  answered "still current", so the interface came up anyway — device, routing
+  table, nft rule — for a connection that had already been called off, and the
+  machine went on sending traffic through something the user had stopped. The
+  question is now asked under the same lock that does the work, as the failing
+  path in the same function already did.
+- **A background task that dies no longer takes Settings with it.** If a worker
+  ended without reporting — a panic, or a daemon connection dropped underneath
+  it — the operation was never completed. For **Apply** that meant its spinner
+  stayed up and Apply and Reset stayed insensitive for the rest of the session,
+  with no way back but restarting the app; and if the apply had been asked to
+  close the window afterwards, that request stayed armed and shut the window on
+  some later save instead. The loss is now reported as a failure of whatever was
+  asked for, and says what it does and does not mean: nothing was cancelled, but
+  what is on screen may be out of date.
+- **The certificate dialogs say when they cannot answer.** Reading a
+  certificate and pinning one each wait on a worker, and both read "the worker
+  has gone" as "the worker has not answered yet" — so a failure produced no
+  message at all, and left a timer polling every 50ms for the life of the
+  process.
 - **A card checking for a long time stops flickering, and giving up on one
   works.** Sweeping a large subscription runs eight checks at a time, so a card
   near the end of the queue can legitimately wait longer than the five-minute

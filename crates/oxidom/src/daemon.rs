@@ -1047,9 +1047,15 @@ impl Shared {
             };
             oxidom_core::sync::lock(&shared.probes).finish(probe_token);
             if ready && latency.is_some() {
+                // The generation is read *under* the engine lock and the answer
+                // held across the bring-up. Read before taking it, a disconnect
+                // landing in between was answered "still current", and the
+                // interface came up — device, routes, nft rule — for a
+                // connection that had already been called off. The failure path
+                // below has always taken the lock first; this one had not.
+                let mut engine = oxidom_core::sync::lock(&shared.engine);
                 let current = shared.generation_is_current(&profile, generation);
                 if current {
-                    let mut engine = oxidom_core::sync::lock(&shared.engine);
                     if let Err(error) = engine.start_interface(&profile) {
                         let reason = format!("could not bring up the profile interface: {error:#}");
                         if let Some(session) = engine.sessions.get(&profile) {
