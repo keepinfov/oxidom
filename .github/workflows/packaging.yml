@@ -11,9 +11,9 @@ name: packaging
 on:
   push:
     branches: [master]
-    paths: ['packaging/**', 'data/**', '.github/workflows/packaging.yml']
+    paths: ['packaging/**', '.github/workflows/packaging.yml']
   pull_request:
-    paths: ['packaging/**', 'data/**', '.github/workflows/packaging.yml']
+    paths: ['packaging/**', '.github/workflows/packaging.yml']
 
 permissions:
   contents: read
