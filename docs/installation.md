@@ -13,6 +13,7 @@ bundle one.
 
 - [Debian and Ubuntu](#debian-and-ubuntu)
 - [Fedora, RHEL and derivatives](#fedora-rhel-and-derivatives)
+- [AppImage](#appimage)
 - [NixOS](#nixos)
 - [Nix without NixOS](#nix-without-nixos)
 - [Arch](#arch)
@@ -40,8 +41,8 @@ dependency at all.
 built against glibc 2.36, so it works on Debian 12 and Ubuntu 22.04 onwards. The
 interface links against the distribution's own GTK and needs libadwaita 1.7,
 which lands in Debian 13 and Ubuntu 25.04 — see the [matrix](#tested-distro-matrix).
-On an older release, install `oxidom` alone and use the CLI, or use the
-[Nix package](#nix-without-nixos), which brings its own GTK stack.
+On an older release, install `oxidom` alone and use the CLI, or take the
+[AppImage](#appimage), which brings its own GTK stack.
 
 Installing does **not** enable the system daemon. That is deliberate and
 explained under [the two databases](configuration.md#the-two-databases): enabling
@@ -67,6 +68,39 @@ Everything above applies unchanged. The daemon package is built against glibc
 interface needs Fedora 42 or newer for libadwaita 1.7.
 
 [releases page]: https://github.com/keepinfov/oxidom/releases
+
+
+## AppImage
+
+For a desktop whose distribution is too old for the `oxidom-gui` package — most
+of all **Ubuntu 24.04 LTS** and **Debian 12**, whose libadwaita is 1.5 and 1.2
+against a floor of 1.7.
+
+```sh
+chmod +x oxidom-0.1.0-x86_64.AppImage
+./oxidom-0.1.0-x86_64.AppImage
+```
+
+It carries its own GTK, libadwaita, icon theme **and glibc**, so the host's
+versions do not matter, and it carries an Xray core, `tun2socks` and the
+`oxidom` daemon binary — nothing else to install.
+
+Two things to know:
+
+- **It is large**, because a whole GTK stack is inside it. That is the price of
+  running on a glibc older than the one GTK 4.18 was built against.
+- **There is no system daemon.** An AppImage installs nothing, so it cannot
+  place a systemd unit or a D-Bus policy: it runs a session daemon of its own,
+  with its own database under `~/.local/share/oxidom`. Local SOCKS and HTTP
+  proxies and the GNOME system-proxy toggle work. TUN interfaces and `oxidom
+  run` do not — both need `CAP_NET_ADMIN`, which only the system daemon can
+  hold. For those, install the `.deb` or `.rpm`.
+
+If it will not start, your system may lack FUSE 2. Run it without:
+
+```sh
+./oxidom-0.1.0-x86_64.AppImage --appimage-extract-and-run
+```
 
 ## NixOS
 

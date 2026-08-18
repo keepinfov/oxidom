@@ -81,6 +81,11 @@
         oxidom = pkgs.symlinkJoin {
           name = "oxidom";
           paths = [oxidom-cli oxidom-gui];
+          # symlinkJoin does not inherit meta from its inputs, so without this
+          # the joined package has no main program and `nix run` and `nix bundle`
+          # cannot tell which of the two binaries is meant. The AppImage is built
+          # from this attribute precisely because it carries both.
+          meta.mainProgram = "oxidom-gui";
         };
       in {
         packages.oxidom-cli = oxidom-cli;
