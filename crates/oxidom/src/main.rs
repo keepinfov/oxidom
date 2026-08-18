@@ -634,7 +634,11 @@ fn probe_reading_for_server<'a>(
 /// Printing first is the point: a pin accepted without being looked at is
 /// `allowInsecure` with extra steps.
 fn trust_certificate(handle: &str, trust: bool) -> CliResult {
-    let client = spawning_client()?;
+    // Never a spawning client. A session daemon keeps its own subscriptions, so
+    // one started here would resolve the handle against a different set of
+    // servers than the daemon the pin is meant for — reporting no such server,
+    // or pinning a certificate into a database nothing else reads.
+    let client = existing_client()?;
     let subscriptions = client.subscriptions().map_err(Failure::error)?;
     let server = resolve_server(&subscriptions, handle)?;
     let sha256 = client
@@ -1040,6 +1044,8 @@ fn print_text(value: String) -> CliResult {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
@@ -1312,5 +1318,108 @@ mod tests {
             ..ProbeState::default()
         };
         assert_eq!(current_pool_latency(&pending, "work"), None);
+    }
+
+    /// `docs/spec/cli.md` binds this: "Only `up` and `connect` may spawn a
+    /// private session daemon; every other control command requires an existing
+    /// daemon." A stub in `OXIDOM_BIN` records having been run, and both bus
+    /// addresses point at sockets that do not exist, so a marker can appear for
+    /// one reason only — the command under test started a daemon of its own.
+    struct SpawnWatch {
+        directory: PathBuf,
+        marker: PathBuf,
+        restore: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl SpawnWatch {
+        fn install() -> std::io::Result<Self> {
+            let directory =
+                std::env::temp_dir().join(format!("oxidom-spawn-watch-{}", std::process::id()));
+            std::fs::create_dir_all(&directory)?;
+            let marker = directory.join("started");
+            let stub = directory.join("oxidom-stub");
+            std::fs::write(&stub, format!("#!/bin/sh\n: > '{}'\n", marker.display()))?;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700))?;
+
+            let unreachable = |name: &str| {
+                std::ffi::OsString::from(format!("unix:path={}", directory.join(name).display()))
+            };
+            let variables = [
+                ("OXIDOM_BIN", stub.clone().into_os_string()),
+                ("DBUS_SYSTEM_BUS_ADDRESS", unreachable("no-system-bus")),
+                ("DBUS_SESSION_BUS_ADDRESS", unreachable("no-session-bus")),
+            ];
+            let mut restore = Vec::new();
+            for (name, value) in variables {
+                restore.push((name, std::env::var_os(name)));
+                // SAFETY: every test that mutates this process's environment
+                // takes `TEST_ROOT_LOCK` first, so no other such test can read
+                // or write it while this one holds the lock.
+                unsafe { std::env::set_var(name, value) };
+            }
+            Ok(SpawnWatch {
+                directory,
+                marker,
+                restore,
+            })
+        }
+
+        fn started_a_daemon(&self) -> bool {
+            self.marker.exists()
+        }
+
+        fn forget(&self) {
+            let _ = std::fs::remove_file(&self.marker);
+        }
+    }
+
+    impl Drop for SpawnWatch {
+        fn drop(&mut self) {
+            for (name, value) in &self.restore {
+                // SAFETY: as in `install`; the test still holds the lock.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn assert_no_daemon_started(watch: &SpawnWatch, command: &str, run: impl Fn() -> CliResult) {
+        let failure = run().expect_err("no daemon is reachable under the spawn watch");
+        assert_eq!(
+            failure.kind,
+            FailureKind::DaemonUnavailable,
+            "`oxidom {command}` should report an unavailable daemon, not something else"
+        );
+        assert!(
+            !watch.started_a_daemon(),
+            "`oxidom {command}` started a session daemon of its own; only `up` \
+             and `connect` may, because a daemon started here answers from a \
+             database no other daemon reads"
+        );
+        watch.forget();
+    }
+
+    #[test]
+    fn reading_and_pinning_a_certificate_never_starts_a_daemon() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let watch = SpawnWatch::install().expect("install the spawn watch");
+
+        assert_no_daemon_started(&watch, "trust <HANDLE>", || {
+            trust_certificate("no-such-server", false)
+        });
+        assert_no_daemon_started(&watch, "trust <HANDLE> --trust", || {
+            trust_certificate("no-such-server", true)
+        });
+        // `alias` is the neighbouring command that resolves a handle and then
+        // writes, and it was already right. It is here so that the invariant is
+        // pinned rather than the single call site that broke it.
+        assert_no_daemon_started(&watch, "alias <HANDLE> <NEW>", || {
+            set_alias("no-such-server", "whatever")
+        });
     }
 }
