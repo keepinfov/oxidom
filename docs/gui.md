@@ -185,6 +185,8 @@ repointing it.
 | **Subscription User-Agent** | Free text, plus a **Client preset** list that fills it. |
 | **Advanced › Xray / tun2socks / nft binary** | Ignored by a **system** daemon on purpose — setting a binary path on a privileged daemon would be a remote-execution primitive. |
 | **In use by the daemon** | What the daemon actually resolved, which is not always what you typed. |
+| **Geo data** | Whether the core can load `geoip.dat` and `geosite.dat`. Decided by asking the core, not by looking for the files — which is also how a corrupt list is told from a missing one. Silent until the daemon has an answer, so a daemon older than the check accuses nothing. |
+| **Install the geo data** | Shown only when the core cannot load them. Looks for a copy already on this machine first and offers to use it; otherwise offers a download, behind a confirmation naming both URLs and both destination paths. A progress bar reports the transfer and **Cancel** stops it. Where the daemon is too old to install anything, the row carries the manual commands instead of a button that could not help. |
 
 ## Logs
 
