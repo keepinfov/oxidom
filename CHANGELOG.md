@@ -79,6 +79,15 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **Disconnecting while a connection is still proving itself no longer leaves
+  an interface behind.** A tunnel is confirmed on its own thread, and that
+  thread asked "is this attempt still the current one?" *before* taking the
+  lock it needed to act on the answer. A disconnect landing in the gap was
+  answered "still current", so the interface came up anyway — device, routing
+  table, nft rule — for a connection that had already been called off, and the
+  machine went on sending traffic through something the user had stopped. The
+  question is now asked under the same lock that does the work, as the failing
+  path in the same function already did.
 - **A card checking for a long time stops flickering, and giving up on one
   works.** Sweeping a large subscription runs eight checks at a time, so a card
   near the end of the queue can legitimately wait longer than the five-minute
