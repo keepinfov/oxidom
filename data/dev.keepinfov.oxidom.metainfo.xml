@@ -43,10 +43,24 @@
     <control>touch</control>
   </supports>
   <releases>
-    <release version="0.1.0" date="2026-07-24">
+    <release version="0.1.0" date="2026-08-18">
       <description>
-        <p>Initial release: subscriptions, server browser, latency probes,
-        GNOME system proxy toggle.</p>
+        <p>
+          The first release. oxidom manages subscriptions and servers, runs an
+          Xray core for you, and exposes the tunnel as local SOCKS5 and HTTP
+          proxies, with an optional GNOME system-proxy toggle.
+        </p>
+        <p>
+          Browse servers as a card grid with country flags and latency sorting,
+          keep several tunnels running side by side, balance across a pool of
+          servers so one dead node does not end the session, and send a single
+          command through a profile without touching anything else.
+        </p>
+        <p>
+          The interface needs no privileges of its own, and oxidom never
+          escalates: the only privileged part is an optional system daemon,
+          used for network interfaces.
+        </p>
       </description>
     </release>
   </releases>
