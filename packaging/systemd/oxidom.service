@@ -4,6 +4,15 @@ Wants=network-online.target
 After=network-online.target dbus.service
 
 [Service]
+# D-Bus activation only closes the startup race if systemd waits for the name.
+# Under Type=simple the unit counts as started the moment the process exists,
+# which is before it has claimed anything, so a GUI autostarting at login can
+# still reach the bus first, find the name unowned and fall back to a session
+# daemon — a *different* database, whose only symptom is that the user's servers
+# have vanished. Type=dbus makes the unit finish starting when the name is owned.
+Type=dbus
+BusName=dev.keepinfov.oxidom.Daemon
+
 # No --socks-port/--http-port here: passing them pins the ports, and a pinned
 # port is one the daemon refuses to change, so Settings shows the row locked and
 # a desktop user cannot move their own proxy off 10808. The daemon reads
@@ -18,11 +27,22 @@ After=network-online.target dbus.service
 #   ExecStart=
 #   ExecStart=/usr/bin/oxidom daemon --system --socks-port 10808 --http-port 10809
 ExecStart=/usr/bin/oxidom daemon --system
+
 User=oxidom
 Group=oxidom
 StateDirectory=oxidom
 Restart=on-failure
 RestartSec=2
+
+# The Xray cores carry the traffic; the daemon only supervises them. Under the
+# default control-group killing a daemon crash takes every tunnel down with it,
+# and the restarted daemon then has nothing left to adopt — which silently made
+# the pool-adoption path in `recover()` unreachable. Signalling only the main
+# process costs a few seconds of supervision instead of the connection. A clean
+# stop still tears the cores down through the daemon's own SIGTERM handler, and
+# anything that leaks is reaped on the next start.
+KillMode=process
+
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=strict

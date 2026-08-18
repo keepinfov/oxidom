@@ -119,6 +119,16 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **The packaged service unit now activates and dies the way the documentation
+  says it does.** `docs/spec/interfaces.md` states `KillMode=process` as binding
+  and `docs/architecture.md` says D-Bus activation closes the login race, but
+  both were describing the NixOS module: the unit installed by the Arch package
+  set neither. So a daemon restart killed every running core with it, leaving
+  nothing for `recover()` to adopt, and a graphical client autostarting at login
+  could still win the race against the unit, fall back to a session daemon and
+  bind to a different database — whose only symptom is that the servers have
+  vanished. The unit now sets `Type=dbus`, `BusName=` and `KillMode=process`.
+
 - **A core with no geo data now says so, instead of blaming the config.** Xray
   reports a missing `geoip.dat` as `invalid field rule` under "failed to build
   routing configuration", naming neither the file nor the asset directory — so
