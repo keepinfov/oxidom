@@ -5,16 +5,14 @@ All notable changes to this project are recorded here, following
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); the release policy,
 including what a `0.x` bump means, is in [AGENTS.md](AGENTS.md#versioning-and-releases).
 
-Nothing has been released yet: there is no `v*` tag, and the `0.1.0` in
-`Cargo.toml` is a placeholder rather than a published version. Everything below
-is therefore unreleased. Changes made before this file existed are in the git
-history.
+`0.1.0` is the first release. Changes made before this file existed are in the
+git history.
 
 Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
-## [Unreleased]
+## [0.1.0] - 2026-08-18
 
 ### Added
 
