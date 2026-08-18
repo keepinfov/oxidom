@@ -230,6 +230,7 @@ condition rather than shrugging:
 | `the server's certificate was rejected` | TLS verification failed. `oxidom trust <HANDLE>` shows the certificate. |
 | `the server asks for unverified TLS, which this core removed` | The link wants `allowInsecure`, which Xray 26.x dropped. A pin is the only way through. |
 | `the core refused the generated config` | The core would not start on this server's settings. |
+| `the core has no geo data (geoip.dat, geosite.dat), so it refused the routing rules` | The core cannot load `geoip.dat`/`geosite.dat`, which every generated config needs. |
 | `the check could not run on this machine` | A local fault the core did not name. |
 
 Four more are about the exchange rather than the server: `probe for <HANDLE> did

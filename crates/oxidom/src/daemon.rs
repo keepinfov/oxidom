@@ -2763,6 +2763,34 @@ mod tests {
         );
     }
 
+    /// A connection that failed because the core has no geo data must say so.
+    /// The account below is the only one the user gets — the session is torn
+    /// down and the core's status goes with it — so "did not pass its latency
+    /// check" would send someone to replace a server that was never the
+    /// problem. This works without a line of its own here because the check
+    /// funnels through `classify_complaint`, which is the point of having one
+    /// classifier; this test is what stops that wiring being removed.
+    #[test]
+    fn a_connection_that_failed_for_want_of_geo_data_says_so() {
+        let logs = vec![
+            "Failed to start: main: failed to load config files: [current-config.json] > \
+             infra/conf: failed to build routing configuration > infra/conf: invalid field \
+             rule > infra/conf: failed to load GeoIP: private > infra/conf: failed to open \
+             file: geoip.dat > open /var/lib/oxidom/assets/geoip.dat: no such file or directory"
+                .to_string(),
+        ];
+        assert_eq!(
+            confirmation_failure(
+                &ConnectionTarget::Server("one".to_string()),
+                false,
+                &logs,
+                None
+            ),
+            oxidom_core::ipc::ProbeDetail::GeoAssetsMissing.message(),
+            "the core's own reason outranks the dead inbound it caused"
+        );
+    }
+
     /// oxidom's own warning about an unrecognised obfuscation type contains the
     /// words `unknown` and `protocol`, and the hysteria2 hint it is emitted
     /// beside names the protocol too. Neither is the core refusing anything —

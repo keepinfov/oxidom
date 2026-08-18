@@ -79,6 +79,15 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **A core with no geo data now says so, instead of blaming the config.** Xray
+  reports a missing `geoip.dat` as `invalid field rule` under "failed to build
+  routing configuration", naming neither the file nor the asset directory — so
+  oxidom repeated it as "the core refused the generated config", which reads as
+  a configuration this program built wrongly and sends the reader to inspect a
+  server that was never at fault. Every latency check and every connection now
+  reports the real cause and offers the Settings page. A corrupt or truncated
+  list is caught the same way: the core rejects it with a different message,
+  and both are recognised.
 - **Reading or pinning a server's certificate no longer starts a daemon of its
   own.** `oxidom trust` was the one command outside `up` and `connect` that
   would start a private session daemon when none was running. That daemon keeps

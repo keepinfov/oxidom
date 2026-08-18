@@ -137,11 +137,13 @@ same reason on stderr:
 | `the server's certificate was rejected` | The server's TLS certificate did not verify. `oxidom trust <HANDLE>` shows it, and accepts it with `--trust` if you recognise it. |
 | `the server asks for unverified TLS, which this core removed` | The share link asked for `allowInsecure`, which Xray 26.x dropped. A certificate pin (`pinSHA256`) is the only way through. |
 | `the core refused the generated config` | The core would not start on this server's settings — usually an option this core version does not have. Connecting to the server will show the core's own words; a probe's core is read once and discarded. |
+| `the core has no geo data (geoip.dat, geosite.dat), so it refused the routing rules` | The core cannot load `geoip.dat`/`geosite.dat`. Nothing about the server is wrong — every generated config needs the lists. See [The core cannot load `geoip.dat`](#the-core-cannot-load-geoipdat). |
 | `the check could not run on this machine` | A local fault the core did not name: no free port, or an unwritable data directory. |
 | `no network connection` (the badge says `No network — the server was not checked`) | This machine has no usable default route. Claimed only on evidence, never guessed from a DNS failure alone, so it is worth believing. |
 
 A single server showing `⊘` while its neighbours show numbers is the certificate
-or config case, not the missing-core one.
+or config case, not the missing-core one — and never the geo-data one, which
+fails every server at once because the lists are not per-server.
 
 Note that a check runs a **throwaway core of its own** for each server it
 measures directly — so a broken core binary breaks measuring even while an

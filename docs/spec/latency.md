@@ -34,7 +34,8 @@ Timeout | NoNetwork | Internal(ProbeDetail)`. The distinction is the point — a
   certificate is reported on one transport and silently dropped on the next. The log is read only
   when the probe failed, capped, and never stored.
 - A recognised complaint becomes a `ProbeDetail` on the wire —
-  `certificate_rejected`, `insecure_tls_unsupported`, `config_refused`, `no_core`, `other` — set
+  `certificate_rejected`, `insecure_tls_unsupported`, `config_refused`, `geo_assets_missing`,
+  `no_core`, `other` — set
   on `LatencyReading.detail` beside `ProbeFailure::Unknown`. It is a serde-defaulted field with a
   `#[serde(other)]` fallback, so a daemon that sends a reason and a client that has never heard of
   it still understand each other; a fifth `ProbeFailure` variant would have made older clients
