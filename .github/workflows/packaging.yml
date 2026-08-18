@@ -73,7 +73,9 @@ jobs:
             fi
           done
           [ "$status" = 0 ] || exit $status
-          shellcheck packaging/nfpm/scripts/*.sh packaging/nfpm/*.sh packaging/*.sh
+          # `find`, not a glob: a glob that matches nothing is passed through
+          # literally and shellcheck fails on a file name instead of on shell.
+          find packaging -name '*.sh' -print0 | xargs -0 shellcheck
 
   aur:
     runs-on: ubuntu-latest
