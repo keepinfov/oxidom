@@ -14,9 +14,13 @@
     flake-parts.lib.mkFlake {inherit inputs;} {
       systems = ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
       perSystem = {pkgs, ...}: let
+        # Cargo.toml is the one place the version is written. Repeating it here
+        # meant a release had to remember two files, and a release that forgot
+        # produced packages whose name disagreed with the binary inside them.
+        version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
         oxidom-cli = pkgs.rustPlatform.buildRustPackage {
           pname = "oxidom";
-          version = "0.1.0";
+          inherit version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFlags = ["-p" "oxidom"];
@@ -37,10 +41,14 @@
             install -Dm444 data/dev.keepinfov.oxidom.Daemon.service \
               $out/share/dbus-1/system-services/dev.keepinfov.oxidom.Daemon.service
           '';
+          # Two binaries end up in the joined package, so nothing can infer which
+          # one `nix run` and `nix bundle` mean. Naming it is also what lets the
+          # AppImage be built straight from this derivation.
+          meta.mainProgram = "oxidom";
         };
         oxidom-gui = pkgs.rustPlatform.buildRustPackage {
           pname = "oxidom-gui";
-          version = "0.1.0";
+          inherit version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFlags = ["-p" "oxidom-gui"];
@@ -68,6 +76,7 @@
             install -Dm444 data/dev.keepinfov.oxidom.metainfo.xml \
               $out/share/metainfo/dev.keepinfov.oxidom.metainfo.xml
           '';
+          meta.mainProgram = "oxidom-gui";
         };
         oxidom = pkgs.symlinkJoin {
           name = "oxidom";

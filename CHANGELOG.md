@@ -115,6 +115,11 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- `flake.nix` reads the version out of `Cargo.toml` instead of repeating it.
+  The manifest is now the only place it is written, and `packaging/version.sh`
+  checks that every other file naming a version agrees — which CI runs on every
+  pull request, rather than leaving it to be discovered while cutting a release.
+
 - The systemd units and the sysusers file live in `packaging/systemd/` and are
   installed straight out of the checkout. They were never Arch-specific, and the
   Arch package carried a second copy of each with a checksum beside it — a
