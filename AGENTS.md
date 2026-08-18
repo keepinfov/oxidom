@@ -172,6 +172,18 @@ type(scope)!: what is true after this commit
   characters at most. It reads as a sentence about the software.
 - Wrap the body at 100 characters. Explain why, and what you verified — not
   what the diff already shows.
+- **A commit message addresses no one.** No "you", no "your suggestion", no "as
+  discussed", no thanking or crediting a person, no answering a question. It is
+  written about the software for a stranger reading `git log` in five years, who
+  was in no conversation and cannot tell whose idea anything was. This is the
+  same rule as [pointing only at what a clone
+  contains](#ground-rules) — a review comment, a chat message and a maintainer's
+  preference are all things the reader does not have — and it is stated
+  separately because the general form did not stop it: `c75517c` opens "Your
+  suggestion, and it is the better answer", which is now permanently in the
+  history of this repository and means nothing to anybody reading it. Where the
+  reason for a change came from a discussion, state the reason, never its
+  source.
 - `Fixes #N` / `Refs #N` only for an issue that actually exists. No other
   trailers without being asked.
 - **Every commit is signed** (SSH or OpenPGP), and signatures are verified
@@ -201,6 +213,10 @@ Open it as a draft while it settles, mark it ready when the validation suite is
 green locally. The description says what changed and why, how you verified it,
 and anything a reviewer should distrust. If you could not run part of the
 suite, say which part and why.
+
+It is squashed into a commit message, so it obeys the same rule as one: it
+[addresses no one](#commits). A description that opens by answering somebody
+becomes a permanent line in `git log` that no later reader can make sense of.
 
 A pull request is mergeable when: CI is green, every commit is signed, the
 [definition of done](#definition-of-done) is satisfied, and a maintainer has
