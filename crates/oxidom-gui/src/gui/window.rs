@@ -3723,7 +3723,17 @@ impl Controller {
     /// exists for, and the running work says so with a spinner and its tooltip.
     fn refresh_activity_status(&self) {
         let state = self.state.borrow();
-        let activity = match (state.ui.operation.as_ref(), state.ui.checking.len()) {
+        // Waits the deadline has given up on are still held, so that the next
+        // tick does not read their ids as new — but their spinners are down,
+        // and counting them here would have the strip announce checks no card
+        // is showing.
+        let checking = state
+            .ui
+            .checking
+            .keys()
+            .filter(|id| state.ui.is_checking(id))
+            .count();
+        let activity = match (state.ui.operation.as_ref(), checking) {
             (Some(operation), _) => Some(operation.label().to_string()),
             (None, 0) => None,
             (None, 1) => Some("Checking latency…".to_string()),
