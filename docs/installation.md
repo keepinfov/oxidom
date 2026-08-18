@@ -96,10 +96,11 @@ chmod +x oxidom-0.1.0-x86_64.AppImage
 ./oxidom-0.1.0-x86_64.AppImage
 ```
 
-It carries its own GTK, libadwaita, icon theme **and glibc**, so the host's
-versions do not matter, and it carries an Xray core and the `oxidom` daemon
-binary — nothing else to install. It needs no root and no special kernel
-permission.
+About 45 MB. It carries its own GTK, libadwaita, icon theme **and glibc**, so
+the host's versions do not matter, and it carries an Xray core and the `oxidom`
+daemon binary — nothing else to install. It needs no root and no special kernel
+permission, which is why it works on Ubuntu 24.04, where a bundle that mounted
+itself through a user namespace would not.
 
 Two things to know:
 
