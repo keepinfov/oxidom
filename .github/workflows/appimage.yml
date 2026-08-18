@@ -38,6 +38,7 @@ jobs:
             libgtk-4-dev libadwaita-1-dev \
             patchelf squashfs-tools libglib2.0-bin \
             file binutils findutils \
+            locales \
             adwaita-icon-theme hicolor-icon-theme desktop-file-utils
 
       - uses: actions/checkout@v4

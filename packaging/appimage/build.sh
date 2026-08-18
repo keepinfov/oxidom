@@ -83,7 +83,9 @@ echo "== data GTK reads at runtime =="
 # org.gtk.Settings aborts on startup rather than degrading.
 install -d "$APPDIR/share/glib-2.0/schemas"
 cp -r /usr/share/glib-2.0/schemas/. "$APPDIR/share/glib-2.0/schemas/"
-glib-compile-schemas --quiet "$APPDIR/share/glib-2.0/schemas"
+# --strict: a schema that will not compile should stop the build, not produce a
+# cache the application aborts on at startup.
+glib-compile-schemas --strict "$APPDIR/share/glib-2.0/schemas"
 
 # Adwaita is where every symbolic icon in the interface comes from; hicolor is
 # the fallback theme the lookup ends at.
