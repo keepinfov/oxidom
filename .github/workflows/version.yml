@@ -4,16 +4,17 @@ name: version
 # the AppStream release entry and the changelog section repeat it in forms that
 # cannot be derived, because both carry hand-written notes. Those are what drift.
 #
-# This runs on every pull request rather than at the tag, which is the whole
-# point: a version that disagrees with itself, discovered while cutting a
-# release, is discovered too late to be cheap.
+# This runs on the pull request that changes one of these files rather than at
+# the tag, which is the whole point: a version that disagrees with itself, or a
+# metainfo GNOME Software will not render, discovered while cutting a release is
+# discovered too late to be cheap.
 
 on:
   push:
     branches: [master]
-    paths: ['Cargo.toml', 'flake.nix', 'data/dev.keepinfov.oxidom.metainfo.xml', 'packaging/version.sh', '.github/workflows/version.yml']
+    paths: ['Cargo.toml', 'flake.nix', 'data/**', 'packaging/version.sh', '.github/workflows/version.yml']
   pull_request:
-    paths: ['Cargo.toml', 'flake.nix', 'data/dev.keepinfov.oxidom.metainfo.xml', 'packaging/version.sh', '.github/workflows/version.yml']
+    paths: ['Cargo.toml', 'flake.nix', 'data/**', 'packaging/version.sh', '.github/workflows/version.yml']
 
 permissions:
   contents: read
@@ -25,8 +26,21 @@ concurrency:
 jobs:
   consistent:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: every file that names the version agrees
         run: packaging/version.sh --check
+
+      # These two tools are not on the runner image, so this step pays for an
+      # apt fetch. That is why it lives behind a path filter on data/ rather
+      # than on the release, where it was costing three minutes every tag.
+      - name: the desktop entry and the AppStream data are valid
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends desktop-file-utils appstream
+          desktop-file-validate data/dev.keepinfov.oxidom.desktop
+          # --strict, because GNOME Software is what reads this and a warning
+          # there is a rendering problem somebody sees rather than a nicety.
+          appstreamcli validate --strict data/dev.keepinfov.oxidom.metainfo.xml
