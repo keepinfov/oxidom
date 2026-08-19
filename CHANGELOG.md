@@ -49,6 +49,12 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **A log that could not be saved says so.** Saving to a place that refuses the write — a
+  directory without permission, most often — closed the file chooser exactly as a success
+  does and left no file and no message. The only trace was a line in the very log the user
+  was trying to save. It now reports the failure, naming the file and the system's own
+  reason.
+
 - **A clock that jumps no longer grows the log view's memory.** Lines wait a fraction of a
   second before being shown, so that a line the daemon wrote first but handed over late
   still appears in the right place. That wait ends on a timestamp, so a clock stepped

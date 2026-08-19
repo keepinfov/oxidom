@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -10,6 +11,8 @@ use super::icon_button;
 use crate::gui::logfeed::FeedBatch;
 
 type ClearCallback = Rc<dyn Fn()>;
+/// Told why the save produced no file, path included.
+type SaveFailedCallback = Rc<dyn Fn(String)>;
 
 /// Lines kept in the widget before the oldest are dropped.
 ///
@@ -92,6 +95,10 @@ pub struct LogsView {
     records: Rc<RefCell<Vec<LogRecord>>>,
     filter: Rc<RefCell<Filter>>,
     clear_callbacks: Rc<RefCell<Vec<ClearCallback>>>,
+    /// The window owns the only toast overlay, and a view reaches it by handing
+    /// the failure outward rather than by walking up the widget tree for it.
+    /// Same shape as `clear_callbacks`, for the same reason.
+    save_failed_callbacks: Rc<RefCell<Vec<SaveFailedCallback>>>,
 }
 
 impl LogsView {
@@ -238,6 +245,7 @@ impl LogsView {
             records: Rc::new(RefCell::new(Vec::new())),
             filter: Rc::new(RefCell::new(Filter::default())),
             clear_callbacks: Rc::new(RefCell::new(Vec::new())),
+            save_failed_callbacks: Rc::new(RefCell::new(Vec::new())),
         };
         view.connect_signals(&sources, &levels, &search);
         view.follow_colours();
@@ -331,6 +339,13 @@ impl LogsView {
             let view = self.clone();
             move |_| view.follow_colours()
         });
+    }
+
+    /// Called when a save the user asked for did not produce a file.
+    pub fn connect_save_failed(&self, callback: impl Fn(String) + 'static) {
+        self.save_failed_callbacks
+            .borrow_mut()
+            .push(Rc::new(callback));
     }
 
     /// Allows the controller to clear the daemon's book as well as the view.
@@ -527,12 +542,21 @@ impl LogsView {
         // The chooser is native and asynchronous; it must outlive this call or
         // it is destroyed before it can be answered.
         let held = RefCell::new(Some(chooser.clone()));
+        let callbacks = self.save_failed_callbacks.clone();
         chooser.connect_response(move |chooser, response| {
             if response == gtk::ResponseType::Accept
                 && let Some(path) = chooser.file().and_then(|file| file.path())
                 && let Err(error) = std::fs::write(&path, text.as_bytes())
             {
+                // The log line stays: it is the record for a bug report. But it
+                // lands in the very log the user was trying to save, so on its
+                // own it told nobody anything — the chooser closed exactly as it
+                // does on success, and there was no file.
                 log::warn!("could not save the log to {}: {error}", path.display());
+                let detail = save_failure_detail(&path, &error);
+                for callback in callbacks.borrow().iter() {
+                    callback(detail.clone());
+                }
             }
             held.borrow_mut().take();
         });
@@ -601,6 +625,23 @@ fn tag_for(severity: Severity) -> Option<&'static str> {
     }
 }
 
+/// Why a save produced no file, for the failure toast's details.
+///
+/// Names the path. Without it the message is useless in the case that produces
+/// it most often — a directory the user cannot write to — because the only thing
+/// they need to know is which place refused, so they can pick another. The
+/// system's own wording carries the reason; inventing a friendlier one would mean
+/// guessing at errors this code has never seen.
+///
+/// The file is written at the process umask, so usually `0644`, while the rest of
+/// the project writes `0600`. That is deliberate and not a defect to be tidied
+/// away later: the safeguards say secrets never reach a log line and that a log
+/// is expected to be safe to paste into a bug report, and a log needing special
+/// permissions to read would contradict its own purpose.
+fn save_failure_detail(path: &Path, error: &std::io::Error) -> String {
+    format!("{}: {error}", path.display())
+}
+
 /// How a gap in the log is announced where it happened.
 fn gap_notice(skipped: u64) -> String {
     if skipped == 1 {
@@ -644,8 +685,36 @@ fn is_at_bottom(adjustment: &gtk::Adjustment) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Filter, gap_notice, render_line};
+    use super::{Filter, gap_notice, render_line, save_failure_detail};
     use oxidom_core::logbook::{LogRecord, LogSource, Severity};
+
+    /// The case that produces this most often is a directory the user cannot
+    /// write to, and then the only thing they need is which place refused, so
+    /// they can pick another. A reason without the path leaves them guessing at
+    /// which of the two they chose was wrong.
+    #[test]
+    fn a_failed_save_names_the_file_it_could_not_write() {
+        let detail = save_failure_detail(
+            std::path::Path::new("/read-only/oxidom.log"),
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(
+            detail.contains("/read-only/oxidom.log"),
+            "the path must survive into the message: {detail}"
+        );
+        assert!(
+            detail.to_lowercase().contains("permission denied"),
+            "and so must the system's own reason: {detail}"
+        );
+        // `show_error` picks the toast's button by matching phrases in the
+        // detail, so a rewording here could quietly send someone to Settings for
+        // a directory permission nothing on that page can change.
+        assert_eq!(
+            oxidom_core::ipc::error_action(&detail),
+            oxidom_core::ipc::ErrorAction::None,
+            "a directory that refused a write has no remedy elsewhere in the app"
+        );
+    }
 
     fn record(source: LogSource, severity: Severity, target: &str, text: &str) -> LogRecord {
         LogRecord {
