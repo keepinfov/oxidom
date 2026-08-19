@@ -12,6 +12,17 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
+## [Unreleased]
+
+### Added
+
+- **A signed package repository**, so that installing oxidom is
+  `apt install oxidom-gui` and upgrades arrive with the rest of the system
+  rather than two files downloaded from a release page. Debian and Ubuntu add a
+  source list; Fedora and RHEL drop in a `.repo` file. Only full releases appear
+  in it — a repository is what a package manager upgrades to without being
+  asked, which is not where release candidates belong.
+
 ## [0.1.0] - 2026-08-18
 
 ### Added

@@ -12,7 +12,8 @@ bundle one.
 ## Contents
 
 - [Verifying a download](#verifying-a-download)
-- [Debian and Ubuntu](#debian-and-ubuntu)
+- [From the package repository](#from-the-package-repository)
+- [Debian and Ubuntu, from a downloaded file](#debian-and-ubuntu-from-a-downloaded-file)
 - [Fedora, RHEL and derivatives](#fedora-rhel-and-derivatives)
 - [AppImage](#appimage)
 - [NixOS](#nixos)
@@ -40,7 +41,37 @@ Each release also has a `SHA256SUMS` beside the assets.
 
 For a program that carries your traffic this is worth the extra command.
 
-## Debian and Ubuntu
+## From the package repository
+
+The least work, and upgrades arrive with the rest of the system.
+
+**Debian, Ubuntu:**
+
+```sh
+curl -fsSL https://keepinfov.github.io/oxidom/KEY.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/oxidom.gpg
+echo "deb [signed-by=/usr/share/keyrings/oxidom.gpg] https://keepinfov.github.io/oxidom/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/oxidom.list
+sudo apt update
+sudo apt install oxidom-gui        # the interface; pulls in the daemon
+```
+
+**Fedora, RHEL:**
+
+```sh
+sudo curl -fsSL https://keepinfov.github.io/oxidom/oxidom.repo \
+  -o /etc/yum.repos.d/oxidom.repo
+sudo dnf install oxidom-gui
+```
+
+On a server, install `oxidom` instead — the daemon and CLI, with no GTK
+dependency at all.
+
+The repository is signed, and the packages in it are the same ones attached to
+the release. Only full releases appear; release candidates do not, because a
+repository is what a package manager upgrades to without being asked.
+
+## Debian and Ubuntu, from a downloaded file
 
 Two packages, from the [releases page]:
 
