@@ -35,7 +35,7 @@ Timeout | NoNetwork | Internal(ProbeDetail)`. The distinction is the point — a
   when the probe failed, capped, and never stored.
 - A recognised complaint becomes a `ProbeDetail` on the wire —
   `certificate_rejected`, `insecure_tls_unsupported`, `config_refused`, `geo_assets_missing`,
-  `no_core`, `other` — set
+  `no_core`, `cancelled`, `other` — set
   on `LatencyReading.detail` beside `ProbeFailure::Unknown`. It is a serde-defaulted field with a
   `#[serde(other)]` fallback, so a daemon that sends a reason and a client that has never heard of
   it still understand each other; a fifth `ProbeFailure` variant would have made older clients
@@ -63,10 +63,11 @@ as `ipc::LatencyReading { value, measured_at_unix_ms, route, method, failure }` 
   card — shown as `—`, never as a number.
 - **`failure.is_some()` ⟺ `value.is_none()`**, upheld by `LatencyReading::ok`/`failed`. Build them
   through those constructors.
-- **Every direct id that enters `ProbeQueue::running` leaves with a `readings` entry**, including
-  ids that no longer resolve; a job for a still-current session leaves its result in `proxied`.
-  The GUI retires its spinner on the id leaving `running ∪ queued`, so a silent early return
-  leaves a card checking forever.
+- **Every direct id that leaves `running ∪ queued` leaves a `readings` entry behind**, including
+  ids that no longer resolve and ids that were cancelled; a job for a still-current session
+  leaves its result in `proxied`. The invariant is stated over the *departure* rather than over
+  running to completion, because the GUI retires its spinner on the id leaving that union: a
+  silent early return, by any route, leaves a card checking forever.
 - **`queued ≠ finished`.** `ProbeState` reports `running` and `queued` separately; a card waiting
   for a slot still carries its *previous* number and must not present it as this measurement's.
 - **`ProbeState.version`** is bumped for incompatible semantic changes. The additive,
@@ -82,21 +83,43 @@ rather than once a second.
 
 ## The D-Bus surface (binding)
 
-Three methods on `dev.keepinfov.oxidom1` carry probing. They are listed here because a client that
+Four methods on `dev.keepinfov.oxidom1` carry probing. They are listed here because a client that
 cannot see the interface has no other place to read what it may call.
 
 | Method | Signature | What it does |
 |---|---|---|
 | `RequestProbe` | `(s server_id) → ()` | Enqueue one server. Returns as soon as it is queued, not when it is measured. |
 | `RequestProbes` | `(as server_ids) → ()` | The same, for a list. One call, so a sweep does not cost one round trip per server. |
+| `CancelProbes` | `(as server_ids) → (s json)` | Drop queued direct probes for these servers. Answers `{"cancelled": N}`. |
 | `ProbeState` | `() → (s json)` | The whole `ProbeState` as JSON. Polled; there is no signal. |
 
 **Requesting is idempotent, not additive.** `ProbeQueue::holds` drops a request for a target already
 running or queued, so pressing a check twice measures once. A client must not treat the second call
 as a second measurement, and must not present it as one.
 
-**There is no way to stop a probe.** A request, once queued, runs to completion — the queue empties
-on its own schedule and the daemon keeps measuring after every client has gone. The per-server
-budget is about ten seconds for the default HTTP method, eight run at once, so a sweep costs
-roughly `ceil(servers / 8) × 10s` and a large subscription occupies the daemon for minutes. This is
-a known gap, not a design decision.
+**Cancelling stops the queue, not the measurement (binding).** The per-server budget is about ten
+seconds for the default HTTP method and eight run at once, so a sweep costs roughly
+`ceil(servers / 8) × 10s`. `CancelProbes` drops everything still queued; the at-most-eight already
+measuring run to their end, because each owns a thread that will `finish` it and releasing a slot
+early would hand it to a second worker while the first is still in it. Cancelling a 600-server
+sweep therefore returns the daemon to idle in about ten seconds rather than thirteen minutes.
+
+**Cancelling is idempotent, and answers with a count.** Asking twice, or for a server nothing is
+queued for, is not an error. The count is what lets a client tell "there was nothing left to stop"
+from "this daemon is too old to ask": called with an empty list, a current daemon answers zero and
+an older one answers `UnknownMethod`, which is how `Client::supports_probe_cancel` decides whether
+to offer a stop control at all.
+
+**A cancel only ever drops `Direct` jobs (binding).** A `Proxied` job is the confirmation deciding
+whether a live tunnel stays up; it is keyed by profile rather than by the server a user is looking
+at, and `spawn_active_probe_loop` re-enqueues it every thirty seconds regardless. Calling one off
+because its server was named in a list is a different act from the one the control offers, so it
+does not happen.
+
+**A cancelled id leaves a reading, marked `ProbeDetail::Cancelled`.** This is required by the
+departure invariant above, and it is also the honest answer: a card whose check was called off must
+not go on presenting its previous number as though that were this measurement's. The reading carries
+`ProbeFailure::Unknown`, because nothing about the server was learned, and
+`LatencyMethod::default()`, because a queued job never read the config and so never learned which
+method it would have used — the same answer as a server removed between the request and its slot. A
+cancel is not a failure and a client must not report it as one: a cancelled sweep raises no error.

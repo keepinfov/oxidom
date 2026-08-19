@@ -18,8 +18,8 @@ use oxidom_core::engine::{Engine, PoolSession, SessionSelection, pool_fingerprin
 use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
     ApplySettingsResult, BUS_NAME, InterfaceInfo, LatencyReading, OBJECT_PATH, PROBE_STATE_VERSION,
-    PoolMember, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo, SelectionInfo,
-    SessionInfo, StatusInfo, UpResult, UpServer,
+    PoolMember, ProbeDetail, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo,
+    SelectionInfo, SessionInfo, StatusInfo, UpResult, UpServer,
 };
 use oxidom_core::model::Server;
 use oxidom_core::pool;
@@ -189,6 +189,34 @@ impl ProbeQueue {
                 .map(|job| job.server_id.clone())
                 .collect(),
         )
+    }
+
+    /// Drop queued direct probes for these servers, and report which ones went.
+    ///
+    /// `running` is left alone for the same reason `retain_alive` leaves it
+    /// alone: each running job owns a thread that will `finish` it, and taking
+    /// the entry out early hands a slot to a second worker while the first is
+    /// still in it. A probe already measuring therefore runs to its end — at
+    /// most eight of them, about ten seconds — while everything behind it is
+    /// dropped at once. That is where the minutes are.
+    ///
+    /// Only `Direct` jobs are touched. A `Proxied` job is the confirmation that
+    /// decides whether a live tunnel stays up, it is keyed by profile rather
+    /// than by the server the user is looking at, and the active-probe loop
+    /// would re-enqueue it within thirty seconds anyway. Cancelling one because
+    /// its server happened to be named would be a different act than the one
+    /// the button offers.
+    fn cancel_direct(&mut self, servers: &HashSet<String>) -> Vec<ProbeJob> {
+        let mut cancelled = Vec::new();
+        self.queued.retain(|job| {
+            let drop =
+                matches!(&job.target, ProbeTarget::Direct(_)) && servers.contains(&job.server_id);
+            if drop {
+                cancelled.push(job.clone());
+            }
+            !drop
+        });
+        cancelled
     }
 
     /// Drop queued ids that are no longer backed by a server. `running` is left
@@ -916,6 +944,41 @@ impl Shared {
             return;
         }
         self.pump_probes();
+    }
+
+    /// Call off queued checks for these servers, and report how many went.
+    ///
+    /// Every cancelled id leaves a reading, exactly as a measured one does. The
+    /// latency contract is that an id which enters the queue leaves it with an
+    /// entry, because a client retires its spinner on the id leaving
+    /// `running ∪ queued` and a silent departure leaves a card checking for
+    /// ever. The entry says `Cancelled`, which is neither the server's fault
+    /// nor this machine's, so the card reports a check that was stopped instead
+    /// of presenting a stale number as though it had just been refreshed.
+    ///
+    /// The method is `LatencyMethod::default()` because a queued job never read
+    /// the config and so never learned which method it would have used — the
+    /// same reason, and the same answer, as a server removed between the
+    /// request and its slot.
+    fn cancel_probes(&self, server_ids: &[String]) -> usize {
+        let wanted: HashSet<String> = server_ids.iter().cloned().collect();
+        let cancelled = oxidom_core::sync::lock(&self.probes).cancel_direct(&wanted);
+        if cancelled.is_empty() {
+            return 0;
+        }
+        let mut readings = oxidom_core::sync::lock(&self.readings);
+        for job in &cancelled {
+            readings.insert(
+                job.server_id.clone(),
+                LatencyReading::failed_locally(
+                    ProbeFailure::Unknown,
+                    ProbeDetail::Cancelled,
+                    ProbeRoute::Direct,
+                    LatencyMethod::default(),
+                ),
+            );
+        }
+        cancelled.len()
     }
 
     fn enqueue_session_probe(&self, profile: String, label: String) {
@@ -2473,6 +2536,22 @@ impl Service {
             self.shared.enqueue_probe(id);
         }
         Ok(())
+    }
+
+    /// Call off queued checks. Idempotent: asking twice, or for a server
+    /// nothing is queued for, is not an error.
+    ///
+    /// Answers with how many were dropped, so a client can tell "there was
+    /// nothing left to stop" from "the daemon does not know this method" —
+    /// which is what the empty call is for, since an older daemon replies
+    /// `UnknownMethod` to it and a current one replies zero.
+    ///
+    /// A check already measuring is not interrupted; at most eight are, and
+    /// they end within about ten seconds. What this removes is the queue behind
+    /// them, which on a large subscription is the minutes.
+    fn cancel_probes(&self, server_ids: Vec<String>) -> fdo::Result<String> {
+        let cancelled = self.shared.cancel_probes(&server_ids);
+        json(&serde_json::json!({ "cancelled": cancelled }))
     }
 
     fn probe_state(&self) -> fdo::Result<String> {
@@ -4131,6 +4210,48 @@ mod tests {
         Ok(())
     }
 
+    /// Every id that enters the queue must leave it with a reading: a client
+    /// retires its spinner on the id leaving `running ∪ queued`, so a cancel
+    /// that wrote nothing would leave a card checking for ever. The reading
+    /// says the check was stopped rather than that the server failed, and it
+    /// replaces the previous number rather than letting a stale one pass as
+    /// freshly measured.
+    #[test]
+    fn a_cancelled_probe_leaves_a_reading_that_blames_no_server() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("cancel-probes");
+        let shared = Shared::new(Engine::load(), false, false, false);
+
+        oxidom_core::sync::lock(&shared.probes).enqueue(
+            ProbeTarget::Direct("waiting".to_string()),
+            "waiting".to_string(),
+        );
+
+        assert_eq!(shared.cancel_probes(&["waiting".to_string()]), 1);
+        assert_eq!(
+            shared.cancel_probes(&["waiting".to_string()]),
+            0,
+            "asking twice is not an error and cancels nothing the second time"
+        );
+
+        let readings = oxidom_core::sync::lock(&shared.readings);
+        let reading = readings
+            .get("waiting")
+            .expect("a cancelled id leaves a reading");
+        assert_eq!(reading.failure, Some(ProbeFailure::Unknown));
+        assert_eq!(reading.detail, Some(ProbeDetail::Cancelled));
+        assert!(
+            reading.value.is_none(),
+            "a cancelled check measured nothing, and failure implies no value"
+        );
+        assert_eq!(
+            reading.detail.unwrap().message(),
+            "the check was stopped before it ran"
+        );
+        drop(readings);
+        drop(root);
+    }
+
     #[test]
     fn a_local_fault_never_blames_the_server() {
         assert_eq!(
@@ -4260,5 +4381,92 @@ mod tests {
 
         queue.retain_alive(&HashSet::new(), &HashSet::new());
         assert_eq!(queue.snapshot().0, vec![started.server_id]);
+    }
+
+    #[test]
+    fn a_cancelled_probe_leaves_the_queue() {
+        let mut queue = ProbeQueue::default();
+        enqueue_direct(&mut queue, "one");
+        enqueue_direct(&mut queue, "two");
+        enqueue_direct(&mut queue, "three");
+
+        let cancelled =
+            queue.cancel_direct(&HashSet::from(["one".to_string(), "three".to_string()]));
+
+        assert_eq!(
+            cancelled
+                .iter()
+                .map(|job| job.server_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "three"],
+            "the dropped jobs are reported so their readings can be written"
+        );
+        assert_eq!(queue.snapshot().1, vec!["two".to_string()]);
+    }
+
+    /// The whole point of cancelling is that the queue behind the running
+    /// probes goes at once, which is where the minutes are: a sweep costs
+    /// `ceil(servers / 8) × 10s` and only the eight in flight are unavoidable.
+    #[test]
+    fn cancelling_drops_the_queue_but_not_what_is_measuring() {
+        let mut queue = ProbeQueue::default();
+        for n in 0..MAX_CONCURRENT_PROBES + 5 {
+            enqueue_direct(&mut queue, &format!("server-{n}"));
+        }
+        let running = drain_slots(&mut queue);
+        assert_eq!(running.len(), MAX_CONCURRENT_PROBES, "the cap still holds");
+
+        let all: HashSet<String> = (0..MAX_CONCURRENT_PROBES + 5)
+            .map(|n| format!("server-{n}"))
+            .collect();
+        let cancelled = queue.cancel_direct(&all);
+
+        assert_eq!(cancelled.len(), 5, "only the queued five were droppable");
+        let (still_running, queued) = queue.snapshot();
+        assert!(queued.is_empty(), "nothing is left waiting");
+        assert_eq!(
+            still_running.len(),
+            MAX_CONCURRENT_PROBES,
+            "a probe already measuring keeps its slot: its thread will finish it, \
+             and releasing the slot early would hand it to a second worker"
+        );
+    }
+
+    /// A cancel names servers, but a proxied job is keyed by profile and is the
+    /// confirmation deciding whether a live tunnel stays up. Naming its server
+    /// must not call it off.
+    #[test]
+    fn cancelling_a_server_does_not_call_off_its_live_connection_check() {
+        let mut queue = ProbeQueue::default();
+        assert!(queue.enqueue(
+            ProbeTarget::Proxied("work".to_string()),
+            "shared-server".to_string(),
+        ));
+
+        let cancelled = queue.cancel_direct(&HashSet::from(["shared-server".to_string()]));
+
+        assert!(
+            cancelled.is_empty(),
+            "the session check is not the user's to cancel here"
+        );
+        assert_eq!(queue.snapshot().1, vec!["shared-server".to_string()]);
+    }
+
+    #[test]
+    fn cancelling_a_probe_that_is_not_queued_is_not_an_error() {
+        let mut queue = ProbeQueue::default();
+        enqueue_direct(&mut queue, "kept");
+
+        assert!(
+            queue
+                .cancel_direct(&HashSet::from(["absent".to_string()]))
+                .is_empty()
+        );
+        assert!(queue.cancel_direct(&HashSet::new()).is_empty());
+        assert_eq!(
+            queue.snapshot().1,
+            vec!["kept".to_string()],
+            "nothing else moved"
+        );
     }
 }

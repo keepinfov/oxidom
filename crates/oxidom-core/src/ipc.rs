@@ -264,6 +264,11 @@ pub enum ProbeDetail {
     /// as a config this program built wrongly and sends the user to look at
     /// their server and their settings. Nothing about the server is at fault.
     GeoAssetsMissing,
+    /// The check was called off before it ran. Not a fault of the server or of
+    /// this machine, and the only reason here that the user chose: it exists so
+    /// that a cancelled queue reports a cancelled check rather than leaving a
+    /// card silently holding its previous number as though that were fresh.
+    Cancelled,
     /// Something else local: no free port, nowhere to stage a config.
     #[serde(other)]
     Other,
@@ -284,6 +289,7 @@ impl ProbeDetail {
             ProbeDetail::GeoAssetsMissing => {
                 "the core has no geo data (geoip.dat, geosite.dat), so it refused the routing rules"
             }
+            ProbeDetail::Cancelled => "the check was stopped before it ran",
             ProbeDetail::Other => "the check could not run on this machine",
         }
     }
@@ -588,6 +594,32 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ProbeDetail>(&json).expect("parses"),
             ProbeDetail::GeoAssetsMissing
+        );
+    }
+
+    /// Same compatibility surface as the geo name above: a daemon that can be
+    /// asked to stop reports `cancelled`, and a client too old to know the
+    /// variant must land on `Other` rather than failing to parse the snapshot
+    /// and freezing every server's latency at once.
+    #[test]
+    fn a_cancelled_check_travels_under_a_name_older_clients_can_ignore() {
+        let json = serde_json::to_string(&ProbeDetail::Cancelled).expect("serializes");
+        assert_eq!(json, r#""cancelled""#);
+        assert_eq!(
+            serde_json::from_str::<ProbeDetail>(&json).expect("parses"),
+            ProbeDetail::Cancelled
+        );
+    }
+
+    /// Stopping a check is something the user did on purpose, so it offers no
+    /// remedy: there is nothing to fix in Settings and no certificate to look
+    /// at. This fails if the wording ever drifts into a phrase `error_action`
+    /// routes on, which it does by substring.
+    #[test]
+    fn a_cancelled_check_offers_no_remedy() {
+        assert_eq!(
+            error_action(ProbeDetail::Cancelled.message()),
+            ErrorAction::None
         );
     }
 

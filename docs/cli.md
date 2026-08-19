@@ -240,8 +240,9 @@ number nor a failure — a daemon bug), and `daemon probe schema N is older than
 required version M`, which means the running daemon predates this binary and
 should be restarted.
 
-Once queued, a probe cannot be called off: Ctrl-C stops the waiting, not the
-measuring.
+`oxidom ping` offers no way to call a check off: Ctrl-C stops the waiting, not the
+measuring. The daemon does accept `CancelProbes`, which drops what is still queued,
+but no command here sends it.
 
 ### `oxidom trust <HANDLE> [--trust]`
 
