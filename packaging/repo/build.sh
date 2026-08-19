@@ -38,9 +38,27 @@ trap 'rm -rf "$work"; gpgconf --kill gpg-agent 2>/dev/null || true' EXIT
 echo "== importing the signing key =="
 export GNUPGHOME="$work/gnupg"
 mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
-printf '%s' "$REPO_SIGNING_KEY" | gpg --batch --quiet --import
+
+# A key with a passphrase is only usable unattended through loopback pinentry,
+# and a key without one must not be handed --passphrase at all. Build the
+# argument list once and use it everywhere rather than assuming either shape.
+gpg_pass=()
+if [ -n "${REPO_SIGNING_PASSPHRASE:-}" ]; then
+    gpg_pass=(--pinentry-mode loopback --passphrase "$REPO_SIGNING_PASSPHRASE")
+    echo "  using a passphrase-protected key"
+fi
+
+printf '%s' "$REPO_SIGNING_KEY" | gpg --batch --quiet "${gpg_pass[@]}" --import
 key=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
 [ -n "$key" ] || { echo "error: no secret key after import" >&2; exit 1; }
+
+# Prove the key can actually sign before building anything with it. Otherwise
+# the first failure is three minutes later, inside apt-ftparchive output.
+echo test | gpg --batch --yes "${gpg_pass[@]}" --default-key "$key" --sign -o /dev/null - 2>/dev/null || {
+    echo "error: the imported key cannot sign. If it has a passphrase, set" >&2
+    echo "       REPO_SIGNING_PASSPHRASE as well." >&2
+    exit 1
+}
 echo "signing as $key"
 
 echo "== collecting packages =="
@@ -89,8 +107,8 @@ cp "$work"/pkgs/*.deb "$deb_root/pool/main/o/oxidom/" 2>/dev/null || {
       release dists/stable > dists/stable/Release
   # Both forms: InRelease is what modern apt fetches, Release.gpg is the
   # detached signature older clients still look for.
-  gpg --batch --yes --default-key "$key" --clearsign -o dists/stable/InRelease dists/stable/Release
-  gpg --batch --yes --default-key "$key" -abs -o dists/stable/Release.gpg dists/stable/Release
+  gpg --batch --yes "${gpg_pass[@]}" --default-key "$key" --clearsign -o dists/stable/InRelease dists/stable/Release
+  gpg --batch --yes "${gpg_pass[@]}" --default-key "$key" -abs -o dists/stable/Release.gpg dists/stable/Release
 )
 
 echo "== rpm =="
@@ -109,6 +127,15 @@ cat > "$work/rpmmacros" <<MACROS
 %__gpg $(command -v gpg)
 %_gpg_digest_algo sha256
 MACROS
+if [ -n "${REPO_SIGNING_PASSPHRASE:-}" ]; then
+    # rpm runs gpg itself, so the loopback flags have to reach it through the
+    # macro rather than through this script's argument list.
+    cat >> "$work/rpmmacros" <<MACROS
+%__gpg_sign_cmd %{__gpg} gpg --batch --no-armor --pinentry-mode loopback \\
+    --passphrase "$REPO_SIGNING_PASSPHRASE" --no-secmem-warning \\
+    -u "%{_gpg_name}" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}
+MACROS
+fi
 cp "$work/rpmmacros" "$work/.rpmmacros"
 for f in "$rpm_root"/*.rpm; do
     HOME="$work" rpm --addsign "$f" > /dev/null
@@ -126,7 +153,7 @@ for f in "$rpm_root"/*.rpm; do
 done
 
 createrepo_c --quiet --update "$rpm_root"
-gpg --batch --yes --default-key "$key" --detach-sign --armor "$rpm_root/repodata/repomd.xml"
+gpg --batch --yes "${gpg_pass[@]}" --default-key "$key" --detach-sign --armor "$rpm_root/repodata/repomd.xml"
 
 cat > "$out/oxidom.repo" <<REPO
 [oxidom]

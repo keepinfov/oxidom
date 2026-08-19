@@ -38,13 +38,23 @@ jobs:
             apt-utils createrepo-c rpm gnupg
 
       # apt will not use a repository it cannot verify, so this is not optional.
-      # Create the key once with:
-      #   gpg --quick-generate-key 'oxidom packages <you@example.com>' rsa4096 sign never
+      # Create the key once, on your own machine:
+      #
+      #   gpg --batch --passphrase '' --quick-generate-key \
+      #       'oxidom packages <you@example.com>' rsa4096 sign never
       #   gpg --armor --export-secret-keys <fingerprint>
-      # and paste the result into the REPO_SIGNING_KEY repository secret.
+      #
+      # and paste the output — the PRIVATE key block — into a **repository
+      # secret** named REPO_SIGNING_KEY. Not a variable: variables are readable
+      # by anyone who can see the repository. Not an environment secret either,
+      # because this job declares no environment and would not receive it.
+      #
+      # Keeping a passphrase on the key is supported: put it in a second secret,
+      # REPO_SIGNING_PASSPHRASE, and drop the --passphrase '' above.
       - name: build
         env:
           REPO_SIGNING_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+          REPO_SIGNING_PASSPHRASE: ${{ secrets.REPO_SIGNING_PASSPHRASE }}
           GH_TOKEN: ${{ github.token }}
           PAGES_URL: ${{ format('https://{0}.github.io/{1}', github.repository_owner, 'oxidom') }}
         run: |
