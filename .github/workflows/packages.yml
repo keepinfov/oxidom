@@ -50,6 +50,7 @@ jobs:
   build:
     name: ${{ matrix.flavour }} on ${{ matrix.image }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     container: ${{ matrix.image }}
     strategy:
       fail-fast: false
@@ -236,6 +237,7 @@ jobs:
     needs: build
     name: install ${{ matrix.what }} on ${{ matrix.image }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     container: ${{ matrix.image }}
     strategy:
       fail-fast: false

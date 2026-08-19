@@ -21,6 +21,7 @@ concurrency:
 jobs:
   cargo-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
@@ -42,6 +43,7 @@ jobs:
     # A lockfile that no longer matches the manifests breaks every downstream
     # packager — the AUR build runs --frozen and would fail on it.
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

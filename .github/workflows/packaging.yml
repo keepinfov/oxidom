@@ -31,6 +31,7 @@ jobs:
   # the manifest that names it.
   nfpm:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -67,7 +68,14 @@ jobs:
       - name: every script a manifest names exists and passes shellcheck
         run: |
           set -eu
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+          # The runner image ships shellcheck. Installing it meant an apt-get
+          # update on every run for something already present — and an apt
+          # fetch is the step most likely to hang, which is exactly what it did.
+          command -v shellcheck > /dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends shellcheck
+          }
+          shellcheck --version | head -2
           grep -hE '^\s+(pre|post)(install|remove): ' packaging/nfpm/*.yaml \
             | sed 's/.*: *//' > /tmp/scripts
           while read -r f; do
@@ -84,6 +92,7 @@ jobs:
 
   aur:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     container: archlinux:base-devel
     steps:
       - name: install tools
