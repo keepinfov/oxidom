@@ -25,6 +25,7 @@ concurrency:
 jobs:
   consistent:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: every file that names the version agrees

@@ -1,0 +1,85 @@
+name: repository
+
+# Publishes a signed apt and rpm repository to GitHub Pages, so that installing
+# oxidom is `apt install oxidom-gui` and upgrades arrive with the rest of the
+# system, rather than two files downloaded from a release page.
+#
+# The releases are the source of truth; this tree is a derived view rebuilt
+# whole on every run. Nothing carries over, so there is no accumulated state to
+# drift out of step with what was actually published, and a release that is
+# deleted or corrected simply stops appearing.
+#
+# Pre-releases are excluded. A repository is what a package manager upgrades to
+# without being asked, which is not where release candidates belong.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repository
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tools
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            apt-utils createrepo-c rpm gnupg
+
+      # apt will not use a repository it cannot verify, so this is not optional.
+      # Create the key once, on your own machine:
+      #
+      #   gpg --batch --passphrase '' --quick-generate-key \
+      #       'oxidom packages <you@example.com>' rsa4096 sign never
+      #   gpg --armor --export-secret-keys <fingerprint>
+      #
+      # and paste the output — the PRIVATE key block — into a **repository
+      # secret** named REPO_SIGNING_KEY. Not a variable: variables are readable
+      # by anyone who can see the repository. Not an environment secret either,
+      # because this job declares no environment and would not receive it.
+      #
+      # Keeping a passphrase on the key is supported: put it in a second secret,
+      # REPO_SIGNING_PASSPHRASE, and drop the --passphrase '' above.
+      - name: build
+        env:
+          REPO_SIGNING_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+          REPO_SIGNING_PASSPHRASE: ${{ secrets.REPO_SIGNING_PASSPHRASE }}
+          GH_TOKEN: ${{ github.token }}
+          PAGES_URL: ${{ format('https://{0}.github.io/{1}', github.repository_owner, 'oxidom') }}
+        run: |
+          set -eu
+          if [ -z "${REPO_SIGNING_KEY}" ]; then
+            echo "::error::REPO_SIGNING_KEY is not set. See the comment above this step; without a key there is nothing to publish that apt would accept."
+            exit 1
+          fi
+          packaging/repo/build.sh site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
