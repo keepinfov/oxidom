@@ -49,6 +49,10 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- **One description per failed check.** The CLI, the server card and the window each wrote their
+  own words for the same four conditions, so the same failure was described differently depending
+  on where it was read. There is now one wording per condition, beside the type that carries it.
+
 - **One word for removing a thing.** The interface said Delete in some places and Remove in
   others, and the two collided: a section headed Remove held a button reading Delete
   Subscription, and every "Delete X?" question explained itself with the word *removed*. It is

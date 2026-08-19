@@ -1968,7 +1968,14 @@ pub(super) fn latency_state(
             // with a server that stayed silent is how a machine with no core
             // reports nine healthy servers as dead.
             Some(ProbeFailure::Unknown) => LatencyState::NotRun(reading.detail),
-            _ => LatencyState::Unreachable,
+            // Named rather than caught by a rest pattern. A timeout and a refusal
+            // both mean the server did not answer, so they share a state — but
+            // saying so is what makes a fifth variant a compile error here
+            // instead of silently becoming "unreachable".
+            Some(ProbeFailure::Unreachable | ProbeFailure::Timeout) => LatencyState::Unreachable,
+            // `failure.is_some()` and `value.is_none()` are the same case by
+            // contract, so this is a daemon that broke it.
+            None => LatencyState::Unmeasured,
         },
     }
 }
