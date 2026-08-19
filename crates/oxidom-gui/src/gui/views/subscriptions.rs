@@ -764,7 +764,7 @@ fn show_subscription_details(
     privacy.add(&send_hwid);
 
     let danger = adw::PreferencesGroup::builder().title("Remove").build();
-    let delete = gtk::Button::with_label("Delete Subscription");
+    let delete = gtk::Button::with_label("Remove subscription");
     delete.set_halign(gtk::Align::Start);
     delete.add_css_class("destructive-action");
     danger.add(&delete);
@@ -798,13 +798,13 @@ fn show_subscription_details(
     delete.connect_clicked(move |_| {
         let affected = holding_any(remove_id.clone());
         let dialog = adw::AlertDialog::new(
-            Some("Delete subscription?"),
+            Some("Remove subscription?"),
             Some(&format!(
                 "“{remove_name}” and all of its servers will be removed.{}",
                 groups_losing_servers(&affected)
             )),
         );
-        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Remove")]);
         dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");

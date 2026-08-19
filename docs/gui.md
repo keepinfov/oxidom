@@ -62,7 +62,7 @@ daemon never learns a second concept.
 The `⋮` menu always acts on **the selection currently on screen**, not on some
 previously selected group. `New profile from this…` lives there and works on an
 unsaved filter too, since it needs no name for the selection. Group-only items
-(`Edit…`, `Update to what's shown`, `Move left/right`, `Delete`) are simply absent
+(`Edit…`, `Update to what's shown`, `Move left/right`, `Remove`) are simply absent
 when no group is selected, rather than present and dead.
 
 ### Connecting

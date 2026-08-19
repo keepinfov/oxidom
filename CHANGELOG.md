@@ -47,6 +47,14 @@ surface, packaging, or the CLI belongs here.
   in it — a repository is what a package manager upgrades to without being
   asked, which is not where release candidates belong.
 
+### Changed
+
+- **One word for removing a thing.** The interface said Delete in some places and Remove in
+  others, and the two collided: a section headed Remove held a button reading Delete
+  Subscription, and every "Delete X?" question explained itself with the word *removed*. It is
+  Remove throughout now — headings, buttons, menu items, confirmations and progress lines. The
+  word matches the CLI, which only ever said remove.
+
 ### Fixed
 
 - **A log that could not be saved says so.** Saving to a place that refuses the write — a

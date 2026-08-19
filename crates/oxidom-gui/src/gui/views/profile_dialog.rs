@@ -408,7 +408,7 @@ pub fn show_profile_dialog(
     groups.append(&core_editor.group);
     if let Some(name) = edit_name.as_deref() {
         let remove_group = adw::PreferencesGroup::builder().title("Remove").build();
-        let delete = gtk::Button::with_label("Delete Profile");
+        let delete = gtk::Button::with_label("Remove profile");
         delete.set_halign(gtk::Align::Start);
         delete.add_css_class("destructive-action");
         remove_group.add(&delete);
@@ -419,12 +419,12 @@ pub fn show_profile_dialog(
         let profile_window = window.clone();
         delete.connect_clicked(move |_| {
             let dialog = adw::AlertDialog::new(
-                Some("Delete profile?"),
+                Some("Remove profile?"),
                 Some(&format!(
                     "«{name}» will be removed. The tunnel it started, if any, keeps running."
                 )),
             );
-            dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+            dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Remove")]);
             dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
             dialog.set_default_response(Some("cancel"));
             dialog.set_close_response("cancel");

@@ -2857,7 +2857,7 @@ impl Controller {
             UiOperation::for_subscription(UiOperationKind::DeleteSubscription, subscription_id),
             move |client| client.remove_subscription(&work_id),
             |controller, result| {
-                controller.finish_removal("delete subscription", result);
+                controller.finish_removal("remove subscription", result);
             },
         );
     }
