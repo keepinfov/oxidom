@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use oxidom_core::client::DaemonSource;
 use oxidom_core::ipc::{
-    LatencyReading, PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry,
-    RuntimeInfo, SelectionInfo, SessionInfo, StatusInfo,
+    LatencyReading, PROBE_STATE_VERSION, ProbeDetail, ProbeFailure, ProbeRoute, ProbeState,
+    ProfileEntry, RuntimeInfo, SelectionInfo, SessionInfo, StatusInfo,
 };
 use oxidom_core::logbook::LogSlice;
 use oxidom_core::model::{OutboundSpec, Subscription};
@@ -414,13 +414,11 @@ pub(super) fn reduce(
             }
             let asked = state.notify_probe.remove(id);
             let swept = state.notify_local.remove(id);
-            if reading.value.is_none() {
-                match reading.failure {
-                    Some(ProbeFailure::Unknown) if asked || swept => toast_not_run = true,
-                    Some(ProbeFailure::NoNetwork) if asked || swept => toast_no_network = true,
-                    _ if asked => toast_unreachable = true,
-                    _ => {}
-                }
+            match probe_toast(reading, asked, swept) {
+                Some(ProbeToast::DidNotRun) => toast_not_run = true,
+                Some(ProbeToast::NoNetwork) => toast_no_network = true,
+                Some(ProbeToast::Unreachable) => toast_unreachable = true,
+                None => {}
             }
         }
     }
@@ -450,13 +448,11 @@ pub(super) fn reduce(
         }
         let asked = state.notify_probe.remove(&id);
         let swept = state.notify_local.remove(&id);
-        if reading.value.is_none() {
-            match reading.failure {
-                Some(ProbeFailure::Unknown) if asked || swept => toast_not_run = true,
-                Some(ProbeFailure::NoNetwork) if asked || swept => toast_no_network = true,
-                _ if asked => toast_unreachable = true,
-                _ => {}
-            }
+        match probe_toast(reading, asked, swept) {
+            Some(ProbeToast::DidNotRun) => toast_not_run = true,
+            Some(ProbeToast::NoNetwork) => toast_no_network = true,
+            Some(ProbeToast::Unreachable) => toast_unreachable = true,
+            None => {}
         }
     }
     // The daemon forgets readings for servers that no longer exist; mirroring
@@ -1873,6 +1869,60 @@ pub(super) fn other_profiles_message(
         0 => None,
         1 => Some("1 more profile is running".to_string()),
         count => Some(format!("{count} more profiles are running")),
+    }
+}
+
+/// Whether pressing a latency control means stop rather than start.
+///
+/// True when *any* of the ids is mid-check, because that is exactly when the
+/// button is showing a stop icon. The tempting rule — "stop if there is nothing
+/// new to start" — reads the press backwards halfway through a sweep: cards
+/// retire one at a time, so once a few have finished, a press on a button
+/// showing a stop would start fresh checks on the finished ones.
+pub(super) fn press_stops(ids: &[String], checking: &HashMap<String, ProbeWait>) -> bool {
+    ids.iter().any(|id| checking.contains_key(id))
+}
+
+/// Which toast a reading earns, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbeToast {
+    Unreachable,
+    NoNetwork,
+    DidNotRun,
+}
+
+/// The single rule for whether a failed reading is worth a toast.
+///
+/// Kept in one place because it was written twice — once for direct readings
+/// and once, verbatim, for proxied ones — and two copies of a rule is how one
+/// of them stops being the rule.
+///
+/// `asked` means the user pressed check on this card, `swept` that it came from
+/// a whole-subscription sweep. A sweep stays quiet about a single silent server,
+/// whose own card already says so, but does report a machine that could not
+/// measure anything: that fails every server at once, and cards alone would
+/// read as a subscription of dead servers.
+///
+/// A cancelled check earns nothing. The user stopped it, so reporting it back as
+/// a failure would be telling them their own decision went wrong — and on a
+/// cancelled sweep of a large subscription it would be an error toast for an
+/// action that worked.
+pub(super) fn probe_toast(
+    reading: &LatencyReading,
+    asked: bool,
+    swept: bool,
+) -> Option<ProbeToast> {
+    if reading.value.is_some() {
+        return None;
+    }
+    if reading.detail == Some(ProbeDetail::Cancelled) {
+        return None;
+    }
+    match reading.failure {
+        Some(ProbeFailure::Unknown) if asked || swept => Some(ProbeToast::DidNotRun),
+        Some(ProbeFailure::NoNetwork) if asked || swept => Some(ProbeToast::NoNetwork),
+        _ if asked => Some(ProbeToast::Unreachable),
+        _ => None,
     }
 }
 
@@ -3771,6 +3821,185 @@ mod tests {
                 .count(),
             1,
             "two failures of the same machine are one piece of news"
+        );
+    }
+
+    /// The case a naive rule gets backwards. Cards retire one at a time, so for
+    /// most of a sweep's life the set is partly checked and partly done — and
+    /// throughout that, the button says stop and must mean it.
+    #[test]
+    fn a_press_part_way_through_a_sweep_still_means_stop() {
+        let now = Instant::now();
+        let mut checking = HashMap::new();
+        checking.insert("still-going".to_string(), ProbeWait::new(now));
+        let swept = vec![
+            "done".to_string(),
+            "still-going".to_string(),
+            "also-done".to_string(),
+        ];
+
+        assert!(
+            press_stops(&swept, &checking),
+            "two of the three have finished, but the sweep has not"
+        );
+        assert!(
+            !press_stops(&swept, &HashMap::new()),
+            "with nothing checking, the same press starts a sweep"
+        );
+        assert!(
+            !press_stops(&[], &checking),
+            "an empty block offers nothing to stop"
+        );
+    }
+
+    /// The interface sends a cancel and repaints nothing, on the strength of
+    /// this: the daemon leaves a `Cancelled` reading, the id leaves
+    /// `running ∪ queued`, and the spinner retires through the same path a
+    /// finished check uses. If that stopped holding, every cancelled card would
+    /// spin until the five-minute deadline, and the fix would be a second copy
+    /// of this rule in the widget layer.
+    #[test]
+    fn a_cancelled_probe_retires_its_spinner_and_says_why() {
+        let mut state = state();
+        let now = Instant::now();
+        // The daemon reports it queued: the card adopts the spinner and the
+        // wait is acknowledged.
+        fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probe(&["a"], &[])),
+            now,
+            true,
+        );
+        assert!(state.checking.contains_key("a"), "the spinner is up");
+
+        let mut probes = idle();
+        let mut reading = LatencyReading::failed_locally(
+            ProbeFailure::Unknown,
+            ProbeDetail::Cancelled,
+            ProbeRoute::Direct,
+            LatencyMethod::default(),
+        );
+        reading.measured_at_unix_ms = NOW_MS;
+        probes.readings.insert("a".to_string(), reading);
+
+        let effects = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probes),
+            now,
+            true,
+        );
+
+        assert!(
+            !state.checking.contains_key("a"),
+            "the id left the queue, so the spinner retires"
+        );
+        assert_eq!(
+            latency(&effects, "a"),
+            Some(LatencyState::NotRun(Some(ProbeDetail::Cancelled))),
+            "and the card says the check was stopped, not that the server failed"
+        );
+    }
+
+    /// The whole reason a cancel carries its own reason on the wire. Without
+    /// this, stopping a sweep of a large subscription answers the user with a
+    /// red toast about an action that did exactly what they asked.
+    #[test]
+    fn a_cancelled_sweep_does_not_toast_a_failure() {
+        let mut state = state();
+        let mut probes = idle();
+        for id in ["a", "b", "c"] {
+            state.notify_local.insert(id.to_string());
+            let mut reading = LatencyReading::failed_locally(
+                ProbeFailure::Unknown,
+                ProbeDetail::Cancelled,
+                ProbeRoute::Direct,
+                LatencyMethod::default(),
+            );
+            reading.measured_at_unix_ms = NOW_MS;
+            probes.readings.insert(id.to_string(), reading);
+        }
+
+        let effects = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probes),
+            Instant::now(),
+            true,
+        );
+
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::ToastProbeDidNotRun | Effect::ToastUnreachable | Effect::ToastNoNetwork
+            )),
+            "a cancel is not a failure"
+        );
+    }
+
+    /// A cancel that the user asked for on one card is just as much not a
+    /// failure as a cancelled sweep. `asked` is the stronger of the two flags —
+    /// it toasts conditions a sweep stays quiet about — so it is worth pinning
+    /// separately rather than trusting the sweep case to cover it.
+    #[test]
+    fn cancelling_one_card_does_not_toast_a_failure() {
+        let mut state = state();
+        state.notify_probe.insert("a".to_string());
+        let mut probes = idle();
+        let mut reading = LatencyReading::failed_locally(
+            ProbeFailure::Unknown,
+            ProbeDetail::Cancelled,
+            ProbeRoute::Direct,
+            LatencyMethod::default(),
+        );
+        reading.measured_at_unix_ms = NOW_MS;
+        probes.readings.insert("a".to_string(), reading);
+
+        let effects = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probes),
+            Instant::now(),
+            true,
+        );
+
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::ToastProbeDidNotRun | Effect::ToastUnreachable | Effect::ToastNoNetwork
+            )),
+            "the user stopped it on purpose"
+        );
+    }
+
+    /// The guard is for `Cancelled` specifically and must not have muted the
+    /// local faults the sweep exists to report — a machine with no core fails
+    /// every server at once, and the cards alone read as a dead subscription.
+    #[test]
+    fn a_local_fault_still_toasts_now_that_a_cancel_does_not() {
+        assert_eq!(
+            probe_toast(
+                &LatencyReading::failed_locally(
+                    ProbeFailure::Unknown,
+                    ProbeDetail::NoCore,
+                    ProbeRoute::Direct,
+                    LatencyMethod::default(),
+                ),
+                false,
+                true,
+            ),
+            Some(ProbeToast::DidNotRun)
+        );
+        assert_eq!(
+            probe_toast(
+                &LatencyReading::failed_locally(
+                    ProbeFailure::Unknown,
+                    ProbeDetail::Cancelled,
+                    ProbeRoute::Direct,
+                    LatencyMethod::default(),
+                ),
+                false,
+                true,
+            ),
+            None,
+            "same failure, same flags — only the reason differs"
         );
     }
 

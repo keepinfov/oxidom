@@ -98,10 +98,25 @@ Hysteria2 is QUIC over UDP and has no TCP port to open.
 
 Two controls start a check. The card's own ⟳ **Re-check latency** sits in the
 expanded card and in its right-click menu; the subscription header's ⚡ **Check
-latency of all servers** sweeps the whole block. Both are fire-and-forget —
-**neither control offers a way to stop a check it started**, and closing the
-window does not stop one either, because the daemon owns the work. A sweep of a
-large subscription can run for minutes.
+latency of all servers** sweeps the whole block.
+
+**Either control stops what it started.** While a check is running the button
+becomes a ⏹ **Stop checking latency**, and pressing it drops everything still
+waiting. On a collapsed card the action row is hidden, so the right-click menu
+carries the same item under the same name. A sweep of a large subscription can
+run for minutes, and stopping it takes about ten seconds: the handful of checks
+already measuring finish, because each is a separate Xray core mid-request, and
+only the queue behind them is dropped.
+
+A card whose check was stopped says so rather than showing the number from last
+time as though it had just been refreshed. Closing the window does not stop
+anything — the daemon owns the work, and it is still there when the window
+comes back.
+
+The stop appears only where the daemon knows how to stop. A session daemon still
+running from an older version does not, and installing a new one does not restart
+the running process, so until it is restarted the buttons behave as they did
+before: they start a check, and pressing again does nothing.
 
 The method itself is chosen in Settings, once, for the whole application.
 

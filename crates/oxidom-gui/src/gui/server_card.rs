@@ -206,6 +206,27 @@ pub struct CardHandlers {
     pub toggle_favourite: Rc<dyn Fn()>,
 }
 
+/// What the check button offers, given whether a check is already running.
+///
+/// Two states, one function, following `collapse_icon` in the servers view. The
+/// label is what the context menu shows: `sync_context_labels` falls back to a
+/// button's tooltip when it has no text of its own, and this button has none.
+fn ping_icon(probing: bool) -> &'static str {
+    if probing {
+        "media-playback-stop-symbolic"
+    } else {
+        "view-refresh-symbolic"
+    }
+}
+
+fn ping_label(probing: bool) -> &'static str {
+    if probing {
+        "Stop checking latency"
+    } else {
+        "Re-check latency"
+    }
+}
+
 fn favourite_icon(favourite: bool) -> &'static str {
     if favourite {
         "starred-symbolic"
@@ -247,6 +268,13 @@ pub struct ServerCard {
     latency_spinner_pill: gtk::Box,
     status: gtk::Label,
     connect_button: gtk::Button,
+    /// Held so its icon can say whether pressing it starts a check or stops
+    /// one. Built and dropped before this change, which is why the button
+    /// looked identical in every state while all the feedback lived in the
+    /// badge. The context menu borrows this very button, so relabelling it
+    /// relabels the menu entry too — which is the only route to the control on
+    /// a collapsed card, where the action row is hidden.
+    ping_button: gtk::Button,
     expanded: Rc<Cell<bool>>,
     /// What the badge is currently showing. The age sweep re-pushes a state for
     /// every card every 15 s, so without this the whole grid would re-fade on
@@ -481,12 +509,12 @@ impl ServerCard {
             copy_button.connect_clicked(move |button| button.clipboard().set_text(&link));
         }
         let ping_button = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Re-check latency")
+            .icon_name(ping_icon(false))
+            .tooltip_text(ping_label(false))
             .valign(gtk::Align::Center)
             .css_classes(["flat", "server-action"])
             .build();
-        ping_button.update_property(&[gtk::accessible::Property::Label("Re-check latency")]);
+        ping_button.update_property(&[gtk::accessible::Property::Label(ping_label(false))]);
         ping_button.connect_clicked(move |_| on_ping());
         // Never shown on the card itself: it exists so the context menu has a
         // button to borrow, the way every other item there does.
@@ -639,6 +667,7 @@ impl ServerCard {
             latency_spinner_pill,
             status,
             connect_button,
+            ping_button,
             expanded,
             last_latency: Rc::new(Cell::new(latency_state)),
             last_connection: Rc::new(Cell::new(CardConnectionState::Disconnected)),
@@ -649,6 +678,20 @@ impl ServerCard {
         card.apply_latency(latency_state);
         card.set_connection_state(connection_state);
         card
+    }
+
+    /// Point the check button at starting a check or at stopping one.
+    ///
+    /// Called by the servers view rather than from inside
+    /// [`Self::set_latency_state`], because whether a stop is offerable at all
+    /// depends on the daemon knowing how to stop — a fact a card has no way to
+    /// learn. The view owns that flag and the same decision for the block's
+    /// sweep button, so both live in one place.
+    pub fn set_probing(&self, probing: bool) {
+        self.ping_button.set_icon_name(ping_icon(probing));
+        self.ping_button.set_tooltip_text(Some(ping_label(probing)));
+        self.ping_button
+            .update_property(&[gtk::accessible::Property::Label(ping_label(probing))]);
     }
 
     pub fn set_latency_state(&self, state: LatencyState) {

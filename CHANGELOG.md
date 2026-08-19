@@ -30,8 +30,15 @@ surface, packaging, or the CLI belongs here.
   parse, and a check confirming a live tunnel is never cancelled: it decides whether that
   tunnel stays up.
 
-  **No control sends it yet** — neither the interface nor `oxidom ping`. This is the
-  daemon and client side only.
+  **In the interface, the button that started a check now stops it.** It becomes a stop
+  icon while a check runs, and switches the moment it is pressed rather than when the
+  daemon answers — on a queue of several hundred that answer is seconds away, and a
+  control that waits for it looks like one that missed the press. On a collapsed card the
+  button is hidden, so the right-click menu carries the same item. Pressing check a second
+  time used to be silently ignored, twice over: once by the interface and once by the
+  daemon.
+
+  `oxidom ping` still has no way to call one off.
 
 - **A signed package repository**, so that installing oxidom is
   `apt install oxidom-gui` and upgrades arrive with the rest of the system

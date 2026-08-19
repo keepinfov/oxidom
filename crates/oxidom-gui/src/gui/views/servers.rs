@@ -80,6 +80,14 @@ struct SubscriptionBlock {
     cards: Vec<(String, gtk::Widget)>,
     display_order: Rc<RefCell<Vec<String>>>,
     sort_button: gtk::Button,
+    /// Held for the same reason `sort_button` is: its icon has to say whether
+    /// pressing it starts a sweep or stops one. It used to be built and dropped,
+    /// so nothing could ever change it.
+    speed_button: gtk::Button,
+    /// How many of this block's cards are checking. A count rather than a flag
+    /// because cards retire one at a time as the daemon works through the queue,
+    /// and the button must stay a stop button until the last of them is done.
+    checking: Rc<Cell<usize>>,
     sort_generation: Rc<Cell<u64>>,
 }
 
@@ -206,6 +214,16 @@ pub struct ServersView {
     servers_area: gtk::Box,
     cards: Rc<RefCell<HashMap<String, ServerCard>>>,
     blocks: Rc<RefCell<Vec<SubscriptionBlock>>>,
+    /// Which servers are mid-check, so a repeated state for the same card does
+    /// not double-count its block. `set_latency_state` is called for every card
+    /// on every age sweep, not only when something changed.
+    checking: Rc<RefCell<HashSet<String>>>,
+    /// Whether the daemon knows how to call a check off. A daemon that does not
+    /// must not be given a stop button: it would be a control that says it will
+    /// stop something and then does not, which is worse than the second press
+    /// being ignored as it was before. Set once at startup from the D-Bus
+    /// capability, the way Settings decides whether to offer a geo download.
+    can_cancel_probes: Rc<Cell<bool>>,
     subscriptions: Rc<RefCell<Vec<Subscription>>>,
     /// Lowercased "name transport protocol address:port country" per server.
     /// The search matches this, never transient widget text like the
@@ -418,6 +436,10 @@ impl ServersView {
             content,
             servers_area,
             no_matches,
+            checking: Rc::new(RefCell::new(HashSet::new())),
+            // Assumed absent until told otherwise: an unasked question must not
+            // paint a control that cannot work.
+            can_cancel_probes: Rc::new(Cell::new(false)),
             chip_bar,
             chip_scroll,
             chip_hint,
@@ -639,15 +661,13 @@ impl ServersView {
                 move |_| cb(id.clone())
             });
             let speed = gtk::Button::builder()
-                .icon_name("power-profile-performance-symbolic")
-                .tooltip_text("Check latency of all servers")
+                .icon_name(sweep_icon(false))
+                .tooltip_text(sweep_label(false))
                 .valign(gtk::Align::Center)
                 .sensitive(!ids.is_empty())
                 .css_classes(["flat", "circular", "server-action"])
                 .build();
-            speed.update_property(&[gtk::accessible::Property::Label(
-                "Check latency of all servers",
-            )]);
+            speed.update_property(&[gtk::accessible::Property::Label(sweep_label(false))]);
             speed.connect_clicked({
                 let cb = callbacks.recheck.clone();
                 let ids = ids.clone();
@@ -880,11 +900,14 @@ impl ServersView {
                 )),
                 cards: block_cards,
                 sort_button: sort,
+                speed_button: speed,
+                checking: Rc::new(Cell::new(0)),
                 sort_generation: Rc::new(Cell::new(0)),
             };
             repack_block(&block, self.columns.get());
             self.blocks.borrow_mut().push(block);
         }
+        self.sync_probing(latency_states);
         // Last child, so it sits below the blocks it stands in for.
         self.servers_area.append(&self.no_matches);
         self.apply_filter();
@@ -2447,10 +2470,112 @@ impl ServersView {
         self.schedule_expanded_remeasure();
     }
 
+    /// Re-derive every stop control from the states a rebuild was handed.
+    ///
+    /// A rebuild builds cards and headers from scratch, so their buttons start
+    /// at "check" no matter what is in flight, and it does not go through
+    /// [`Self::set_latency_state`] — the state arrives as a constructor argument
+    /// instead. Without this, sorting or filtering during a sweep left a row of
+    /// fresh buttons offering to start a sweep that was already running.
+    ///
+    /// The passed states are the authority rather than the set this view keeps,
+    /// which is why the set is rebuilt from them here too.
+    fn sync_probing(&self, latency_states: &HashMap<String, LatencyState>) {
+        let mut checking = self.checking.borrow_mut();
+        checking.clear();
+        for (id, state) in latency_states {
+            if *state == LatencyState::Checking {
+                checking.insert(id.clone());
+            }
+        }
+        if !self.can_cancel_probes.get() {
+            return;
+        }
+        let cards = self.cards.borrow();
+        for block in self.blocks.borrow().iter() {
+            let count = block
+                .cards
+                .iter()
+                .filter(|(id, _)| checking.contains(id))
+                .count();
+            block.checking.set(count);
+            let probing = count > 0;
+            block.speed_button.set_icon_name(sweep_icon(probing));
+            block
+                .speed_button
+                .set_tooltip_text(Some(sweep_label(probing)));
+            block
+                .speed_button
+                .update_property(&[gtk::accessible::Property::Label(sweep_label(probing))]);
+            for (id, _) in &block.cards {
+                if let Some(card) = cards.get(id) {
+                    card.set_probing(checking.contains(id));
+                }
+            }
+        }
+    }
+
+    /// Record whether the daemon can call a check off, which decides whether
+    /// either latency control is allowed to offer a stop.
+    pub fn set_probe_cancel_supported(&self, supported: bool) {
+        self.can_cancel_probes.set(supported);
+    }
+
+    /// Keep each block's sweep button pointed at the right action.
+    ///
+    /// The count is per block rather than global because two subscriptions can
+    /// be swept independently, and a stop button on the block that is idle would
+    /// stop the wrong thing. Only a crossing of zero touches a widget: a sweep
+    /// of six hundred servers calls through here twice per card, and repainting
+    /// the header on each of those would be twelve hundred no-op set_icon_names.
+    fn track_checking(&self, server_id: &str, checking: bool) {
+        let was = self.checking.borrow().contains(server_id);
+        if was == checking {
+            return;
+        }
+        if checking {
+            self.checking.borrow_mut().insert(server_id.to_string());
+        } else {
+            self.checking.borrow_mut().remove(server_id);
+        }
+        if !self.can_cancel_probes.get() {
+            return;
+        }
+        if let Some(card) = self.cards.borrow().get(server_id) {
+            card.set_probing(checking);
+        }
+        for block in self.blocks.borrow().iter() {
+            if !block.cards.iter().any(|(id, _)| id == server_id) {
+                continue;
+            }
+            let count = block.checking.get();
+            let count = if checking {
+                count + 1
+            } else {
+                count.saturating_sub(1)
+            };
+            block.checking.set(count);
+            // Only a crossing of zero, which is the only time the button's
+            // meaning actually changes.
+            if (checking && count == 1) || (!checking && count == 0) {
+                let probing = count > 0;
+                block.speed_button.set_icon_name(sweep_icon(probing));
+                block
+                    .speed_button
+                    .set_tooltip_text(Some(sweep_label(probing)));
+                block
+                    .speed_button
+                    .update_property(&[gtk::accessible::Property::Label(sweep_label(probing))]);
+            }
+            break;
+        }
+    }
+
     pub fn set_latency_state(&self, server_id: &str, state: LatencyState) {
         if let Some(card) = self.cards.borrow().get(server_id) {
             card.set_latency_state(state);
         }
+        self.track_checking(server_id, state == LatencyState::Checking);
         // `Checking` says nothing about where the card belongs in a latency
         // sort, so it leaves the previous key alone rather than clearing it.
         match sort_value(state) {
@@ -3301,6 +3426,23 @@ fn columns_for_width_with_hysteresis(width: i32, current: usize, hysteresis: i32
         3 if width < three_columns.saturating_sub(hysteresis) => 2,
         3 => 3,
         _ => columns_for_width(width),
+    }
+}
+
+/// What the sweep button offers, given whether its block is already checking.
+fn sweep_icon(probing: bool) -> &'static str {
+    if probing {
+        "media-playback-stop-symbolic"
+    } else {
+        "power-profile-performance-symbolic"
+    }
+}
+
+fn sweep_label(probing: bool) -> &'static str {
+    if probing {
+        "Stop checking latency"
+    } else {
+        "Check latency of all servers"
     }
 }
 

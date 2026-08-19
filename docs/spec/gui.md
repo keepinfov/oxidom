@@ -13,6 +13,14 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
     quick connect). Collapses in narrow mode with a small toggle button in the header.
   - **Content:** `adw::HeaderBar` with standard window controls; a **search entry** spanning the
     top that filters servers by name/protocol/country.
+- **Latency controls are two-state.** The card's check button and the subscription header's
+  sweep button each show whether pressing them starts a check or stops one, and they switch on
+  press rather than on the daemon's acknowledgement — on a full queue that answer is seconds
+  away, and a control that waits for it reads as one that missed the press. The card's button
+  lives in the region a collapsed card hides, so the context menu borrows the same button and
+  therefore shows the same label. Stopping is not a failure and raises no error. Neither
+  control offers a stop unless the daemon answered `CancelProbes` at startup: a button that
+  says it will stop something and then cannot is worse than the second press being ignored.
 - **Server card** (custom widget): country **flag**, server **name**, protocol **subtitle**
   (`transport_label`, e.g. "vless + xhttp + reality"), optional **latency badge** (green when
   low). Whole card is a click target → selects that server. Every server carried by a connected

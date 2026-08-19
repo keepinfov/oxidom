@@ -25,7 +25,8 @@ use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
     SwitcherItem, active_latency_for, card_action, human_bytes, latency_states,
     missing_core_message, other_profiles_message, pool_action, pool_for_profile, pool_short_label,
-    reduce, selected_status, session_for, session_rows, switcher_items, switcher_visible,
+    press_stops, reduce, selected_status, session_for, session_rows, switcher_items,
+    switcher_visible,
 };
 use super::server_card::LatencyState;
 use super::sidebar::{Page, Sidebar};
@@ -576,6 +577,12 @@ fn build(
     // helped by anything this process downloads into the user's home.
     let daemon_source = client.source();
     let geo_download_supported = client.supports_geo_download();
+    // Asked once, here, because the answer decides whether the latency controls
+    // may offer a stop at all. A session daemon left running from an older
+    // version is the realistic case: the packages pin the daemon to the same
+    // version as the interface, but a running process is not upgraded by an
+    // install.
+    let probe_cancel_supported = client.supports_probe_cancel();
     let selected_id = initial_status.active_id.clone();
     let servers = ServersView::new(&subscriptions_snapshot);
     let state = Rc::new(RefCell::new(AppState {
@@ -615,6 +622,7 @@ fn build(
         }
     });
     settings.set_daemon_capabilities(daemon_source, geo_download_supported);
+    servers.set_probe_cancel_supported(probe_cancel_supported);
     settings.set_runtime_info(initial_runtime.as_ref());
 
     // Apply the saved scheme before anything is on screen, so a window pinned
@@ -2315,7 +2323,12 @@ impl Controller {
     fn probe_one(self: &Rc<Self>, server_id: String, notify_failure: bool) {
         {
             let mut state = self.state.borrow_mut();
+            // A press while this card is checking means stop, not "ignore me".
+            // Answering the same gesture with silence, twice over — the daemon
+            // drops the duplicate too — is what made the control feel dead.
             if state.ui.checking.contains_key(&server_id) {
+                drop(state);
+                self.cancel_probes(vec![server_id]);
                 return;
             }
             state
@@ -2333,20 +2346,21 @@ impl Controller {
     }
 
     fn enqueue_probes(self: &Rc<Self>, ids: Vec<String>) {
+        if press_stops(&ids, &self.state.borrow().ui.checking) {
+            self.cancel_probes(ids);
+            return;
+        }
         let new_ids: Vec<String> = {
             let mut state = self.state.borrow_mut();
             let now = Instant::now();
             let mut new_ids = Vec::new();
             for id in ids {
-                if !state.ui.checking.contains_key(&id) {
-                    state.ui.checking.insert(id.clone(), ProbeWait::new(now));
-                    // A sweep says nothing about one silent server, but it must
-                    // say when nothing was measured at all: without this, a
-                    // machine with no Xray core marks every card and explains
-                    // none of them.
-                    state.ui.notify_local.insert(id.clone());
-                    new_ids.push(id);
-                }
+                state.ui.checking.insert(id.clone(), ProbeWait::new(now));
+                // A sweep says nothing about one silent server, but it must say
+                // when nothing was measured at all: without this, a machine with
+                // no Xray core marks every card and explains none of them.
+                state.ui.notify_local.insert(id.clone());
+                new_ids.push(id);
             }
             new_ids
         };
@@ -2358,6 +2372,32 @@ impl Controller {
         }
         self.refresh_activity_status();
         self.request_probes(new_ids);
+    }
+
+    /// Ask the daemon to call off checks.
+    ///
+    /// Nothing is repainted here, and that is deliberate rather than lazy. The
+    /// daemon leaves a `Cancelled` reading for every id it drops, so those ids
+    /// leave `running ∪ queued` and the reducer retires their spinners on the
+    /// next poll through the path it already uses for a finished check. Anything
+    /// already measuring is not called off — only the queue is dropped — and its
+    /// card retires when its own reading lands. Deciding here which of the two a
+    /// card is would be a second copy of a rule the reducer already owns, and
+    /// the copy would be the one that is wrong.
+    fn cancel_probes(self: &Rc<Self>, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        let client = self.state.borrow().client.clone();
+        std::thread::spawn(move || {
+            // Fire and forget, with the failure in the log rather than a toast:
+            // the checks carry on, every card still says so, and interrupting
+            // the user to report that stopping failed is worse than letting the
+            // spinners speak for themselves.
+            if let Err(error) = client.cancel_probes(&ids) {
+                log::warn!("could not call off the latency checks: {error:#}");
+            }
+        });
     }
 
     /// Ask the daemon to probe `ids` on a worker thread, and put the cards
