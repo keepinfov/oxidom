@@ -184,7 +184,7 @@ pub fn show_profile_dialog(
         ProfileDialog::New { pool } => {
             let mut initial = DialogValues::new(None);
             initial.pool = pool;
-            ("New Profile".to_string(), None, initial)
+            ("New profile".to_string(), None, initial)
         }
     };
 
@@ -421,7 +421,7 @@ pub fn show_profile_dialog(
             let dialog = adw::AlertDialog::new(
                 Some("Remove profile?"),
                 Some(&format!(
-                    "«{name}» will be removed. The tunnel it started, if any, keeps running."
+                    "“{name}” will be removed. The tunnel it started, if any, keeps running."
                 )),
             );
             dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Remove")]);
@@ -724,7 +724,7 @@ fn confirm_dns_leak(
         Some("Route everything, but not DNS?"),
         Some(DNS_LEAK_WARNING),
     );
-    dialog.add_responses(&[("cancel", "Cancel"), ("accept", "Route Everything")]);
+    dialog.add_responses(&[("cancel", "Cancel"), ("accept", "Route everything")]);
     dialog.set_response_appearance("accept", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");

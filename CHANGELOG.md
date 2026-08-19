@@ -49,6 +49,12 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- **One system of quotation marks, and one case for a label.** Profile names were quoted with
+  guillemets while groups, subscriptions and servers used curly quotes, so a single confirmation
+  could ask `Connect «work» to “Europe”?` — two conventions in one sentence. Everything is quoted
+  the one way now. A handful of labels were in Title Case while the rest of the interface is
+  sentence case; they have joined it, which also means one action no longer answers to three
+  differently capitalised names.
 - **One description per failed check.** The CLI, the server card and the window each wrote their
   own words for the same four conditions, so the same failure was described differently depending
   on where it was read. There is now one wording per condition, beside the type that carries it.

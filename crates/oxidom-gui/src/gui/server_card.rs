@@ -1167,7 +1167,7 @@ fn show_alias_dialog(
     on_save: Rc<dyn Fn(String)>,
 ) {
     let window = adw::Window::builder()
-        .title("Set Alias")
+        .title("Set alias")
         .modal(true)
         .default_width(420)
         .build();

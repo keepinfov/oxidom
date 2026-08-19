@@ -432,7 +432,7 @@ fn show_add_subscription(
     prefill: Option<String>,
 ) {
     let window = adw::Window::builder()
-        .title("Add Subscription")
+        .title("Add subscription")
         .modal(true)
         .default_width(480)
         .default_height(390)
@@ -533,7 +533,7 @@ fn show_import_servers(
     prefill: Option<String>,
 ) {
     let window = adw::Window::builder()
-        .title("Import Server")
+        .title("Import server")
         .modal(true)
         .default_width(520)
         .default_height(430)
@@ -831,7 +831,7 @@ fn show_local_servers(
     callbacks: SubscriptionCallbacks,
 ) {
     let window = adw::Window::builder()
-        .title("Local Servers")
+        .title("Local servers")
         .modal(true)
         .default_width(540)
         .default_height(500)

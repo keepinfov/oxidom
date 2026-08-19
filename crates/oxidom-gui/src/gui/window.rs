@@ -525,7 +525,7 @@ fn show_daemon_error(app: &adw::Application, message: &str) {
         Some("oxidom daemon unavailable"),
         Some(message),
     );
-    dialog.add_responses(&[("quit", "Quit"), ("retry", "Try Again")]);
+    dialog.add_responses(&[("quit", "Quit"), ("retry", "Try again")]);
     dialog.set_response_appearance("retry", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("retry"));
     // Escape must quit, not dismiss: the hold guard is already taken in
@@ -1726,7 +1726,7 @@ impl Controller {
             Some(name) => {
                 let Some(entry) = profiles.iter().find(|entry| entry.name == name) else {
                     // Removed through the CLI between the click and the reread.
-                    self.show_message(&format!("Profile «{name}» no longer exists"));
+                    self.show_message(&format!("Profile “{name}” no longer exists"));
                     return;
                 };
                 ProfileDialog::Edit { name, entry }
@@ -2079,7 +2079,7 @@ impl Controller {
                 .find(|entry| entry.name == profile_name)
             else {
                 drop(state);
-                self.show_message(&format!("Profile «{profile_name}» no longer exists"));
+                self.show_message(&format!("Profile “{profile_name}” no longer exists"));
                 return;
             };
             let server = state
@@ -2122,9 +2122,9 @@ impl Controller {
         };
 
         let title = if replaces_pool {
-            format!("Replace the group in «{profile_name}» with {server_name}?")
+            format!("Replace the group in “{profile_name}” with {server_name}?")
         } else {
-            format!("Point «{profile_name}» at {server_name}?")
+            format!("Point “{profile_name}” at {server_name}?")
         };
         let body = if replaces_pool {
             "This replaces the saved group with one server. The running connection will \
@@ -2132,7 +2132,7 @@ impl Controller {
                 .to_string()
         } else {
             format!(
-                "This will rewrite the saved server selection for «{profile_name}» and connect it."
+                "This will rewrite the saved server selection for “{profile_name}” and connect it."
             )
         };
         let dialog = adw::AlertDialog::new(Some(title.as_str()), Some(body.as_str()));
@@ -2141,9 +2141,9 @@ impl Controller {
             (
                 "repoint",
                 if replaces_pool {
-                    "Replace Group and Connect"
+                    "Replace group and connect"
                 } else {
-                    "Repoint and Connect"
+                    "Repoint and connect"
                 },
             ),
         ]);
@@ -2187,7 +2187,7 @@ impl Controller {
             }
             PoolAction::NoProfile(name) => {
                 self.show_message(&format!(
-                    "«{name}» has no profile to write. Create one on the Profiles page first."
+                    "“{name}” has no profile to write. Create one on the Profiles page first."
                 ));
                 return;
             }
@@ -2197,8 +2197,8 @@ impl Controller {
             PoolAction::RetuneAndUp { profile, expected } => {
                 if let Some(rewritten) = self.profile_with_pool(&profile, query.clone()) {
                     self.show_message(&match expected {
-                        0 => format!("«{profile}» now rotates over every live node"),
-                        count => format!("«{profile}» now rotates over {count} nodes"),
+                        0 => format!("“{profile}” now rotates over every live node"),
+                        count => format!("“{profile}” now rotates over {count} nodes"),
                     });
                     self.repoint_and_up(profile, rewritten);
                 }
@@ -2227,19 +2227,19 @@ impl Controller {
         };
         let body = match (replaces_pool, replaces_server.as_deref()) {
             (true, _) => format!(
-                "«{profile_name}» will run {group} across {nodes} servers instead of its current \
+                "“{profile_name}” will run {group} across {nodes} servers instead of its current \
                  pool. It will reconnect, and existing connections will close."
             ),
             (false, Some(server)) => format!(
-                "«{profile_name}» points at {server}. Connecting {group} replaces that with a \
+                "“{profile_name}” points at {server}. Connecting {group} replaces that with a \
                  pool of {nodes} servers, and rewrites the saved selection."
             ),
             (false, None) => format!(
-                "«{profile_name}» will run {group} across {nodes} servers, and the saved \
+                "“{profile_name}” will run {group} across {nodes} servers, and the saved \
                  selection is rewritten."
             ),
         };
-        let title = format!("Connect «{profile_name}» to {group}?");
+        let title = format!("Connect “{profile_name}” to {group}?");
         let dialog = adw::AlertDialog::new(Some(title.as_str()), Some(body.as_str()));
         dialog.add_responses(&[("cancel", "Cancel"), ("connect", "Connect")]);
         dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
@@ -2266,7 +2266,7 @@ impl Controller {
         let state = self.state.borrow();
         let Some(entry) = state.profiles.iter().find(|entry| entry.name == name) else {
             drop(state);
-            self.show_message(&format!("Profile «{name}» no longer exists"));
+            self.show_message(&format!("Profile “{name}” no longer exists"));
             return None;
         };
         Some(Profile {
@@ -2764,7 +2764,7 @@ impl Controller {
                 // handler and paints whichever of the two it actually is.
                 self.mark_error_notified(&format!("{error:#}"));
                 self.show_error(
-                    &format!("Could not bring up «{name}»"),
+                    &format!("Could not bring up “{name}”"),
                     &format!("{error:#}"),
                 );
             }
@@ -2792,7 +2792,7 @@ impl Controller {
                     Ok(false) => {
                         controller.rebuild_sessions();
                         controller.show_message(&format!(
-                            "«{message_name}» is not the profile running the tunnel"
+                            "“{message_name}” is not the profile running the tunnel"
                         ));
                     }
                     Ok(true) => {
@@ -2813,7 +2813,7 @@ impl Controller {
                     Err(error) => {
                         controller.rebuild_sessions();
                         controller.show_error(
-                            &format!("Could not disconnect «{message_name}»"),
+                            &format!("Could not disconnect “{message_name}”"),
                             &format!("{error:#}"),
                         );
                     }
@@ -4127,8 +4127,8 @@ impl Controller {
         let dialog = adw::AlertDialog::new(Some("Use the geo data on this machine?"), Some(&body));
         dialog.add_responses(&[
             ("cancel", "Cancel"),
-            ("download", "Download Instead"),
-            ("use", "Use These"),
+            ("download", "Download instead"),
+            ("use", "Use these"),
         ]);
         dialog.set_response_appearance("use", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("use"));
