@@ -16,6 +16,37 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **A profile can carry its own routing rules.** Everything oxidom generated said the same
+  two things about where traffic goes — private addresses direct, and for a pool the rest
+  to the balancer — and there was no way to say anything else short of not using oxidom.
+  A profile file now takes a `routing` block, written as Xray writes it, and its rules go
+  **ahead** of the two above, so a rule you write wins over the built-in one below it:
+
+  ```toml
+  routing = '''
+  { "rules": [ { "domain": ["geosite:category-ads-all"], "outboundTag": "block" } ] }
+  '''
+  ```
+
+  Traffic can be sent to `direct`, `block`, or — on a profile that selects a single server —
+  `proxy`. A pool has no `proxy` outbound, because its members are reached through the
+  balancer, and a rule aimed at one there is refused by name rather than becoming a core
+  that will not start. Balancers, a `balancerTag`, and `domainStrategy` are refused too:
+  the first two are oxidom's to build, and the third already has a home in `[core]`.
+  Everything is checked when the profile is saved and again when it is brought up, so the
+  answer is a sentence rather than an exit code.
+
+  There is no editor for it. The profile dialog reports how many rules the block holds and
+  writes it back untouched, the way it already treats a group's membership — so editing a
+  profile from the interface cannot lose them. It is a profile key rather than a machine
+  one on purpose: a rule set machine-wide would also reach the short-lived cores that
+  measure latency, where a rule sending the measurement out direct would report a dead
+  server as fast.
+
+  **A subscription's own routing is still discarded at import.** Carrying a provider's
+  block means mapping its outbound tags onto oxidom's; this is the half that does not need
+  that, and it is what lets someone write the same rules by hand today.
+
 - **A latency check can be called off.** The daemon gained `CancelProbes`, which drops
   every check still waiting in the queue. The at-most-eight already measuring finish on
   their own — each holds a slot a thread will release, and taking it early would hand it

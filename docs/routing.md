@@ -11,6 +11,9 @@ oxidom has three routing layers. They stack, and each is opt-in above the first.
 
 Nothing here ever touches `/etc/resolv.conf`. oxidom does not rewrite your DNS.
 
+Where traffic goes *inside* the tunnel is decided by the core's routing rules;
+a profile can carry [rules of your own](#rules-of-your-own).
+
 ## Local proxies
 
 Every session always gets both a SOCKS5 and an HTTP inbound. No privilege, no
@@ -175,6 +178,66 @@ The exit code is the child's, so this composes with ordinary shell logic.
 Cleanup removes the profile's nftables chain *before* taking down its routing
 domain, so traffic is never briefly released onto the ordinary default route on
 the way down.
+
+## Rules of your own
+
+The three layers above decide *what* reaches the tunnel. Where a given request
+goes once it is inside is the core's routing table, and oxidom writes two rules
+into it: private addresses go direct, and, for a pool, everything else goes to
+the balancer.
+
+A profile can carry an Xray `routing` block of its own, written into the profile
+file and spliced **ahead** of those two — so a rule you write wins over the one
+oxidom installs:
+
+```toml
+# ~/.config/oxidom/profiles/work.toml
+routing = '''
+{
+  "rules": [
+    { "domain": ["geosite:category-ads-all"], "outboundTag": "block" },
+    { "ip": ["geoip:ch"], "outboundTag": "direct" }
+  ]
+}
+'''
+```
+
+That is advertising blocked and one country direct, with everything else still
+going through the tunnel. The syntax is Xray's own, so its documentation is the
+reference; `geosite:` and `geoip:` names come from the data files the daemon
+installs.
+
+Three outbound tags exist to send traffic to:
+
+| `outboundTag` | Where it goes |
+|---|---|
+| `proxy` | the tunnel — **only on a profile that selects one server** |
+| `direct` | out of the machine normally, not through the tunnel |
+| `block` | nowhere |
+
+A profile running a **pool** has no `proxy` outbound: its members are reached
+through the balancer, and a rule aimed at `proxy` is refused rather than
+producing a core that will not start. Send those to `direct` or `block`, and
+leave everything else to fall through to the balancer.
+
+Four things are refused, when the profile is saved and again when it is brought
+up, with the reason in the message:
+
+- `balancers`, or a rule with a `balancerTag` — oxidom builds the balancer, and a
+  selector from elsewhere can resolve to an outbound that leaves the tunnel;
+- `domainStrategy` — set it as `domain_strategy` under `[core]`, which owns it;
+- an `outboundTag` naming anything but the three above;
+- a rule with no `outboundTag`, which decides nothing.
+
+There is no editor for this in the interface. The profile dialog shows how many
+rules the block holds and writes it back untouched, the way it already treats a
+group's membership — so editing a profile from the interface cannot lose the
+rules, and the file is where you change them.
+
+**A subscription's own routing is still discarded on import.** Keeping a
+provider's block means mapping its outbound tags onto oxidom's, and modelling
+rules properly is a separate piece of work; until then this block is how you say
+the same thing yourself.
 
 ---
 

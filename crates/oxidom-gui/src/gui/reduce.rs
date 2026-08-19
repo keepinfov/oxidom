@@ -2107,6 +2107,7 @@ mod tests {
             interface: ProfileInterface::default(),
             pool: None,
             core: Default::default(),
+            routing: None,
         }
     }
 

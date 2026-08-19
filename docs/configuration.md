@@ -240,6 +240,14 @@ The two differ in what "unset" means, so they behave differently on purpose:
 to offer, so the GUI reports how many there are and writes back what it was
 given; edit them in the file.
 
+A profile's `routing` block is treated the same way, and for the same reason —
+it is hand-written Xray JSON with no useful default. The profile dialog shows
+how many rules it holds and saves it untouched. What it can say, and what is
+refused, is in [routing.md](routing.md#rules-of-your-own). Note that it is a
+profile key rather than a `[core]` one: a rule set machine-wide would reach the
+short-lived cores that measure latency, and a rule sending a measurement out
+direct would report a dead server as fast.
+
 One thing the GUI cannot express, because the file cannot either: a profile can
 point `dns.server` somewhere else, but it cannot *remove* a resolver set for the
 machine. An unset field means "inherit", and there is no third state.

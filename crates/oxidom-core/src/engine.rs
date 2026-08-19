@@ -984,8 +984,19 @@ impl Engine {
     /// [`Engine::configure_interface`] is: a bare `Connect` has no profile file
     /// to read, and a session that was never configured has to keep working off
     /// the global settings alone.
-    pub fn configure_core(&mut self, profile: &str, requested: &CoreOptions) {
-        let resolved = CoreOptions::resolve(&self.registry.config.core, requested);
+    /// `routing` is the profile's own block, already checked by
+    /// [`crate::profile::Profile::routing_block`]. It is passed separately
+    /// because it is not a `[core]` key and must never be resolved like one: a
+    /// probe folds the machine-wide `[core]` alone, and a rule that reached a
+    /// probe core would measure the route it chose rather than the server.
+    pub fn configure_core(
+        &mut self,
+        profile: &str,
+        requested: &CoreOptions,
+        routing: Option<serde_json::Value>,
+    ) {
+        let mut resolved = CoreOptions::resolve(&self.registry.config.core, requested);
+        resolved.routing = routing;
         if let Some(session) = self.sessions.get_mut(profile) {
             session.core_options = resolved;
         }
