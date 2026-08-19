@@ -2,8 +2,13 @@ name: build
 
 # Proves the two artefacts people actually install still build: the wrapped CLI
 # (which the systemd unit runs) and the wrapped GUI (which carries the icon
-# theme and the desktop files). `nix build` also runs the crate tests the flake
-# names, so a green build here is stronger than a green `cargo build`.
+# theme and the desktop files). The derivations run the crate tests the flake
+# names as they build, so a green check here is stronger than a green
+# `cargo build`.
+#
+# It does not replace lint.yml or format.yml. Nothing in the flake runs clippy
+# or rustfmt, so dropping those in favour of this would lose both — and they are
+# the two cheapest signals in the repository.
 
 on:
   push:
@@ -26,7 +31,9 @@ jobs:
       - uses: cachix/install-nix-action@v27
         with:
           extra_nix_config: experimental-features = nix-command flakes
+      # Not `nix build` as well: `checks.{cli,gui}` are the very derivations
+      # `packages.{oxidom-cli,oxidom-gui}` name, so building both realised each
+      # one twice for one answer. AGENTS.md has said "run one, not both" since
+      # before this workflow existed.
       - name: nix flake check
         run: nix flake check --print-build-logs
-      - name: nix build
-        run: nix build .#oxidom-cli .#oxidom-gui --print-build-logs
