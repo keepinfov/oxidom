@@ -113,8 +113,10 @@ separate commit rather than folding it into yours.
 
 ## Testing obligations
 
-The suite is 417 tests and takes seven seconds warm. There is no excuse for
-sending an untested change.
+The suite is 521 tests, plus eight marked `#[ignore]`, and takes seven seconds
+warm. There is no excuse for sending an untested change. The count is whatever
+`cargo test --workspace` prints, summed across its test binaries — read it
+there rather than trusting this line, which has been wrong before.
 
 - **Every bug fix ships with a regression test that fails without the fix.**
   Write the test first and watch it fail; a test that passes before your change
@@ -257,8 +259,9 @@ published history is rewritten.
 ## Versioning and releases
 
 The project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Nothing has been released yet: there is no `v*` tag, and the `0.1.0` in
-`Cargo.toml` is a placeholder.
+`v0.1.0` was released on 2026-08-19, so the version in `Cargo.toml` is what
+people have installed rather than a placeholder, and the signed package
+repository upgrades them to whatever the next tag publishes.
 
 Never change a version, write a release commit, or create a tag without being
 asked to. Recommend a release; do not perform one unbidden.
