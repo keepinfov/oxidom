@@ -215,10 +215,10 @@ line naming a server is prefixed with its handle:
 
 | Message | Meaning |
 |---|---|
-| `server is unreachable` | The server never answered, or answered and refused. |
-| `probe timed out` | The measurement itself ran out of time. |
-| `no network connection` | This machine has no usable route. Claimed only on evidence — see [spec/latency.md](spec/latency.md). |
-| `probe could not run on this machine` | Something local stopped the check, and the daemon did not say what. |
+| `the server did not answer` | The server never answered, or answered and refused. |
+| `the check ran out of time` | The measurement itself ran out of time. |
+| `this machine has no network` | This machine has no usable route. Claimed only on evidence — see [spec/latency.md](spec/latency.md). |
+| `the check could not run on this machine` | Something local stopped the check, and the daemon did not say what. |
 
 When the daemon *does* say what stopped it, that reason is printed instead of the
 last line — these come from the probe core's own complaint, so they name a
@@ -231,7 +231,7 @@ condition rather than shrugging:
 | `the server asks for unverified TLS, which this core removed` | The link wants `allowInsecure`, which Xray 26.x dropped. A pin is the only way through. |
 | `the core refused the generated config` | The core would not start on this server's settings. |
 | `the core has no geo data (geoip.dat, geosite.dat), so it refused the routing rules` | The core cannot load `geoip.dat`/`geosite.dat`, which every generated config needs. |
-| `the check could not run on this machine` | A local fault the core did not name. |
+| `the check could not run on this machine` | A local fault the core did not name — the same line as in the table above, because it is the same condition. |
 
 Four more are about the exchange rather than the server: `probe for <HANDLE> did
 not finish within 30 seconds`, `daemon finished the probe for <HANDLE> without a
