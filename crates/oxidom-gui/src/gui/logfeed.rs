@@ -13,7 +13,7 @@
 //! [`REORDER_WINDOW_MS`] is past the point where a straggler can still arrive to
 //! sit in front of it, and can be appended in timestamp order for good.
 
-use oxidom_core::logbook::{LEGACY_BOOK_ID, LogRecord, LogSlice};
+use oxidom_core::logbook::{CAPACITY, LEGACY_BOOK_ID, LogRecord, LogSlice};
 
 /// How long a record waits before it is considered safely ordered.
 ///
@@ -21,6 +21,19 @@ use oxidom_core::logbook::{LEGACY_BOOK_ID, LogRecord, LogSlice};
 /// daemon record can be. The cost is that the newest lines appear that much
 /// after the fact, which at this size reads as live.
 pub const REORDER_WINDOW_MS: u64 = 600;
+
+/// How many records may wait at once before the window is given up on.
+///
+/// The window releases on a timestamp, which assumes timestamps advance. A clock
+/// stepped backwards, or one record stamped in the future, moves the cutoff
+/// behind everything held and holds it there for the whole size of the
+/// discrepancy — and `holding` had no ceiling, so an NTP correction was enough to
+/// grow it without end.
+///
+/// The number is the log book's own capacity rather than a figure of its own:
+/// holding more records than the book keeps cannot help anybody, because the
+/// view discards the excess on arrival regardless.
+const HOLD_CAPACITY: usize = CAPACITY;
 
 /// What one tick produced.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -57,6 +70,13 @@ impl LogFeed {
     /// The cursor to read this process's own book from.
     pub fn local_cursor(&self) -> u64 {
         self.local_cursor
+    }
+
+    /// How many records are waiting for the window to open. Exists so a test can
+    /// state the ceiling as an invariant rather than reaching into the field.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.holding.len()
     }
 
     /// Take one round of both books and return what is now safe to display.
@@ -103,7 +123,21 @@ impl LogFeed {
             .iter()
             .take_while(|record| record.unix_ms <= cutoff)
             .count();
-        let records: Vec<LogRecord> = self.holding.drain(..settled).collect();
+        let mut records: Vec<LogRecord> = self.holding.drain(..settled).collect();
+
+        // Over the ceiling, the oldest of what is still held goes out anyway,
+        // ordering unproven. Releasing early is the right way to lose this
+        // argument: the alternative is dropping records, and a gap the reader
+        // cannot see is worse than two lines in the wrong order. Nothing is
+        // lost, so nothing is announced as skipped.
+        //
+        // `holding` is sorted ascending and every settled record was below the
+        // cutoff, so these are still the oldest remaining and appending them
+        // after keeps the batch in order.
+        if self.holding.len() > HOLD_CAPACITY {
+            let excess = self.holding.len() - HOLD_CAPACITY;
+            records.extend(self.holding.drain(..excess));
+        }
 
         FeedBatch {
             records,
@@ -147,6 +181,49 @@ mod tests {
 
     const DAEMON: u64 = 77;
     const LOCAL: u64 = 99;
+
+    /// The window releases on a timestamp, so a stamp from the future — or a
+    /// clock stepped backwards — puts the cutoff behind everything held and keeps
+    /// it there for the size of the discrepancy. `holding` had no ceiling, so a
+    /// single NTP correction was enough to grow it for as long as the window
+    /// stayed shut.
+    #[test]
+    fn a_record_stamped_in_the_future_does_not_grow_the_hold_without_end() {
+        let mut feed = LogFeed::new();
+        let now_ms = 1_000_000;
+        // One record stamped a day ahead. Nothing that arrives afterwards can
+        // reach the cutoff while it is held, so the window never opens.
+        let future = now_ms + 86_400_000;
+        let mut seq = 0;
+        let mut released = 0;
+        for _ in 0..4 {
+            let batch = feed.absorb(
+                slice(
+                    DAEMON,
+                    (0..2_000)
+                        .map(|_| {
+                            seq += 1;
+                            record(seq, future, LogSource::Xray, "from the future")
+                        })
+                        .collect(),
+                ),
+                empty(LOCAL),
+                now_ms,
+            );
+            released += batch.records.len();
+            assert!(
+                feed.held() <= HOLD_CAPACITY,
+                "the hold must stay bounded even while the window cannot open: {} held",
+                feed.held()
+            );
+        }
+
+        assert_eq!(
+            released + feed.held(),
+            seq as usize,
+            "every record either went out or is still held — none were dropped"
+        );
+    }
 
     #[test]
     fn a_record_is_held_until_no_straggler_can_still_precede_it() {
