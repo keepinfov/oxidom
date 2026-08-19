@@ -327,7 +327,7 @@ pub fn show_profile_dialog(
     pool_expected.set_value(initial_pool.expected as f64);
     pool_group.add(&pool_expected);
     let pool_probe_interval = adw::EntryRow::builder()
-        .title("Probe interval")
+        .title("Check interval")
         .text(&initial_pool.probe_interval)
         .build();
     pool_group.add(&pool_probe_interval);

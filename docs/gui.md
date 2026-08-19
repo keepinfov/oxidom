@@ -197,7 +197,7 @@ repointing it.
 | **System proxy** | "Send the whole desktop's traffic through oxidom while connected (GNOME)". See [routing.md](routing.md#gnome-system-proxy). |
 | **Reconnect automatically** | "Reconnect only when Xray exits unexpectedly, never after Disconnect". |
 | **Latency method** | `icmp`, `tcp`, `http_head`, `http_get`. |
-| **Latency test URL** | Target for the HTTP methods. |
+| **Latency check URL** | Target for the HTTP methods. |
 | **Subscription User-Agent** | Free text, plus a **Client preset** list that fills it. |
 | **Advanced › Xray / tun2socks / nft binary** | Ignored by a **system** daemon on purpose — setting a binary path on a privileged daemon would be a remote-execution primitive. |
 | **In use by the daemon** | What the daemon actually resolved, which is not always what you typed. |

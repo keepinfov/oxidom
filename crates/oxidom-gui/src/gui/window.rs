@@ -3774,8 +3774,8 @@ impl Controller {
                 set_status_tone(&self.sidebar_status, StatusTone::Neutral);
                 self.sidebar_status_icon
                     .set_icon_name(Some("network-vpn-symbolic"));
-                self.sidebar_status_label.set_label("Ready");
-                "Ready".to_string()
+                self.sidebar_status_label.set_label("Disconnected");
+                "Disconnected".to_string()
             }
             Status::Connecting => {
                 set_status_tone(&self.sidebar_status, StatusTone::Working);
@@ -4558,7 +4558,7 @@ fn session_row_tone(state: SessionRowState) -> StatusTone {
 
 fn session_row_state_label(state: SessionRowState) -> &'static str {
     match state {
-        SessionRowState::Stopped => "Stopped",
+        SessionRowState::Stopped => "Disconnected",
         SessionRowState::Connecting => "Connecting",
         SessionRowState::Connected => "Connected",
         SessionRowState::Error => "Error",

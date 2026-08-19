@@ -794,7 +794,7 @@ impl ServerCard {
                 self.latency.add_css_class("latency-tunnel");
             }
             LatencyState::Unmeasured => {
-                self.show_label("—", "Latency has not been measured");
+                self.show_label("—", "Latency has not been checked");
             }
             LatencyState::Superseded => {
                 self.show_label("—", "Measured in a different context — needs a fresh check");
@@ -803,7 +803,7 @@ impl ServerCard {
                 self.latency_display.set_visible_child_name("spinner");
                 self.latency_spinner.set_spinning(true);
                 self.latency_spinner_pill
-                    .set_tooltip_text(Some("Checking server reachability"));
+                    .set_tooltip_text(Some("Checking latency"));
             }
             // Same dash as an unmeasured server, in the error colour: a failed
             // check still leaves no number, and a cross reads as a verdict on
@@ -826,10 +826,6 @@ impl ServerCard {
             LatencyState::NotRun(detail) => {
                 let tooltip = match detail {
                     Some(detail) => format!("Not measured: {}", detail.message()),
-                    // Not `ProbeFailure::Unknown.message()`: that is a fragment
-                    // written to follow a colon, and this is a sentence carrying
-                    // where to look. Reusing it here would say the same thing
-                    // twice in one tooltip.
                     None => "The check could not run on this machine — see Settings › Xray core"
                         .to_string(),
                 };
@@ -861,7 +857,7 @@ impl ServerCard {
 
     pub fn set_connection_state(&self, state: CardConnectionState) {
         // Entering the failed state is what makes the current number stale, not
-        // being in it: a re-check while the card still says "Failed" clears
+        // being in it: a re-check while the card still says "Error" clears
         // this again, and the poll re-asserting the same state must not undo
         // that.
         let previous = self.last_connection.replace(state);
@@ -884,7 +880,7 @@ impl ServerCard {
             CardConnectionState::ConnectedHere => "Connected",
             CardConnectionState::InPool => "One of several servers in use",
             CardConnectionState::Connecting => "Connecting",
-            CardConnectionState::Failed => "Connection failed",
+            CardConnectionState::Failed => "Connection error",
         };
         self.header
             .update_property(&[gtk::accessible::Property::Description(accessible_status)]);
@@ -935,10 +931,10 @@ impl ServerCard {
                 self.root.remove_css_class("active-server");
             }
             CardConnectionState::Failed => {
-                self.status.set_label("Failed");
+                self.status.set_label("Error");
                 self.status.add_css_class("status-error");
                 self.status.set_visible(true);
-                // A number taken *before* the attempt reads beside "Failed" as
+                // A number taken *before* the attempt reads beside "Error" as
                 // "the tunnel is fine, 84 ms" — the exact lie — so it stays
                 // hidden. A number taken after it is the opposite: it is how
                 // the user finds out the server came back, so re-checking

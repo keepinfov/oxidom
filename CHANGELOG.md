@@ -52,6 +52,20 @@ surface, packaging, or the CLI belongs here.
 - **One description per failed check.** The CLI, the server card and the window each wrote their
   own words for the same four conditions, so the same failure was described differently depending
   on where it was read. There is now one wording per condition, beside the type that carries it.
+- **One verb for measuring latency.** The same operation was called check, measure, probe, ping
+  and test depending on where you looked: a button said Check, the badge beside it said "not
+  measured", the profile dialog said Probe interval and Settings said Latency test URL. It is
+  check throughout now. Settings also names the methods the way results do — pick "TCP
+  handshake" and the badge reports a TCP handshake, where before you picked "TCP" and were told
+  something with a different name.
+- **One word for a failure.** A server card's badge read Failed while the description a screen
+  reader announced for that same badge said Connection failed, and everywhere else in the
+  interface the word is error. The badge and its description now both say error, so the label
+  and the spoken text agree.
+- **One word for a tunnel that is not up.** The same state was called Ready in the sidebar,
+  Disconnected on a card and in the header, and Stopped in the session list — three names a user
+  could see at once, none of which meant anything different. It is Disconnected everywhere, which
+  is what the daemon has always called it.
 
 - **One word for removing a thing.** The interface said Delete in some places and Remove in
   others, and the two collided: a section headed Remove held a button reading Delete
