@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use oxidom_core::config::{Config, LatencyMethod};
+use oxidom_core::config::{Config, LatencyMethod, OnCoreExit};
 use oxidom_core::core_options::CoreOptions;
 use oxidom_core::ipc::RuntimeInfo;
 // Recognized subscription client identifiers: picking one fills the editable
@@ -24,12 +24,21 @@ use crate::gui::reduce::{self, GeoOffer};
 const SYSTEM_PROXY_SUBTITLE: &str =
     "Send the whole desktop's traffic through oxidom while connected (GNOME)";
 
+/// Says what the *other* setting would do, because "hold" only means something
+/// against the alternative — and the alternative is the one with a consequence
+/// worth spelling out.
+const HOLD_TRAFFIC_SUBTITLE: &str = "Keep the routes when the core dies, so traffic is dropped until it reconnects. Turn this \
+     off and apps fall back to your ordinary connection, with your own address, until it does";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsValues {
     pub socks_port: u16,
     pub http_port: u16,
     pub system_proxy: bool,
     pub reconnect: bool,
+    /// What a session does with its routes when its core exits by itself. The
+    /// machine's answer; a profile may override it.
+    pub hold_traffic: bool,
     pub latency_method: LatencyMethod,
     pub latency_test_url: String,
     pub subscription_user_agent: String,
@@ -52,6 +61,7 @@ impl From<&Config> for SettingsValues {
             http_port: config.http_port,
             system_proxy: config.system_proxy,
             reconnect: config.reconnect,
+            hold_traffic: config.on_core_exit == OnCoreExit::Hold,
             latency_method: config.latency_method,
             latency_test_url: config.latency_test_url.clone(),
             subscription_user_agent: config.subscription_user_agent.clone(),
@@ -130,6 +140,7 @@ struct SettingsWidgets {
     http: adw::SpinRow,
     system_proxy: adw::SwitchRow,
     reconnect: adw::SwitchRow,
+    hold_traffic: adw::SwitchRow,
     method: adw::ComboRow,
     test_url: adw::EntryRow,
     user_agent: adw::EntryRow,
@@ -177,6 +188,7 @@ impl SettingsWidgets {
             http_port: self.http.value() as u16,
             system_proxy: self.system_proxy.is_active(),
             reconnect: self.reconnect.is_active(),
+            hold_traffic: self.hold_traffic.is_active(),
             latency_method: match self.method.selected() {
                 0 => LatencyMethod::Icmp,
                 1 => LatencyMethod::Tcp,
@@ -199,6 +211,7 @@ impl SettingsWidgets {
         self.http.set_value(f64::from(values.http_port));
         self.system_proxy.set_active(values.system_proxy);
         self.reconnect.set_active(values.reconnect);
+        self.hold_traffic.set_active(values.hold_traffic);
         self.method.set_selected(match values.latency_method {
             LatencyMethod::Icmp => 0,
             LatencyMethod::Tcp => 1,
@@ -259,6 +272,11 @@ impl SettingsView {
             .title("Reconnect automatically")
             .subtitle("Reconnect only when Xray exits unexpectedly, never after Disconnect")
             .active(applied.reconnect)
+            .build();
+        let hold_traffic = adw::SwitchRow::builder()
+            .title("Hold traffic if Xray exits")
+            .subtitle(HOLD_TRAFFIC_SUBTITLE)
+            .active(applied.hold_traffic)
             .build();
 
         let methods =
@@ -347,6 +365,7 @@ impl SettingsView {
         proxy_group.add(&ports_error);
         proxy_group.add(&system_proxy);
         proxy_group.add(&reconnect);
+        proxy_group.add(&hold_traffic);
         let xray_group = adw::PreferencesGroup::builder()
             .title("Xray core")
             .description(
@@ -523,6 +542,7 @@ impl SettingsView {
             http,
             system_proxy,
             reconnect,
+            hold_traffic,
             method,
             test_url,
             user_agent,
@@ -1098,6 +1118,10 @@ fn connect_draft_signals(
         let update = update.clone();
         move |_| update()
     });
+    widgets.hold_traffic.connect_active_notify({
+        let update = update.clone();
+        move |_| update()
+    });
     widgets.method.connect_selected_notify({
         let update = update.clone();
         move |_| update()
@@ -1235,6 +1259,7 @@ mod tests {
             http_port: 10809,
             system_proxy: false,
             reconnect: false,
+            hold_traffic: true,
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".into(),
             subscription_user_agent: "oxidom/test".into(),

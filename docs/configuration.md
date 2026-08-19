@@ -67,6 +67,7 @@ socks_port = 10808
 http_port  = 10809
 system_proxy = false
 reconnect = false
+on_core_exit = "hold"
 latency_method = "http_get"
 latency_test_url = "https://www.gstatic.com/generate_204"
 subscription_user_agent = "v2rayN/6.45"
@@ -81,6 +82,7 @@ nft_binary = ""
 | `http_port` | `u16` | `10809` | Local HTTP inbound port. |
 | `system_proxy` | bool | `false` | Whether a connected session takes over the GNOME system proxy. See [routing.md](routing.md#gnome-system-proxy). |
 | `reconnect` | bool | `false` | Redial when the core exits **unexpectedly** — never after you asked for `down`. Opt-in on purpose: a tunnel that silently comes back is a tunnel you cannot turn off. |
+| `on_core_exit` | `"hold"` \| `"release"` | `"hold"` | What happens to a session's routes when its core exits by itself. `hold` keeps them, so traffic for that tunnel is **dropped** until it reconnects or you stop it. `release` removes them immediately, and your apps fall back to the ordinary connection with your own address. A profile's own `on_core_exit` wins. An explicit `down` always releases. |
 | `latency_method` | enum | `"http_get"` | One of `icmp`, `tcp`, `http_head`, `http_get`. |
 | `latency_test_url` | string | `https://www.gstatic.com/generate_204` | Target for the HTTP probe methods. |
 | `subscription_user_agent` | string | `"v2rayN/6.45"` | Sent when fetching subscriptions. Many panels serve a different body — or a different *format*, or a web page — depending on it. See [the format it selects](subscriptions-and-protocols.md#the-user-agent-decides-the-format). |

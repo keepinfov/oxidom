@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use oxidom_core::config::OnCoreExit;
 use oxidom_core::core_options::CoreOptions;
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
@@ -112,6 +113,9 @@ struct DialogValues {
     /// Only the sections this profile overrides; the rest is inherited from
     /// `config.toml` and never written here.
     core: CoreOptions,
+    /// `None` follows the machine's setting, the same "unset means inherit"
+    /// the `[core]` sections use.
+    on_core_exit: Option<OnCoreExit>,
 }
 
 impl DialogValues {
@@ -138,8 +142,39 @@ impl DialogValues {
             interface_routes: interface.routes,
             interface_list: interface.list.join(", "),
             core: entry.map(|entry| entry.core.clone()).unwrap_or_default(),
+            on_core_exit: entry.and_then(|entry| entry.on_core_exit),
         }
     }
+}
+
+/// Which row of the "If Xray exits" list a stored answer is.
+fn core_exit_index(setting: Option<OnCoreExit>) -> u32 {
+    match setting {
+        None => 0,
+        Some(OnCoreExit::Hold) => 1,
+        Some(OnCoreExit::Release) => 2,
+    }
+}
+
+fn core_exit_choice(index: u32) -> Option<OnCoreExit> {
+    match index {
+        1 => Some(OnCoreExit::Hold),
+        2 => Some(OnCoreExit::Release),
+        // Anything else is the first row, and a row this build does not know
+        // is safest read as "whatever the machine says".
+        _ => None,
+    }
+}
+
+/// What inheriting currently means, so nobody has to switch the row off the
+/// first entry to find out — which is how a profile ends up pinning a value
+/// nobody meant to pin.
+fn core_exit_subtitle(machine_holds: bool) -> String {
+    let machine = if machine_holds { "hold" } else { "release" };
+    format!(
+        "A core that exits by itself is not a Disconnect. The machine is set to {machine} \
+         traffic; an explicit Disconnect always releases it."
+    )
 }
 
 fn profile_from_dialog(values: DialogValues) -> Profile {
@@ -162,6 +197,7 @@ fn profile_from_dialog(values: DialogValues) -> Profile {
             list: parse_subnets(&values.interface_list),
         },
         core: values.core,
+        on_core_exit: values.on_core_exit,
     }
 }
 
@@ -173,6 +209,9 @@ pub fn show_profile_dialog(
     // The machine's `[core]`, so every section this profile does not override
     // can show what it inherits instead of standing blank.
     machine_core: &CoreOptions,
+    // What "follow the machine setting" currently resolves to, so the row can
+    // say it instead of making the reader go and look.
+    machine_hold: bool,
     callbacks: ProfileDialogCallbacks,
 ) {
     let (title, edit_name, initial) = match mode {
@@ -399,6 +438,22 @@ pub fn show_profile_dialog(
         .build();
     interface_group.add(&routed_subnets);
 
+    // In the interface group because that is where the routes it decides the
+    // fate of are configured — but it governs the desktop proxy setting too, so
+    // it says "traffic" rather than "routes".
+    let core_exit_labels = gtk::StringList::new(&[
+        "Follow the machine setting",
+        "Hold traffic — drop it until this reconnects",
+        "Release traffic — fall back to the ordinary connection",
+    ]);
+    let core_exit = adw::ComboRow::builder()
+        .title("If Xray exits")
+        .subtitle(core_exit_subtitle(machine_hold))
+        .model(&core_exit_labels)
+        .selected(core_exit_index(initial.on_core_exit))
+        .build();
+    interface_group.add(&core_exit);
+
     let core_editor = CoreEditor::new(CoreLevel::Profile, machine_core, &initial.core);
 
     let groups = gtk::Box::new(gtk::Orientation::Vertical, 24);
@@ -461,6 +516,7 @@ pub fn show_profile_dialog(
     let interface_address = initial.interface_address.clone();
     let collect_profile: Rc<dyn Fn() -> Option<(String, Profile)>> = Rc::new({
         let core_editor = core_editor.clone();
+        let core_exit = core_exit.clone();
         let name_entry = name_entry.clone();
         let edit_name = edit_name.clone();
         let description_entry = description_entry.clone();
@@ -515,6 +571,7 @@ pub fn show_profile_dialog(
                 interface_routes: route_mode(routes.selected()),
                 interface_list: routed_subnets.text().to_string(),
                 core: core_editor.values(),
+                on_core_exit: core_exit_choice(core_exit.selected()),
             };
             Some((name, profile_from_dialog(values)))
         }
@@ -1062,17 +1119,35 @@ mod tests {
                 },
                 ..CoreOptions::default()
             },
+            // The row for this shows three choices, and "follow the machine" is
+            // one of them — so a save has to be able to write back a deliberate
+            // answer *and* a deliberate absence of one.
+            on_core_exit: Some(OnCoreExit::Release),
         };
 
         let saved = profile_from_dialog(DialogValues::new(Some(&entry)));
         assert_eq!(saved.interface, entry.interface);
         assert_eq!(saved.core, entry.core);
+        assert_eq!(saved.on_core_exit, entry.on_core_exit);
         assert_eq!(saved.description, entry.description);
         assert_eq!(saved.select.server, entry.server);
         assert_eq!(saved.select.pool, entry.pool);
         assert_eq!(saved.proxy.socks_port, entry.socks_port);
         assert_eq!(saved.proxy.http_port, entry.http_port);
         saved.validate(&entry.name).unwrap();
+    }
+
+    /// Three rows, and the first is the absence of an answer rather than an
+    /// answer of its own. A row this build does not know reads as that too:
+    /// following the machine is the only safe guess.
+    #[test]
+    fn the_core_exit_row_round_trips_including_the_inherited_choice() {
+        for setting in [None, Some(OnCoreExit::Hold), Some(OnCoreExit::Release)] {
+            assert_eq!(core_exit_choice(core_exit_index(setting)), setting);
+        }
+        assert_eq!(core_exit_choice(9), None);
+        assert!(core_exit_subtitle(true).contains("hold"));
+        assert!(core_exit_subtitle(false).contains("release"));
     }
 
     #[test]

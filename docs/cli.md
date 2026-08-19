@@ -180,6 +180,12 @@ Text output is tab-separated, except `sessions`, which is a padded table with
 columns `PROFILE STATE SERVER ADDRESS [DEVICE] LATENCY`. `DEVICE` appears only
 when at least one session has an interface; missing values render as `—`.
 
+`STATE` reads `holding` for a session whose core exited while it kept its routes:
+its traffic is being dropped rather than sent out unprotected. See
+[when the core dies](routing.md#when-the-core-dies). In `--json` that is the
+`holding_traffic` field, which is what a script checking whether the machine is
+exposed should read — `state` still says `error`, because the core is still gone.
+
 ### `oxidom tun [PROFILE] [--down]`
 
 Inspect or remove a session's persistent TUN device. `PROFILE` defaults to

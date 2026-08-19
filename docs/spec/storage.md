@@ -70,6 +70,8 @@ socks_port = 10808            # local SOCKS inbound
 http_port  = 10809            # local HTTP inbound
 system_proxy = false          # toggle GNOME/env system proxy on connect
 reconnect = false             # reconnect after an unexpected core exit; explicit opt-in
+on_core_exit = "hold"         # hold | release — a core that exits by itself keeps its routes,
+                              # so traffic is dropped rather than released; a profile overrides
 latency_method = "http_get"   # one of: icmp | tcp | http_head | http_get
 latency_test_url = "https://www.gstatic.com/generate_204"
 subscription_user_agent = "v2rayN/6.45"    # panels gate the body *and its format* on this

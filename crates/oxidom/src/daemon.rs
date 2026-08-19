@@ -496,13 +496,12 @@ impl Shared {
             dead.push((profile, target));
         }
         for (profile, _) in &dead {
-            if let Err(error) = engine.stop_interface(profile) {
-                log::warn!(
-                    "could not clean the interface after profile {profile:?}'s core exited: \
-                     {error:#}"
-                );
-            }
-            engine.sessions.release_system_proxy(profile);
+            // Not a teardown. A core exiting is not a person asking for their
+            // ordinary connection back, and removing the routes before the
+            // retry sends every application straight out with the machine's own
+            // address for as long as the reconnect takes. `note_core_exit`
+            // holds by default and releases only where the profile asked for it.
+            engine.note_core_exit(profile);
         }
         dead
     }
@@ -1492,9 +1491,9 @@ impl Shared {
     /// `note_core_deaths` only fires when the Xray *process* exits; a server that
     /// simply stops answering leaves the core alive with its inbound still bound,
     /// so nothing there would ever notice. This walks the same path by hand — kill
-    /// the wedged core, mark it failed, drop the interface — then hands off to the
-    /// ordinary reconnect loop, which retries with backoff until the server is
-    /// back and `start_interface` re-marks the still-running child's cgroup.
+    /// the wedged core, mark it failed, and hold or release its routes according
+    /// to the session's own setting — then hands off to the ordinary reconnect
+    /// loop, which retries with backoff until the server is back.
     fn recover_dead_tunnel(&self, profile: &str) {
         let target = {
             let mut engine = oxidom_core::sync::lock(&self.engine);
@@ -1512,12 +1511,10 @@ impl Shared {
             session.core.disconnect();
             session.core.fail(CORE_EXITED_MESSAGE);
             session.balancer_info = None;
-            if let Err(error) = engine.stop_interface(profile) {
-                log::warn!(
-                    "could not clean the interface while reviving profile {profile:?}: {error:#}"
-                );
-            }
-            engine.sessions.release_system_proxy(profile);
+            // Same reasoning as the core-death sweep: the tunnel stopped
+            // answering, which is a reason to stop passing traffic through it,
+            // not a reason to pass that traffic in the clear instead.
+            engine.note_core_exit(profile);
             target
         };
         if let Some(generation) = self.current_generation(profile) {
@@ -1832,6 +1829,7 @@ fn session_info_with_status(
         socks_port: session.socks_port,
         http_port: session.http_port,
         owns_system_proxy: engine.sessions.owner_of_system_proxy() == Some(profile),
+        holding_traffic: session.holding_traffic,
         interface: session.interface.as_ref().map(|interface| InterfaceInfo {
             device: interface.device.clone(),
             address: interface.address.to_string(),
@@ -2190,6 +2188,7 @@ impl Service {
                 .prepare_session("default", Ipv4Addr::LOCALHOST, socks_port, http_port)
                 .map_err(failed)?;
             engine.configure_core("default", &default_profile.core);
+            engine.configure_hold_traffic("default", default_profile.on_core_exit);
             if let Err(error) = engine.configure_interface(
                 "default",
                 &default_profile.interface,
@@ -2241,6 +2240,7 @@ impl Service {
                     interface: profile.interface,
                     pool: profile.select.pool,
                     core: profile.core,
+                    on_core_exit: profile.on_core_exit,
                 }),
                 Err(error) => log::warn!("skipping profile {name:?}: {error:#}"),
             }
@@ -2436,6 +2436,7 @@ impl Service {
                 .prepare_session(&name, address, socks_port, http_port)
                 .map_err(failed)?;
             engine.configure_core(&name, &profile.core);
+            engine.configure_hold_traffic(&name, profile.on_core_exit);
             if let Err(error) = engine.configure_interface(&name, &profile.interface, &servers) {
                 engine.sessions.remove(&name);
                 return Err(failed(error));
@@ -3579,8 +3580,13 @@ mod tests {
         Ok(())
     }
 
+    /// Renamed and rewritten rather than deleted: it pinned the behaviour this
+    /// change replaces. A dead core used to release the desktop proxy — and the
+    /// TUN routes with it — before anything was retried, which is the leak. The
+    /// sweep still notices every dead session; what it no longer does is let
+    /// their traffic out.
     #[test]
-    fn every_dead_session_is_noticed_and_releases_the_system_proxy() -> Result<()> {
+    fn every_dead_session_is_noticed_and_holds_its_traffic() -> Result<()> {
         let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("all-dead-cores")?;
         let service = for_test();
@@ -3614,13 +3620,171 @@ mod tests {
             ]
         );
         let engine = oxidom_core::sync::lock(&service.shared.engine);
-        assert!(engine.sessions.owner_of_system_proxy().is_none());
+        // The desktop keeps pointing at a port nothing is listening on, which
+        // is the point: an application that honours it fails rather than
+        // quietly reaching the internet with the machine's own address.
+        assert_eq!(engine.sessions.owner_of_system_proxy(), Some("home"));
         assert!(matches!(
             engine.sessions.get("home").map(|session| session.status()),
             Some(Status::Error(message)) if message == CORE_EXITED_MESSAGE
         ));
+        assert!(
+            engine
+                .sessions
+                .get("home")
+                .is_some_and(|session| session.holding_traffic),
+            "a held session says so, or the interface cannot"
+        );
         drop(engine);
         assert!(service.shared.note_core_deaths().is_empty());
+        Ok(())
+    }
+
+    /// The setting is what the old behaviour is now called, and it still works:
+    /// a profile that asked to be released is released, on the same sweep that
+    /// holds the one beside it.
+    #[test]
+    fn a_session_set_to_release_gives_up_the_system_proxy_as_before() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("released-core")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            mark_active(&mut engine, "home", "same")?;
+            *oxidom_core::sync::lock(
+                &engine
+                    .sessions
+                    .get("home")
+                    .context("test session")?
+                    .core
+                    .status,
+            ) = Status::Connected;
+            engine.sessions.claim_system_proxy("home")?;
+            engine.configure_hold_traffic("home", Some(oxidom_core::config::OnCoreExit::Release));
+        }
+
+        assert_eq!(service.shared.note_core_deaths().len(), 1);
+        let engine = oxidom_core::sync::lock(&service.shared.engine);
+        assert!(engine.sessions.owner_of_system_proxy().is_none());
+        assert!(
+            engine
+                .sessions
+                .get("home")
+                .is_some_and(|session| !session.holding_traffic),
+            "nothing is being held, so nothing should claim to be"
+        );
+        Ok(())
+    }
+
+    /// The machine's answer is what a profile that names none gets, and it is
+    /// fixed when the session comes up rather than read when the core dies: a
+    /// profile edited mid-session must not change what happens to the tunnel
+    /// already running.
+    #[test]
+    fn a_profile_that_names_no_answer_takes_the_machines_one_at_up() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("inherited-hold")?;
+        let service = for_test();
+        let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+        mark_active(&mut engine, "home", "same")?;
+
+        engine.registry.config.on_core_exit = oxidom_core::config::OnCoreExit::Release;
+        engine.configure_hold_traffic("home", None);
+        assert!(
+            !engine
+                .sessions
+                .get("home")
+                .context("session")?
+                .holds_traffic
+        );
+
+        engine.registry.config.on_core_exit = oxidom_core::config::OnCoreExit::Hold;
+        engine.configure_hold_traffic("home", None);
+        assert!(
+            engine
+                .sessions
+                .get("home")
+                .context("session")?
+                .holds_traffic
+        );
+
+        // A profile that answered for itself is not overruled by the machine.
+        engine.registry.config.on_core_exit = oxidom_core::config::OnCoreExit::Hold;
+        engine.configure_hold_traffic("home", Some(oxidom_core::config::OnCoreExit::Release));
+        assert!(
+            !engine
+                .sessions
+                .get("home")
+                .context("session")?
+                .holds_traffic
+        );
+        Ok(())
+    }
+
+    /// An explicit down is unchanged, and it is the difference the whole setting
+    /// rests on: a person asking for their ordinary connection back gets it,
+    /// held session or not.
+    #[test]
+    fn an_explicit_down_releases_a_session_that_was_holding_traffic() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("down-after-hold")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            mark_active(&mut engine, "home", "same")?;
+            *oxidom_core::sync::lock(
+                &engine
+                    .sessions
+                    .get("home")
+                    .context("test session")?
+                    .core
+                    .status,
+            ) = Status::Connected;
+            engine.sessions.claim_system_proxy("home")?;
+        }
+        assert_eq!(service.shared.note_core_deaths().len(), 1);
+
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            assert_eq!(engine.sessions.owner_of_system_proxy(), Some("home"));
+            engine.stop_session("home");
+            assert!(engine.sessions.owner_of_system_proxy().is_none());
+            assert!(
+                engine
+                    .sessions
+                    .get("home")
+                    .is_some_and(|session| !session.holding_traffic)
+            );
+        }
+        Ok(())
+    }
+
+    /// Reviving a tunnel whose core is alive but silent takes the same route,
+    /// and used to release the same things.
+    #[test]
+    fn reviving_a_silent_tunnel_holds_its_traffic_too() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("silent-tunnel-hold")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.config.reconnect = false;
+            mark_active(&mut engine, "default", "silent-server")?;
+            let session = engine.default_session_mut().context("default session")?;
+            *oxidom_core::sync::lock(&session.core.status) = Status::Connected;
+            engine.sessions.claim_system_proxy("default")?;
+        }
+
+        service.shared.recover_dead_tunnel("default");
+
+        let engine = oxidom_core::sync::lock(&service.shared.engine);
+        assert_eq!(engine.sessions.owner_of_system_proxy(), Some("default"));
+        assert!(
+            engine
+                .sessions
+                .get("default")
+                .is_some_and(|session| session.holding_traffic)
+        );
         Ok(())
     }
 
@@ -4179,6 +4343,7 @@ mod tests {
             },
             interface: Default::default(),
             core: Default::default(),
+            on_core_exit: None,
         };
 
         service.save_profile("work".to_string(), serde_json::to_string(&profile)?)?;
