@@ -1,0 +1,128 @@
+name: Bug report
+description: Something oxidom does that it should not, or does not do that it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things before you start.
+
+        **Never paste a real subscription URL, share link, UUID, password or
+        server address**, not even partially redacted. They are live
+        credentials, and an issue is public forever. Invent values instead.
+
+        **A security flaw does not belong here.** Report it privately through
+        the process in [SECURITY.md](https://github.com/keepinfov/oxidom/blob/master/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `oxidom --version`.
+      placeholder: oxidom 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How it was installed
+      description: >
+        This decides which binaries you have and which GTK they link against,
+        so it is often the answer rather than a detail.
+      options:
+        - The apt or rpm repository
+        - A .deb or .rpm downloaded from a release
+        - AppImage
+        - AUR
+        - Nix or NixOS
+        - Built from source
+    validations:
+      required: true
+
+  - type: dropdown
+    id: daemon
+    attributes:
+      label: Which daemon
+      description: >
+        The session daemon keeps its database under your XDG data directory,
+        the system one under `/var/lib/oxidom`. They do not share servers or
+        profiles, so a subscription missing from one is expected in the other.
+        `oxidom status` says which one answered.
+      options:
+        - Session daemon
+        - System daemon (systemd service)
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: core
+    attributes:
+      label: Xray core
+      description: >
+        The output of `xray version`, or "none" if none is installed. The core
+        is not part of oxidom, and its version decides what a config may
+        contain.
+      placeholder: Xray 26.3.27
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: Distribution and desktop
+      placeholder: Fedora 42, GNOME 49, Wayland
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw. Screenshots are welcome, with no credentials in them.
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-was-expected
+    attributes:
+      label: What was expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps that produce it
+      description: >
+        Numbered, from a state someone else can reach. Say so if it happens
+        only sometimes, and how often.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: >
+        From the Logs page in the interface, which has Copy and Save buttons.
+        Headless, the daemon logs to the journal: `journalctl -u oxidom.service`
+        for the system daemon, `journalctl --user` for a session one. The log is
+        written to be safe to paste — secrets never reach a log line — but read
+        it before pasting anyway.
+      render: text
+
+  - type: checkboxes
+    id: credentials
+    attributes:
+      label: Before submitting
+      options:
+        - label: >
+            This issue contains no real subscription URL, share link, UUID,
+            password, server address or personal path.
+          required: true

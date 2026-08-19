@@ -1,0 +1,63 @@
+name: Feature request
+description: Something oxidom cannot do that it should be able to.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Open one of these before writing a large feature, so the design can be
+        discussed before the code exists.
+
+        **Never paste a real subscription URL, share link, UUID, password or
+        server address**, not even partially redacted. They are live
+        credentials, and an issue is public forever.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What cannot be done today
+      description: >
+        The situation, not the solution. Where the current behaviour leaves you
+        stuck, and what you do instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it matters
+      description: >
+        Who hits this and how often. A rare annoyance and a daily obstacle earn
+        different amounts of complexity, and this is the only place that
+        distinction can come from.
+    validations:
+      required: true
+
+  - type: textarea
+    id: enough
+    attributes:
+      label: What would be enough
+      description: >
+        The smallest change you would call a fix, stated so that someone else
+        could tell whether it had happened. A narrow answer that ships beats a
+        general one that does not.
+    validations:
+      required: true
+
+  - type: textarea
+    id: elsewhere
+    attributes:
+      label: Where this exists already
+      description: >
+        Another client that does it, or the Xray option that would carry it.
+        Optional, but it turns a discussion about whether into one about how.
+
+  - type: checkboxes
+    id: credentials
+    attributes:
+      label: Before submitting
+      options:
+        - label: >
+            This issue contains no real subscription URL, share link, UUID,
+            password, server address or personal path.
+          required: true
