@@ -1784,6 +1784,103 @@ fn json<T: serde::Serialize>(value: &T) -> fdo::Result<String> {
     serde_json::to_string(value).map_err(failed)
 }
 
+/// Turn a pool query into the target a connection is started against.
+///
+/// Shared by `UpProfile`, where the query came out of a profile file, and by
+/// `ConnectPool`, where it came straight off the Servers page and no file is
+/// involved at all. The warnings below are the reason this is one function: they
+/// are said once, where somebody can act on them, rather than by `pool::resolve`,
+/// which the interface calls on every keystroke — and a second copy of them would
+/// drift.
+///
+/// `label` is what the warnings call this pool: a profile names itself, an ad-hoc
+/// selection has no name to give.
+fn resolve_pool_target(
+    engine: &Engine,
+    readings: &HashMap<String, oxidom_core::ipc::LatencyReading>,
+    label: &str,
+    query: &oxidom_core::pool::PoolQuery,
+    address: Ipv4Addr,
+    socks_port: u16,
+    http_port: u16,
+) -> anyhow::Result<(ConnectionTarget, Vec<oxidom_core::model::Server>)> {
+    let composites = oxidom_core::pool::excluded_composites(query, &engine.registry.subscriptions);
+    if !composites.is_empty() {
+        log::warn!(
+            "{label} pool omitted composite Xray profiles: {}",
+            composites
+                .iter()
+                .map(|server| format!(
+                    "{} ({})",
+                    server.name,
+                    server.alias.as_deref().unwrap_or(&server.id)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // A frozen list is expected to shrink as servers go away, so a
+    // handle nobody holds any more is a note, not a failure. Said
+    // once here, where a user can act on it, rather than by
+    // `resolve`, which the GUI calls on every keystroke.
+    let missing = oxidom_core::pool::missing_members(query, &engine.registry.subscriptions);
+    if !missing.is_empty() {
+        log::warn!(
+            "{label} pool lists {} server(s) no subscription holds any more: {}",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+    // Ranked, not merely resolved: `max` truncates, and the first
+    // member is the exit the balancer uses until the observatory
+    // reports. Subscription order gave both jobs to whichever
+    // entry the provider happened to list first.
+    let resolved =
+        oxidom_core::pool::resolve_ranked(query, &engine.registry.subscriptions, |server| {
+            known_state(readings, &server.id)
+        })?;
+    if resolved.len() > MAX_POOL_MEMBERS {
+        return Err(anyhow::anyhow!(
+            "{label} pool resolves to {} nodes; set [select.pool] max to \
+                     {MAX_POOL_MEMBERS} or less",
+            resolved.len()
+        ));
+    }
+    // A pool spreads traffic over exit addresses, not over
+    // subscription entries. Providers list the same host many times
+    // — 26 of 42 German entries shared one `address:port` on the
+    // store this was found on — and a pool that says "42 nodes"
+    // while owning 9 addresses overstates itself nearly fivefold.
+    // Reported here, once, rather than by `resolve`, which the GUI
+    // calls on every keystroke.
+    let hosts = oxidom_core::pool::distinct_endpoints(&resolved);
+    if hosts < resolved.len() {
+        log::warn!(
+            "{label} pool has {} member(s) on only {hosts} exit address(es); \
+                     traffic can spread no wider than that",
+            resolved.len()
+        );
+    }
+    let servers = resolved.into_iter().cloned().collect::<Vec<_>>();
+    let members = servers
+        .iter()
+        .map(|server| server.id.clone())
+        .collect::<Vec<_>>();
+    let api_port = oxidom_core::engine::free_port(address, &[socks_port, http_port])?;
+    let expected = query.expected_or_all(members.len());
+    Ok((
+        ConnectionTarget::Pool {
+            members,
+            name: query.name.clone(),
+            strategy: query.strategy.as_xray().to_string(),
+            expected,
+            probe_interval: query.probe_interval_or_default().to_string(),
+            api_port,
+        },
+        servers,
+    ))
+}
+
 fn session_info(
     engine: &Engine,
     profile: &str,
@@ -2220,6 +2317,88 @@ impl Service {
         result.map(|_| ()).map_err(failed)
     }
 
+    /// Run a selection now, without writing it anywhere.
+    ///
+    /// The pool counterpart of [`Service::connect`], and it works the same way:
+    /// the session is `default`, `default.toml` is read only to learn whether an
+    /// interface was asked for, and **no profile file is written or modified**.
+    /// "Connect me to one of these" is the commonest thing the Servers page is
+    /// asked, and until now it cost a profile write plus a dialog about a
+    /// concept the request never mentioned — and refused outright when no
+    /// profile was selected.
+    ///
+    /// Saving a selection is still a separate, deliberate act, and repointing a
+    /// saved profile still goes through `SaveProfile` and still asks first.
+    fn connect_pool(&self, query_json: String) -> fdo::Result<String> {
+        let query: oxidom_core::pool::PoolQuery =
+            serde_json::from_str(&query_json).map_err(failed)?;
+        let default_profile = profile::load_or_default("default").map_err(failed)?;
+        default_profile.validate("default").map_err(failed)?;
+
+        // Taken before the engine lock, and in this order everywhere: the two
+        // are wanted together only here and in `up_profile`, and taking them the
+        // other way round is how a deadlock gets written.
+        let readings = oxidom_core::sync::lock(&self.shared.readings).clone();
+
+        let target = {
+            let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            let socks_port = engine.registry.config.socks_port;
+            let http_port = engine.registry.config.http_port;
+            if engine.registry.config.system_proxy
+                && let Some(owner) = engine.sessions.owner_of_system_proxy()
+                && owner != "default"
+            {
+                return Err(failed(format!(
+                    "the system proxy is already held by profile {owner:?}"
+                )));
+            }
+            let existed = engine.sessions.get("default").is_some();
+            let (target, servers) = resolve_pool_target(
+                &engine,
+                &readings,
+                "the selected group",
+                &query,
+                Ipv4Addr::LOCALHOST,
+                socks_port,
+                http_port,
+            )
+            .map_err(failed)?;
+            engine
+                .prepare_session("default", Ipv4Addr::LOCALHOST, socks_port, http_port)
+                .map_err(failed)?;
+            engine.configure_core("default", &default_profile.core);
+            if let Err(error) =
+                engine.configure_interface("default", &default_profile.interface, &servers)
+            {
+                if !existed {
+                    engine.sessions.remove("default");
+                }
+                return Err(failed(error));
+            }
+            if engine.registry.config.system_proxy {
+                engine
+                    .sessions
+                    .claim_system_proxy("default")
+                    .map_err(failed)?;
+            }
+            target
+        };
+
+        self.shared.clear_override("default");
+        let generation = self.shared.next_connect_generation("default");
+        let result = self.shared.start_connection_target(
+            "default",
+            &target,
+            generation,
+            ConnectionOrigin::Explicit,
+        );
+        // A death noticed just before this explicit operation may have queued
+        // its reconnect override. The user's action owns the visible state.
+        self.shared.clear_override("default");
+        result.map_err(failed)?;
+        Ok("default".to_string())
+    }
+
     fn disconnect(&self) -> fdo::Result<()> {
         self.stop_profile("default")?;
         Ok(())
@@ -2314,87 +2493,17 @@ impl Service {
                 .ok_or_else(|| failed("no free profile loopback addresses remain"))?;
 
             let (target, servers, up_server) = if let Some(query) = &profile.select.pool {
-                let composites =
-                    oxidom_core::pool::excluded_composites(query, &engine.registry.subscriptions);
-                if !composites.is_empty() {
-                    log::warn!(
-                        "profile {name:?} pool omitted composite Xray profiles: {}",
-                        composites
-                            .iter()
-                            .map(|server| format!(
-                                "{} ({})",
-                                server.name,
-                                server.alias.as_deref().unwrap_or(&server.id)
-                            ))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
-                // A frozen list is expected to shrink as servers go away, so a
-                // handle nobody holds any more is a note, not a failure. Said
-                // once here, where a user can act on it, rather than by
-                // `resolve`, which the GUI calls on every keystroke.
-                let missing =
-                    oxidom_core::pool::missing_members(query, &engine.registry.subscriptions);
-                if !missing.is_empty() {
-                    log::warn!(
-                        "profile {name:?} pool lists {} server(s) no subscription holds any more: {}",
-                        missing.len(),
-                        missing.join(", ")
-                    );
-                }
-                // Ranked, not merely resolved: `max` truncates, and the first
-                // member is the exit the balancer uses until the observatory
-                // reports. Subscription order gave both jobs to whichever
-                // entry the provider happened to list first.
-                let resolved = oxidom_core::pool::resolve_ranked(
+                let (target, servers) = resolve_pool_target(
+                    &engine,
+                    &readings,
+                    &format!("profile {name:?}"),
                     query,
-                    &engine.registry.subscriptions,
-                    |server| known_state(&readings, &server.id),
+                    address,
+                    socks_port,
+                    http_port,
                 )
                 .map_err(failed)?;
-                if resolved.len() > MAX_POOL_MEMBERS {
-                    return Err(failed(format!(
-                        "profile {name:?} pool resolves to {} nodes; set [select.pool] max to \
-                         {MAX_POOL_MEMBERS} or less",
-                        resolved.len()
-                    )));
-                }
-                // A pool spreads traffic over exit addresses, not over
-                // subscription entries. Providers list the same host many times
-                // — 26 of 42 German entries shared one `address:port` on the
-                // store this was found on — and a pool that says "42 nodes"
-                // while owning 9 addresses overstates itself nearly fivefold.
-                // Reported here, once, rather than by `resolve`, which the GUI
-                // calls on every keystroke.
-                let hosts = oxidom_core::pool::distinct_endpoints(&resolved);
-                if hosts < resolved.len() {
-                    log::warn!(
-                        "profile {name:?} pool has {} member(s) on only {hosts} exit address(es); \
-                         traffic can spread no wider than that",
-                        resolved.len()
-                    );
-                }
-                let servers = resolved.into_iter().cloned().collect::<Vec<_>>();
-                let members = servers
-                    .iter()
-                    .map(|server| server.id.clone())
-                    .collect::<Vec<_>>();
-                let api_port = oxidom_core::engine::free_port(address, &[socks_port, http_port])
-                    .map_err(failed)?;
-                let expected = query.expected_or_all(members.len());
-                (
-                    ConnectionTarget::Pool {
-                        members,
-                        name: query.name.clone(),
-                        strategy: query.strategy.as_xray().to_string(),
-                        expected,
-                        probe_interval: query.probe_interval_or_default().to_string(),
-                        api_port,
-                    },
-                    servers,
-                    UpServer::default(),
-                )
+                (target, servers, UpServer::default())
             } else {
                 let server = match handle::resolve(engine.all_servers(), &profile.select.server) {
                     HandleMatch::One(server) => server.clone(),
@@ -3621,6 +3730,40 @@ mod tests {
         ));
         drop(engine);
         assert!(service.shared.note_core_deaths().is_empty());
+        Ok(())
+    }
+
+    /// The whole point of the verb: it runs a selection and leaves the profiles
+    /// directory exactly as it found it. Connecting used to write the selection
+    /// into a profile first, and refuse when there was none to write to.
+    #[test]
+    fn connecting_a_selection_writes_no_profile() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("ad-hoc-pool")?;
+        let service = for_test();
+        let before = oxidom_core::profile::list()?;
+
+        // No servers are stored, so the connect cannot get as far as spawning a
+        // core — which is the point: even the failing path must not write.
+        let query = oxidom_core::pool::PoolQuery {
+            name: "Europe".to_string(),
+            countries: vec!["de".to_string()],
+            ..oxidom_core::pool::PoolQuery::default()
+        };
+        let error = service
+            .connect_pool(serde_json::to_string(&query)?)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains("no profile"),
+            "a missing profile is no longer a reason to refuse: {error}"
+        );
+
+        assert_eq!(
+            oxidom_core::profile::list()?,
+            before,
+            "connecting a selection creates no profile"
+        );
         Ok(())
     }
 

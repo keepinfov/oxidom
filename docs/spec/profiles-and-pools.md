@@ -180,6 +180,12 @@ address, ports, optional interface and status. “Connect one server” means th
 not a separate global mode. Several profiles may run at once, including several profiles on the
 same server.
 
+A session does not require a profile file. `Connect` runs one server under `default` and reads
+`default.toml` only to learn whether an interface was asked for; `ConnectPool` does the same for a
+selection, taking the query the interface resolved and writing **nothing** — the profiles directory
+is untouched, and connecting a group therefore neither needs a profile nor modifies one. Saving a
+selection is a separate act (`SaveProfile`), and repointing a saved profile still rewrites its file.
+
 A session's selection is a single server **or** a pool, and a pool session has no active server:
 `Session::server_id()` returns `None` for it, deliberately, so nothing can quietly pick the first
 member and call it the exit. Everything that means “the tunnel is carrying server X” — the

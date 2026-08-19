@@ -1618,121 +1618,59 @@ pub(super) fn connect_choices() -> Vec<ConnectChoice> {
     ]
 }
 
-/// What pressing Connect on a group's bar means for the selected profile.
+/// What pressing Connect on a group's bar does.
+///
+/// Two answers, and neither writes a file. "Connect me to one of these" is the
+/// commonest thing the Servers page is asked, and it used to cost a write into
+/// the selected profile plus a dialog about a concept the request never
+/// mentioned — and with no profile selected it refused outright and sent the
+/// user to another page before anything could connect at all.
+///
+/// Repointing a saved profile still exists, still rewrites a file, and still
+/// asks first: that is what connecting a *profile* means. This is not that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PoolAction {
-    /// The profile already carries exactly this pool and is running it.
-    DownProfile(String),
-    /// It carries exactly this pool but nothing is up.
-    UpProfile(String),
-    /// It carries exactly this pool, but over a different number of nodes.
-    ///
-    /// Separate from [`Self::RepointAndUp`] because nothing is being replaced:
-    /// the same servers stay selected and only the rotation width changes.
-    /// Asking "replace your pool?" for that would describe an act the user did
-    /// not request, and folding it into `UpProfile` would drop the new width on
-    /// the floor — the profile would come up on the width it already had.
-    RetuneAndUp {
-        profile: String,
-        /// Nodes the rotation will use, `0` meaning every live one. Named in
-        /// the toast so a silent rewrite still says what it did.
-        expected: usize,
-    },
-    /// It selects something else. Like [`CardAction::RepointAndUp`] this
-    /// rewrites `profiles/<name>.toml`, so the widget layer has to ask first.
-    RepointAndUp {
-        profile: String,
-        /// The server the profile points at today, if it points at one. Named
-        /// in the confirmation so nobody replaces a working selection without
-        /// being told what it was.
-        replaces_server: Option<String>,
-        replaces_pool: bool,
-    },
-    /// The selected profile has no file to write. `default` is normally seeded
-    /// on the daemon's first start, so this is the deleted-everything case.
-    NoProfile(String),
+    /// Run the visible selection now. No profile is read, written or confirmed.
+    ConnectSelection,
+    /// A session is already running exactly this selection, so the button that
+    /// started it stops it. Carries that session's profile name.
+    Stop(String),
 }
 
-/// Whether two pools **select** the same thing under the same strategy.
+/// Decide what connecting a group does. Nothing here writes anything.
 ///
-/// `max` and `probe_interval` are excluded on purpose: only the profile editor
-/// has a widget for either, and a comparison that counted them would report
-/// "different pool" for a profile the user merely tuned — then offer to
-/// overwrite the tuning as the fix. `expected` is excluded here too, but for
-/// the opposite reason: the Connect bar *does* set it, so a change to it is a
-/// retune of this pool rather than a different one. See [`same_rotation`].
-fn same_pool(saved: &PoolQuery, wanted: &PoolQuery) -> bool {
-    saved.name == wanted.name
-        && saved.strategy == wanted.strategy
-        && saved.members == wanted.members
-        && saved.subscriptions == wanted.subscriptions
-        && saved.countries == wanted.countries
-        && saved.protocols == wanted.protocols
-        && saved.exclude == wanted.exclude
-}
-
-/// Whether both pools rotate over the same number of nodes.
-///
-/// Split from [`same_pool`] so "the same servers, six at a time instead of all
-/// of them" is neither mistaken for a no-op nor dressed up as replacing a pool.
-fn same_rotation(saved: &PoolQuery, wanted: &PoolQuery) -> bool {
-    saved.expected == wanted.expected
-}
-
-/// The pool to write when a group is connected: what the bar chose, over the
-/// runtime knobs the profile already carried.
-pub(super) fn pool_for_profile(entry: Option<&ProfileEntry>, wanted: PoolQuery) -> PoolQuery {
-    let Some(saved) = entry.and_then(|entry| entry.pool.as_ref()) else {
-        return wanted;
-    };
-    // `expected` comes from `wanted` — the bar has a control for it, so keeping
-    // the profile's old value would make that control do nothing. `max` and
-    // `probe_interval` still travel through untouched: nothing outside the
-    // profile editor can express them, and a write that reset them would undo
-    // tuning the user did not revisit.
-    PoolQuery {
-        max: saved.max,
-        probe_interval: saved.probe_interval.clone(),
-        ..wanted
+/// `members` is the selection as the page resolved it — the server ids the query
+/// matches right now. Comparing those rather than the query is what makes the
+/// button honest: a saved group and the same servers arrived at by hand are the
+/// same session, and a session started from one is stopped by the other.
+pub(super) fn pool_action(state: &SnapshotState, members: &[String]) -> PoolAction {
+    let running = state.sessions.iter().find(|session| {
+        session.selection.kind == "pool" && same_members(&session.selection, members)
+    });
+    match running {
+        Some(session) => PoolAction::Stop(session.profile.clone()),
+        None => PoolAction::ConnectSelection,
     }
 }
 
-/// Decide what connecting a group does, before any file is written.
+/// Whether a running pool holds exactly these servers.
 ///
-/// The profile acted on is the selected one — the same rule a card click
-/// follows. A group is not a second kind of connection; it is what the profile
-/// selects, so connecting one has to land in the same place a server does.
-pub(super) fn pool_action(
-    profiles: &[ProfileEntry],
-    state: &SnapshotState,
-    query: &PoolQuery,
-) -> PoolAction {
-    let selected = state.selected_profile.clone();
-    let Some(entry) = profiles.iter().find(|entry| entry.name == selected) else {
-        return PoolAction::NoProfile(selected);
-    };
-    // Compared against the profile as stored, not against the members a live
-    // session resolved: a session that went `stale` because a subscription
-    // refreshed still belongs to this group, and calling that "a different
-    // pool" would ask the user to confirm replacing a pool with itself.
-    if let Some(pool) = entry.pool.as_ref().filter(|pool| same_pool(pool, query)) {
-        if !same_rotation(pool, query) {
-            return PoolAction::RetuneAndUp {
-                profile: selected,
-                expected: query.expected,
-            };
-        }
-        return if session_for(state, &selected).is_some() {
-            PoolAction::DownProfile(selected)
-        } else {
-            PoolAction::UpProfile(selected)
-        };
+/// Order-insensitive: a pool's member order is the ranking it was started with,
+/// which moves with the latency readings, and a comparison that counted it would
+/// report "a different selection" every time a check ran.
+fn same_members(selection: &SelectionInfo, members: &[String]) -> bool {
+    if selection.members.len() != members.len() {
+        return false;
     }
-    PoolAction::RepointAndUp {
-        profile: selected,
-        replaces_server: (!entry.server.is_empty()).then(|| entry.server.clone()),
-        replaces_pool: entry.pool.is_some(),
-    }
+    let mut running = selection
+        .members
+        .iter()
+        .map(|member| member.server_id.as_str())
+        .collect::<Vec<_>>();
+    let mut wanted = members.iter().map(String::as_str).collect::<Vec<_>>();
+    running.sort_unstable();
+    wanted.sort_unstable();
+    running == wanted
 }
 
 /// The banner over every page but Profiles.
@@ -2539,111 +2477,69 @@ mod tests {
         assert_eq!(ids(&ordered_subscriptions(&groups, &[])), ids(&groups));
     }
 
+    /// The complaint this answers: connecting a group cost a profile write and a
+    /// dialog about profiles, and with none selected it refused and pointed at
+    /// another page. None of that is a thing the request mentioned.
     #[test]
-    fn connecting_a_group_acts_on_the_selected_profile_and_says_what_it_replaces() {
-        let europe = PoolQuery {
-            name: "Europe".to_string(),
-            countries: vec!["de".to_string()],
-            ..PoolQuery::default()
-        };
+    fn connecting_a_group_runs_the_selection_and_writes_no_profile() {
+        let members = vec!["berlin".to_string(), "munich".to_string()];
         let mut state = state();
+
+        // No profile is selected, none exists, and it connects anyway.
+        state.selected_profile = String::new();
+        assert_eq!(pool_action(&state, &members), PoolAction::ConnectSelection);
+
+        // A profile pointing somewhere else is not consulted and not rewritten.
         state.selected_profile = "work".to_string();
-
-        // Nothing to write to: every profile file is gone.
-        assert_eq!(
-            pool_action(&[], &state, &europe),
-            PoolAction::NoProfile("work".to_string())
-        );
-
-        // Points at a server, so connecting the group repoints it — and the
-        // server it is losing is named rather than merely implied.
-        let profiles = vec![profile("work", "berlin"), profile("default", "")];
-        assert_eq!(
-            pool_action(&profiles, &state, &europe),
-            PoolAction::RepointAndUp {
-                profile: "work".to_string(),
-                replaces_server: Some("berlin".to_string()),
-                replaces_pool: false,
-            }
-        );
-
-        // Already carries this exact pool: nothing to rewrite, only to start.
-        let mut carrying = profiles.clone();
-        carrying[0].server = String::new();
-        carrying[0].pool = Some(europe.clone());
-        assert_eq!(
-            pool_action(&carrying, &state, &europe),
-            PoolAction::UpProfile("work".to_string())
-        );
-
-        // …and once it is up, the same button takes it down.
         state.sessions = vec![session("work", "connected", "berlin")];
         assert_eq!(
-            pool_action(&carrying, &state, &europe),
-            PoolAction::DownProfile("work".to_string())
+            pool_action(&state, &members),
+            PoolAction::ConnectSelection,
+            "a single-server session is not this selection running"
+        );
+    }
+
+    /// Started from the bar, stopped from the bar — whichever session is
+    /// carrying it, and whatever profile happens to be selected now.
+    #[test]
+    fn a_running_selection_is_stopped_by_the_button_that_started_it() {
+        let members = vec!["berlin".to_string(), "munich".to_string()];
+        let mut state = state();
+        state.selected_profile = "home".to_string();
+
+        let mut running = session("default", "connected", "berlin");
+        running.selection = SelectionInfo {
+            kind: "pool".to_string(),
+            members: vec![
+                PoolMember {
+                    server_id: "munich".to_string(),
+                    ..PoolMember::default()
+                },
+                PoolMember {
+                    server_id: "berlin".to_string(),
+                    ..PoolMember::default()
+                },
+            ],
+            ..SelectionInfo::default()
+        };
+        state.sessions = vec![running];
+
+        // Order is the ranking the pool started with, and it moves with every
+        // latency check. Counting it would make the button flip to Connect for
+        // a session that is plainly running.
+        assert_eq!(
+            pool_action(&state, &members),
+            PoolAction::Stop("default".to_string())
         );
 
-        // A different strategy over the same servers is a different pool: the
-        // file has to change, so the user has to be asked.
-        let faster = PoolQuery {
-            strategy: Strategy::LeastPing,
-            ..europe.clone()
-        };
-        assert_eq!(
-            pool_action(&carrying, &state, &faster),
-            PoolAction::RepointAndUp {
-                profile: "work".to_string(),
-                replaces_server: None,
-                replaces_pool: true,
-            }
-        );
-
-        // Tuning the profile is not repointing it. `max` and `probe_interval`
-        // have no widget outside the profile editor, so a comparison that
-        // counted them would call a tuned profile "a different pool" and offer
-        // to erase the tuning as the fix.
-        let tuned = PoolQuery {
-            max: 8,
-            expected: 4,
-            probe_interval: "30s".to_string(),
-            ..europe.clone()
-        };
-        carrying[0].pool = Some(tuned.clone());
-        state.sessions.clear();
-        let at_four = PoolQuery {
-            expected: 4,
-            ..europe.clone()
-        };
-        assert_eq!(
-            pool_action(&carrying, &state, &at_four),
-            PoolAction::UpProfile("work".to_string())
-        );
-        // The knobs the bar cannot express ride through untouched.
-        assert_eq!(pool_for_profile(carrying.first(), at_four.clone()), tuned);
-
-        // `expected` is different: the bar does have a control for it, so a new
-        // width is this pool retuned, not a different pool. Neither a no-op
-        // (which would drop the width the user just chose) nor a replacement
-        // (which would ask them to confirm swapping a pool for itself).
-        let at_six = PoolQuery {
-            expected: 6,
-            ..europe.clone()
-        };
-        assert_eq!(
-            pool_action(&carrying, &state, &at_six),
-            PoolAction::RetuneAndUp {
-                profile: "work".to_string(),
-                expected: 6,
-            }
-        );
-        assert_eq!(
-            pool_for_profile(carrying.first(), at_six).expected,
-            6,
-            "the width the bar chose is what gets written"
-        );
-
-        // With nothing saved to carry, what the bar chose is what gets written.
-        assert_eq!(pool_for_profile(None, at_four.clone()), at_four);
+        // One server more is a different selection, so it connects rather than
+        // stopping something the user did not ask about.
+        let wider = vec![
+            "berlin".to_string(),
+            "munich".to_string(),
+            "hamburg".to_string(),
+        ];
+        assert_eq!(pool_action(&state, &wider), PoolAction::ConnectSelection);
     }
 
     #[test]

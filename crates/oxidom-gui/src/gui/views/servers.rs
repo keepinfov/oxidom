@@ -58,10 +58,12 @@ pub struct CardCallbacks {
     pub refresh: Rc<dyn Fn(String)>,
     pub set_alias: Rc<dyn Fn(String, String)>,
     pub create_pool: Rc<dyn Fn(PoolQuery)>,
-    /// Connect the selected profile to the group on screen. Unlike
-    /// `create_pool` this makes no new profile: a group is what a profile
-    /// selects, so connecting one lands where connecting a server lands.
-    pub connect_pool: Rc<dyn Fn(PoolQuery)>,
+    /// Run the group on screen, now. Writes no profile and confirms nothing —
+    /// `create_pool` is where a selection is saved, and it is a separate,
+    /// deliberate act. The second argument is the selection already resolved to
+    /// server ids, which is how the window recognises a session that is already
+    /// running it.
+    pub connect_pool: Rc<dyn Fn(PoolQuery, Vec<String>)>,
 }
 
 /// One subscription block. Cards live in independent vertical column boxes
@@ -94,6 +96,8 @@ struct SubscriptionBlock {
 type BrowseCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 /// Set on every rebuild, read long afterwards by the filter popover.
 type PoolCallback = Rc<RefCell<Option<Rc<dyn Fn(PoolQuery)>>>>;
+/// Like [`PoolCallback`], plus the ids the query resolved to.
+type ResolvedPoolCallback = Rc<RefCell<Option<Rc<dyn Fn(PoolQuery, Vec<String>)>>>>;
 /// Server id to its checkbox, in the order the picker laid them out.
 type PickerChecks = Rc<RefCell<Vec<(String, gtk::CheckButton)>>>;
 /// The handles a picker's checkboxes write into. Shared with whoever will save
@@ -265,7 +269,7 @@ pub struct ServersView {
     /// Set on every rebuild; the popover's "Create pool" needs it long after
     /// the callbacks that carried it went out of scope.
     on_create_pool: PoolCallback,
-    on_connect_pool: PoolCallback,
+    on_connect_pool: ResolvedPoolCallback,
     /// The row of saved scopes, above the subscription blocks.
     chip_bar: gtk::Box,
     chip_scroll: gtk::ScrolledWindow,
@@ -1072,7 +1076,7 @@ impl ServersView {
         let create_pool = item(
             "New profile from this…",
             "Create a connection profile whose servers are the visible selection. Connect \
-             only re-points the profile already chosen; this makes a new one.",
+             runs the selection without saving anything; this is how it is kept.",
         );
         create_pool.connect_clicked({
             let view = self.clone();
@@ -1320,8 +1324,11 @@ impl ServersView {
         let Some(query) = self.connect_query() else {
             return;
         };
+        // Resolved here, where the subscriptions already are, and for the same
+        // reason the bar's count is: what Connect runs is what the page shows.
+        let members = filtered_ids(&query, &self.subscriptions.borrow());
         if let Some(callback) = self.on_connect_pool.borrow().as_ref() {
-            callback(query);
+            callback(query, members);
         }
     }
 

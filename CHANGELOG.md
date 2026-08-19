@@ -49,6 +49,24 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- **Connecting a group needs no profile, and rewrites none.** Connect on the Servers page
+  wrote the visible selection into whichever profile happened to be selected, asked the user
+  to confirm replacing what that profile held, and — with no profile selected — refused
+  outright and told them to go and make one on another page. "Connect me to one of these" is
+  the commonest thing the page is asked, and none of that was part of the request.
+
+  It now runs the selection immediately: nothing is written, nothing is confirmed, and no
+  profile has to exist. The session is the daemon's `default`, the same one connecting a
+  single server uses, over a new `ConnectPool` method; an older daemon says so plainly
+  instead of failing with a bus error. Pressing Connect again stops the session running that
+  selection — matched on the servers rather than on the name, so a saved group and the same
+  servers picked by hand are one run, and the ranking moving between latency checks does not
+  make the button forget what is up.
+
+  Saving stays available and stays deliberate: **Save as group** keeps the selection as a
+  chip, and **New profile from this…** makes a profile out of it. Connecting a *profile*,
+  from the Profiles page, still repoints it and still asks first.
+
 - **One system of quotation marks, and one case for a label.** Profile names were quoted with
   guillemets while groups, subscriptions and servers used curly quotes, so a single confirmation
   could ask `Connect «work» to “Europe”?` — two conventions in one sentence. Everything is quoted

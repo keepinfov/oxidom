@@ -30,8 +30,13 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   shows the same server two or three times and leaves no way to tell which card is real, and
   "show it only in its highest-priority group" makes a starred server vanish from its
   subscription. Cards stay in their subscription; the chip narrows what is shown. Selecting a
-  chip reveals a Connect bar that points the **selected profile** at that group — the same rule a
-  card click follows. Favourites is a built-in list; the card's star is what fills it, and it
+  chip reveals a Connect bar that **runs the visible selection immediately**: no profile is read,
+  written or confirmed, and the session is the daemon's `default` — the same one a bare `Connect`
+  on a single server uses, over `ConnectPool`, its pool counterpart. Pressing it again stops the
+  session running that selection, matched on the server ids rather than on the query, so a saved
+  group and the same servers arrived at by hand are one session. Saving stays explicit and stays
+  separate: **New profile from this…**. Repointing a saved profile still rewrites a file and still
+  asks first, which is what connecting a *profile* means. Favourites is a built-in list; the card's star is what fills it, and it
   cannot be deleted because the star would have nowhere to put things.
 - **Server grid:** a top block of "loose"/favorite servers, then one **block per subscription**:
   each block shows its **title** + **description** (name + quota/expiry from userinfo) followed by
