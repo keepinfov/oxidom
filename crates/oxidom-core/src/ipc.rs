@@ -185,10 +185,14 @@ pub enum ProbeRoute {
     Proxied,
 }
 
-/// Why a probe produced no number. Carried whole so the GUI can eventually
-/// distinguish "this server is down" from "this machine is offline"; phase 1
-/// only ever reports [`ProbeFailure::Unreachable`] and [`ProbeFailure::Unknown`],
-/// because `probe::measure` still collapses every failure into `None`.
+/// Why a probe produced no number. Carried whole so a client can distinguish
+/// "this server is down" from "this machine is offline": `probe::measure`
+/// returns a `ProbeOutcome`, and `daemon::wire_failure` maps every one of these
+/// four from it.
+///
+/// Unlike [`ProbeDetail`] this enum has no `#[serde(other)]`, so a fifth variant
+/// would stop an older client parsing the whole snapshot. A new reason goes on
+/// [`ProbeDetail`] beside [`ProbeFailure::Unknown`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeFailure {

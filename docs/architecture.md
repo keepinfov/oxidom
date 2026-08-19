@@ -85,8 +85,11 @@ window.
 ## Running the core
 
 Each session writes its own `current-config-<profile>.json` (mode `0600` — it holds
-credentials) and runs `xray run -c <that file>`. Output goes into a 500-line ring
-buffer, which is what the GUI's Logs page shows; nothing is written to a log file.
+credentials) and runs `xray run -c <that file>`. Output goes into a 5000-record ring
+buffer, which is what the GUI's Logs page shows. The core gets no log file of its own:
+the daemon's stderr already reaches the journal, and the GUI, which detaches and has no
+journal, keeps its own `oxidom-gui.log` — both described in
+[`spec/storage.md`](spec/storage.md).
 
 Before spawning, oxidom **resolves the binary first and then checks the ports** —
 in that order, so a busy port can never mask a missing core. Stopping is SIGTERM,
