@@ -195,6 +195,11 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- **A release lists the commits it contains.** The notes carry the changelog section for the
+  version, which says what changed for someone using oxidom, and now also the commit subjects
+  since the previous tag — generated, not written. The two are deliberately different lists: a
+  release of refactors and CI work has little to say in the first and plenty in the second.
+
 - `flake.nix` reads the version out of `Cargo.toml` instead of repeating it.
   The manifest is now the only place it is written, and `packaging/version.sh`
   checks that every other file naming a version agrees — which CI runs on every

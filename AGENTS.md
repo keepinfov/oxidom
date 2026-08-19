@@ -294,6 +294,10 @@ package before:
    signature.
 8. Merge, then create a signed annotated tag `vX.Y.Z` on the merge commit.
 
+The notes are the changelog section for the version plus the commit subjects since the
+previous tag, which the workflow generates. A subject that reads badly is therefore published
+on the release page, not only visible to someone running `git log`.
+
 Pushing the tag publishes the release. Confirm the remote and the tag before
 pushing it.
 

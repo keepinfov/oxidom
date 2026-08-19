@@ -97,7 +97,11 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # Full history and tags: the notes list the commits since the previous tag,
+      # and a shallow clone knows neither the tag nor the commits.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -126,6 +130,7 @@ jobs:
         env:
           VERSION: ${{ needs.verify.outputs.version }}
           REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -eu
           version=$VERSION
@@ -178,6 +183,33 @@ jobs:
 
             printf '\n## Verifying a download\n\n'
             printf '    gh attestation verify <file> --repo %s\n' "$REPO"
+          } >> notes.md
+
+          # The commits, generated. The changelog above says what changed for a
+          # user, which is deliberately not the same list: a release of refactors
+          # and CI work reads as an empty one without this.
+          #
+          # No previous tag means the first release, so the range is every commit
+          # reachable from this one. Nothing is truncated -- a list that quietly
+          # stopped would read as a shorter release than it was.
+          # A dispatch rehearsal names a tag that may not exist yet, so fall back
+          # to what is checked out rather than failing the whole notes step.
+          if git rev-parse --verify --quiet "$TAG^{commit}" >/dev/null; then
+            head=$TAG
+          else
+            head=HEAD
+            echo "note: $TAG is not a commit here; listing commits up to HEAD"
+          fi
+          prev=$(git describe --tags --abbrev=0 "$head^" 2>/dev/null || true)
+          {
+            printf '\n## Commits\n\n'
+            if [ -n "$prev" ]; then
+              printf 'Since %s.\n\n' "$prev"
+            fi
+            # The release commit is dropped: it announces the version and says
+            # nothing about the software.
+            git log --no-merges --format='- %s' "${prev:+$prev..}$head" \
+              | grep -v '^- chore(release)'
           } >> notes.md
           cat notes.md
 
