@@ -427,6 +427,45 @@ impl DaemonClient {
             .map_err(friendly)
     }
 
+    /// Call off queued checks for these servers, and report how many were
+    /// dropped. Not an error when nothing is queued for them.
+    ///
+    /// A check already measuring is not interrupted — at most eight are, and
+    /// they end within about ten seconds. What this drops is the queue behind
+    /// them. Each cancelled server leaves a reading marked
+    /// [`ProbeDetail::Cancelled`], so a client retires its spinner the same way
+    /// it does for a measured one.
+    ///
+    /// A daemon older than this method answers `UnknownMethod`; callers must
+    /// degrade rather than treat it as fatal.
+    ///
+    /// [`ProbeDetail::Cancelled`]: crate::ipc::ProbeDetail::Cancelled
+    pub fn cancel_probes(&self, server_ids: &[String]) -> Result<usize> {
+        let json: String = self
+            .proxy
+            .call("CancelProbes", &(server_ids,))
+            .map_err(friendly)?;
+        let answer: serde_json::Value = serde_json::from_str(&json)?;
+        Ok(answer
+            .get("cancelled")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize)
+    }
+
+    /// Whether this daemon knows how to call off a check at all.
+    ///
+    /// Distinguishes "asked and there was nothing queued" from "too old to
+    /// ask", which a client needs in order to offer a stop control rather than
+    /// one that cannot work. Asked with an empty list, so the question costs
+    /// nothing and cancels nothing.
+    pub fn supports_probe_cancel(&self) -> bool {
+        let empty: Vec<String> = Vec::new();
+        match self.proxy.call::<_, _, String>("CancelProbes", &(&empty,)) {
+            Ok(_) => true,
+            Err(error) => !is_unknown_method(&error),
+        }
+    }
+
     pub fn probe_state(&self) -> Result<ProbeState> {
         let json: String = self.proxy.call("ProbeState", &()).map_err(friendly)?;
         Ok(serde_json::from_str(&json)?)

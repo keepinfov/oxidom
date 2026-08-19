@@ -16,6 +16,23 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **A latency check can be called off.** The daemon gained `CancelProbes`, which drops
+  every check still waiting in the queue. The at-most-eight already measuring finish on
+  their own — each holds a slot a thread will release, and taking it early would hand it
+  to a second worker — so cancelling a 600-server sweep returns the daemon to idle in
+  about ten seconds instead of thirteen minutes. Before this there was no way to stop one
+  short of killing the daemon, and quitting the interface did not help because the daemon
+  owns the work.
+
+  A cancelled server reports that its check was stopped, rather than going on showing the
+  number from last time as though it had just been refreshed. Older clients that have
+  never heard of the new reason read it as an ordinary local one instead of failing to
+  parse, and a check confirming a live tunnel is never cancelled: it decides whether that
+  tunnel stays up.
+
+  **No control sends it yet** — neither the interface nor `oxidom ping`. This is the
+  daemon and client side only.
+
 - **A signed package repository**, so that installing oxidom is
   `apt install oxidom-gui` and upgrades arrive with the rest of the system
   rather than two files downloaded from a release page. Debian and Ubuntu add a

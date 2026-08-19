@@ -99,8 +99,9 @@ Hysteria2 is QUIC over UDP and has no TCP port to open.
 Two controls start a check. The card's own ⟳ **Re-check latency** sits in the
 expanded card and in its right-click menu; the subscription header's ⚡ **Check
 latency of all servers** sweeps the whole block. Both are fire-and-forget —
-**there is no way to stop a check once it has started**, and closing the window
-does not stop it either. A sweep of a large subscription can run for minutes.
+**neither control offers a way to stop a check it started**, and closing the
+window does not stop one either, because the daemon owns the work. A sweep of a
+large subscription can run for minutes.
 
 The method itself is chosen in Settings, once, for the whole application.
 
