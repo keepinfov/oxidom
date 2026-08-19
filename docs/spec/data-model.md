@@ -36,10 +36,15 @@ struct UserInfo { upload: u64, download: u64, total: u64, expire: Option<i64> }
 
 ## Subscription fetch & parse
 
-1. HTTP GET the subscription URL with `ureq`. Send a normal browser-ish `User-Agent`.
-   If `send_hwid` is true for that sub, add the HWID header (Happ uses an `x-hwid`-style header —
-   send `Hwid: <id>` and `User-Agent` including the app; **only when opted in**). Otherwise send
-   nothing identifying.
+1. HTTP GET the subscription URL with `ureq`. Send a **client** `User-Agent`, not a browser one:
+   panels gate both the body and its format on it, so the string is a choice from
+   `subscription::CLIENT_PRESETS` — defaulting to `v2rayN/6.45` — settable per subscription over
+   the global one. Which panel answers with which format is tabulated in
+   [subscriptions-and-protocols.md](../subscriptions-and-protocols.md#what-each-panel-answers-with),
+   where every case has a fixture named after the panel.
+   If `send_hwid` is true for that sub, add the Happ/Remnawave device headers — `x-hwid` carries
+   the identifier, and `x-device-os`, `x-ver-os` and `x-device-model` let the panel label it —
+   **only when opted in**. Otherwise send nothing identifying.
 2. Read response headers: `subscription-userinfo` (`upload=..; download=..; total=..; expire=..`),
    `profile-title` (may be base64 with `base64:` prefix), `profile-update-interval`.
 3. Body may be base64-encoded; if it decodes to text lines, use that, else use raw text.

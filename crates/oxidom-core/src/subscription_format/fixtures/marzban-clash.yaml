@@ -1,0 +1,49 @@
+# Fixture only: the Clash body a Marzban panel serves to a Clash-family client
+# string. Every credential and host below is invented; see
+# docs/subscriptions-and-protocols.md for what this file is a case of.
+proxies:
+  - name: "NL Amsterdam"
+    type: vless
+    server: nl1.panel.example
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000001
+    network: tcp
+    tls: true
+    servername: www.example.org
+    client-fingerprint: chrome
+    flow: xtls-rprx-vision
+    reality-opts:
+      public-key: RmFrZVB1YmxpY0tleUZvclRlc3RzT25seUFBQUFBQUE
+      short-id: 1a2b3c4d
+  - name: "DE Frankfurt"
+    type: vmess
+    server: de1.panel.example
+    port: 8443
+    uuid: 00000000-0000-4000-8000-000000000002
+    alterId: 0
+    cipher: auto
+    network: ws
+    tls: true
+    servername: de1.panel.example
+    ws-opts:
+      path: /marzban
+      headers:
+        Host: de1.panel.example
+  - name: "FR Paris"
+    type: trojan
+    server: fr1.panel.example
+    port: 443
+    password: not-a-real-password
+    network: ws
+    sni: fr1.panel.example
+    ws-opts:
+      path: /trojan
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - "NL Amsterdam"
+      - "DE Frankfurt"
+      - "FR Paris"
+rules:
+  - MATCH,PROXY

@@ -1,0 +1,28 @@
+{
+  "_fixture": "Fixture only: the sing-box body a Hiddify Manager panel serves to its own and to sing-box client strings. Every credential and host below is invented.",
+  "outbounds": [
+    { "type": "selector", "tag": "select", "outbounds": ["Hysteria2 Direct", "WS Relay"] },
+    {
+      "type": "hysteria2",
+      "tag": "Hysteria2 Direct",
+      "server": "hy2.hiddify.example",
+      "server_port": 8443,
+      "password": "not-a-real-password",
+      "up_mbps": 100,
+      "down_mbps": 500,
+      "obfs": { "type": "salamander", "password": "not-a-real-obfs-password" },
+      "tls": { "enabled": true, "server_name": "hy2.hiddify.example", "alpn": ["h3"] }
+    },
+    {
+      "type": "vless",
+      "tag": "WS Relay",
+      "server": "ws.hiddify.example",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000041",
+      "transport": { "type": "ws", "path": "/hiddify", "headers": { "Host": "ws.hiddify.example" } },
+      "tls": { "enabled": true, "server_name": "ws.hiddify.example" }
+    },
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" }
+  ]
+}
