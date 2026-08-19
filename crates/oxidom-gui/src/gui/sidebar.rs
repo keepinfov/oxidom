@@ -128,7 +128,7 @@ impl Sidebar {
             .css_classes(["sidebar-status-icon"])
             .build();
         let status_label = gtk::Label::builder()
-            .label("Ready")
+            .label("Disconnected")
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();

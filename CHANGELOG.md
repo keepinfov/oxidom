@@ -49,6 +49,11 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- **One word for a tunnel that is not up.** The same state was called Ready in the sidebar,
+  Disconnected on a card and in the header, and Stopped in the session list — three names a user
+  could see at once, none of which meant anything different. It is Disconnected everywhere, which
+  is what the daemon has always called it.
+
 - **One word for removing a thing.** The interface said Delete in some places and Remove in
   others, and the two collided: a section headed Remove held a button reading Delete
   Subscription, and every "Delete X?" question explained itself with the word *removed*. It is
