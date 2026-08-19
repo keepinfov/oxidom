@@ -1331,6 +1331,18 @@ impl Controller {
                 }
             }
         });
+        self.logs.connect_save_failed({
+            let weak = Rc::downgrade(self);
+            move |detail: String| {
+                if let Some(controller) = weak.upgrade() {
+                    // The failure path rather than the neutral one: this carries
+                    // text from the system, and `show_error` is what keeps that
+                    // text reachable in full behind Details instead of truncating
+                    // it into a one-line toast.
+                    controller.show_error("Could not save the log", &detail);
+                }
+            }
+        });
         self.window.connect_close_request({
             let weak = Rc::downgrade(self);
             move |_| {
