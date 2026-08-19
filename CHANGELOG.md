@@ -40,6 +40,16 @@ surface, packaging, or the CLI belongs here.
   in it — a repository is what a package manager upgrades to without being
   asked, which is not where release candidates belong.
 
+### Fixed
+
+- **A clock that jumps no longer grows the log view's memory.** Lines wait a fraction of a
+  second before being shown, so that a line the daemon wrote first but handed over late
+  still appears in the right place. That wait ends on a timestamp, so a clock stepped
+  backwards — or one line stamped in the future — could hold the queue shut for as long as
+  the discrepancy lasted, and nothing limited what piled up behind it. Past a ceiling the
+  oldest waiting lines are now shown anyway, their order unproven. Nothing is discarded:
+  two lines in the wrong order are a smaller lie than a gap nobody can see.
+
 ## [0.1.0] - 2026-08-18
 
 ### Added
