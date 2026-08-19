@@ -69,7 +69,7 @@ impl UiOperation {
             UiOperationKind::AddSubscription => "Fetching subscription…",
             UiOperationKind::UpdateSubscription => "Updating subscription…",
             UiOperationKind::UpdateAllSubscriptions => "Updating subscriptions…",
-            UiOperationKind::DeleteSubscription => "Deleting subscription…",
+            UiOperationKind::DeleteSubscription => "Removing subscription…",
             UiOperationKind::ImportServers => "Importing servers…",
             UiOperationKind::DeleteServer => "Removing server…",
             UiOperationKind::ApplySettings => "Applying settings…",

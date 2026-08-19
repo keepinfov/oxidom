@@ -1185,14 +1185,14 @@ impl ServersView {
 
         list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         let delete = item(
-            "Delete",
+            "Remove",
             // Favourites is where the star puts things, so removing it would
             // leave the star with nowhere to go. Emptying it is always
             // possible, and is what "delete" would have meant.
             if group.id == FAVOURITES_ID {
                 "Favourites is built in. Unstar its servers to empty it."
             } else {
-                "Delete this group. The servers in it are not touched."
+                "Remove this group. The servers in it are not touched."
             },
         );
         delete.add_css_class("destructive-action");
@@ -2151,13 +2151,13 @@ impl ServersView {
     fn delete_group_dialog(&self, group: ServerGroup) {
         let parent = self.root.root().and_downcast::<gtk::Window>();
         let dialog = adw::AlertDialog::new(
-            Some("Delete group?"),
+            Some("Remove group?"),
             Some(&format!(
                 "“{}” will be removed. The servers in it stay where they are.",
                 group.name
             )),
         );
-        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Remove")]);
         dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
