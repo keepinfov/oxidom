@@ -53,6 +53,10 @@ surface, packaging, or the CLI belongs here.
   reader announced for that same badge said Connection failed, and everywhere else in the
   interface the word is error. The badge and its description now both say error, so the label
   and the spoken text agree.
+- **One word for a tunnel that is not up.** The same state was called Ready in the sidebar,
+  Disconnected on a card and in the header, and Stopped in the session list — three names a user
+  could see at once, none of which meant anything different. It is Disconnected everywhere, which
+  is what the daemon has always called it.
 
 - **One word for removing a thing.** The interface said Delete in some places and Remove in
   others, and the two collided: a section headed Remove held a button reading Delete
