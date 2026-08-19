@@ -34,6 +34,10 @@ talks to a network.
 - Bugs and features: the [issue tracker](https://github.com/keepinfov/oxidom/issues).
   Open one before writing a large feature, so the design can be discussed
   before the code exists.
+- Both kinds go through a form, and the questions are not ceremony. Which
+  daemon answered decides which database is authoritative; how oxidom was
+  installed decides which GTK it links against; the core's version decides what
+  a config may contain. A report without them usually cannot be acted on.
 - Security problems: **not** an issue — see [SECURITY.md](SECURITY.md).
 - Not sure how a subsystem works? [`docs/spec/`](docs/spec/) is the
   implementation contract, written with the reasoning that produced it. It is
