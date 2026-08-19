@@ -206,6 +206,15 @@ pub struct CardHandlers {
     pub toggle_favourite: Rc<dyn Fn()>,
 }
 
+/// What a server that stayed silent is called, wherever it is reported.
+///
+/// The card's badge and the window's sweep toast carried this verbatim in two
+/// places. One of two copies is always the one that stops being updated.
+pub const UNREACHABLE_TEXT: &str = "Server is unreachable or did not respond";
+
+/// Likewise for this machine having no network at all.
+pub const NO_NETWORK_TEXT: &str = "No network connection";
+
 /// What the check button offers, given whether a check is already running.
 ///
 /// Two states, one function, following `collapse_icon` in the servers view. The
@@ -800,7 +809,7 @@ impl ServerCard {
             // check still leaves no number, and a cross reads as a verdict on
             // the server rather than as the absence of a reading.
             LatencyState::Unreachable => {
-                self.show_label("—", "Server is unreachable or did not respond");
+                self.show_label("—", UNREACHABLE_TEXT);
                 self.latency.add_css_class("latency-error");
             }
             LatencyState::NoNetwork => {
@@ -816,7 +825,7 @@ impl ServerCard {
             // than saying nothing.
             LatencyState::NotRun(detail) => {
                 let tooltip = match detail {
-                    Some(detail) => format!("Not checked: {}", detail.message()),
+                    Some(detail) => format!("Not measured: {}", detail.message()),
                     None => "The check could not run on this machine — see Settings › Xray core"
                         .to_string(),
                 };

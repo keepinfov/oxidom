@@ -49,6 +49,9 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- **One description per failed check.** The CLI, the server card and the window each wrote their
+  own words for the same four conditions, so the same failure was described differently depending
+  on where it was read. There is now one wording per condition, beside the type that carries it.
 - **One verb for measuring latency.** The same operation was called check, measure, probe, ping
   and test depending on where you looked: a button said Check, the badge beside it said "not
   measured", the profile dialog said Probe interval and Settings said Latency test URL. It is

@@ -17,8 +17,7 @@ use oxidom_core::cli_json::{
 use oxidom_core::client::DaemonClient;
 use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
-    LatencyReading, PROBE_STATE_VERSION, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry,
-    SessionInfo,
+    LatencyReading, PROBE_STATE_VERSION, ProbeRoute, ProbeState, ProfileEntry, SessionInfo,
 };
 use oxidom_core::model::{Server, Subscription};
 use oxidom_core::profile::{Profile, ProfileProxy};
@@ -601,13 +600,12 @@ fn print_probe_result(probes: &ProbeState, sessions: &[SessionInfo], server: &Se
     // The detail, when the daemon sent one, says which local condition it was
     // — "the server's certificate was rejected" rather than the shrug that
     // sends people to replace a server that is fine.
-    let reason = match (reading.failure, reading.detail) {
-        (Some(ProbeFailure::Unknown), Some(detail)) => detail.message(),
-        (Some(ProbeFailure::Unreachable), _) => "server is unreachable",
-        (Some(ProbeFailure::Timeout), _) => "probe timed out",
-        (Some(ProbeFailure::NoNetwork), _) => "no network connection",
-        (Some(ProbeFailure::Unknown), None) => "probe could not run on this machine",
-        (None, _) => "daemon returned an invalid probe reading",
+    let reason = match reading.failure {
+        Some(failure) => failure.message_with(reading.detail),
+        // Neither a number nor a reason: the reading contract says those are the
+        // same case, so this is a daemon bug rather than a probe outcome and has
+        // no wording beside the enum to borrow.
+        None => "daemon returned an invalid probe reading",
     };
     Err(Failure::message(format!(
         "{}: {reason}",

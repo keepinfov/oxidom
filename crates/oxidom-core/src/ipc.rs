@@ -274,6 +274,38 @@ pub enum ProbeDetail {
     Other,
 }
 
+impl ProbeFailure {
+    /// One line, in the words a user needs. Kept beside the enum for the same
+    /// reason [`ProbeDetail::message`] is: without it the CLI, the card and the
+    /// window each wrote their own, and they diverged into four sets of words for
+    /// the same four conditions.
+    ///
+    /// `Unknown` is deliberately vague here. It means the check never reached the
+    /// server, and what actually went wrong is a [`ProbeDetail`] — a caller that
+    /// has one should say that instead, which is what [`Self::message_with`] is
+    /// for.
+    pub fn message(self) -> &'static str {
+        match self {
+            ProbeFailure::Unreachable => "the server did not answer",
+            ProbeFailure::Timeout => "the check ran out of time",
+            ProbeFailure::NoNetwork => "this machine has no network",
+            ProbeFailure::Unknown => "the check could not run on this machine",
+        }
+    }
+
+    /// The reason, preferring the specific one when the daemon sent it.
+    ///
+    /// A detail only ever accompanies `Unknown`, which is the variant that says
+    /// nothing useful on its own; the other three describe the server or the link
+    /// and a detail would not sharpen them.
+    pub fn message_with(self, detail: Option<ProbeDetail>) -> &'static str {
+        match (self, detail) {
+            (ProbeFailure::Unknown, Some(detail)) => detail.message(),
+            (failure, _) => failure.message(),
+        }
+    }
+}
+
 impl ProbeDetail {
     /// One line, in the words a user needs. Kept beside the enum so the CLI
     /// and the GUI cannot drift into describing the same condition
@@ -594,6 +626,48 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ProbeDetail>(&json).expect("parses"),
             ProbeDetail::GeoAssetsMissing
+        );
+    }
+
+    /// The reason `ProbeDetail::message` exists, applied to its neighbour: four
+    /// clients each wrote their own words for these four conditions and drifted.
+    /// Every variant must have one, and none may collide with a phrase
+    /// `error_action` routes on — that routing is by substring, so a wording that
+    /// drifted into one would offer a remedy for a condition it cannot fix.
+    #[test]
+    fn every_probe_failure_has_words_and_offers_no_wrong_remedy() {
+        for failure in [
+            ProbeFailure::Unreachable,
+            ProbeFailure::Timeout,
+            ProbeFailure::NoNetwork,
+            ProbeFailure::Unknown,
+        ] {
+            let message = failure.message();
+            assert!(!message.is_empty(), "{failure:?} has no wording");
+            assert_eq!(
+                error_action(message),
+                ErrorAction::None,
+                "{failure:?} routes somewhere it cannot help: {message}"
+            );
+        }
+    }
+
+    /// A detail sharpens `Unknown` and nothing else. The other three describe the
+    /// server or the link, where a local cause would be a different claim.
+    #[test]
+    fn a_detail_only_sharpens_the_failure_that_says_nothing_on_its_own() {
+        assert_eq!(
+            ProbeFailure::Unknown.message_with(Some(ProbeDetail::CertificateRejected)),
+            ProbeDetail::CertificateRejected.message()
+        );
+        assert_eq!(
+            ProbeFailure::Unreachable.message_with(Some(ProbeDetail::CertificateRejected)),
+            ProbeFailure::Unreachable.message(),
+            "a server that did not answer is not explained by a local detail"
+        );
+        assert_eq!(
+            ProbeFailure::Unknown.message_with(None),
+            ProbeFailure::Unknown.message()
         );
     }
 
