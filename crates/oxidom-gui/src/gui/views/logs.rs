@@ -459,28 +459,43 @@ impl LogsView {
     /// Drop the oldest lines once the buffer has grown past what one text view
     /// should be asked to lay out.
     ///
-    /// Two conditions, both load bearing. Only while following, because a reader
-    /// who has scrolled up is looking at the old end and must not have it pulled
-    /// out from under them. And never past the first line actually on screen,
-    /// so that even a mistimed call cannot delete what is being read.
+    /// The clamp to the first line on screen is what protects the reader, and it
+    /// does so whether or not they are following: nothing being read is ever
+    /// inside the deleted range. Following used to gate this as well, which
+    /// bounded the buffer only for a reader sitting at the bottom — the one who
+    /// needed it least. A reader scrolled up is exactly who is looking at an old
+    /// log while a core at debug level fills it.
+    ///
+    /// What following *did* protect against is the jump. Deleting above the
+    /// viewport shrinks the buffer while the scroll value stays put, so the text
+    /// under that value has moved up by the height removed and the view leaps by
+    /// that much. So the height is measured before the delete and subtracted
+    /// after, which puts the same line back under the same pixel. The clamp
+    /// guarantees the deleted range ends at or before the first visible line, so
+    /// that height is exactly the y of the first line kept.
+    ///
+    /// Called only from `append`, which holds `updating_scroll` across the whole
+    /// batch and releases it one main-loop iteration later. The adjustment write
+    /// here depends on that: unguarded, the `value_changed` it provokes is read as
+    /// the user scrolling and turns following off on every trimmed append.
     fn trim(&self) {
-        if !self.following.get() {
-            return;
-        }
-        if self.buffer.line_count() <= VIEW_LINES + TRIM_CHUNK {
-            return;
-        }
         let visible = self.text.visible_rect();
         let (first_visible, _) = self.text.line_at_y(visible.y());
-        let cut = TRIM_CHUNK.min(first_visible.line());
-        if cut <= 0 {
+        let Some(cut) = trim_cut(self.buffer.line_count(), first_visible.line()) else {
             return;
-        }
+        };
         let mut start = self.buffer.start_iter();
         let Some(mut end) = self.buffer.iter_at_line(cut) else {
             return;
         };
+        // Measured before the delete, because afterwards those lines are gone
+        // and their height is unknowable. The first line's y is zero, so the y of
+        // the first line kept *is* the height of everything above it.
+        let (removed_height, _) = self.text.line_yrange(&end);
+        let adjustment = self.scrolled.vadjustment();
+        let restored = adjustment.value() - f64::from(removed_height);
         self.buffer.delete(&mut start, &mut end);
+        adjustment.set_value(restored);
     }
 
     fn scroll_to_mark(&self) {
@@ -625,6 +640,26 @@ fn tag_for(severity: Severity) -> Option<&'static str> {
     }
 }
 
+/// How many leading lines may be dropped, or `None` to leave the buffer alone.
+///
+/// Split out from the widget work because it is the whole decision and the only
+/// part of it that can be tested without a display: `first_visible` is a layout
+/// query, so it arrives as an argument rather than being read here.
+///
+/// Two rules. The buffer has to have grown past what one text view should lay
+/// out, with a chunk's worth of slack so that trimming happens in batches rather
+/// than on every appended line — each delete revalidates the layout. And the cut
+/// never reaches the first line on screen, so nothing being read is inside it,
+/// which is what makes trimming safe for a reader who has scrolled away from the
+/// bottom.
+fn trim_cut(line_count: i32, first_visible: i32) -> Option<i32> {
+    if line_count <= VIEW_LINES + TRIM_CHUNK {
+        return None;
+    }
+    let cut = TRIM_CHUNK.min(first_visible);
+    (cut > 0).then_some(cut)
+}
+
 /// Why a save produced no file, for the failure toast's details.
 ///
 /// Names the path. Without it the message is useless in the case that produces
@@ -685,8 +720,53 @@ fn is_at_bottom(adjustment: &gtk::Adjustment) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Filter, gap_notice, render_line, save_failure_detail};
+    use super::{
+        Filter, TRIM_CHUNK, VIEW_LINES, gap_notice, render_line, save_failure_detail, trim_cut,
+    };
     use oxidom_core::logbook::{LogRecord, LogSource, Severity};
+
+    /// The bound used to apply only while the reader sat at the bottom, which is
+    /// the reader who needed it least. Someone scrolled up is exactly who is
+    /// reading an old log while a core at debug level fills it, and for them the
+    /// widget's buffer grew without a ceiling.
+    #[test]
+    fn a_reader_scrolled_away_from_the_bottom_still_has_a_bounded_buffer() {
+        let over = VIEW_LINES + TRIM_CHUNK + 1;
+        // Scrolled well up: the first line on screen is line 900 of the buffer.
+        assert_eq!(trim_cut(over, 900), Some(TRIM_CHUNK));
+        // And sitting at the bottom, which behaved this way before and still does.
+        assert_eq!(trim_cut(over, over - 10), Some(TRIM_CHUNK));
+    }
+
+    /// The clamp is what makes trimming safe at all: whatever else changes, the
+    /// deleted range must end at or before the line the reader is looking at.
+    #[test]
+    fn trimming_never_reaches_the_first_line_on_screen() {
+        let over = VIEW_LINES + TRIM_CHUNK + 1;
+        // Scrolled to the very top: there is nothing above the reader to drop,
+        // so the buffer is left over its ceiling rather than the read line cut.
+        assert_eq!(trim_cut(over, 0), None);
+        // Just below the top, only those few lines may go — never a whole chunk.
+        assert_eq!(trim_cut(over, 5), Some(5));
+        for first_visible in [0, 1, 5, 100, TRIM_CHUNK, TRIM_CHUNK + 1, 5_000] {
+            if let Some(cut) = trim_cut(over, first_visible) {
+                assert!(
+                    cut <= first_visible,
+                    "cut {cut} would delete the line being read at {first_visible}"
+                );
+            }
+        }
+    }
+
+    /// Trimming in batches, because every delete revalidates the layout. Without
+    /// the slack the buffer would be trimmed on each appended line once it
+    /// reached the ceiling.
+    #[test]
+    fn a_buffer_under_its_ceiling_is_left_alone() {
+        assert_eq!(trim_cut(VIEW_LINES, 900), None);
+        assert_eq!(trim_cut(VIEW_LINES + TRIM_CHUNK, 900), None);
+        assert_eq!(trim_cut(VIEW_LINES + TRIM_CHUNK + 1, 900), Some(TRIM_CHUNK));
+    }
 
     /// The case that produces this most often is a directory the user cannot
     /// write to, and then the only thing they need is which place refused, so

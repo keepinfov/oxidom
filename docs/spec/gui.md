@@ -57,8 +57,13 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   minimum severity, and a text search. Records arrive by cursor (`LogsSince`), so a refresh
   appends and **never rebuilds** — rebuilding is what threw the reader back to the top of the log.
   A rebuild happens only on a filter change, a clear, or a daemon restart. The buffer is trimmed
-  only while following and never past the first visible line, so a reader who has scrolled up is
-  left alone. Lines the daemon could not hand over are announced in place, not silently dropped.
+  whenever it has outgrown what one text view should lay out, and **never past the first visible
+  line** — so nothing being read is ever inside the deleted range. Trimming does not move the
+  reading position: the height removed from above the viewport is measured before the delete and
+  taken off the scroll offset after it, which is what leaves a reader who has scrolled up alone.
+  That promise is about the position, not about following; gating the trim on following instead
+  bounded the buffer only for the reader sitting at the bottom, who needed it least. Lines the
+  daemon could not hand over are announced in place, not silently dropped.
 
 Responsiveness: a breakpoint (~700px) collapses the split view and switches the grid to a single
 column, exposing the small sidebar toggle button (as annotated in the narrow mockup).

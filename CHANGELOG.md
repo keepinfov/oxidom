@@ -55,6 +55,12 @@ surface, packaging, or the CLI belongs here.
   was trying to save. It now reports the failure, naming the file and the system's own
   reason.
 
+- **Reading back through the log no longer grows without limit.** The Logs page dropped its
+  oldest lines only while you were sitting at the bottom of it, which is the one position where
+  it hardly matters. Scroll up — to read what happened while a core was talking at debug level,
+  the reason anyone scrolls up — and nothing bounded what the page held. It is now trimmed
+  wherever you are reading, and your place on the page does not move when it happens.
+
 - **A clock that jumps no longer grows the log view's memory.** Lines wait a fraction of a
   second before being shown, so that a line the daemon wrote first but handed over late
   still appears in the right place. That wait ends on a timestamp, so a clock stepped
