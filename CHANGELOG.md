@@ -49,6 +49,11 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- **One word for a failure.** A server card's badge read Failed while the description a screen
+  reader announced for that same badge said Connection failed, and everywhere else in the
+  interface the word is error. The badge and its description now both say error, so the label
+  and the spoken text agree.
+
 - **One word for removing a thing.** The interface said Delete in some places and Remove in
   others, and the two collided: a section headed Remove held a button reading Delete
   Subscription, and every "Delete X?" question explained itself with the word *removed*. It is

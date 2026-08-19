@@ -848,7 +848,7 @@ impl ServerCard {
 
     pub fn set_connection_state(&self, state: CardConnectionState) {
         // Entering the failed state is what makes the current number stale, not
-        // being in it: a re-check while the card still says "Failed" clears
+        // being in it: a re-check while the card still says "Error" clears
         // this again, and the poll re-asserting the same state must not undo
         // that.
         let previous = self.last_connection.replace(state);
@@ -871,7 +871,7 @@ impl ServerCard {
             CardConnectionState::ConnectedHere => "Connected",
             CardConnectionState::InPool => "One of several servers in use",
             CardConnectionState::Connecting => "Connecting",
-            CardConnectionState::Failed => "Connection failed",
+            CardConnectionState::Failed => "Connection error",
         };
         self.header
             .update_property(&[gtk::accessible::Property::Description(accessible_status)]);
@@ -922,10 +922,10 @@ impl ServerCard {
                 self.root.remove_css_class("active-server");
             }
             CardConnectionState::Failed => {
-                self.status.set_label("Failed");
+                self.status.set_label("Error");
                 self.status.add_css_class("status-error");
                 self.status.set_visible(true);
-                // A number taken *before* the attempt reads beside "Failed" as
+                // A number taken *before* the attempt reads beside "Error" as
                 // "the tunnel is fine, 84 ms" — the exact lie — so it stays
                 // hidden. A number taken after it is the opposite: it is how
                 // the user finds out the server came back, so re-checking
