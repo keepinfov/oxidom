@@ -4241,7 +4241,7 @@ mod tests {
     }
 
     /// A failure that names its server is what lets the card the user clicked
-    /// say "Failed" instead of falling back to looking merely disconnected.
+    /// say "Error" instead of falling back to looking merely disconnected.
     #[test]
     fn a_failure_keeps_naming_its_server_until_something_replaces_it() {
         let mut state = state();

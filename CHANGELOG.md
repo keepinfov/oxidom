@@ -49,6 +49,10 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- **One word for a failure.** A server card's badge read Failed while the description a screen
+  reader announced for that same badge said Connection failed, and everywhere else in the
+  interface the word is error. The badge and its description now both say error, so the label
+  and the spoken text agree.
 - **One word for a tunnel that is not up.** The same state was called Ready in the sidebar,
   Disconnected on a card and in the header, and Stopped in the session list — three names a user
   could see at once, none of which meant anything different. It is Disconnected everywhere, which
