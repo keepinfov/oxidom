@@ -89,7 +89,7 @@ jobs:
             # `curl` is deliberately absent: AlmaLinux 9 preinstalls curl-minimal,
             # which provides the same binary and conflicts with the full package,
             # so asking for it by name fails the whole transaction.
-            dnf install -y gcc pkgconf-pkg-config ca-certificates git tar xz
+            dnf install -y gcc pkgconf-pkg-config ca-certificates git tar xz diffutils
             command -v curl >/dev/null || dnf install -y --allowerasing curl
             if [ "${{ matrix.flavour }}" = gui ]; then
               dnf install -y gtk4-devel libadwaita-devel
@@ -208,11 +208,21 @@ jobs:
           else
             rpm -qlp dist/*.rpm 2>/dev/null | sort > /tmp/actual
           fi
-          if ! diff -u "packaging/nfpm/expected/$pkg.txt" /tmp/actual; then
+          # The verdict is a shell string comparison, which needs nothing
+          # installed at all. AlmaLinux's minimal image ships no diffutils, and
+          # a missing `diff` made this report the package as wrong when it had
+          # never compared anything — and `cmp` would not have helped, since it
+          # lives in that same package. `diff` is used only to show a human what
+          # moved, when it happens to be there.
+          if [ "$(cat "packaging/nfpm/expected/$pkg.txt")" = "$(cat /tmp/actual)" ]; then
+            echo "$pkg installs exactly the expected $(wc -l < /tmp/actual) files"
+          else
+            echo "expected:"; cat "packaging/nfpm/expected/$pkg.txt"
+            echo "actual:";   cat /tmp/actual
+            command -v diff > /dev/null && diff -u "packaging/nfpm/expected/$pkg.txt" /tmp/actual || true
             echo "::error file=packaging/nfpm/expected/$pkg.txt::the package no longer installs what this list says. If the change was deliberate, regenerate the list; see the README beside it."
             exit 1
           fi
-          echo "$pkg installs exactly the expected $(wc -l < /tmp/actual) files"
 
       - uses: actions/upload-artifact@v4
         with:
