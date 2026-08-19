@@ -420,7 +420,7 @@ fn set_state_label(label: &gtk::Label, state: SessionRowState) {
         label.remove_css_class(class);
     }
     let (text, class) = match state {
-        SessionRowState::Stopped => ("Stopped", "status-neutral"),
+        SessionRowState::Stopped => ("Disconnected", "status-neutral"),
         SessionRowState::Connecting => ("Connecting", "status-working"),
         SessionRowState::Connected => ("Connected", "status-connected"),
         SessionRowState::Error => ("Error", "status-error"),
