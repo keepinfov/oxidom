@@ -140,11 +140,42 @@ jobs:
           # An empty section means a release with no notes, which verify should
           # already have caught — but publishing one anyway is worse than failing.
           [ -s notes.md ]
-          # An indented code block rather than a backtick fence: backticks in a
+          # Which file to download is not obvious from a list of five, and the
+          # graphical package alone does not resolve: it depends on the daemon
+          # package at the same version, and neither is in any repository, so
+          # apt and dnf can only see one if it is named on the command line.
+          # Somebody who downloads just the interface gets an unresolvable
+          # dependency and nothing explaining it. Say so here, where they are.
+          #
+          # Indented code blocks rather than backtick fences: backticks inside a
           # quoted shell string read as command substitution to a linter, and
           # markdown renders four-space indentation as code just the same.
           {
-            printf '\n---\n\nVerify an asset:\n\n'
+            printf '\n---\n\n## Which file\n\n'
+
+            printf '**Debian 13, Ubuntu 25.04 or newer** — both packages, in one command:\n\n'
+            printf '    sudo apt install ./oxidom_%s-1_amd64.deb ./oxidom-gui_%s-1_amd64.deb\n\n' "$version" "$version"
+
+            printf '**Fedora 42 or newer:**\n\n'
+            printf '    sudo dnf install ./oxidom-%s-1.x86_64.rpm ./oxidom-gui-%s-1.x86_64.rpm\n\n' "$version" "$version"
+
+            printf '**A server, or anything without a desktop** — the daemon alone has no GTK\n'
+            printf 'dependency, and installs on Debian 12, Ubuntu 24.04 and RHEL 9 as well:\n\n'
+            printf '    sudo apt install ./oxidom_%s-1_amd64.deb\n\n' "$version"
+
+            printf '**Anything older, with a desktop** — the AppImage, which carries its own GTK,\n'
+            printf 'its own glibc and an Xray core, and needs nothing installed:\n\n'
+            printf '    chmod +x oxidom-%s-x86_64.AppImage && ./oxidom-%s-x86_64.AppImage\n\n' "$version" "$version"
+
+            printf 'The two packages go together: **oxidom-gui** is a thin client and depends\n'
+            printf 'on **oxidom**, which carries the daemon it talks to. Installing the\n'
+            printf 'interface on its own will not resolve.\n\n'
+
+            printf 'The packages do **not** include an Xray core — no distribution packages one.\n'
+            printf 'oxidom starts without it and Settings names the exact download for your\n'
+            printf 'machine. The AppImage has one inside it already.\n'
+
+            printf '\n## Verifying a download\n\n'
             printf '    gh attestation verify <file> --repo %s\n' "$REPO"
           } >> notes.md
           cat notes.md
