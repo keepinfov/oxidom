@@ -261,7 +261,8 @@ impl SettingsView {
             .active(applied.reconnect)
             .build();
 
-        let methods = gtk::StringList::new(&["ICMP", "TCP", "HTTP HEAD", "HTTP GET"]);
+        let methods =
+            gtk::StringList::new(&["ICMP ping", "TCP handshake", "HTTP HEAD", "HTTP GET"]);
         let initial_method = match applied.latency_method {
             LatencyMethod::Icmp => 0,
             LatencyMethod::Tcp => 1,
@@ -275,7 +276,7 @@ impl SettingsView {
             .selected(initial_method)
             .build();
         let test_url = adw::EntryRow::builder()
-            .title("Latency test URL")
+            .title("Latency check URL")
             .text(&applied.latency_test_url)
             // Only the HTTP methods request a URL; keep the row visibly
             // inert otherwise instead of silently ignoring edits.
@@ -1159,7 +1160,7 @@ fn set_validation_message(label: &gtk::Label, message: Option<&str>) {
 
 fn method_subtitle(index: u32) -> &'static str {
     match index {
-        0 => "Regular ping straight to the server, outside the tunnel",
+        0 => "Straight to the server, outside the tunnel",
         1 => "Time to open a direct connection to the server, outside the tunnel",
         // Say that the request goes *through the server*: that is the whole
         // difference from the two above, and the only thing that catches a

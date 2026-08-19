@@ -49,6 +49,13 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- **One verb for measuring latency.** The same operation was called check, measure, probe, ping
+  and test depending on where you looked: a button said Check, the badge beside it said "not
+  measured", the profile dialog said Probe interval and Settings said Latency test URL. It is
+  check throughout now. Settings also names the methods the way results do — pick "TCP
+  handshake" and the badge reports a TCP handshake, where before you picked "TCP" and were told
+  something with a different name.
+
 - **One word for removing a thing.** The interface said Delete in some places and Remove in
   others, and the two collided: a section headed Remove held a button reading Delete
   Subscription, and every "Delete X?" question explained itself with the word *removed*. It is

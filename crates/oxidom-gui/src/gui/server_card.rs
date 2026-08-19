@@ -785,7 +785,7 @@ impl ServerCard {
                 self.latency.add_css_class("latency-tunnel");
             }
             LatencyState::Unmeasured => {
-                self.show_label("—", "Latency has not been measured");
+                self.show_label("—", "Latency has not been checked");
             }
             LatencyState::Superseded => {
                 self.show_label("—", "Measured in a different context — needs a fresh check");
@@ -794,7 +794,7 @@ impl ServerCard {
                 self.latency_display.set_visible_child_name("spinner");
                 self.latency_spinner.set_spinning(true);
                 self.latency_spinner_pill
-                    .set_tooltip_text(Some("Checking server reachability"));
+                    .set_tooltip_text(Some("Checking latency"));
             }
             // Same dash as an unmeasured server, in the error colour: a failed
             // check still leaves no number, and a cross reads as a verdict on
@@ -816,7 +816,7 @@ impl ServerCard {
             // than saying nothing.
             LatencyState::NotRun(detail) => {
                 let tooltip = match detail {
-                    Some(detail) => format!("Not measured: {}", detail.message()),
+                    Some(detail) => format!("Not checked: {}", detail.message()),
                     None => "The check could not run on this machine — see Settings › Xray core"
                         .to_string(),
                 };
