@@ -61,13 +61,11 @@ jobs:
       - name: the lockfile matches the manifests
         run: cargo metadata --locked --format-version 1 > /dev/null
 
-      - name: the desktop entry and the AppStream data are valid
-        run: |
-          set -eu
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends desktop-file-utils appstream
-          desktop-file-validate data/dev.keepinfov.oxidom.desktop
-          appstreamcli validate --strict data/dev.keepinfov.oxidom.metainfo.xml
+      # The desktop entry and the AppStream data are validated by version.yml,
+      # on the pull request that changes them. They were checked here too, which
+      # cost three minutes of `apt-get update` on the one path where waiting is
+      # least welcome — to re-answer a question already answered about files
+      # that cannot reach master unreviewed.
 
   packages:
     needs: verify
