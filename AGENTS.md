@@ -254,7 +254,16 @@ conflict is settled once.
 
 A pull request is mergeable when: CI is green, every commit is signed, the
 [definition of done](#definition-of-done) is satisfied, and a maintainer has
-approved it. The branch is deleted afterwards.
+read it and merged it. The branch is deleted afterwards.
+
+The approval is the merge. This used to read "a maintainer has approved it",
+which named a thing that does not happen here: the branch ruleset asks for no
+approving review, and GitHub will not accept one from the person who opened the
+pull request — so on a project with a single maintainer, a rule requiring one
+would stop every change rather than gate it. What the sentence was always
+describing is somebody reading the branch and deciding to merge it, and that is
+what it now says. Nothing is loosened: the wait is the same wait, and an agent
+that has pushed a branch is not finished with it until someone else has looked.
 
 Nothing is pushed to `master` directly, nothing is force-pushed, and no
 published history is rewritten.
