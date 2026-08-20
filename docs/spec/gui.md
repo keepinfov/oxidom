@@ -58,6 +58,29 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   `ProtectHome=true`, so nothing this process writes to the user's home could ever be read by it.
   The confirmation names the release host and says it may be blocked, and offers to fetch through
   a tunnel that is already up. Progress is polled off the status tick, only while a download runs.
+- **Primary menu and About:** one menu button on the right of the header, outermost so that it
+  does not move when a page's own menus appear beside it. It is the only header control that is
+  not about the current view, and it carries Quit and About.
+  The About dialog is where the interface says **which versions are running**, which is three
+  programs and not one: this window, the daemon it is talking to, and the core the daemon
+  resolved. The daemon's and the core's arrive over `RuntimeInfo` (`daemon_version` and
+  `core_version`, both `Option<String>` under the struct's existing `serde(default)`, so a daemon
+  that predates them still parses and is reported as unknown rather than blank). The core's is
+  read by running `xray version` once and caching it against the binary that answered, for the
+  same reason the geo verdict is cached: `RuntimeInfo` is fetched every time Settings opens.
+  Where the daemon is **not this build**, the dialog says so in a sentence rather than leaving the
+  user to infer it from a control that is missing — which is the symptom version skew produces
+  today, because every `supports_*` check answers "too old" by hiding something. A daemon that
+  cannot name its version at all is older than the release that added the field, so silence is
+  read as "older", not as "unknown". Matching versions draw no sentence: a dialog that warns every
+  time it opens is one whose warnings stop being read.
+  The block the bug form asks for — version, install method, which daemon, core, distribution and
+  desktop — is the dialog's own debug information page, which libadwaita already gives a Copy and
+  a Save button. Assembling it is `oxidom_core::versions`, not the window, so that anything else
+  needing the same header (a problem report, the CLI) produces the same bytes. The install method
+  is judged from the path the binary was started as and the two variables the sandboxed formats
+  set; `.deb`, `.rpm` and the AUR are indistinguishable once installed and are reported as one
+  answer rather than as a guess between three.
 - **Logs view:** the process log book, filtered by source (all / oxidom / Xray / interface),
   minimum severity, and a text search. Records arrive by cursor (`LogsSince`), so a refresh
   appends and **never rebuilds** — rebuilding is what threw the reader back to the top of the log.

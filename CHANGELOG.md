@@ -16,6 +16,24 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **The application says which versions it is running.** A menu button on the right of the
+  header — the window's first primary menu — opens an About dialog carrying the version of
+  the interface, of the daemon it is talking to, and of the Xray core. The three are separate
+  programs with separate lifetimes: a package upgrade replaces the binaries and restarts
+  nothing, so a window can spend a whole session driving the daemon it started the morning
+  with, and until now the only symptom of that was a control quietly missing from the
+  interface. The dialog now says it in a sentence instead, and says nothing at all when the
+  two agree.
+
+  Its Troubleshooting page carries the block the bug form asks for — version, how oxidom was
+  installed, which daemon answered, what `xray version` says, and the distribution and
+  desktop — with the Copy and Save buttons libadwaita provides. Every one of those five was
+  something the machine already knew and a reporter was being asked to go and look up.
+
+  A daemon that is too old to name itself is reported as too old, not as blank: `RuntimeInfo`
+  gained the two version fields additively, so an older daemon still answers and an older
+  client still reads a newer daemon's reply.
+
 - **An expanded card says why the last check failed.** A failed check left one dash and one
   sentence, and "the server did not answer" covers a refused handshake, a wrong TLS
   parameter and a dead network alike. Telling those apart is the whole diagnosis, and it

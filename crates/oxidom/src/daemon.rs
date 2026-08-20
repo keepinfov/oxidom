@@ -357,6 +357,9 @@ pub(crate) struct Shared {
     /// Everything about the core's geo data: the cached verdict, and whatever a
     /// running download has reported so far.
     geo: Arc<Mutex<GeoState>>,
+    /// What the core answered when asked its version, cached against the
+    /// binary that answered.
+    core_version: Arc<Mutex<CoreVersion>>,
     /// Set to stop a running download. Outside the mutex on purpose: `Cancel`
     /// must be reachable while the download thread holds the lock to publish
     /// progress, or cancelling would wait for the very loop it is stopping.
@@ -377,6 +380,19 @@ pub(crate) struct GeoState {
     progress: oxidom_core::xray::assets::Progress,
     last_error: Option<String>,
     cancelled: bool,
+}
+
+/// The daemon's memory of the core's version.
+///
+/// Cached against the binary it was read from for the same reason the geo
+/// verdict is: answering costs a subprocess, and `RuntimeInfo` is fetched
+/// every time Settings opens. A core that could not be run is cached too —
+/// `version: None` against the path that failed — so a broken binary is
+/// spawned once rather than on every open.
+#[derive(Default)]
+pub(crate) struct CoreVersion {
+    read_for: Option<std::path::PathBuf>,
+    version: Option<String>,
 }
 
 impl Shared {
@@ -414,6 +430,7 @@ impl Shared {
             http_port_locked,
             system_bus,
             geo: Arc::new(Mutex::new(GeoState::default())),
+            core_version: Arc::new(Mutex::new(CoreVersion::default())),
             geo_cancel: Arc::new(oxidom_core::xray::assets::Cancel::default()),
         }
     }
@@ -724,7 +741,41 @@ impl Shared {
             // grey the rows instead of accepting text the daemon will revert.
             binary_paths_locked: self.system_bus,
             geo: self.geo_assets(resolved_path.as_deref()),
+            daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            core_version: self.read_core_version(resolved_path.as_deref()),
         }
+    }
+
+    /// What the resolved core calls itself.
+    ///
+    /// `None` when none resolved, or when the binary that did could not be run
+    /// — a file that is not executable, an architecture this machine cannot
+    /// load. Why it failed is already in `xray_error` where resolution is what
+    /// went wrong, and where it is not, a version the daemon cannot obtain is
+    /// better reported as absent than as the error text, which would end up in
+    /// a row that a reader takes for a version string.
+    ///
+    /// The lock is held across the spawn, as `geo_assets` below holds its own
+    /// across `xray run -test`: two callers arriving together then produce one
+    /// subprocess rather than two, and `xray version` is the lighter of the
+    /// two questions.
+    fn read_core_version(&self, xray: Option<&std::path::Path>) -> Option<String> {
+        let xray = xray?;
+        let mut cached = oxidom_core::sync::lock(&self.core_version);
+        if cached.read_for.as_deref() == Some(xray) {
+            return cached.version.clone();
+        }
+        let version = std::process::Command::new(xray)
+            .arg("version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                oxidom_core::versions::core_version(&String::from_utf8_lossy(&output.stdout))
+            });
+        cached.read_for = Some(xray.to_path_buf());
+        cached.version = version.clone();
+        version
     }
 
     /// What this daemon can say about the core's geo data.
