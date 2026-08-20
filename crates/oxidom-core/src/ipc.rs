@@ -509,6 +509,23 @@ pub struct RuntimeInfo {
     /// `serde(default)` then leaves `usable: None`, which every caller reads as
     /// "not determined" and says nothing about.
     pub geo: GeoAssets,
+    /// The daemon's own version, and the version the core reports.
+    ///
+    /// The two processes have separate lifetimes and are routinely not the
+    /// same build: a package upgrade replaces both binaries and restarts
+    /// neither, so a client can spend a whole session talking to the daemon it
+    /// started the morning with. Version skew is already handled silently —
+    /// `client::DaemonClient::supports_probe_cancel` and its neighbours answer
+    /// "too old" by hiding a control — and the symptom a user meets is a
+    /// button that is not there.
+    ///
+    /// `None` from a daemon that predates these fields, which is itself the
+    /// answer: no such daemon can be this build, so silence places it earlier.
+    /// `core_version` is separately `None` when no core resolved or it could
+    /// not be run, which is the same word for a different fact and is why the
+    /// resolution error stays in `xray_error` rather than being folded in.
+    pub daemon_version: Option<String>,
+    pub core_version: Option<String>,
 }
 
 /// One profile in a listing, flattened for CLI and other D-Bus clients.
