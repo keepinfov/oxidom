@@ -2132,6 +2132,7 @@ mod tests {
             pool: None,
             core: Default::default(),
             on_core_exit: None,
+            routing: None,
         }
     }
 

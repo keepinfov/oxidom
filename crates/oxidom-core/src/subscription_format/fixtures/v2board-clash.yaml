@@ -1,0 +1,28 @@
+# Fixture only: the Clash body a V2Board or XBoard panel serves to a
+# Clash-family client string. Every credential and host below is invented.
+mixed-port: 7890
+allow-lan: false
+mode: rule
+proxies:
+  - name: "US Los Angeles"
+    type: ss
+    server: la.v2board.example
+    port: 8388
+    cipher: aes-256-gcm
+    password: not-a-real-password
+    udp: true
+  - name: "JP Tokyo"
+    type: trojan
+    server: tokyo.v2board.example
+    port: 443
+    password: not-a-real-password-either
+    sni: tokyo.v2board.example
+    udp: true
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies:
+      - "US Los Angeles"
+      - "JP Tokyo"
+rules:
+  - MATCH,Proxy

@@ -274,7 +274,11 @@ impl Origin {
 /// The `Option`s that survive mean "do not emit this at all", not "unset": the
 /// generated config has to stay byte-identical to the pre-`[core]` one when
 /// nothing is configured, and an emitted-but-default block would break that.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is not derived: `routing` holds arbitrary JSON, and `serde_json::Value`
+/// is only `PartialEq` because it can hold a float. Nothing compares two of
+/// these for equality.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedCore {
     pub log_level: LogLevel,
     pub domain_strategy: DomainStrategy,
@@ -282,6 +286,16 @@ pub struct ResolvedCore {
     pub mux: Option<ResolvedMux>,
     pub dialer: Option<ResolvedDialer>,
     pub dns: Option<ResolvedDns>,
+    /// A profile's own `routing` block, already checked by
+    /// [`crate::xray::routing::validate`].
+    ///
+    /// [`CoreOptions::resolve`] always leaves this `None`, and that is what
+    /// keeps it away from probes: a probe resolves the machine-wide `[core]`
+    /// with no profile, so the only way this is ever set is
+    /// `Engine::configure_core`, which a probe does not call. Do not give
+    /// `CoreOptions` a `routing` field — a probe routed by the user's rules
+    /// stops measuring the server it claims to.
+    pub routing: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +453,9 @@ impl CoreOptions {
             mux,
             dialer,
             dns,
+            // Never from here: see the field's own comment. `Engine::configure_core`
+            // is the only writer, and a probe does not call it.
+            routing: None,
         }
     }
 

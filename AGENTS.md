@@ -156,8 +156,15 @@ current `master`.
 
 - Name it `type/short-kebab` — `type` being one of the commit types below.
 - Lowercase ASCII, digits, hyphens; two to six words; 48 characters at most.
-- Work-in-progress and fixup commits are fine on the branch. They do not
-  survive the merge.
+- Work-in-progress and fixup commits are fine while the branch is yours alone,
+  and must not survive it. A pull request lands **one commit, or a few that each
+  stand on their own**; anything else is squashed before it is marked ready.
+  Nothing else cleans up after you now: the merge preserves what the branch
+  carries.
+- **If `master` moved while you worked, merge it into your branch.** Do not
+  rebase commits that are already pushed, and do not transplant somebody else's.
+  A merge is what lets the next one be a three-way merge against real shared
+  ancestry, which is the whole reason several branches can be open at once.
 
 ## Commits
 
@@ -189,6 +196,10 @@ type(scope)!: what is true after this commit
   source.
 - `Fixes #N` / `Refs #N` only for an issue that actually exists. No other
   trailers without being asked.
+- **A merge commit is the exception to all of the above.** Its subject is the
+  pull request's title, with the ` (#N)` the forge appends, and its body is
+  empty, so there is nothing there to write. The rules apply to the commits it
+  brings in.
 - **Every commit is signed** (SSH or OpenPGP), and signatures are verified
   before a merge. Configure `user.signingkey` and `commit.gpgsign` locally;
   never commit a key or an identity into a tracked file. If you cannot sign,
@@ -217,13 +228,28 @@ green locally. The description says what changed and why, how you verified it,
 and anything a reviewer should distrust. If you could not run part of the
 suite, say which part and why.
 
-It is squashed into a commit message, so it obeys the same rule as one: it
-[addresses no one](#commits). A description that opens by answering somebody
-becomes a permanent line in `git log` that no later reader can make sense of.
+The description obeys the same rule a commit does: it
+[addresses no one](#commits). It no longer becomes a commit body — the merge
+takes the title and nothing else — but it outlives the review that prompted it,
+and a description that opens by answering somebody is unreadable to everyone who
+arrives later.
+
+**A pull request merges as a merge commit** — never a squash, never a rebase.
+The merge commit's subject is the pull request's title, which is why the title
+obeys [the commit contract](#commits) like any other subject, and its body is
+empty, because the prose belongs to the commit underneath it and a review
+checklist is not history. The result reads with `git log --first-parent`: one
+line per pull request, and the detail one level down.
+
+This is what makes several branches workable at once. A squash replaces a
+branch's commits with a new one, so a second branch that shares a file has no
+ancestor in common with what landed and re-resolves the same conflicts by hand,
+however many times it merges `master`. A merge keeps the ancestry, so each
+conflict is settled once.
 
 A pull request is mergeable when: CI is green, every commit is signed, the
 [definition of done](#definition-of-done) is satisfied, and a maintainer has
-approved it. It merges as a squash, and the branch is deleted.
+approved it. The branch is deleted afterwards.
 
 Nothing is pushed to `master` directly, nothing is force-pushed, and no
 published history is rewritten.

@@ -35,6 +35,12 @@ const NEW_CONNECTIONS_HINT: &str = "Switching between the group's servers affect
     connections; existing connections do not migrate.";
 const POOL_FROM_GROUPS_HINT: &str = "To run several servers at once, save a group on the Servers \
     page and press Connect on it.";
+/// Same words as the noise-packet row in the core editor: the two are the same
+/// promise, and a user meeting one after the other should not have to work out
+/// whether they mean different things.
+const ROUTING_HINT: &str =
+    "Edited in the profile file, ahead of the rules oxidom generates. Saved from here untouched.";
+
 const LIST_MEMBERSHIP_HINT: &str = "A fixed list. New servers do not join it on their own. Change \
     which servers are in it from the group chips on the Servers page.";
 const RULE_MEMBERSHIP_HINT: &str = "A rule, so servers a future refresh adds can join it. Change \
@@ -116,6 +122,10 @@ struct DialogValues {
     /// `None` follows the machine's setting, the same "unset means inherit"
     /// the `[core]` sections use.
     on_core_exit: Option<OnCoreExit>,
+    /// The profile's routing block, carried the way the noise packets are:
+    /// there is no editor for it, the row below reports how many rules it holds,
+    /// and a save writes back exactly what was loaded.
+    routing: Option<String>,
 }
 
 impl DialogValues {
@@ -143,6 +153,7 @@ impl DialogValues {
             interface_list: interface.list.join(", "),
             core: entry.map(|entry| entry.core.clone()).unwrap_or_default(),
             on_core_exit: entry.and_then(|entry| entry.on_core_exit),
+            routing: entry.and_then(|entry| entry.routing.clone()),
         }
     }
 }
@@ -177,6 +188,24 @@ fn core_exit_subtitle(machine_holds: bool) -> String {
     format!("Follows the machine: {machine} traffic")
 }
 
+/// What the routing row says about a block nobody can edit here.
+///
+/// A count, because that is the honest amount a row can carry about arbitrary
+/// JSON, and it is enough to notice that a save kept it.
+fn describe_routing(routing: Option<&str>) -> String {
+    let Some(raw) = routing else {
+        return "No routing rules".to_string();
+    };
+    match oxidom_core::xray::routing::rule_count(raw) {
+        Some(0) => "A routing block with no rules".to_string(),
+        Some(1) => "1 routing rule".to_string(),
+        Some(many) => format!("{many} routing rules"),
+        // Saving is refused with the parse error, so this row only has to avoid
+        // claiming a count it does not have.
+        None => "A routing block that does not parse".to_string(),
+    }
+}
+
 fn profile_from_dialog(values: DialogValues) -> Profile {
     Profile {
         description: values.description,
@@ -198,6 +227,7 @@ fn profile_from_dialog(values: DialogValues) -> Profile {
         },
         core: values.core,
         on_core_exit: values.on_core_exit,
+        routing: values.routing,
     }
 }
 
@@ -452,6 +482,24 @@ pub fn show_profile_dialog(
         .selected(core_exit_index(initial.on_core_exit))
         .build();
     interface_group.add(&core_exit);
+    // No editor, for the same reason the noise packets have none: a routing
+    // block is hand-written JSON with no useful default, and a blind round trip
+    // through a form that could not show it would be worse than saying so. The
+    // row reports how many rules it holds and the value is written back
+    // untouched, exactly as the pool membership is above.
+    // "Routing rules", not "Routing": the profile row on the Profiles page
+    // already carries a Routing detail, and it answers a different question —
+    // whether this profile captures the machine or only offers local proxies.
+    let routing_group = adw::PreferencesGroup::builder()
+        .title("Routing rules")
+        .build();
+    let routing_row = adw::ActionRow::builder()
+        .title(describe_routing(initial.routing.as_deref()))
+        .subtitle(ROUTING_HINT)
+        .subtitle_lines(2)
+        .activatable(false)
+        .build();
+    routing_group.add(&routing_row);
 
     let core_editor = CoreEditor::new(CoreLevel::Profile, machine_core, &initial.core);
 
@@ -459,6 +507,7 @@ pub fn show_profile_dialog(
     groups.append(&profile_group);
     groups.append(&pool_group);
     groups.append(&interface_group);
+    groups.append(&routing_group);
     groups.append(&core_editor.group);
     if let Some(name) = edit_name.as_deref() {
         let remove_group = adw::PreferencesGroup::builder().title("Remove").build();
@@ -524,6 +573,7 @@ pub fn show_profile_dialog(
         let picker_entries = picker_entries.clone();
         let strategy = strategy.clone();
         let carried = initial_pool.clone();
+        let carried_routing = initial.routing.clone();
         let pool_max = pool_max.clone();
         let pool_expected = pool_expected.clone();
         let pool_probe_interval = pool_probe_interval.clone();
@@ -571,6 +621,7 @@ pub fn show_profile_dialog(
                 interface_list: routed_subnets.text().to_string(),
                 core: core_editor.values(),
                 on_core_exit: core_exit_choice(core_exit.selected()),
+                routing: carried_routing.clone(),
             };
             Some((name, profile_from_dialog(values)))
         }
@@ -1122,12 +1173,20 @@ mod tests {
             // one of them — so a save has to be able to write back a deliberate
             // answer *and* a deliberate absence of one.
             on_core_exit: Some(OnCoreExit::Release),
+            // No editor at all, so this is the field with the most to lose: a
+            // dialog that dropped it would return a routed profile to the two
+            // rules oxidom installs, and say nothing.
+            routing: Some(
+                r#"{"rules":[{"domain":["geosite:category-ads-all"],"outboundTag":"block"}]}"#
+                    .to_string(),
+            ),
         };
 
         let saved = profile_from_dialog(DialogValues::new(Some(&entry)));
         assert_eq!(saved.interface, entry.interface);
         assert_eq!(saved.core, entry.core);
         assert_eq!(saved.on_core_exit, entry.on_core_exit);
+        assert_eq!(saved.routing, entry.routing);
         assert_eq!(saved.description, entry.description);
         assert_eq!(saved.select.server, entry.server);
         assert_eq!(saved.select.pool, entry.pool);

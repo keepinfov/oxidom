@@ -76,10 +76,20 @@ Draft while it settles, ready when the checks pass. Say what you changed, why,
 and how you verified it. If you could not run part of the suite — no Nix, no
 Linux, no hardware — say which part; that is useful information, not a failing.
 
+**Give it a title in the commit form**, because the merge commit takes it
+verbatim: `fix(gui): a stopped group profile says which group`, not `fixes`.
+
 CI runs formatting, clippy, the tests, a full `nix build`, and packaging
 checks. Documentation-only changes skip the Rust jobs automatically.
 
-A maintainer reviews, and the branch is squash-merged.
+A maintainer reviews, and the branch is merged with a merge commit — not
+squashed. So tidy the branch before marking it ready: one commit, or a few that
+each stand on their own, each with a message worth reading. Anything else gets
+squashed by you first, since nothing does it for you at the merge.
+
+If `master` moves while you work, **merge it into your branch** rather than
+rebasing. Your commits are already published once they are pushed, and rebasing
+them costs the next merge its shared ancestry.
 
 ## A few house rules worth repeating
 

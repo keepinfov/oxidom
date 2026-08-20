@@ -1261,4 +1261,186 @@ proxies:
              &sni=real.example&insecure=1&up=100&down=50#N"
         );
     }
+
+    /// One case per panel this application claims to read.
+    ///
+    /// The parsers were tested against bodies written here by hand, none of
+    /// them named after the software that would send it, so nothing recorded
+    /// which panel any shape came from. A user whose panel serves a shape
+    /// nobody tried sees an empty list, and the application cannot say whether
+    /// that shape is unsupported or whether it is broken.
+    ///
+    /// **Every fixture below is fixture-only.** No live panel was available, so
+    /// each body is written from the format that panel is documented to serve
+    /// for that client string, with invented credentials throughout. The table
+    /// in `docs/subscriptions-and-protocols.md` says the same, so the claim
+    /// stays exactly as wide as what was actually tried.
+    ///
+    /// A `.b64` fixture is stored the way the panel sends it — base64 around
+    /// the link list — because that wrapper is a branch of its own
+    /// (`decode_body`). Read one with `base64 -d`.
+    mod panels {
+        use super::*;
+
+        const MARZBAN_LINKS: &str = include_str!("subscription_format/fixtures/marzban-v2rayn.b64");
+        const MARZBAN_CLASH: &str = include_str!("subscription_format/fixtures/marzban-clash.yaml");
+        const MARZBAN_SING_BOX: &str =
+            include_str!("subscription_format/fixtures/marzban-sing-box.json");
+        const MARZNESHIN_LINKS: &str =
+            include_str!("subscription_format/fixtures/marzneshin-v2rayn.b64");
+        const REMNAWAVE_LINKS: &str =
+            include_str!("subscription_format/fixtures/remnawave-v2rayn.b64");
+        const REMNAWAVE_XRAY: &str =
+            include_str!("subscription_format/fixtures/remnawave-v2rayng.json");
+        const THREE_X_UI_LINKS: &str =
+            include_str!("subscription_format/fixtures/three-x-ui-v2rayn.b64");
+        const HIDDIFY_SING_BOX: &str =
+            include_str!("subscription_format/fixtures/hiddify-manager-sing-box.json");
+        const V2BOARD_CLASH: &str = include_str!("subscription_format/fixtures/v2board-clash.yaml");
+        const WEB_PAGE: &str = include_str!("subscription_format/fixtures/panel-web-page.html");
+
+        /// Marzban wraps its share-link list in base64, so the wrapper is part
+        /// of the case: a body that decodes to three links must arrive as three
+        /// servers, not as one unreadable line.
+        #[test]
+        fn a_marzban_link_list_arrives_as_one_server_per_link() {
+            let (servers, skipped) = parse(MARZBAN_LINKS).unwrap();
+            assert!(skipped.is_empty(), "nothing in this body is unsupported");
+            let seen: Vec<_> = servers
+                .iter()
+                .map(|server| (server.protocol, server.address.as_str(), server.port))
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    (Protocol::Vless, "nl1.panel.example", 443),
+                    (Protocol::Vmess, "de1.panel.example", 8443),
+                    (Protocol::Trojan, "fr1.panel.example", 443),
+                ]
+            );
+            assert!(
+                servers.iter().all(|server| server.link.is_some()),
+                "a link list keeps the link each server arrived on"
+            );
+        }
+
+        /// The same panel, the same servers, a Clash client string.
+        #[test]
+        fn a_marzban_clash_body_carries_the_same_three_servers() {
+            let (servers, _skipped) = parse(MARZBAN_CLASH).unwrap();
+            let seen: Vec<_> = servers
+                .iter()
+                .map(|server| (server.protocol, server.address.as_str(), server.port))
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    (Protocol::Vless, "nl1.panel.example", 443),
+                    (Protocol::Vmess, "de1.panel.example", 8443),
+                    (Protocol::Trojan, "fr1.panel.example", 443),
+                ]
+            );
+        }
+
+        /// A sing-box body names its nodes in a `selector` outbound that is not
+        /// itself a server; counting it would show a node nobody can connect to.
+        #[test]
+        fn a_marzban_sing_box_body_skips_the_selector_that_names_its_nodes() {
+            let (servers, _skipped) = parse(MARZBAN_SING_BOX).unwrap();
+            assert_eq!(servers.len(), 2);
+            assert_eq!(servers[0].address, "nl1.panel.example");
+            assert_eq!(servers[1].address, "de1.panel.example");
+        }
+
+        #[test]
+        fn a_marzneshin_link_list_arrives_as_one_server_per_link() {
+            let (servers, skipped) = parse(MARZNESHIN_LINKS).unwrap();
+            assert!(skipped.is_empty());
+            assert_eq!(servers.len(), 2);
+            assert_eq!(servers[0].address, "a.marzneshin.example");
+            assert_eq!(servers[0].port, 2087);
+            assert_eq!(servers[1].address, "b.marzneshin.example");
+        }
+
+        /// Both halves of the split this application's default client string
+        /// exists for: the same Remnawave subscription answers `v2rayN` with a
+        /// link list of individual nodes, and `v2rayNG` with whole Xray
+        /// configurations that are one balanced server each.
+        #[test]
+        fn a_remnawave_link_list_is_one_server_per_node() {
+            let (servers, _skipped) = parse(REMNAWAVE_LINKS).unwrap();
+            assert_eq!(servers.len(), 2);
+            assert!(
+                servers.iter().all(|server| server.link.is_some()),
+                "each node is individually shareable and poolable"
+            );
+        }
+
+        #[test]
+        fn a_remnawave_xray_config_is_one_balanced_server_with_no_link() {
+            let (servers, _skipped) = parse(REMNAWAVE_XRAY).unwrap();
+            assert_eq!(
+                servers.len(),
+                1,
+                "a balanced configuration is one server, not one per outbound"
+            );
+            assert!(matches!(servers[0].spec, OutboundSpec::XrayProfile { .. }));
+            assert!(
+                servers[0].link.is_none(),
+                "no share link can express a whole balanced configuration"
+            );
+        }
+
+        #[test]
+        fn a_three_x_ui_link_list_carries_reality_and_shadowsocks_together() {
+            let (servers, skipped) = parse(THREE_X_UI_LINKS).unwrap();
+            assert!(skipped.is_empty());
+            assert_eq!(servers.len(), 2);
+            assert_eq!(servers[0].protocol, Protocol::Vless);
+            assert_eq!(servers[1].protocol, Protocol::Shadowsocks);
+            assert_eq!(servers[1].address, "ss.xui.example");
+        }
+
+        /// Hiddify Manager leads with hysteria2, whose parameters live in a
+        /// different place from every other protocol's.
+        #[test]
+        fn a_hiddify_manager_sing_box_body_keeps_its_hysteria2_parameters() {
+            let (servers, _skipped) = parse(HIDDIFY_SING_BOX).unwrap();
+            assert_eq!(servers.len(), 2);
+            assert_eq!(servers[0].protocol, Protocol::Hysteria2);
+            assert_eq!(servers[0].address, "hy2.hiddify.example");
+            assert_eq!(servers[0].port, 8443);
+            assert_eq!(servers[1].protocol, Protocol::Vless);
+        }
+
+        #[test]
+        fn a_v2board_clash_body_carries_both_of_its_protocols() {
+            let (servers, _skipped) = parse(V2BOARD_CLASH).unwrap();
+            assert_eq!(servers.len(), 2);
+            assert_eq!(servers[0].protocol, Protocol::Shadowsocks);
+            assert_eq!(servers[0].address, "la.v2board.example");
+            assert_eq!(servers[1].protocol, Protocol::Trojan);
+            assert_eq!(servers[1].address, "tokyo.v2board.example");
+        }
+
+        /// The commonest failure a user meets, and the only one whose message
+        /// names a cure. It had no test: the body that produced it fell into
+        /// the generic bail beside it.
+        #[test]
+        fn a_panel_answering_with_a_web_page_says_so_and_quotes_nothing() {
+            let error = parse(WEB_PAGE).unwrap_err().to_string();
+            assert!(
+                error.contains("web page instead of a server list"),
+                "got: {error}"
+            );
+            assert!(
+                error.contains("Client preset"),
+                "the message names what to change: {error}"
+            );
+            assert!(
+                !error.contains("<html") && !error.contains("subscription</title>"),
+                "the body is classified, never quoted back: {error}"
+            );
+        }
+    }
 }

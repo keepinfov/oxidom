@@ -1,0 +1,37 @@
+{
+  "_fixture": "Fixture only: the sing-box body a Marzban panel serves to sing-box family client strings. Every credential and host below is invented.",
+  "log": { "level": "warn" },
+  "outbounds": [
+    { "type": "selector", "tag": "PROXY", "outbounds": ["NL Amsterdam", "DE Frankfurt"] },
+    {
+      "type": "vless",
+      "tag": "NL Amsterdam",
+      "server": "nl1.panel.example",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.org",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": {
+          "enabled": true,
+          "public_key": "RmFrZVB1YmxpY0tleUZvclRlc3RzT25seUFBQUFBQUE",
+          "short_id": "1a2b3c4d"
+        }
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "DE Frankfurt",
+      "server": "de1.panel.example",
+      "server_port": 8443,
+      "uuid": "00000000-0000-4000-8000-000000000002",
+      "alter_id": 0,
+      "security": "auto",
+      "transport": { "type": "ws", "path": "/marzban", "headers": { "Host": "de1.panel.example" } },
+      "tls": { "enabled": true, "server_name": "de1.panel.example" }
+    },
+    { "type": "direct", "tag": "direct" }
+  ]
+}

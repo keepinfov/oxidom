@@ -2164,6 +2164,7 @@ impl Service {
         // interface was requested.
         let default_profile = profile::load_or_default("default").map_err(failed)?;
         default_profile.validate("default").map_err(failed)?;
+        let default_routing = default_profile.routing_block().map_err(failed)?;
         self.shared.clear_override("default");
         let generation = self.shared.next_connect_generation("default");
         {
@@ -2187,7 +2188,7 @@ impl Service {
             engine
                 .prepare_session("default", Ipv4Addr::LOCALHOST, socks_port, http_port)
                 .map_err(failed)?;
-            engine.configure_core("default", &default_profile.core);
+            engine.configure_core("default", &default_profile.core, default_routing);
             engine.configure_hold_traffic("default", default_profile.on_core_exit);
             if let Err(error) = engine.configure_interface(
                 "default",
@@ -2241,6 +2242,7 @@ impl Service {
                     pool: profile.select.pool,
                     core: profile.core,
                     on_core_exit: profile.on_core_exit,
+                    routing: profile.routing,
                 }),
                 Err(error) => log::warn!("skipping profile {name:?}: {error:#}"),
             }
@@ -2272,6 +2274,7 @@ impl Service {
         // Only files written through `SaveProfile` were validated on the way
         // in; this one may have been edited by hand since.
         profile.validate(&name).map_err(failed)?;
+        let profile_routing = profile.routing_block().map_err(failed)?;
         if profile.select.server.is_empty() && profile.select.pool.is_none() {
             return Err(failed(format!(
                 "profile {name:?} does not name a server yet; set select.server to an alias or id"
@@ -2435,7 +2438,7 @@ impl Service {
             engine
                 .prepare_session(&name, address, socks_port, http_port)
                 .map_err(failed)?;
-            engine.configure_core(&name, &profile.core);
+            engine.configure_core(&name, &profile.core, profile_routing);
             engine.configure_hold_traffic(&name, profile.on_core_exit);
             if let Err(error) = engine.configure_interface(&name, &profile.interface, &servers) {
                 engine.sessions.remove(&name);
@@ -4344,6 +4347,10 @@ mod tests {
             interface: Default::default(),
             core: Default::default(),
             on_core_exit: None,
+            routing: Some(
+                r#"{"rules":[{"domain":["geosite:category-ads-all"],"outboundTag":"block"}]}"#
+                    .to_string(),
+            ),
         };
 
         service.save_profile("work".to_string(), serde_json::to_string(&profile)?)?;
@@ -4355,6 +4362,24 @@ mod tests {
         assert_eq!(entries[0].name, "work");
         assert_eq!(entries[0].server, "ch-trojan");
         assert_eq!(entries[0].socks_port, 21080);
+        // The listing carries the block too: the editor rewrites a profile from
+        // this entry, and one that did not carry it would drop the rules on the
+        // next save.
+        assert_eq!(entries[0].routing, profile.routing);
+
+        // A block the daemon cannot use is refused where the caller still sees
+        // why, rather than at spawn where it would be an Xray exit code.
+        let unusable = Profile {
+            routing: Some(
+                r#"{"rules":[{"domain":["x.example"],"outboundTag":"warp"}]}"#.to_string(),
+            ),
+            ..profile.clone()
+        };
+        let error = service
+            .save_profile("broken".to_string(), serde_json::to_string(&unusable)?)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("\"warp\""), "got: {error}");
 
         // A name that would escape the profiles directory is refused by the
         // daemon, not merely by whoever called it.

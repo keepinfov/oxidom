@@ -16,6 +16,37 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **A profile can carry its own routing rules.** Everything oxidom generated said the same
+  two things about where traffic goes — private addresses direct, and for a pool the rest
+  to the balancer — and there was no way to say anything else short of not using oxidom.
+  A profile file now takes a `routing` block, written as Xray writes it, and its rules go
+  **ahead** of the two above, so a rule you write wins over the built-in one below it:
+
+  ```toml
+  routing = '''
+  { "rules": [ { "domain": ["geosite:category-ads-all"], "outboundTag": "block" } ] }
+  '''
+  ```
+
+  Traffic can be sent to `direct`, `block`, or — on a profile that selects a single server —
+  `proxy`. A pool has no `proxy` outbound, because its members are reached through the
+  balancer, and a rule aimed at one there is refused by name rather than becoming a core
+  that will not start. Balancers, a `balancerTag`, and `domainStrategy` are refused too:
+  the first two are oxidom's to build, and the third already has a home in `[core]`.
+  Everything is checked when the profile is saved and again when it is brought up, so the
+  answer is a sentence rather than an exit code.
+
+  There is no editor for it. The profile dialog reports how many rules the block holds and
+  writes it back untouched, the way it already treats a group's membership — so editing a
+  profile from the interface cannot lose them. It is a profile key rather than a machine
+  one on purpose: a rule set machine-wide would also reach the short-lived cores that
+  measure latency, where a rule sending the measurement out direct would report a dead
+  server as fast.
+
+  **A subscription's own routing is still discarded at import.** Carrying a provider's
+  block means mapping its outbound tags onto oxidom's; this is the half that does not need
+  that, and it is what lets someone write the same rules by hand today.
+
 - **A latency check can be called off.** The daemon gained `CancelProbes`, which drops
   every check still waiting in the queue. The at-most-eight already measuring finish on
   their own — each holds a slot a thread will release, and taking it early would hand it
@@ -48,6 +79,16 @@ surface, packaging, or the CLI belongs here.
   asked, which is not where release candidates belong.
 
 ### Changed
+
+- **The documentation now says which panel answers with which format.** oxidom reads
+  share-link lists, Xray JSON, sing-box JSON and Clash YAML, and the panel picks between
+  them from the client string it is sent — but nothing said which panel does what, so a
+  subscription that came back empty gave no way to tell an unsupported shape from a broken
+  one. Marzban, Marzneshin, Remnawave, 3x-ui, Hiddify Manager and V2Board/XBoard now have a
+  row in the manual and a test case named after them, including the one where a panel
+  answers with a web page because it did not recognise the client. None of the cases has
+  been tried against a live panel, and the table says so: each is written from the format
+  that panel is documented to serve, so the claim is no wider than what was tested.
 
 - **One system of quotation marks, and one case for a label.** Profile names were quoted with
   guillemets while groups, subscriptions and servers used curly quotes, so a single confirmation

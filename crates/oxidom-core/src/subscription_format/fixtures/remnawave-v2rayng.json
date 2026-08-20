@@ -1,0 +1,30 @@
+[
+  {
+    "remarks": "Fixture only: one of the whole Xray configurations a Remnawave panel serves when its XRAY_JSON template is on. Invented credentials.",
+    "log": { "loglevel": "warning" },
+    "outbounds": [
+      {
+        "tag": "proxy-se",
+        "protocol": "vless",
+        "settings": { "vnext": [ { "address": "se.remna.example", "port": 443, "users": [ { "id": "00000000-0000-4000-8000-000000000031", "encryption": "none", "flow": "xtls-rprx-vision" } ] } ] },
+        "streamSettings": { "network": "tcp", "security": "reality", "realitySettings": { "publicKey": "UmVtbmFGYWtlUHVibGljS2V5Rm9yVGVzdHNPbmx5QQ", "shortId": "0f1e2d3c", "serverName": "www.example.net", "fingerprint": "chrome" } }
+      },
+      {
+        "tag": "proxy-fi",
+        "protocol": "vless",
+        "settings": { "vnext": [ { "address": "fi.remna.example", "port": 443, "users": [ { "id": "00000000-0000-4000-8000-000000000032", "encryption": "none", "flow": "xtls-rprx-vision" } ] } ] },
+        "streamSettings": { "network": "tcp", "security": "reality", "realitySettings": { "publicKey": "UmVtbmFGYWtlUHVibGljS2V5Rm9yVGVzdHNPbmx5QQ", "shortId": "0f1e2d3c", "serverName": "www.example.net", "fingerprint": "chrome" } }
+      },
+      { "tag": "direct", "protocol": "freedom" },
+      { "tag": "block", "protocol": "blackhole" }
+    ],
+    "routing": {
+      "rules": [
+        { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
+        { "type": "field", "network": "tcp,udp", "balancerTag": "nordics" }
+      ],
+      "balancers": [ { "tag": "nordics", "selector": ["proxy-"], "strategy": { "type": "leastPing" } } ]
+    },
+    "burstObservatory": { "subjectSelector": ["proxy-"], "pingConfig": { "destination": "https://panel.example/generate_204", "interval": "5m" } }
+  }
+]

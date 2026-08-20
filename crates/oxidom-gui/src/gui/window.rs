@@ -2116,9 +2116,11 @@ impl Controller {
                     interface: entry.interface.clone(),
                     // Retargeting changes the selection, nothing else: the
                     // advanced core settings have no row in this flow and must
-                    // survive it untouched.
+                    // survive it untouched. So must the routing block, which has
+                    // no row anywhere.
                     core: entry.core.clone(),
                     on_core_exit: entry.on_core_exit,
+                    routing: entry.routing.clone(),
                 },
                 server_name,
             )
@@ -2290,9 +2292,11 @@ impl Controller {
             },
             interface: entry.interface.clone(),
             // As with the pool's tuning above: connecting a group changes the
-            // membership, not the core settings the profile was given.
+            // membership, not the core settings or the routing block the profile
+            // was given.
             core: entry.core.clone(),
             on_core_exit: entry.on_core_exit,
+            routing: entry.routing.clone(),
         })
     }
 

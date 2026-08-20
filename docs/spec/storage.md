@@ -89,6 +89,12 @@ noises = []
 [core.dns]                    # server | direct_server | query_strategy
 ```
 
+A profile file carries the same `[core]` table plus `description`, `[select]`, `[proxy]`,
+`[interface]`, and `routing` — a string holding an Xray `routing` object, normally written as a
+TOML multi-line literal. It is spliced ahead of the generated rules; what it may not contain is in
+[A profile's own routing block](xray-config.md#a-profiles-own-routing-block-binding). A profile
+that carries none gains no key.
+
 Every `[core]` key is optional at both levels, and an untouched section is not written to the file
 at all. See [Advanced core settings](xray-config.md#advanced-core-settings-binding) for what each
 one generates.

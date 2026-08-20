@@ -5,6 +5,7 @@
 - [Protocols](#protocols)
 - [Share links](#share-links)
 - [What subscriptions may return](#what-subscriptions-may-return)
+- [The User-Agent decides the format](#the-user-agent-decides-the-format)
 - [Quota and expiry](#quota-and-expiry)
 - [Privacy and HWID](#privacy-and-hwid)
 - [Refreshing](#refreshing)
@@ -98,6 +99,36 @@ share-link list of the same nodes. Both parse, but they are not equivalent:
 | --- | --- |
 | Share-link list | one server per node, each with a share link, poolable, pingable |
 | Array of balanced Xray configs | one `xray + balanced (N)` server per config, no share link, not poolable |
+
+### What each panel answers with
+
+Every panel oxidom claims to read has a case in the test suite named after it,
+so an empty server list can be told apart from a shape nobody tried. The
+fixtures live in `crates/oxidom-core/src/subscription_format/fixtures/`.
+
+| Panel | Client preset | Format it answers with | Fixture |
+| --- | --- | --- | --- |
+| Marzban | v2rayN, v2rayNG | share-link list | `marzban-v2rayn.b64` |
+| Marzban | Clash Meta | Clash YAML | `marzban-clash.yaml` |
+| Marzban | sing-box, Hiddify | sing-box JSON | `marzban-sing-box.json` |
+| Marzneshin | v2rayN, v2rayNG | share-link list | `marzneshin-v2rayn.b64` |
+| Remnawave | v2rayN | share-link list | `remnawave-v2rayn.b64` |
+| Remnawave | v2rayNG | array of whole Xray configs | `remnawave-v2rayng.json` |
+| 3x-ui | v2rayN, v2rayNG | share-link list | `three-x-ui-v2rayn.b64` |
+| Hiddify Manager | Hiddify, sing-box | sing-box JSON | `hiddify-manager-sing-box.json` |
+| V2Board, XBoard | Clash Meta | Clash YAML | `v2board-clash.yaml` |
+| any, unrecognised client | — | a web page, which is an error naming the cure | `panel-web-page.html` |
+
+**None of these has been tried against a live panel.** No instance of any of
+them was available, so each fixture is written from the format that panel is
+documented to serve for that client string, with invented credentials
+throughout — the table says what oxidom parses, not what a particular
+installation was observed to send. A panel that answers differently from its
+row is worth an issue: that is the gap these cases exist to expose.
+
+A share-link list normally arrives base64-encoded, which oxidom unwraps before
+parsing; the `.b64` fixtures are stored that way because the wrapper is a case
+of its own, and `base64 -d` reads one.
 
 So a subscription that shows far fewer normal servers than you expect — most of
 them labelled `xray + balanced (…)` — is usually answering the wrong format

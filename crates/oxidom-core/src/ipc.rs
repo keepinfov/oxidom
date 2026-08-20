@@ -536,6 +536,11 @@ pub struct ProfileEntry {
     /// profile from this entry would otherwise drop the answer on every save.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_core_exit: Option<crate::config::OnCoreExit>,
+    /// The profile's `routing` block, carried for the same reason: the editor
+    /// does not show it, and a save that dropped it would silently return a
+    /// routed profile to the two rules oxidom installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<String>,
 }
 
 /// The selected server returned after bringing a profile up.
