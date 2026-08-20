@@ -619,6 +619,7 @@ mod tests {
             interface: Default::default(),
             pool: None,
             core: Default::default(),
+            routing: None,
         }];
 
         assert_eq!(

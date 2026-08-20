@@ -521,6 +521,11 @@ pub struct ProfileEntry {
     /// dropped them would quietly un-fragment a profile that needed it.
     #[serde(default, skip_serializing_if = "CoreOptions::is_unset")]
     pub core: CoreOptions,
+    /// The profile's `routing` block, carried for the same reason as the two
+    /// above: the editor does not show it, and a save that dropped it would
+    /// silently return a routed profile to the two rules oxidom installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<String>,
 }
 
 /// The selected server returned after bringing a profile up.
