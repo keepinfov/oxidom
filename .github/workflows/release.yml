@@ -206,9 +206,14 @@ jobs:
             if [ -n "$prev" ]; then
               printf 'Since %s.\n\n' "$prev"
             fi
+            # First parent, so the list is one line per pull request — the merge
+            # commit carries the title and the `(#N)` that links it. Walking
+            # every commit instead publishes whatever a branch happened to carry
+            # and drops the number, which is a longer list that says less.
+            #
             # The release commit is dropped: it announces the version and says
             # nothing about the software.
-            git log --no-merges --format='- %s' "${prev:+$prev..}$head" \
+            git log --first-parent --format='- %s' "${prev:+$prev..}$head" \
               | grep -v '^- chore(release)'
           } >> notes.md
           cat notes.md
