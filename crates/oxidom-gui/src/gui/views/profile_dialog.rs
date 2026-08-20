@@ -434,7 +434,12 @@ pub fn show_profile_dialog(
     // through a form that could not show it would be worse than saying so. The
     // row reports how many rules it holds and the value is written back
     // untouched, exactly as the pool membership is above.
-    let routing_group = adw::PreferencesGroup::builder().title("Routing").build();
+    // "Routing rules", not "Routing": the profile row on the Profiles page
+    // already carries a Routing detail, and it answers a different question —
+    // whether this profile captures the machine or only offers local proxies.
+    let routing_group = adw::PreferencesGroup::builder()
+        .title("Routing rules")
+        .build();
     let routing_row = adw::ActionRow::builder()
         .title(describe_routing(initial.routing.as_deref()))
         .subtitle(ROUTING_HINT)
