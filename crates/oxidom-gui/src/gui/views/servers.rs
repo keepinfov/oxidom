@@ -12,10 +12,10 @@ use oxidom_core::pool::PoolQuery;
 use super::super::group::subscription_description;
 use super::super::prefs::{FAVOURITES_ID, GroupKind, GuiPrefs, ServerGroup};
 use super::super::reduce::{
-    FailureReport, FilterOption, ServerProfiles, available_countries, available_protocols,
-    available_subscriptions, connect_choices, describe_rule, excludable_servers, filtered_ids,
-    filters_to_query, group_member_ids, groups_holding, moved_in_order, ordered_subscriptions,
-    query_equals_group, toggled_member, upsert_group,
+    FailureReport, FilterOption, HistoryRow, ServerProfiles, available_countries,
+    available_protocols, available_subscriptions, connect_choices, describe_rule,
+    excludable_servers, filtered_ids, filters_to_query, group_member_ids, groups_holding,
+    moved_in_order, ordered_subscriptions, query_equals_group, toggled_member, upsert_group,
 };
 use super::super::server_card::{
     CARD_MEASURE_WIDTH, COMPACT_CARD_HEIGHT, CardConnectionState, CardHandlers, LatencyState,
@@ -2610,6 +2610,24 @@ impl ServersView {
         let changed = match self.cards.borrow().get(server_id) {
             Some(card) => {
                 card.set_failure_report(report);
+                card.is_expanded()
+            }
+            None => false,
+        };
+        if changed {
+            self.refresh_expanded_height();
+        }
+    }
+
+    /// Put the recent checks on one card, or take them away.
+    ///
+    /// A lookup and a re-measure for the same reasons as
+    /// [`Self::set_failure_report`]: only the expanded card carries a history,
+    /// and the list growing a row is a content change under a fixed height.
+    pub fn set_history(&self, server_id: &str, rows: &[HistoryRow]) {
+        let changed = match self.cards.borrow().get(server_id) {
+            Some(card) => {
+                card.set_history(rows);
                 card.is_expanded()
             }
             None => false,

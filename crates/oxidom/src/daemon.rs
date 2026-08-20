@@ -17,9 +17,10 @@ use oxidom_core::config::{Config, LatencyMethod};
 use oxidom_core::engine::{Engine, PoolSession, SessionSelection, pool_fingerprint};
 use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
-    ApplySettingsResult, BUS_NAME, InterfaceInfo, LatencyReading, OBJECT_PATH, PROBE_STATE_VERSION,
-    PoolMember, ProbeDetail, ProbeFailure, ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo,
-    SelectionInfo, SessionInfo, StatusInfo, UpResult, UpServer,
+    ApplySettingsResult, BUS_NAME, InterfaceInfo, LatencyReading, OBJECT_PATH, PROBE_HISTORY_LIMIT,
+    PROBE_STATE_VERSION, PoolMember, ProbeDetail, ProbeFailure, ProbeHistory, ProbeRoute,
+    ProbeState, ProfileEntry, RuntimeInfo, SelectionInfo, SessionInfo, StatusInfo, UpResult,
+    UpServer,
 };
 use oxidom_core::model::Server;
 use oxidom_core::pool;
@@ -333,6 +334,12 @@ pub struct DaemonOptions {
 pub(crate) struct Shared {
     engine: Arc<Mutex<Engine>>,
     readings: Arc<Mutex<HashMap<String, LatencyReading>>>,
+    /// The last few readings per server, newest first, for the one card that
+    /// is open. Kept beside `readings` rather than inside it because the two
+    /// are read on completely different schedules: `readings` crosses the wire
+    /// twice a second for every server, this crosses it once when a card is
+    /// expanded.
+    history: Arc<Mutex<HashMap<String, Vec<LatencyReading>>>>,
     proxied: Arc<Mutex<HashMap<String, LatencyReading>>>,
     probes: Arc<Mutex<ProbeQueue>>,
     /// Layered over the core status, e.g. when the confirming probe after a
@@ -417,6 +424,7 @@ impl Shared {
         Shared {
             engine: Arc::new(Mutex::new(engine)),
             readings: Arc::new(Mutex::new(HashMap::new())),
+            history: Arc::new(Mutex::new(HashMap::new())),
             proxied: Arc::new(Mutex::new(HashMap::new())),
             probes: Arc::new(Mutex::new(ProbeQueue::default())),
             override_status: Arc::new(Mutex::new(HashMap::new())),
@@ -1069,10 +1077,21 @@ impl Shared {
                 .find_server(server_id)
                 .map(|server| (server, engine.registry.config.clone()))
         };
-        let reading = match target {
+        // `measured` is what separates the two maps below. A probe that ran
+        // says something about the server whether or not it produced a number —
+        // a server that times out half the time is exactly what the history is
+        // for — while the arm that never ran says only that this daemon lost
+        // track of the server, which belongs in the current reading and nowhere
+        // else.
+        let (reading, measured) = match target {
             Some((server, config)) => {
                 let method = config.latency_method;
-                match probe::measure(&server, &config, probe::Route::Direct, Ipv4Addr::LOCALHOST) {
+                let reading = match probe::measure(
+                    &server,
+                    &config,
+                    probe::Route::Direct,
+                    Ipv4Addr::LOCALHOST,
+                ) {
                     // The reading carries the method that produced it, not the
                     // one the config asked for: a hysteria2 server may answer
                     // only ICMP. The card says which it was rather than
@@ -1081,21 +1100,40 @@ impl Shared {
                         LatencyReading::ok(measured.ms, ProbeRoute::Direct, measured.method)
                     }
                     outcome => wire_reading(&outcome, ProbeRoute::Direct, method),
-                }
+                };
+                (reading, true)
             }
             // The server was removed between the request and its slot. Nothing
             // was measured and nothing about it is known — including which
             // method would have been used, since that read the config we never
             // got to.
-            None => LatencyReading::failed(
-                ProbeFailure::Unknown,
-                ProbeRoute::Direct,
-                LatencyMethod::default(),
+            None => (
+                LatencyReading::failed(
+                    ProbeFailure::Unknown,
+                    ProbeRoute::Direct,
+                    LatencyMethod::default(),
+                ),
+                false,
             ),
         };
         let value = reading.value;
         oxidom_core::sync::lock(&self.readings).insert(server_id.to_string(), reading);
+        if measured {
+            self.record_history(server_id, reading);
+        }
         value
+    }
+
+    /// Push one measured reading onto a server's history, newest first.
+    ///
+    /// Taken after the `readings` lock is released, never with both held: the
+    /// two maps are written in this order everywhere, and the D-Bus methods
+    /// that read them take one at a time.
+    fn record_history(&self, server_id: &str, reading: LatencyReading) {
+        let mut history = oxidom_core::sync::lock(&self.history);
+        let entries = history.entry(server_id.to_string()).or_default();
+        entries.insert(0, reading);
+        entries.truncate(PROBE_HISTORY_LIMIT);
     }
 
     /// Probe the tunnel owned by one profile, keeping the raw outcome.
@@ -1501,6 +1539,7 @@ impl Shared {
             )
         };
         oxidom_core::sync::lock(&self.readings).retain(|id, _| alive_servers.contains(id));
+        oxidom_core::sync::lock(&self.history).retain(|id, _| alive_servers.contains(id));
         oxidom_core::sync::lock(&self.proxied)
             .retain(|profile, _| alive_profiles.contains(profile));
         oxidom_core::sync::lock(&self.tunnel_failures)
@@ -2732,6 +2771,22 @@ impl Service {
             proxied: oxidom_core::sync::lock(&self.shared.proxied).clone(),
         };
         json(&state)
+    }
+
+    /// What one server's recent checks measured, newest first.
+    ///
+    /// One server per call, and not folded into `ProbeState`, because that one
+    /// is polled twice a second for every server a client knows about: ten
+    /// readings each would multiply a standing broadcast to serve a panel only
+    /// the expanded card draws. A server with no measured check yet answers an
+    /// empty list rather than an error — there is nothing wrong with a server
+    /// that has never been checked.
+    fn probe_history(&self, server_id: String) -> fdo::Result<String> {
+        let readings = oxidom_core::sync::lock(&self.shared.history)
+            .get(&server_id)
+            .cloned()
+            .unwrap_or_default();
+        json(&ProbeHistory { readings })
     }
 
     fn get_settings(&self) -> fdo::Result<String> {
@@ -4638,6 +4693,124 @@ mod tests {
         );
         drop(readings);
         drop(root);
+    }
+
+    /// Ten deep, newest first. The bound is what makes the history affordable
+    /// for a subscription of several hundred servers that have all been swept:
+    /// the daemon holds every one of these lists at once.
+    #[test]
+    fn a_history_keeps_the_last_ten_checks_newest_first() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("history-bound");
+        let shared = Shared::new(Engine::load(), false, false, false);
+
+        for ms in 1..=(PROBE_HISTORY_LIMIT as u32 + 5) {
+            shared.record_history(
+                "berlin",
+                LatencyReading::ok(ms, ProbeRoute::Direct, LatencyMethod::default()),
+            );
+        }
+
+        let history = oxidom_core::sync::lock(&shared.history);
+        let entries = history.get("berlin").expect("a checked server has one");
+        assert_eq!(entries.len(), PROBE_HISTORY_LIMIT);
+        assert_eq!(
+            entries.first().and_then(|reading| reading.value),
+            Some(PROBE_HISTORY_LIMIT as u32 + 5),
+            "newest first"
+        );
+        assert_eq!(
+            entries.last().and_then(|reading| reading.value),
+            Some(6),
+            "the oldest five fell off the end rather than the newest five"
+        );
+        drop(history);
+        drop(root);
+    }
+
+    /// A check called off before it ran measured nothing about the server, so
+    /// it says nothing the history is for. It must also not *displace*
+    /// anything: one press of Stop on a 600-server sweep would otherwise push
+    /// every server's real record out of a ten-deep list, erasing the history
+    /// by filling it.
+    #[test]
+    fn a_stopped_check_leaves_the_history_alone() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("history-cancel");
+        let shared = Shared::new(Engine::load(), false, false, false);
+
+        shared.record_history(
+            "waiting",
+            LatencyReading::ok(41, ProbeRoute::Direct, LatencyMethod::default()),
+        );
+        oxidom_core::sync::lock(&shared.probes).enqueue(
+            ProbeTarget::Direct("waiting".to_string()),
+            "waiting".to_string(),
+        );
+        assert_eq!(shared.cancel_probes(&["waiting".to_string()]), 1);
+
+        assert_eq!(
+            oxidom_core::sync::lock(&shared.readings)
+                .get("waiting")
+                .and_then(|reading| reading.detail),
+            Some(ProbeDetail::Cancelled),
+            "the current reading still owes the card an answer"
+        );
+        let history = oxidom_core::sync::lock(&shared.history);
+        let entries = history.get("waiting").expect("the measured check is kept");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, Some(41));
+        drop(history);
+        drop(root);
+    }
+
+    /// Histories are pruned with their server, for the same reason readings
+    /// are: a subscription refresh that drops a server must not leave the
+    /// daemon carrying ten readings for it for the rest of the session.
+    #[test]
+    fn a_history_is_pruned_with_the_server_it_describes() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("history-prune");
+        let shared = Shared::new(Engine::load(), false, false, false);
+
+        shared.record_history(
+            "gone",
+            LatencyReading::ok(41, ProbeRoute::Direct, LatencyMethod::default()),
+        );
+        shared.prune_readings();
+
+        assert!(
+            oxidom_core::sync::lock(&shared.history).is_empty(),
+            "no server by that id is loaded, so nothing should hold its history"
+        );
+        drop(root);
+    }
+
+    /// A server nobody has checked is not an error, and answers a payload the
+    /// caller can render as "no checks yet" rather than one it must handle as
+    /// a failure.
+    #[test]
+    fn a_server_never_checked_answers_an_empty_history() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("history-empty");
+        let service = for_test();
+
+        let history: ProbeHistory =
+            serde_json::from_str(&service.probe_history("never-checked".to_string())?)?;
+        assert!(history.readings.is_empty());
+
+        service.shared.record_history(
+            "berlin",
+            LatencyReading::ok(41, ProbeRoute::Direct, LatencyMethod::default()),
+        );
+        let history: ProbeHistory =
+            serde_json::from_str(&service.probe_history("berlin".to_string())?)?;
+        assert_eq!(
+            history.readings.iter().map(|r| r.value).collect::<Vec<_>>(),
+            vec![Some(41)]
+        );
+        drop(root);
+        Ok(())
     }
 
     #[test]

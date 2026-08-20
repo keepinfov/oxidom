@@ -76,6 +76,11 @@ as `ipc::LatencyReading { value, measured_at_unix_ms, route, method, failure }` 
 - `ProbeState.readings` contains direct measurements keyed by server id.
   `ProbeState.proxied` contains connection measurements keyed by profile; two profiles on one
   server must never overwrite each other. Readings are pruned with their server or session.
+- **`ProbeState` carries the newest reading and nothing older.** It is polled every 500 ms for
+  every server a client knows about, so anything added to it is a standing broadcast. That is why
+  the history below is a second payload and not a field here — and why `PROBE_STATE_VERSION` does
+  **not** move for it: nothing in this struct changed, so a client that has never heard of the
+  history parses a current daemon's snapshot exactly as before.
 
 Freshness is the GUI's job: `gui::reduce::latency_state` is the **single** mapper from a reading to
 a `LatencyState`, and ages are bucketed to whole minutes so the badge repaints on a bucket change
@@ -106,9 +111,34 @@ for this check beside the reason from the one before it.
   what the prober and the core write. A name is the user's word for a server and appears in no log
   line. The narrowing is the log page's own search entry, so it is visible and can be widened.
 
+## What the recent checks say (binding)
+
+One number is the weakest possible basis for choosing between servers: a server that is fast half
+the time and one that is steady are indistinguishable through their newest reading alone. The
+daemon therefore keeps the last `ipc::PROBE_HISTORY_LIMIT` readings per server, and the expanded
+card draws them with the method and the age of each.
+
+- **The history is fetched, never polled.** `ProbeHistory` is asked for one server at a time, when
+  a card opens and when something about that server changes, the way `RuntimeInfo` is asked for
+  when Settings opens. Folding it into `ProbeState` would multiply a twice-a-second payload for
+  every server by ten to feed a list only the one open card can show.
+- **It records checks that ran.** A check called off before it got a slot measured nothing about
+  the server, so it leaves a `readings` entry — the card still owes an answer for having no
+  number — and no history entry. Recording those would let one press of Stop on a large sweep push
+  every server's real record out of a ten-deep list, erasing the history by way of filling it.
+- **A check that ran and failed keeps its place.** A server that times out every other attempt is
+  exactly what the list exists to expose, and dropping those rows would make it look steady. The
+  reason is `ProbeFailure::message_with` again, not a second wording.
+- **It is direct measurements only**, like `readings`. A `Proxied` reading describes a tunnel, and
+  belongs to the profile carrying it rather than to the server.
+- **Histories are pruned with their server**, for the same reason readings are.
+- **The age is worded by one function.** `gui::reduce::when_text` writes "just now", "3 minutes
+  ago" and "at an unrecorded time" for both the reason above the list and every row in it, because
+  the two sit on the same card and two spellings there read as two different facts.
+
 ## The D-Bus surface (binding)
 
-Four methods on `dev.keepinfov.oxidom1` carry probing. They are listed here because a client that
+Five methods on `dev.keepinfov.oxidom1` carry probing. They are listed here because a client that
 cannot see the interface has no other place to read what it may call.
 
 | Method | Signature | What it does |
@@ -117,6 +147,13 @@ cannot see the interface has no other place to read what it may call.
 | `RequestProbes` | `(as server_ids) → ()` | The same, for a list. One call, so a sweep does not cost one round trip per server. |
 | `CancelProbes` | `(as server_ids) → (s json)` | Drop queued direct probes for these servers. Answers `{"cancelled": N}`. |
 | `ProbeState` | `() → (s json)` | The whole `ProbeState` as JSON. Polled; there is no signal. |
+| `ProbeHistory` | `(s server_id) → (s json)` | One server's recent checks as a `ProbeHistory`, newest first. Fetched on demand, never polled. |
+
+**A missing history is not an error.** A server nobody has checked answers an empty list, and a
+daemon too old to know the method answers `UnknownMethod` — which `Client::probe_history` also
+reports as an empty history, because that is the truth from the caller's side: no such daemon kept
+one. The card falls back to the single reading it already has rather than raising a failure over a
+panel.
 
 **Requesting is idempotent, not additive.** `ProbeQueue::holds` drops a request for a target already
 running or queued, so pressing a check twice measures once. A client must not treat the second call

@@ -8,8 +8,8 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
 use crate::ipc::{
-    ApplySettingsResult, BUS_NAME, INTERFACE, OBJECT_PATH, ProbeState, ProfileEntry, RuntimeInfo,
-    SessionInfo, StatusInfo, UpResult,
+    ApplySettingsResult, BUS_NAME, INTERFACE, OBJECT_PATH, ProbeHistory, ProbeState, ProfileEntry,
+    RuntimeInfo, SessionInfo, StatusInfo, UpResult,
 };
 use crate::model::Subscription;
 use crate::profile::Profile;
@@ -464,6 +464,27 @@ impl DaemonClient {
             Ok(_) => true,
             Err(error) => !is_unknown_method(&error),
         }
+    }
+
+    /// What this server's recent checks measured, newest first.
+    ///
+    /// Asked for one server at a time and only when something is about to show
+    /// it, because this is the half of the probe state that does not belong on
+    /// the poll: `ProbeState` carries one reading for every server twice a
+    /// second, and the history is ten deep.
+    ///
+    /// A daemon too old to know the method answers `UnknownMethod`, which is
+    /// reported here as an empty history rather than as an error. That is the
+    /// truth from the caller's side — such a daemon kept no history to give —
+    /// and it lets the card fall back to the single reading it already has
+    /// instead of raising a failure over a panel.
+    pub fn probe_history(&self, server_id: &str) -> Result<ProbeHistory> {
+        let json: String = match self.proxy.call("ProbeHistory", &(server_id,)) {
+            Ok(json) => json,
+            Err(error) if is_unknown_method(&error) => return Ok(ProbeHistory::default()),
+            Err(error) => return Err(friendly(error)),
+        };
+        Ok(serde_json::from_str(&json)?)
     }
 
     /// Run a selection now, writing no profile. Returns the session's name.

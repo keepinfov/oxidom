@@ -23,9 +23,10 @@ use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
-    SwitcherItem, about_comments, active_latency_for, card_action, human_bytes, latency_states,
-    missing_core_message, other_profiles_message, pool_action, pool_short_label, press_stops,
-    reduce, selected_status, session_for, session_rows, switcher_items, switcher_visible,
+    SwitcherItem, about_comments, active_latency_for, card_action, history_rows, human_bytes,
+    latency_states, missing_core_message, other_profiles_message, pool_action, pool_short_label,
+    press_stops, reduce, selected_status, session_for, session_rows, switcher_items,
+    switcher_visible,
 };
 use super::server_card::{self, LatencyState};
 use super::sidebar::{Page, Sidebar};
@@ -311,6 +312,13 @@ struct Controller {
     applied_connection: RefCell<CardConnection>,
     poll_in_flight: Arc<AtomicBool>,
     poll_snapshot: Arc<Mutex<Option<PolledSnapshot>>>,
+    /// A history fetch is out on a worker thread, and whether a reading landed
+    /// while it was. The history is the one card fact that costs a D-Bus call
+    /// of its own, and every finished check in a 600-server sweep asks for it:
+    /// without these two, a sweep would put a round trip on a worker thread
+    /// twice a second for the whole of it.
+    history_in_flight: Cell<bool>,
+    history_stale: Cell<bool>,
     /// Poll ticks since the last age sweep. See [`AGE_SWEEP_TICKS`].
     sweep_tick: Cell<u8>,
     /// Merges the daemon's log with this process's own, and remembers how far
@@ -921,6 +929,8 @@ fn build(
         applied_proxy_endpoint: Cell::new(None),
         applied_connection: RefCell::new(CardConnection::default()),
         poll_in_flight: Arc::new(AtomicBool::new(false)),
+        history_in_flight: Cell::new(false),
+        history_stale: Cell::new(false),
         sweep_tick: Cell::new(0),
         poll_snapshot: Arc::new(Mutex::new(None)),
         log_feed: RefCell::new(LogFeed::new()),
@@ -2027,6 +2037,7 @@ impl Controller {
         // The cards are new widgets and carry nothing yet; a card that was
         // open across the rebuild still owes an answer for having no number.
         self.refresh_failure_report();
+        self.refresh_history();
         self.rebuild_sessions();
 
         let sub_callbacks = super::views::subscriptions::SubscriptionCallbacks {
@@ -2328,6 +2339,7 @@ impl Controller {
         };
         self.servers.set_selected(selected_id.as_deref());
         self.refresh_failure_report();
+        self.refresh_history();
         self.refresh_status();
     }
 
@@ -2347,6 +2359,77 @@ impl Controller {
             state.ui.card_failure(&server_id, ipc::now_unix_ms())
         };
         self.servers.set_failure_report(&server_id, report.as_ref());
+    }
+
+    /// Fetch the selected card's recent checks and draw them.
+    ///
+    /// Asked for by a call of its own rather than read out of the poll: the
+    /// polled snapshot carries one reading for every server twice a second, and
+    /// putting ten per server in it would multiply a standing broadcast to feed
+    /// a list only the open card draws. One server, when there is something new
+    /// to say about it.
+    ///
+    /// Never more than one fetch at a time. A sweep finishes a check every few
+    /// hundred milliseconds and every one of them asks for this, so a request
+    /// arriving while one is out is remembered and made once, on its return,
+    /// instead of stacking a thread per tick.
+    fn refresh_history(self: &Rc<Self>) {
+        let Some(server_id) = self.state.borrow().selected_id.clone() else {
+            return;
+        };
+        if self.history_in_flight.get() {
+            self.history_stale.set(true);
+            return;
+        }
+        self.history_in_flight.set(true);
+        self.history_stale.set(false);
+
+        let client = self.state.borrow().client.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let wanted = server_id.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(client.probe_history(&wanted));
+        });
+
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(40), move || {
+            let answer = match receiver.try_recv() {
+                Ok(answer) => answer,
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.history_in_flight.set(false);
+                    }
+                    return glib::ControlFlow::Break;
+                }
+            };
+            let Some(controller) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            controller.history_in_flight.set(false);
+            match answer {
+                Ok(history) => {
+                    // The selection may have moved while this was out. Drawing
+                    // it now would put one server's record on another's card,
+                    // which is the failure this whole panel exists to prevent.
+                    if controller.state.borrow().selected_id.as_deref() == Some(server_id.as_str())
+                    {
+                        let rows = history_rows(&history, ipc::now_unix_ms());
+                        controller.servers.set_history(&server_id, &rows);
+                    }
+                }
+                // Nothing is said to the user. A daemon too old to keep a
+                // history already answers an empty one rather than an error, so
+                // anything reaching here is the bus itself — which the poll is
+                // about to report in its own words, and which leaves the card's
+                // number, badge and reason all standing.
+                Err(error) => log::warn!("could not read the recent checks: {error:#}"),
+            }
+            if controller.history_stale.replace(false) {
+                controller.refresh_history();
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     /// Open the log page showing only the lines that name this server.
@@ -2515,6 +2598,7 @@ impl Controller {
             self.servers.set_latency_state(&id, latency_state);
         }
         self.refresh_failure_report();
+        self.refresh_history();
         self.refresh_activity_status();
         self.show_error("Could not check latency", &format!("{error:#}"));
     }
@@ -3371,6 +3455,7 @@ impl Controller {
         }
         if latency_changed {
             self.refresh_failure_report();
+            self.refresh_history();
         }
         for id in reprobe {
             // `probe_one` is a no-op for an id already being checked, which is
@@ -3446,8 +3531,13 @@ impl Controller {
             self.servers.set_latency_state(&id, latency);
         }
         // The report dates its reading too — "4 minutes ago" goes stale on the
-        // same clock the badge does.
+        // same clock the badge does, and so does every row of the history. The
+        // rows are re-fetched rather than re-rendered from a copy kept here:
+        // once every fifteen seconds, for one server, is cheaper than a second
+        // store of the same readings that could fall out of step with the
+        // daemon's.
         self.refresh_failure_report();
+        self.refresh_history();
     }
 
     /// Push the current connection onto the cards, skipping the O(cards)
@@ -4796,11 +4886,15 @@ fn install_css() {
         .server-action image { -gtk-icon-size: 18px; }
         .server-meta { font-size: 0.85em; }
         .server-detail-name { font-weight: 600; font-size: 0.9em; }
-        /* Ruled off rather than coloured. A check the user stopped is reported
-           in this block too, and painting the whole of it as an error would be
-           telling someone their own decision went wrong. */
-        .server-failure { border-left: 2px solid alpha(@window_fg_color, 0.25); padding-left: 8px; }
-        .server-failure-reason { font-weight: 500; }
+        /* Both blocks are ruled off rather than coloured. A check the user
+           stopped is reported in the first, and painting the whole of it as an
+           error would be telling someone their own decision went wrong; the
+           second is a plain record, most of whose rows are ordinary successes.
+           One rule for the two so they read as one region of the card. */
+        .server-failure,
+        .server-history { border-left: 2px solid alpha(@window_fg_color, 0.25); padding-left: 8px; }
+        .server-failure-reason,
+        .server-history-title { font-weight: 500; }
 
         .server-flag { min-width: 28px; min-height: 28px; border-radius: 4px; }
         .server-globe { min-width: 28px; min-height: 28px; }

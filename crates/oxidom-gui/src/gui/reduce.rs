@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use oxidom_core::client::DaemonSource;
 use oxidom_core::ipc::{
-    LatencyReading, PROBE_STATE_VERSION, ProbeDetail, ProbeFailure, ProbeRoute, ProbeState,
-    ProfileEntry, RuntimeInfo, SelectionInfo, SessionInfo, StatusInfo,
+    LatencyReading, PROBE_STATE_VERSION, ProbeDetail, ProbeFailure, ProbeHistory, ProbeRoute,
+    ProbeState, ProfileEntry, RuntimeInfo, SelectionInfo, SessionInfo, StatusInfo,
 };
 use oxidom_core::logbook::LogSlice;
 use oxidom_core::model::{OutboundSpec, Subscription};
@@ -2054,19 +2054,78 @@ pub(super) fn failure_report(
             )
         }
     };
-    let when = match age_of(reading, now_unix_ms) {
+    Some(FailureReport {
+        reason,
+        attempt: format!("{how} · {}", when_text(reading, now_unix_ms)),
+    })
+}
+
+/// When a reading was taken, in the one wording the interface uses for it.
+///
+/// Shared by the reason under a failed check and by every row of the history,
+/// because the two sit one above the other on the same card: two spellings of
+/// "three minutes ago" there would read as two different facts.
+fn when_text(reading: &LatencyReading, now_unix_ms: u64) -> String {
+    match age_of(reading, now_unix_ms) {
         LatencyAge::Fresh => "just now".to_string(),
         LatencyAge::Stale(minutes) => minutes_ago(minutes),
         // A daemon that predates the timestamp, or two clocks that disagree.
         // "Just now" would be the flattering answer rather than the true one,
-        // and how old the reason is decides whether it still describes
+        // and how old the reading is decides whether it still describes
         // anything.
         LatencyAge::Unknown => "at an unrecorded time".to_string(),
-    };
-    Some(FailureReport {
-        reason,
-        attempt: format!("{how} · {when}"),
-    })
+    }
+}
+
+/// One past check, as the expanded card states it.
+pub(super) struct HistoryRow {
+    /// `"41 ms"`, or an em dash when the check produced no number. Never blank:
+    /// a row with nothing in this column reads as a rendering fault rather than
+    /// as a check that failed.
+    pub value: String,
+    /// How it was taken, when, and — where there is no number — why:
+    /// `"HTTP · 3 minutes ago"`, or `"HTTP · 3 minutes ago · the server did not
+    /// answer"`. The reason stays a fragment here, unlike the one standing on
+    /// its own above, because it is the tail of a line.
+    pub taken: String,
+}
+
+/// The recent checks, newest first, as rows.
+///
+/// A single sample is the weakest possible basis for choosing between servers:
+/// one that is fast half the time and one that is steady look identical through
+/// their newest number alone. These rows are what tells them apart.
+///
+/// Every row is a check that *ran*. The daemon records no history for a check
+/// it called off, so nothing here needs to distinguish "measured badly" from
+/// "never measured" — the failures shown are the server's or this machine's.
+pub(super) fn history_rows(history: &ProbeHistory, now_unix_ms: u64) -> Vec<HistoryRow> {
+    history
+        .readings
+        .iter()
+        .map(|reading| {
+            let mut taken = format!(
+                "{} · {}",
+                method_text(reading.method),
+                when_text(reading, now_unix_ms)
+            );
+            // `failure.is_some()` exactly when `value.is_none()`, so a reading
+            // with neither comes from a daemon that broke the contract. The row
+            // still owes the column something, and a dash with no reason is the
+            // honest form of "it did not say".
+            if let (None, Some(failure)) = (reading.value, reading.failure) {
+                taken.push_str(" · ");
+                taken.push_str(failure.message_with(reading.detail));
+            }
+            HistoryRow {
+                value: match reading.value {
+                    Some(ms) => format!("{ms} ms"),
+                    None => "—".to_string(),
+                },
+                taken,
+            }
+        })
+        .collect()
 }
 
 /// A message written to sit mid-sentence, promoted to standing on its own.
@@ -4934,5 +4993,74 @@ mod tests {
         );
         assert!(text.contains("No Xray core"), "{text}");
         assert!(text.contains("older than this window"), "{text}");
+    }
+
+    fn measured_at(ms: u32, method: LatencyMethod, measured_at_unix_ms: u64) -> LatencyReading {
+        let mut reading = LatencyReading::ok(ms, ProbeRoute::Direct, method);
+        reading.measured_at_unix_ms = measured_at_unix_ms;
+        reading
+    }
+
+    /// The point of the panel: two servers whose newest number is the same can
+    /// have completely different records behind it, and the rows are what say
+    /// so. Newest first, because that is the order the daemon keeps and the
+    /// order the number above the list belongs to.
+    #[test]
+    fn the_history_reads_newest_first_with_the_method_and_the_age_of_each_check() {
+        let history = ProbeHistory {
+            readings: vec![
+                measured_at(41, LatencyMethod::HttpGet, NOW_MS),
+                measured_at(870, LatencyMethod::Tcp, NOW_MS - 3 * 60_000),
+            ],
+        };
+        let rows = history_rows(&history, NOW_MS);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].value, "41 ms");
+        assert_eq!(rows[0].taken, "HTTP GET · just now");
+        assert_eq!(rows[1].value, "870 ms");
+        assert_eq!(rows[1].taken, "TCP handshake · 3 minutes ago");
+    }
+
+    /// A check that ran and failed is part of the record — a server that times
+    /// out every other attempt is exactly what this panel exists to expose, and
+    /// dropping those rows would make it look steady. The reason is the
+    /// daemon's own wording, the same words the block above the list uses.
+    #[test]
+    fn a_failed_check_keeps_its_place_in_the_history_and_says_why() {
+        let history = ProbeHistory {
+            readings: vec![failed_at(
+                ProbeFailure::Timeout,
+                None,
+                ProbeRoute::Direct,
+                LatencyMethod::HttpGet,
+                NOW_MS - 60_000,
+            )],
+        };
+        let rows = history_rows(&history, NOW_MS);
+        assert_eq!(rows[0].value, "—", "a failed check still fills its column");
+        assert_eq!(
+            rows[0].taken,
+            "HTTP GET · 1 minute ago · the check ran out of time"
+        );
+    }
+
+    /// A daemon too old to keep a history answers an empty one, and a server
+    /// nobody has checked answers the same. Neither is an error and neither
+    /// draws a row; the card falls back to the single reading it already has.
+    #[test]
+    fn a_daemon_with_no_history_to_give_draws_no_rows() {
+        assert!(history_rows(&ProbeHistory::default(), NOW_MS).is_empty());
+    }
+
+    /// A reading that cannot be dated says so rather than reading as fresh,
+    /// which is the same promise the reason above the list makes — and it is
+    /// one function making it, so the two cannot drift apart.
+    #[test]
+    fn an_undated_reading_in_the_history_is_not_passed_off_as_recent() {
+        let history = ProbeHistory {
+            readings: vec![measured_at(41, LatencyMethod::HttpGet, 0)],
+        };
+        let rows = history_rows(&history, NOW_MS);
+        assert_eq!(rows[0].taken, "HTTP GET · at an unrecorded time");
     }
 }
