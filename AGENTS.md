@@ -113,7 +113,7 @@ separate commit rather than folding it into yours.
 
 ## Testing obligations
 
-The suite is 521 tests, plus eight marked `#[ignore]`, and takes seven seconds
+The suite is 577 tests, plus eight marked `#[ignore]`, and takes seven seconds
 warm. There is no excuse for sending an untested change. The count is whatever
 `cargo test --workspace` prints, summed across its test binaries — read it
 there rather than trusting this line, which has been wrong before.
