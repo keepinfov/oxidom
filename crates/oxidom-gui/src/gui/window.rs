@@ -1939,6 +1939,14 @@ impl Controller {
                     }
                 })
             },
+            show_logs: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.show_server_in_logs(&id);
+                    }
+                })
+            },
             activate: {
                 let weak = Rc::downgrade(self);
                 Rc::new(move |id| {
@@ -2016,6 +2024,9 @@ impl Controller {
             &latency_states,
             callbacks,
         );
+        // The cards are new widgets and carry nothing yet; a card that was
+        // open across the rebuild still owes an answer for having no number.
+        self.refresh_failure_report();
         self.rebuild_sessions();
 
         let sub_callbacks = super::views::subscriptions::SubscriptionCallbacks {
@@ -2316,7 +2327,50 @@ impl Controller {
             state.selected_id.clone()
         };
         self.servers.set_selected(selected_id.as_deref());
+        self.refresh_failure_report();
         self.refresh_status();
+    }
+
+    /// Put the diagnosis for the selected card's last failed check on it.
+    ///
+    /// Only the expanded card shows one, and only one card is expanded, so
+    /// this is a lookup rather than the pass over every card that the badge
+    /// updates make. Called wherever a reading can have changed and after the
+    /// selection moves — a card opened long after its check still owes an
+    /// answer for having no number.
+    fn refresh_failure_report(self: &Rc<Self>) {
+        let Some(server_id) = self.state.borrow().selected_id.clone() else {
+            return;
+        };
+        let report = {
+            let state = self.state.borrow();
+            state.ui.card_failure(&server_id, ipc::now_unix_ms())
+        };
+        self.servers.set_failure_report(&server_id, report.as_ref());
+    }
+
+    /// Open the log page showing only the lines that name this server.
+    ///
+    /// The needle is the address, because that is what the core and the prober
+    /// write — a name is the user's word for the server and appears in no log
+    /// line. Nothing leaves the machine: this sets the page's own search
+    /// entry, which is also why the user can widen it again afterwards.
+    fn show_server_in_logs(self: &Rc<Self>, server_id: &str) {
+        let address = self
+            .state
+            .borrow()
+            .subscriptions
+            .iter()
+            .flat_map(|subscription| subscription.servers.iter())
+            .find(|server| server.id == server_id)
+            .map(|server| server.address.clone());
+        // A card whose server has since left the list. Switching to the page
+        // unfiltered beats staying put with nothing said, and beats filtering
+        // on an id that appears in no line.
+        if let Some(address) = address {
+            self.logs.show_only(&address);
+        }
+        self.navigate_to(Page::Logs);
     }
 
     /// Mark a card as checking and ask the daemon for a probe. Results come
@@ -2460,6 +2514,7 @@ impl Controller {
         for (id, latency_state) in restored {
             self.servers.set_latency_state(&id, latency_state);
         }
+        self.refresh_failure_report();
         self.refresh_activity_status();
         self.show_error("Could not check latency", &format!("{error:#}"));
     }
@@ -3289,10 +3344,15 @@ impl Controller {
         // Collected rather than issued inline: `probe_one` borrows the state the
         // effects were just produced from.
         let mut reprobe = Vec::new();
+        // The expanded card's diagnosis is refreshed once at the end rather
+        // than per effect: a sweep produces one `Latency` effect per server,
+        // and only one card is open.
+        let mut latency_changed = false;
         for effect in effects {
             match effect {
                 Effect::Latency(id, latency_state) => {
-                    self.servers.set_latency_state(&id, latency_state)
+                    self.servers.set_latency_state(&id, latency_state);
+                    latency_changed = true;
                 }
                 Effect::Reprobe(id) => reprobe.push(id),
                 Effect::ToastUnreachable => self.show_message(server_card::UNREACHABLE_TEXT),
@@ -3308,6 +3368,9 @@ impl Controller {
                      until it is restarted",
                 ),
             }
+        }
+        if latency_changed {
+            self.refresh_failure_report();
         }
         for id in reprobe {
             // `probe_one` is a no-op for an id already being checked, which is
@@ -3382,6 +3445,9 @@ impl Controller {
         for (id, latency) in states {
             self.servers.set_latency_state(&id, latency);
         }
+        // The report dates its reading too — "4 minutes ago" goes stale on the
+        // same clock the badge does.
+        self.refresh_failure_report();
     }
 
     /// Push the current connection onto the cards, skipping the O(cards)
@@ -4730,6 +4796,11 @@ fn install_css() {
         .server-action image { -gtk-icon-size: 18px; }
         .server-meta { font-size: 0.85em; }
         .server-detail-name { font-weight: 600; font-size: 0.9em; }
+        /* Ruled off rather than coloured. A check the user stopped is reported
+           in this block too, and painting the whole of it as an error would be
+           telling someone their own decision went wrong. */
+        .server-failure { border-left: 2px solid alpha(@window_fg_color, 0.25); padding-left: 8px; }
+        .server-failure-reason { font-weight: 500; }
 
         .server-flag { min-width: 28px; min-height: 28px; border-radius: 4px; }
         .server-globe { min-width: 28px; min-height: 28px; }

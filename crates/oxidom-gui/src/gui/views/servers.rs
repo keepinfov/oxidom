@@ -12,7 +12,7 @@ use oxidom_core::pool::PoolQuery;
 use super::super::group::subscription_description;
 use super::super::prefs::{FAVOURITES_ID, GroupKind, GuiPrefs, ServerGroup};
 use super::super::reduce::{
-    FilterOption, ServerProfiles, available_countries, available_protocols,
+    FailureReport, FilterOption, ServerProfiles, available_countries, available_protocols,
     available_subscriptions, connect_choices, describe_rule, excludable_servers, filtered_ids,
     filters_to_query, group_member_ids, groups_holding, moved_in_order, ordered_subscriptions,
     query_equals_group, toggled_member, upsert_group,
@@ -72,6 +72,10 @@ pub struct CardCallbacks {
     /// server ids, which is how the window recognises a session that is already
     /// running it.
     pub connect_pool: Rc<dyn Fn(PoolQuery, Vec<String>)>,
+    /// Show the log page narrowed to one server. Offered from the expanded
+    /// card beside a failed check, where what the core printed is the next
+    /// thing anybody wants.
+    pub show_logs: Rc<dyn Fn(String)>,
 }
 
 /// One subscription block. Cards live in independent vertical column boxes
@@ -837,6 +841,11 @@ impl ServersView {
                     let id = id.clone();
                     move |alias| cb(id.clone(), alias)
                 };
+                let on_show_logs = {
+                    let cb = callbacks.show_logs.clone();
+                    let id = id.clone();
+                    move || cb(id.clone())
+                };
                 let connection_state = match (connected_profiles.get(&id), connected_id) {
                     (Some(profiles), _) if !profiles.connected.is_empty() => {
                         CardConnectionState::ConnectedHere
@@ -866,6 +875,7 @@ impl ServersView {
                             let id = id.clone();
                             Rc::new(move || view.toggle_favourite(&id))
                         },
+                        show_logs: Rc::new(on_show_logs),
                     },
                 );
                 let mut tooltip = format!(
@@ -2587,6 +2597,25 @@ impl ServersView {
                     .update_property(&[gtk::accessible::Property::Label(sweep_label(probing))]);
             }
             break;
+        }
+    }
+
+    /// Put the diagnosis for a failed check on one card, or take it away.
+    ///
+    /// Only the expanded card shows one, so this is a lookup rather than a
+    /// pass over the grid — and the expansion is re-measured after it, because
+    /// the block appearing is the one content change that happens while a card
+    /// is already open at a fixed height.
+    pub fn set_failure_report(&self, server_id: &str, report: Option<&FailureReport>) {
+        let changed = match self.cards.borrow().get(server_id) {
+            Some(card) => {
+                card.set_failure_report(report);
+                card.is_expanded()
+            }
+            None => false,
+        };
+        if changed {
+            self.refresh_expanded_height();
         }
     }
 
