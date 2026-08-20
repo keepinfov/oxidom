@@ -26,6 +26,14 @@ const CARD_COLUMN_SPACING: i32 = 12;
 const CARD_ROW_SPACING: i32 = 12;
 const MIN_CARD_WIDTH: i32 = 250;
 const MIN_CARD_WIDTH_FOR_THREE_COLUMNS: i32 = 300;
+// Deliberately `CARD_MEASURE_WIDTH` rather than another step of the 250 -> 300
+// ladder. That is the width a card measures its own expanded height at, so a
+// column narrower than this makes the cached height a measurement of a card
+// that does not exist — text wraps to more lines than were paid for. Three
+// columns already sit below it at 300, which is survivable at that count and is
+// not worth widening now; a fourth column is where the gap stops being small,
+// so this is where the two numbers are tied together.
+const MIN_CARD_WIDTH_FOR_FOUR_COLUMNS: i32 = CARD_MEASURE_WIDTH;
 const COLUMN_HYSTERESIS: i32 = 16;
 const RESIZE_SETTLE_MS: u64 = 120;
 
@@ -302,7 +310,7 @@ pub struct ServersView {
     /// The pill's text, so `apply_filter` can say how many fields are set
     /// without rebuilding the row under the pointer.
     filter_label: gtk::Label,
-    /// Number of card columns; driven by the window width (1, 2, or 3).
+    /// Number of card columns; driven by the window width (1, 2, 3, or 4).
     columns: Rc<Cell<usize>>,
     pending_columns: Rc<Cell<usize>>,
     column_update_scheduled: Rc<Cell<bool>>,
@@ -536,7 +544,7 @@ impl ServersView {
     }
 
     fn set_columns(&self, count: usize) {
-        let count = count.clamp(1, 3);
+        let count = count.clamp(1, 4);
         if self.columns.get() == count {
             return;
         }
@@ -3401,15 +3409,20 @@ fn repack_block(block: &SubscriptionBlock, columns: usize) {
 }
 
 /// Pick a masonry column count from the available content width so cards keep a
-/// comfortable minimum size: 3 wide, 2 mid, 1 when cramped.
+/// comfortable minimum size: 4 on a wide screen, then 3, 2, 1 when cramped.
 fn columns_for_width(width: i32) -> usize {
+    let four_columns = MIN_CARD_WIDTH_FOR_FOUR_COLUMNS
+        .saturating_mul(4)
+        .saturating_add(CARD_COLUMN_SPACING.saturating_mul(3));
     let three_columns = MIN_CARD_WIDTH_FOR_THREE_COLUMNS
         .saturating_mul(3)
         .saturating_add(CARD_COLUMN_SPACING.saturating_mul(2));
     let two_columns = MIN_CARD_WIDTH
         .saturating_mul(2)
         .saturating_add(CARD_COLUMN_SPACING);
-    if width >= three_columns {
+    if width >= four_columns {
+        4
+    } else if width >= three_columns {
         3
     } else if width >= two_columns {
         2
@@ -3426,16 +3439,30 @@ fn columns_for_width_with_hysteresis(width: i32, current: usize, hysteresis: i32
     let three_columns = MIN_CARD_WIDTH_FOR_THREE_COLUMNS
         .saturating_mul(3)
         .saturating_add(CARD_COLUMN_SPACING.saturating_mul(2));
-    match current.clamp(1, 3) {
+    let four_columns = MIN_CARD_WIDTH_FOR_FOUR_COLUMNS
+        .saturating_mul(4)
+        .saturating_add(CARD_COLUMN_SPACING.saturating_mul(3));
+    // One arm per transition rather than a computed count, so that widening the
+    // window and narrowing it are written down separately: a step up needs the
+    // hysteresis added, a step down needs it subtracted, and a single formula
+    // would have to pick one.
+    match current.clamp(1, 4) {
+        1 if width >= four_columns.saturating_add(hysteresis) => 4,
         1 if width >= three_columns.saturating_add(hysteresis) => 3,
         1 if width >= two_columns.saturating_add(hysteresis) => 2,
         1 => 1,
         2 if width < two_columns.saturating_sub(hysteresis) => 1,
+        2 if width >= four_columns.saturating_add(hysteresis) => 4,
         2 if width >= three_columns.saturating_add(hysteresis) => 3,
         2 => 2,
         3 if width < two_columns.saturating_sub(hysteresis) => 1,
         3 if width < three_columns.saturating_sub(hysteresis) => 2,
+        3 if width >= four_columns.saturating_add(hysteresis) => 4,
         3 => 3,
+        4 if width < two_columns.saturating_sub(hysteresis) => 1,
+        4 if width < three_columns.saturating_sub(hysteresis) => 2,
+        4 if width < four_columns.saturating_sub(hysteresis) => 3,
+        4 => 4,
         _ => columns_for_width(width),
     }
 }
@@ -3662,5 +3689,33 @@ mod tests {
         assert_eq!(columns_for_width_with_hysteresis(940, 2, 16), 3);
         assert_eq!(columns_for_width_with_hysteresis(909, 3, 16), 3);
         assert_eq!(columns_for_width_with_hysteresis(907, 3, 16), 2);
+        // 1316 = MIN_CARD_WIDTH_FOR_FOUR_COLUMNS * 4 + CARD_COLUMN_SPACING * 3,
+        // so widening asks for 1332 and narrowing gives up below 1300.
+        assert_eq!(columns_for_width_with_hysteresis(1331, 3, 16), 3);
+        assert_eq!(columns_for_width_with_hysteresis(1332, 3, 16), 4);
+        assert_eq!(columns_for_width_with_hysteresis(1300, 4, 16), 4);
+        assert_eq!(columns_for_width_with_hysteresis(1299, 4, 16), 3);
+        // A hard narrow from four skips the arms in between rather than
+        // stopping at the neighbouring one.
+        assert_eq!(columns_for_width_with_hysteresis(900, 4, 16), 2);
+        assert_eq!(columns_for_width_with_hysteresis(495, 4, 16), 1);
+    }
+
+    #[test]
+    fn four_columns_start_only_after_the_widest_breakpoint() {
+        assert_eq!(columns_for_width(1315), 3);
+        assert_eq!(columns_for_width(1316), 4);
+    }
+
+    #[test]
+    fn a_window_parked_between_three_and_four_columns_keeps_what_it_has() {
+        // The raw breakpoint sits inside the hysteresis band on both sides, so
+        // a window resting exactly on it must be answered with whatever is
+        // already packed rather than with the count the width alone implies.
+        // Answering 4 here regardless is what makes a grid flicker.
+        for width in 1300..=1331 {
+            assert_eq!(columns_for_width_with_hysteresis(width, 3, 16), 3);
+            assert_eq!(columns_for_width_with_hysteresis(width, 4, 16), 4);
+        }
     }
 }
