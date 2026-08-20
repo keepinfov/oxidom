@@ -52,6 +52,20 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   `oxidom status`.
 - **Subscriptions view:** add (URL + optional name), update-now, delete; per-sub **"send HWID"**
   switch (default OFF) with a privacy hint.
+  **An import says what it did not take (binding).** The parser reads outbounds and nothing
+  else, so a body carrying routing — `route.rules`/`route.rule_set` in sing-box, `rules`/
+  `rule-providers`/`geox-url` in Clash, `routing.rules` in a full Xray config — has all of it
+  dropped. That is correct, and staying silent about it is not: silence reads as "there was
+  nothing else in the body", which is how the same subscription behaves differently here and
+  in another client with nothing to connect the two. `subscription_format::not_taken` counts
+  what was recognised and left, `NotTaken::summary` is the single wording, and it is said in
+  **two** places — the log line at import, and a **Routing** row beside the quota, which is
+  where the question is asked long after the toast would have gone. Kept apart from
+  **Skipped**, which is about servers this build could not read: one is a failure to
+  understand, the other a deliberate refusal, and merging them would make both unreadable.
+  Nothing carried is said as nothing — never "0 rules", which reads as an import that went
+  wrong. Whether any of it may ever be *applied*, and whether a provider may choose where
+  rule or geo data is fetched from, is a separate question and not answered here.
 - **Settings view:** ports, system-proxy toggle, latency method + test URL. The Xray core group also
   reports whether the core can load its geo data and offers to install it. What the rows offer is a
   pure decision (`reduce::geo_offer`), not a widget-level one, because the awkward cases are the

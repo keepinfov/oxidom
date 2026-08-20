@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::link::Skipped;
+use crate::subscription_format::NotTaken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -377,6 +378,11 @@ pub struct Subscription {
     /// here?") is asked long after the refresh, and a toast is gone by then.
     #[serde(default, skip_serializing_if = "Skipped::is_empty")]
     pub skipped: Skipped,
+    /// What the last refresh read and deliberately did not apply. Stored for
+    /// the same reason `skipped` is: the question it answers is asked long
+    /// after the refresh that would have toasted it.
+    #[serde(default, skip_serializing_if = "NotTaken::is_empty")]
+    pub not_taken: NotTaken,
     pub updated_at: Option<i64>,
 }
 
@@ -392,6 +398,7 @@ impl Subscription {
             user_agent: None,
             servers: Vec::new(),
             skipped: Skipped::default(),
+            not_taken: NotTaken::default(),
             updated_at: None,
         }
     }

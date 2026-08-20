@@ -15,6 +15,22 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Added
+- **An import says what it did not take.** Providers ship routing alongside their nodes —
+  advertising blocked, one country direct, the rest through the proxy. oxidom reads the
+  servers and nothing else, which is deliberate, and said nothing about the rest, which was
+  not: silence reads as "there was nothing else in the body", and the only way to find out
+  otherwise was to fetch the subscription by hand.
+
+  Opening a subscription now shows a **Routing** row whenever one arrived with rules of its
+  own — how many rules and rule sets, whether it named its own source for rule or geo data,
+  and that **none of it was applied**. The same sentence goes in the log at import. Nothing
+  carried is still said as nothing: there is no "0 rules" row on a plain subscription.
+
+  It is kept apart from **Skipped**, which is about servers this build could not read. One is
+  a failure to understand and the other a deliberate refusal, and a reader needs to tell them
+  apart. Where traffic goes stays decided by this application's settings — whoever chooses the
+  routing chooses which of your traffic goes around the tunnel.
+
 
 - **The application says which versions it is running.** A menu button on the right of the
   header — the window's first primary menu — opens an About dialog carrying the version of

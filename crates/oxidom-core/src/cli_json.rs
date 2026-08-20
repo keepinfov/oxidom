@@ -605,6 +605,7 @@ mod tests {
             user_agent: None,
             servers: vec![server],
             skipped: Default::default(),
+            not_taken: Default::default(),
             updated_at: None,
         };
 
@@ -652,6 +653,7 @@ mod tests {
             user_agent: Some("private override".to_string()),
             servers: Vec::new(),
             skipped: Default::default(),
+            not_taken: Default::default(),
             updated_at: Some(5),
         };
         let json = serde_json::to_string(&SubscriptionOutput::all(&[subscription])).unwrap();

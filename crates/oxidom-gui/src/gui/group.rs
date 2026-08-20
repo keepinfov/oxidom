@@ -56,6 +56,21 @@ pub fn skipped_note(subscription: &Subscription) -> Option<String> {
     })
 }
 
+/// "This subscription carried 12 routing rules and 3 rule sets, none of which
+/// oxidom applied" — or nothing, which is the usual case.
+///
+/// Beside the quota for the same reason `skipped_note` is: it answers a
+/// question asked whenever the list is looked at ("this behaves differently in
+/// the other app"), not once at refresh time when a toast would already be
+/// gone. The wording is `NotTaken::summary`, in core, so the log line and this
+/// cannot describe one import two ways.
+pub fn not_taken_note(subscription: &Subscription) -> Option<String> {
+    subscription
+        .not_taken
+        .summary()
+        .map(|summary| format!("This subscription {summary}."))
+}
+
 /// Human-readable byte count, in the SI units panels quote their quotas in.
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -76,13 +91,63 @@ pub fn format_bytes(bytes: u64) -> String {
 mod tests {
     use oxidom_core::link::Skipped;
     use oxidom_core::model::Subscription;
+    use oxidom_core::subscription_format::NotTaken;
 
-    use super::{skipped_note, subscription_description};
+    use super::{not_taken_note, skipped_note, subscription_description};
 
     fn subscription(skipped: Skipped) -> Subscription {
         let mut subscription = Subscription::new("https://example.invalid/s".into(), None);
         subscription.skipped = skipped;
         subscription
+    }
+
+    /// Nothing carried is said as nothing. "0 routing rules" would read as an
+    /// import that went wrong rather than as a plain subscription, and most
+    /// subscriptions are plain.
+    #[test]
+    fn a_subscription_that_carried_only_servers_says_nothing_about_routing() {
+        assert_eq!(not_taken_note(&subscription(Skipped::default())), None);
+    }
+
+    /// The two counts read as one sentence, and it says *not applied* rather
+    /// than leaving a number to be read as something that worked.
+    #[test]
+    fn routing_that_arrived_and_was_left_is_reported_as_left() {
+        let mut sub = subscription(Skipped::default());
+        sub.not_taken = NotTaken {
+            rules: 12,
+            rule_sets: 3,
+            own_source: true,
+        };
+        let note = not_taken_note(&sub).expect("something was carried");
+        assert_eq!(
+            note,
+            "This subscription carried 12 routing rules and 3 rule sets, and its own \
+             source for that data, none of which oxidom applied."
+        );
+
+        sub.not_taken = NotTaken {
+            rules: 1,
+            rule_sets: 0,
+            own_source: false,
+        };
+        assert_eq!(
+            not_taken_note(&sub).expect("one rule is still one rule"),
+            "This subscription carried 1 routing rule, none of which oxidom applied."
+        );
+
+        // A body that named only a source, with no rules of its own to go with
+        // it, still named one.
+        sub.not_taken = NotTaken {
+            rules: 0,
+            rule_sets: 0,
+            own_source: true,
+        };
+        assert_eq!(
+            not_taken_note(&sub).expect("a source is something"),
+            "This subscription carried its own source for rule or geo data, none of \
+             which oxidom applied."
+        );
     }
 
     #[test]
