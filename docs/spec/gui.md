@@ -61,6 +61,19 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   `ProtectHome=true`, so nothing this process writes to the user's home could ever be read by it.
   The confirmation names the release host and says it may be blocked, and offers to fetch through
   a tunnel that is already up. Progress is polled off the status tick, only while a download runs.
+  **Where the lists come from is a setting** (`geoip_url`, `geosite_url`), because the published
+  lists differ in what they cover and a regional one decides whether routing works at all in some
+  countries. Three sources are offered by name and any address is accepted; the two lists are
+  chosen separately. Two rules are binding and belong to `oxidom_core::xray::assets` rather than
+  to the window: the address must be **`https`**, refused before anything is fetched — the list
+  and the digest that vouches for it travel the same connection, so plain HTTP would let whoever
+  sits between the two machines rewrite both and the check would still pass — and the digest is
+  always the `.sha256sum` published beside the file named, so a source offering none is **refused
+  rather than installed unverified**. Because the source is a setting, the confirmation is
+  `reduce::geo_download_prompt` rather than a format string at the call site: it names the host
+  actually configured, and it quotes the file sizes only for the built-in pair, which is the one
+  case where they are known. The manual recipe for a daemon that cannot install quotes the
+  configured addresses for the same reason.
 - **Primary menu and About:** one menu button on the right of the header, outermost so that it
   does not move when a page's own menus appear beside it. It is the only header control that is
   not about the current view, and it carries Quit and About.

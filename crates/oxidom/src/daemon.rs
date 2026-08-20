@@ -929,9 +929,19 @@ impl Shared {
         if let Some(proxy) = proxy {
             log::info!("fetching the geo data through {proxy}");
         }
-        for asset in assets::GeoAsset::ALL {
-            log::info!("fetching {} from {}", asset.installed_name(), asset.url());
-            let path = assets::download(asset, dir, &agent, &sink)?;
+        // Read once, before the first fetch: the two lists must come from the
+        // pair the settings held when the download was asked for, not from
+        // whatever a settings save between them left behind.
+        let urls: Vec<(assets::GeoAsset, String)> = {
+            let engine = oxidom_core::sync::lock(&self.engine);
+            assets::GeoAsset::ALL
+                .into_iter()
+                .map(|asset| (asset, engine.registry.config.geo_url(asset).to_string()))
+                .collect()
+        };
+        for (asset, url) in urls {
+            log::info!("fetching {} from {url}", asset.installed_name());
+            let path = assets::download(asset, &url, dir, &agent, &sink)?;
             log::info!("installed {}", path.display());
         }
         Ok(())

@@ -72,36 +72,14 @@ impl GeoAsset {
         }
     }
 
-    /// What upstream calls the same file. `domain-list-community` publishes
-    /// `dlc.dat`; the core will not find it under that name, and its checksum
-    /// sidecar names `dlc.dat` too — so this is also the name a digest must be
-    /// looked up by.
-    pub fn published_name(self) -> &'static str {
-        match self {
-            GeoAsset::GeoIp => "geoip.dat",
-            GeoAsset::GeoSite => "dlc.dat",
-        }
-    }
-
-    pub fn url(self) -> &'static str {
-        match self {
-            GeoAsset::GeoIp => "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat",
-            GeoAsset::GeoSite => {
-                "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
-            }
-        }
-    }
-
-    /// The `sha256sum(1)` sidecar published beside the file.
-    pub fn checksum_url(self) -> &'static str {
-        match self {
-            GeoAsset::GeoIp => {
-                "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat.sha256sum"
-            }
-            GeoAsset::GeoSite => {
-                "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat.sha256sum"
-            }
-        }
+    /// Where this list comes from unless the settings say otherwise.
+    ///
+    /// Only a default. The lists differ in what they cover, and a regional one
+    /// is sometimes the difference between routing that works and routing that
+    /// does not, so `config::Config` carries the address actually used and
+    /// [`download`] is given it.
+    pub fn default_url(self) -> &'static str {
+        GEO_PRESETS[0].url(self)
     }
 
     pub fn parse(name: &str) -> Option<GeoAsset> {
@@ -496,22 +474,132 @@ pub fn agent(through_proxy: Option<&str>) -> Result<ureq::Agent> {
     Ok(builder.build())
 }
 
+/// Sources known to publish both lists with a `sha256sum` sidecar beside each.
+///
+/// A convenience, not a closed set: the settings hold addresses, so anything
+/// publishing the same shape works and nothing here has to be edited for it.
+/// The first is the default, and an empty setting means exactly this one.
+///
+/// They differ in what they cover rather than in quality, which is the whole
+/// reason this is a choice: a list built for one country's blocking is the
+/// difference between routing that works there and routing that does not.
+pub const GEO_PRESETS: &[GeoPreset] = &[
+    GeoPreset {
+        label: "v2fly",
+        geoip: "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat",
+        geosite: "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat",
+    },
+    GeoPreset {
+        label: "Loyalsoldier",
+        geoip: "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+        geosite: "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+    },
+    GeoPreset {
+        label: "runetfreedom (Russia)",
+        geoip: "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat",
+        geosite: "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat",
+    },
+];
+
+/// One named pair of addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeoPreset {
+    pub label: &'static str,
+    pub geoip: &'static str,
+    pub geosite: &'static str,
+}
+
+impl GeoPreset {
+    pub fn url(&self, asset: GeoAsset) -> &'static str {
+        match asset {
+            GeoAsset::GeoIp => self.geoip,
+            GeoAsset::GeoSite => self.geosite,
+        }
+    }
+}
+
+/// The address actually used: what was configured, or the built-in default.
+///
+/// Empty means the default rather than "no source", which is what makes a
+/// setting written before this existed behave as it did, and what lets an
+/// address be cleared back to the default without a second flag meaning
+/// "unset". One function so the process that downloads and the dialog that
+/// says what will be contacted cannot name different hosts.
+pub fn resolve_url(asset: GeoAsset, configured: &str) -> &str {
+    match configured.trim() {
+        "" => asset.default_url(),
+        url => url,
+    }
+}
+
+/// The host an address names, for saying what is about to be contacted.
+pub fn host_of(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+}
+
+/// What the file is called where it is published, which is not always what the
+/// core wants it called on disk.
+///
+/// `domain-list-community` publishes `dlc.dat` while two other common sources
+/// publish `geosite.dat`, and each one's `sha256sum` sidecar names its own
+/// file — so the digest has to be looked up by *this* name rather than by the
+/// installed one. Taken from the address instead of being listed here, because
+/// the address is a setting and a list here could only ever describe the
+/// sources somebody thought of first.
+pub fn published_name(url: &str) -> &str {
+    url.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(url)
+}
+
+/// The `sha256sum(1)` sidecar published beside the file.
+pub fn checksum_url(url: &str) -> String {
+    format!("{url}.sha256sum")
+}
+
+/// Refuse an address this has no business fetching from.
+///
+/// **`https` only, and not a formality.** These lists decide which traffic
+/// leaves the tunnel, and the digest that vouches for a list is fetched over
+/// the same connection — so plain HTTP would let whoever is between the two
+/// machines rewrite the list and the digest that proves it, and the check would
+/// pass. The one guarantee here rests on the transport.
+pub fn validate_url(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).with_context(|| format!("{url} is not an address"))?;
+    if parsed.scheme() != "https" {
+        bail!("{url} is not https, and the geo data is only fetched over https");
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        bail!("{url} names no host");
+    }
+    Ok(())
+}
+
 /// Fetch one list, verify it against its published digest, and install it.
 ///
 /// Nothing is written until the digest matches: a mismatch leaves the target
-/// exactly as it was, so a bad download cannot replace a good file.
+/// exactly as it was, so a bad download cannot replace a good file. A source
+/// that publishes no digest is **refused by name** rather than trusted: the
+/// promise above is the only thing standing between a routing list and whatever
+/// answered the request, and quietly dropping it where it is inconvenient is
+/// how a guarantee becomes a habit.
 pub fn download(
     asset: GeoAsset,
+    url: &str,
     into: &Path,
     agent: &ureq::Agent,
     sink: &dyn Sink,
 ) -> Result<PathBuf> {
-    let expected = fetch_digest(asset, agent)?;
+    validate_url(url)?;
+    let expected = fetch_digest(url, agent)?;
 
     let response = agent
-        .get(asset.url())
+        .get(url)
         .call()
-        .map_err(|error| transport_error(asset.published_name(), error))?;
+        .map_err(|error| transport_error(published_name(url), error))?;
     let total = response
         .header("content-length")
         .and_then(|value| value.parse::<u64>().ok())
@@ -519,7 +607,7 @@ pub fn download(
     if total > MAX_ASSET_BYTES {
         bail!(
             "{} is {total} bytes, larger than the {MAX_ASSET_BYTES} this will install",
-            asset.published_name()
+            published_name(url)
         );
     }
 
@@ -532,7 +620,7 @@ pub fn download(
         }
         let read = reader
             .read(&mut buffer)
-            .with_context(|| format!("reading {}", asset.published_name()))?;
+            .with_context(|| format!("reading {}", published_name(url)))?;
         if read == 0 {
             break;
         }
@@ -540,7 +628,7 @@ pub fn download(
         if bytes.len() as u64 > MAX_ASSET_BYTES {
             bail!(
                 "{} is larger than the {MAX_ASSET_BYTES} bytes this will install",
-                asset.published_name()
+                published_name(url)
             );
         }
         sink.progress(&Progress {
@@ -565,14 +653,14 @@ pub fn download(
     Ok(target)
 }
 
-fn fetch_digest(asset: GeoAsset, agent: &ureq::Agent) -> Result<String> {
+fn fetch_digest(url: &str, agent: &ureq::Agent) -> Result<String> {
     let text = agent
-        .get(asset.checksum_url())
+        .get(&checksum_url(url))
         .call()
         .map_err(|error| transport_error("the published checksum", error))?
         .into_string()
         .context("reading the published checksum")?;
-    parse_sha256_sidecar(&text, asset.published_name())
+    parse_sha256_sidecar(&text, published_name(url))
 }
 
 /// Keep the release host out of the message but say what happened. Unlike a
@@ -775,16 +863,60 @@ mod tests {
         assert!(parse_sha256_sidecar(text, "geoip.dat").is_err());
     }
 
+    /// The address is a setting, and the one guarantee this module makes rests
+    /// on the transport: the list and the digest that vouches for it come down
+    /// the same connection, so over plain HTTP whoever sits between the two
+    /// machines rewrites both and the check still passes.
+    #[test]
+    fn a_source_that_is_not_https_is_refused_before_anything_is_fetched() {
+        assert!(validate_url("https://example.invalid/geoip.dat").is_ok());
+
+        let error = validate_url("http://example.invalid/geoip.dat")
+            .expect_err("plain HTTP must not be accepted")
+            .to_string();
+        assert!(error.contains("https"), "{error}");
+
+        assert!(
+            validate_url("file:///tmp/geoip.dat").is_err(),
+            "a local file is not a source this fetches from"
+        );
+        assert!(validate_url("not an address at all").is_err());
+        assert!(validate_url("").is_err());
+    }
+
+    /// The digest is always the sidecar beside the file, whatever the file is
+    /// called and wherever it lives. A source publishing none is refused when
+    /// the sidecar cannot be fetched, rather than installed unverified.
+    #[test]
+    fn the_digest_is_looked_for_beside_the_file_that_was_asked_for() {
+        assert_eq!(
+            checksum_url("https://example.invalid/latest/download/geosite.dat"),
+            "https://example.invalid/latest/download/geosite.dat.sha256sum"
+        );
+        assert_eq!(
+            checksum_url(GeoAsset::GeoIp.default_url()),
+            "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat.sha256sum",
+            "the address the constant produced before it became a setting"
+        );
+    }
+
     /// The trap that would silently break every geosite download: upstream
     /// publishes the file as `dlc.dat` and its sidecar says `dlc.dat`, while
     /// the core looks for `geosite.dat`. The digest must be looked up under the
     /// published name, not the installed one.
     #[test]
     fn geosite_is_verified_against_the_name_it_was_published_under() {
-        assert_eq!(GeoAsset::GeoSite.published_name(), "dlc.dat");
+        let default = GeoAsset::GeoSite.default_url();
+        assert_eq!(published_name(default), "dlc.dat");
         assert_eq!(GeoAsset::GeoSite.installed_name(), "geosite.dat");
+        // Two other common sources publish the same list as `geosite.dat`, so
+        // the name has to come from the address rather than from the asset.
+        assert_eq!(
+            published_name("https://example.invalid/releases/latest/download/geosite.dat"),
+            "geosite.dat"
+        );
         let text = "8e0e5476fa1d7ad1d7e6a0e9c3b2a1908b7e6d5c4b3a29180706f5e4d3c2b1a0  dlc.dat\n";
-        assert!(parse_sha256_sidecar(text, GeoAsset::GeoSite.published_name()).is_ok());
+        assert!(parse_sha256_sidecar(text, published_name(default)).is_ok());
         assert!(
             parse_sha256_sidecar(text, GeoAsset::GeoSite.installed_name()).is_err(),
             "looking the digest up by the installed name would reject every download"
@@ -957,7 +1089,8 @@ mod live_network {
         let into = Dir::new("live-download");
         let agent = agent(None).expect("building the agent");
         for asset in GeoAsset::ALL {
-            let path = download(asset, &into.0, &agent, &Quiet).expect("downloading");
+            let path =
+                download(asset, asset.default_url(), &into.0, &agent, &Quiet).expect("downloading");
             assert!(path.exists());
         }
         assert!(complete(&into.0), "both lists must have landed");
@@ -996,13 +1129,13 @@ mod live_network {
         // Verify against the *wrong* asset's digest by asking for a sidecar
         // that describes a different file.
         let text = agent
-            .get(GeoAsset::GeoSite.checksum_url())
+            .get(&checksum_url(GeoAsset::GeoSite.default_url()))
             .call()
             .expect("fetching a sidecar")
             .into_string()
             .expect("reading it");
-        let wrong =
-            parse_sha256_sidecar(&text, GeoAsset::GeoSite.published_name()).expect("parsing it");
+        let wrong = parse_sha256_sidecar(&text, published_name(GeoAsset::GeoSite.default_url()))
+            .expect("parsing it");
         let bytes = b"not the file that digest describes";
         assert_ne!(sha256_hex(bytes), wrong);
         assert_eq!(

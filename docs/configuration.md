@@ -71,6 +71,8 @@ on_core_exit = "hold"
 latency_method = "http_get"
 latency_test_url = "https://www.gstatic.com/generate_204"
 subscription_user_agent = "v2rayN/6.45"
+geoip_url = ""
+geosite_url = ""
 xray_binary = ""
 tun2socks_binary = ""
 nft_binary = ""
@@ -86,12 +88,43 @@ nft_binary = ""
 | `latency_method` | enum | `"http_get"` | One of `icmp`, `tcp`, `http_head`, `http_get`. |
 | `latency_test_url` | string | `https://www.gstatic.com/generate_204` | Target for the HTTP probe methods. |
 | `subscription_user_agent` | string | `"v2rayN/6.45"` | Sent when fetching subscriptions. Many panels serve a different body — or a different *format*, or a web page — depending on it. See [the format it selects](subscriptions-and-protocols.md#the-user-agent-decides-the-format). |
+| `geoip_url` | URL | `""` | Where `geoip.dat` is fetched from. Empty is the built-in source (v2fly). Must be `https`. |
+| `geosite_url` | URL | `""` | Where `geosite.dat` is fetched from. Empty is the built-in source. Must be `https`. |
 | `xray_binary` | path | `""` | Empty falls through to the env var, then `PATH`. |
 | `tun2socks_binary` | path | `""` | Same. Needed only for TUN mode. |
 | `nft_binary` | path | `""` | Same. Needed only for `oxidom run`. |
 
 Ports must be between 1 and 65535, and the SOCKS and HTTP inbounds cannot share
 one.
+
+### Where the geo data comes from
+
+The two `geo*_url` keys name the lists the core reads to tell your local network,
+and whatever you route directly, apart from the tunnel. The published lists differ
+in what they cover, and for some countries a regional list is the difference
+between routing that works and routing that does not. Three sources are offered by
+name in **Settings › Xray core › Where the geo data comes from**; any address
+publishing the same shape works.
+
+| Source | Covers |
+|---|---|
+| v2fly | The default. Broad and neutral. |
+| Loyalsoldier | Larger domain lists, with China-oriented categories. |
+| runetfreedom | Built around what is blocked in Russia. |
+
+Two rules hold whatever you point at:
+
+- **`https` only.** The list and the SHA-256 that vouches for it come down the
+  same connection, so over plain HTTP whoever sits between the two machines
+  rewrites both and the check still passes. A non-`https` address is refused
+  before anything is fetched.
+- **A digest or nothing.** The digest is always the `.sha256sum` file published
+  beside the one named — `geoip.dat.sha256sum` beside `geoip.dat`. A source that
+  publishes none is refused rather than installed unverified. Nothing is written
+  until the digest matches, so a bad download cannot replace a good file.
+
+The two lists are chosen separately: mixing one source's GeoIP with another's
+Geosite is allowed, and the settings row then reads *Custom*.
 
 ### Settings the daemon will refuse to change
 

@@ -11,6 +11,7 @@ use oxidom_core::ipc::RuntimeInfo;
 // can still be typed. Shared with a subscription's own override, so the two
 // scopes of one choice cannot drift apart.
 use oxidom_core::subscription::CLIENT_PRESETS as UA_PRESETS;
+use oxidom_core::xray::assets::{self, GEO_PRESETS};
 
 use oxidom_core::client::DaemonSource;
 
@@ -42,6 +43,10 @@ pub struct SettingsValues {
     pub latency_method: LatencyMethod,
     pub latency_test_url: String,
     pub subscription_user_agent: String,
+    /// Where the geo lists are fetched from. Empty means the built-in source,
+    /// which is what clearing the field back to the default looks like.
+    pub geoip_url: String,
+    pub geosite_url: String,
     /// Empty means "let the daemon fall back to $OXIDOM_XRAY_BIN, then $PATH".
     pub xray_binary: String,
     /// Kept in the draft so applying unrelated GUI settings cannot erase a
@@ -65,6 +70,8 @@ impl From<&Config> for SettingsValues {
             latency_method: config.latency_method,
             latency_test_url: config.latency_test_url.clone(),
             subscription_user_agent: config.subscription_user_agent.clone(),
+            geoip_url: config.geoip_url.clone(),
+            geosite_url: config.geosite_url.clone(),
             xray_binary: config.xray_binary.clone(),
             tun2socks_binary: config.tun2socks_binary.clone(),
             nft_binary: config.nft_binary.clone(),
@@ -144,6 +151,9 @@ struct SettingsWidgets {
     method: adw::ComboRow,
     test_url: adw::EntryRow,
     user_agent: adw::EntryRow,
+    geoip_url: adw::EntryRow,
+    geosite_url: adw::EntryRow,
+    geo_preset: adw::ComboRow,
     ua_preset: adw::ComboRow,
     xray_binary: adw::EntryRow,
     tun2socks_binary: adw::EntryRow,
@@ -197,6 +207,8 @@ impl SettingsWidgets {
             },
             latency_test_url: self.test_url.text().to_string(),
             subscription_user_agent: self.user_agent.text().to_string(),
+            geoip_url: self.geoip_url.text().to_string(),
+            geosite_url: self.geosite_url.text().to_string(),
             // Trimmed here so trailing whitespace never counts as an edit and
             // never reaches the daemon's path resolution.
             xray_binary: self.xray_binary.text().trim().to_string(),
@@ -220,6 +232,8 @@ impl SettingsWidgets {
         });
         self.test_url.set_text(&values.latency_test_url);
         self.user_agent.set_text(&values.subscription_user_agent);
+        self.geoip_url.set_text(&values.geoip_url);
+        self.geosite_url.set_text(&values.geosite_url);
         self.xray_binary.set_text(&values.xray_binary);
         self.tun2socks_binary.set_text(&values.tun2socks_binary);
         self.nft_binary.set_text(&values.nft_binary);
@@ -325,6 +339,37 @@ impl SettingsView {
             .model(&presets)
             .selected(selected_preset)
             .build();
+
+        // Left blank rather than pre-filled with the built-in address: a field
+        // showing the default is a field the user has to recognise as the
+        // default before they dare clear it, and clearing is how you go back.
+        let geoip_url = adw::EntryRow::builder()
+            .title("GeoIP list")
+            .text(&applied.geoip_url)
+            .build();
+        let geosite_url = adw::EntryRow::builder()
+            .title("Geosite list")
+            .text(&applied.geosite_url)
+            .build();
+        let geo_labels: Vec<&str> = std::iter::once("Custom")
+            .chain(GEO_PRESETS.iter().map(|preset| preset.label))
+            .collect();
+        let geo_preset = adw::ComboRow::builder()
+            .title("Source")
+            .subtitle("Fills both addresses below")
+            .model(&gtk::StringList::new(&geo_labels))
+            .selected(preset_for_geo(&applied.geoip_url, &applied.geosite_url))
+            .build();
+        let geo_source = adw::ExpanderRow::builder()
+            .title("Where the geo data comes from")
+            .subtitle(
+                "The lists differ in what they cover; each is checked against the \
+                       SHA-256 published beside it",
+            )
+            .build();
+        geo_source.add_row(&geo_preset);
+        geo_source.add_row(&geoip_url);
+        geo_source.add_row(&geosite_url);
 
         let xray_binary = adw::EntryRow::builder()
             .title("Xray binary")
@@ -482,6 +527,7 @@ impl SettingsView {
         xray_group.add(&geo_action);
         xray_group.add(&geo_progress);
         xray_group.add(&install_hint);
+        xray_group.add(&geo_source);
         let latency_group = adw::PreferencesGroup::builder()
             .title("Latency")
             .description("HTTP checks use the active local SOCKS proxy")
@@ -549,6 +595,9 @@ impl SettingsView {
             method,
             test_url,
             user_agent,
+            geoip_url,
+            geosite_url,
+            geo_preset,
             ua_preset,
             xray_binary,
             tun2socks_binary,
@@ -774,15 +823,18 @@ impl SettingsView {
     /// it is in the core's built-in search path, so it needs no environment
     /// variable and works for a daemon of any age, including the old one that
     /// prompted the advice.
-    fn manual_install_command() -> String {
-        let geoip = oxidom_core::xray::assets::GeoAsset::GeoIp;
-        let geosite = oxidom_core::xray::assets::GeoAsset::GeoSite;
+    ///
+    /// The addresses are the configured ones, not the built-in pair: a recipe
+    /// that fetched a different list from the one the settings name would
+    /// install the wrong lists by hand and give no sign of it.
+    fn manual_install_command(widgets: &SettingsWidgets) -> String {
+        use oxidom_core::xray::assets::GeoAsset;
         format!(
-            "curl -LO {}\ncurl -Lo geosite.dat {}\n\
+            "curl -Lo geoip.dat   {}\ncurl -Lo geosite.dat {}\n\
              sudo install -Dm644 geoip.dat   /usr/local/share/xray/geoip.dat\n\
              sudo install -Dm644 geosite.dat /usr/local/share/xray/geosite.dat",
-            geoip.url(),
-            geosite.url(),
+            assets::resolve_url(GeoAsset::GeoIp, &widgets.geoip_url.text()),
+            assets::resolve_url(GeoAsset::GeoSite, &widgets.geosite_url.text()),
         )
     }
 
@@ -852,7 +904,7 @@ impl SettingsView {
                 ));
                 widgets.geo_button.set_visible(false);
                 widgets.geo_cancel.set_visible(false);
-                *widgets.geo_command.borrow_mut() = Self::manual_install_command();
+                *widgets.geo_command.borrow_mut() = Self::manual_install_command(widgets);
                 widgets.geo_copy.set_visible(true);
                 show(true, true, false);
             }
@@ -873,7 +925,7 @@ impl SettingsView {
                 });
                 widgets.geo_button.set_visible(false);
                 widgets.geo_cancel.set_visible(false);
-                *widgets.geo_command.borrow_mut() = Self::manual_install_command();
+                *widgets.geo_command.borrow_mut() = Self::manual_install_command(widgets);
                 widgets.geo_copy.set_visible(true);
                 show(true, true, false);
             }
@@ -1062,11 +1114,29 @@ fn refuse(submitted: &SettingsValues, effective: &SettingsValues, draft: &mut Se
         latency_method,
         latency_test_url,
         subscription_user_agent,
+        geoip_url,
+        geosite_url,
         xray_binary,
         tun2socks_binary,
         nft_binary,
         core,
     );
+}
+
+/// Which named source both addresses currently describe, or `Custom`.
+///
+/// Empty counts as the built-in one, because that is what empty means
+/// everywhere else. A pair that matches no preset — or two halves from
+/// different presets, which is legitimate — reads as Custom rather than as
+/// whichever half happened to match.
+fn preset_for_geo(geoip: &str, geosite: &str) -> u32 {
+    let geoip = assets::resolve_url(assets::GeoAsset::GeoIp, geoip);
+    let geosite = assets::resolve_url(assets::GeoAsset::GeoSite, geosite);
+    GEO_PRESETS
+        .iter()
+        .position(|preset| preset.geoip == geoip && preset.geosite == geosite)
+        .map(|index| index as u32 + 1)
+        .unwrap_or(0)
 }
 
 fn preset_for_user_agent(user_agent: &str) -> u32 {
@@ -1081,6 +1151,10 @@ fn sync_preset(widgets: &SettingsWidgets) {
     let selected = preset_for_user_agent(&widgets.user_agent.text());
     if widgets.ua_preset.selected() != selected {
         widgets.ua_preset.set_selected(selected);
+    }
+    let selected = preset_for_geo(&widgets.geoip_url.text(), &widgets.geosite_url.text());
+    if widgets.geo_preset.selected() != selected {
+        widgets.geo_preset.set_selected(selected);
     }
 }
 
@@ -1266,11 +1340,29 @@ mod tests {
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".into(),
             subscription_user_agent: "oxidom/test".into(),
+            geoip_url: String::new(),
+            geosite_url: String::new(),
             xray_binary: String::new(),
             tun2socks_binary: String::new(),
             nft_binary: String::new(),
             core: CoreOptions::default(),
         }
+    }
+
+    /// Empty is the built-in source, so it must read as that preset rather
+    /// than as Custom — otherwise the row would tell a user who has changed
+    /// nothing that they have.
+    #[test]
+    fn an_unset_geo_source_reads_as_the_built_in_preset() {
+        assert_eq!(preset_for_geo("", ""), 1);
+        let second = &GEO_PRESETS[1];
+        assert_eq!(preset_for_geo(second.geoip, second.geosite), 2);
+        assert_eq!(
+            preset_for_geo(second.geoip, ""),
+            0,
+            "one half from one source and one from another is nobody's preset"
+        );
+        assert_eq!(preset_for_geo("https://example.invalid/geoip.dat", ""), 0);
     }
 
     #[test]

@@ -24,10 +24,10 @@ use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
-    SwitcherItem, about_comments, active_latency_for, card_action, history_rows, human_bytes,
-    latency_states, missing_core_message, other_profiles_message, pool_action, pool_short_label,
-    press_stops, reduce, selected_status, session_for, session_rows, switcher_items,
-    switcher_visible,
+    SwitcherItem, about_comments, active_latency_for, card_action, geo_download_prompt,
+    history_rows, human_bytes, latency_states, missing_core_message, other_profiles_message,
+    pool_action, pool_short_label, press_stops, reduce, selected_status, session_for, session_rows,
+    switcher_items, switcher_visible,
 };
 use super::server_card::{self, LatencyState};
 use super::sidebar::{Page, Sidebar};
@@ -3228,6 +3228,8 @@ impl Controller {
             latency_method: values.latency_method,
             latency_test_url: values.latency_test_url.clone(),
             subscription_user_agent: values.subscription_user_agent.clone(),
+            geoip_url: values.geoip_url.clone(),
+            geosite_url: values.geosite_url.clone(),
             xray_binary: values.xray_binary.clone(),
             tun2socks_binary: values.tun2socks_binary.clone(),
             nft_binary: values.nft_binary.clone(),
@@ -4423,8 +4425,6 @@ impl Controller {
     /// can go through it, which turns "blocked" from a dead end into a
     /// checkbox.
     fn present_geo_download(self: &Rc<Self>) {
-        use oxidom_core::xray::assets::GeoAsset;
-
         let dir = self
             .runtime
             .borrow()
@@ -4442,26 +4442,8 @@ impl Controller {
             .iter()
             .any(|session| session.state == "connected");
 
-        let body = format!(
-            "oxidom will contact GitHub over HTTPS and fetch two files:\n\n\
-             \u{2003}{}\n\u{2003}\u{2192} {dir}/geoip.dat\u{2003}about 22 MB\n\n\
-             \u{2003}{}\n\u{2003}\u{2192} {dir}/geosite.dat\u{2003}about 2 MB\n\n\
-             These are the IP and domain lists the core reads to tell your local network \
-             apart from the tunnel. Every configuration oxidom generates needs them.\n\n\
-             GitHub is blocked on some networks and in some countries. If this fails, that \
-             is the likely reason{}\n\n\
-             Each file is checked against the SHA-256 published beside it. That catches a \
-             broken download, not a compromised release \u{2014} there is no signature to \
-             verify. Nothing is executed.",
-            GeoAsset::GeoIp.url(),
-            GeoAsset::GeoSite.url(),
-            if connected {
-                " \u{2014} \"Through the tunnel\" below sends the request over your \
-                 connection instead."
-            } else {
-                ", and connecting first would let oxidom fetch them through the tunnel."
-            },
-        );
+        let applied = self.settings.applied();
+        let body = geo_download_prompt(&applied.geoip_url, &applied.geosite_url, &dir, connected);
 
         let dialog = adw::AlertDialog::new(Some("Download the geo data?"), Some(&body));
         dialog.add_responses(&[("cancel", "Cancel"), ("download", "Download")]);
