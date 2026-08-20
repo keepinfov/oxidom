@@ -10,10 +10,24 @@ name: build
 # or rustfmt, so dropping those in favour of this would lose both — and they are
 # the two cheapest signals in the repository.
 
+# It runs once per pull request rather than once per push. Realising the flake
+# costs about fourteen minutes and almost none of it is download, so on a branch
+# that lands in five commits it was spending an hour to answer the same question
+# five times. `synchronize` is therefore absent from the list below.
+#
+# `ready_for_review` alone would not do: it fires only when a draft is marked
+# ready, so a pull request opened ready would never build here at all. `opened`
+# closes that hole, and the `if` below drops the draft case it lets in — a draft
+# is by definition not asking for this answer yet.
+#
+# Nothing enforced is weakened: the `forbid-master` ruleset requires `rustfmt`
+# and `nixfmt` and has never required this workflow. The push trigger on master
+# stays, so every merge is still built.
 on:
   push:
     branches: [master]
   pull_request:
+    types: [opened, ready_for_review]
     paths: ['crates/**', 'data/**', 'nix/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.github/workflows/build.yml']
 
 permissions:
@@ -25,6 +39,7 @@ concurrency:
 
 jobs:
   nix-build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
