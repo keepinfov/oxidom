@@ -210,6 +210,26 @@ fn responsive_mode_for_width(width: f64) -> ResponsiveMode {
     }
 }
 
+/// The width to lay out from, given what was reported and the window's default.
+///
+/// A reported width of zero means nobody has been asked yet — the compositor
+/// has not configured the surface — and the default is the best answer
+/// available, being the size the window is about to be given. Any positive
+/// width is taken at face value, narrow ones included: a genuinely small
+/// window is not a mistake to correct.
+///
+/// Pulled out of its caller because it is the one part of the width path a
+/// test can hold. The rest is widget wiring, and that asymmetry — tested
+/// arithmetic beside untested wiring — is what let the grid open in one
+/// column through a green suite.
+fn layout_width(reported: i32, default_width: i32) -> i32 {
+    if reported > 0 {
+        reported
+    } else {
+        default_width
+    }
+}
+
 /// Width the servers view actually gets: in compact mode the sidebar overlays
 /// the content, in wide mode OverlaySplitView carves out its fraction
 /// (25% clamped to the configured 230..=280 range).
@@ -218,7 +238,13 @@ fn servers_available_width(window_width: i32, compact: bool) -> i32 {
         return window_width;
     }
     let sidebar = (window_width / 4).clamp(230, 280);
-    window_width.saturating_sub(sidebar)
+    // Floored at zero. The sidebar's minimum is wider than a window this
+    // narrow, so the subtraction goes negative — which is not a width, and
+    // means the same thing zero does: no room. Unreachable through
+    // `push_servers_width_from`, since `layout_width` never hands it a
+    // non-positive number; the floor is here because the function is public
+    // enough to be called with one and a negative answer is not one.
+    window_width.saturating_sub(sidebar).max(0)
 }
 
 struct AppState {
@@ -963,6 +989,32 @@ fn build(
     controller.watch_termination();
 
     // Column count follows the window width (see push_servers_width).
+    //
+    // **Three triggers, one idempotent sink, and that is the fix.** The grid
+    // used to open in a single column however wide the window was, and stay
+    // that way until some unrelated resize corrected it. The cause was not the
+    // arithmetic — that is a pure function and it is right — but that the
+    // width was pushed *once*, at realize, and nothing re-ran it. A first
+    // value that was not yet final therefore stuck for the whole session.
+    //
+    // So there is no longer a single push that has to be right:
+    //
+    // 1. **At realize**, from the `GdkSurface` rather than from the widget.
+    //    The surface is what a compositor configures and the widget's own
+    //    width lags it — see `push_servers_width_from`. At this point nothing
+    //    may have been configured yet, in which case the width is `0` and
+    //    `layout_width` falls back to the default.
+    // 2. **On the first main-loop turn after mapping**, when the window has
+    //    been through layout and its width is the one about to be drawn. This
+    //    is the push that makes the *first frame* right, and it is the one
+    //    that was missing.
+    // 3. **On every later `width-notify`**, as before.
+    //
+    // `ServerCardsView::set_available_width` schedules work only when the
+    // column count actually changes, so pushing the same width three times
+    // costs nothing and no trigger has to know about the others. That is what
+    // makes the first frame trustworthy where one carefully-placed push was
+    // not: being wrong early is now recoverable instead of permanent.
     window.connect_realize({
         let weak = Rc::downgrade(&controller);
         move |window| {
@@ -978,8 +1030,21 @@ fn build(
                         }
                     }
                 });
+                controller.push_servers_width_from(surface.width());
+            } else {
+                controller.push_servers_width();
             }
-            controller.push_servers_width();
+        }
+    });
+    window.connect_map({
+        let weak = Rc::downgrade(&controller);
+        move |_| {
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(controller) = weak.upgrade() {
+                    controller.push_servers_width();
+                }
+            });
         }
     });
 
@@ -1703,11 +1768,7 @@ impl Controller {
     /// surface's own width (which is definitionally current, since it is
     /// what just changed) avoids that race entirely.
     fn push_servers_width_from(&self, width: i32) {
-        let width = if width > 0 {
-            width
-        } else {
-            self.window.default_width()
-        };
+        let width = layout_width(width, self.window.default_width());
         self.servers
             .set_available_width(servers_available_width(width, self.compact.get()));
     }
@@ -5046,12 +5107,51 @@ fn install_css() {
 
 #[cfg(test)]
 mod tests {
+    /// The first frame used to lay out from whatever width happened to be
+    /// reported at realize, and a value that was not yet final stuck for the
+    /// session. Zero is the one reported width that means "nobody has been
+    /// asked yet"; every positive one is an answer, including a narrow one.
+    #[test]
+    fn a_width_nobody_has_reported_yet_falls_back_to_the_one_about_to_be_given() {
+        assert_eq!(layout_width(0, 1100), 1100);
+        assert_eq!(layout_width(-1, 1100), 1100);
+        assert_eq!(layout_width(1400, 1100), 1400);
+        assert_eq!(
+            layout_width(420, 1100),
+            420,
+            "a genuinely narrow window is not a mistake to correct"
+        );
+    }
+
+    /// The arithmetic the column count is taken from had no test at all, which
+    /// is half of why a layout defect survived a green suite. The default
+    /// window is 1100 wide, and what it leaves the grid is what decides
+    /// whether the first frame is one column or two.
+    #[test]
+    fn the_default_window_leaves_the_grid_room_for_more_than_one_column() {
+        // 1100 / 4 = 275, inside the 230..=280 clamp.
+        assert_eq!(servers_available_width(1100, false), 825);
+        // Clamped low: a narrow window still surrenders 230 to the sidebar.
+        assert_eq!(servers_available_width(800, false), 570);
+        // Clamped high: a wide one surrenders no more than 280.
+        assert_eq!(servers_available_width(2000, false), 1720);
+        // Compact overlays the sidebar instead of carving it out, so the grid
+        // gets the whole width.
+        assert_eq!(servers_available_width(600, true), 600);
+        assert_eq!(
+            servers_available_width(0, false),
+            0,
+            "no width means no room, not a negative one"
+        );
+    }
+
     use oxidom_core::ipc::SessionInfo;
     use oxidom_core::xray::core::Status;
 
     use super::{
         ResponsiveMode, SearchState, StatusAction, WorkerPoll, desired_system_proxy_endpoint,
-        poll_worker, responsive_mode_for_width, status_action_for, summarize_error,
+        layout_width, poll_worker, responsive_mode_for_width, servers_available_width,
+        status_action_for, summarize_error,
     };
 
     /// `try_recv` reports "nothing yet" and "nobody will ever send" as two
