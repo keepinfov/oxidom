@@ -81,6 +81,31 @@ Freshness is the GUI's job: `gui::reduce::latency_state` is the **single** mappe
 a `LatencyState`, and ages are bucketed to whole minutes so the badge repaints on a bucket change
 rather than once a second.
 
+## What a failed check says (binding)
+
+The badge answers a glance across the whole grid; the **expanded card** answers the diagnosis. They
+are different questions and have two mappers, `gui::reduce::latency_state` and
+`gui::reduce::failure_report`, but they must read **the same reading** — `SnapshotState::card_state`
+and `SnapshotState::card_failure` both take it from `shown_reading`, so a card cannot show a dash
+for this check beside the reason from the one before it.
+
+- **The reason is the daemon's, not the card's.** `ProbeFailure::message_with` is the one place the
+  wording lives, so the CLI, the badge and the card cannot describe one condition three ways. The
+  card promotes the fragment to a sentence and adds nothing.
+- **A reason travels with how the check was made and when.** The method actually used and the route
+  are what decide whether the reason is about the server at all: a refusal measured through a
+  tunnel that has since gone down describes the tunnel. A reading that cannot be dated says so
+  rather than reading as fresh.
+- **A check in flight carries no reason.** The previous one describes a measurement being replaced,
+  and under a spinner it reads as why the spinner is spinning.
+- **A stopped check still gives a reason.** The card owes an answer for having no number, and
+  `Cancelled` is that answer. It is reported as what happened, not as a fault — which is why the
+  block is ruled off rather than coloured as an error.
+- **One action leads to the rest of what happened**, which is in the process log mixed with every
+  other source: the card opens the log page narrowed to the server's **address**, because that is
+  what the prober and the core write. A name is the user's word for a server and appears in no log
+  line. The narrowing is the log page's own search entry, so it is visible and can be widened.
+
 ## The D-Bus surface (binding)
 
 Four methods on `dev.keepinfov.oxidom1` carry probing. They are listed here because a client that

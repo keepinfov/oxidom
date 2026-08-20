@@ -10,6 +10,7 @@ use oxidom_core::config::LatencyMethod;
 use oxidom_core::ipc::ProbeDetail;
 use oxidom_core::model::Server;
 
+use super::reduce::FailureReport;
 use super::views::{
     dialog_content, icon_button, set_transient_parent, set_validation, validation_label,
 };
@@ -165,7 +166,7 @@ pub enum LatencyState {
 /// Named after what actually happened on the wire rather than after the
 /// setting: a card measured with a TCP handshake says "TCP handshake" even
 /// when the user picked HTTP GET, because that is what the number is.
-fn method_text(method: LatencyMethod) -> &'static str {
+pub(super) fn method_text(method: LatencyMethod) -> &'static str {
     match method {
         LatencyMethod::Icmp => "ICMP ping",
         LatencyMethod::Tcp => "TCP handshake",
@@ -204,6 +205,10 @@ pub struct CardHandlers {
     pub trust: Rc<dyn Fn()>,
     pub set_alias: Rc<dyn Fn(String)>,
     pub toggle_favourite: Rc<dyn Fn()>,
+    /// Open the log page narrowed to this server. Offered only beside a failed
+    /// check, because that is the one place where what the core printed is the
+    /// next thing anybody wants and the log is where it went.
+    pub show_logs: Rc<dyn Fn()>,
 }
 
 /// What a server that stayed silent is called, wherever it is reported.
@@ -284,6 +289,13 @@ pub struct ServerCard {
     /// relabels the menu entry too — which is the only route to the control on
     /// a collapsed card, where the action row is hidden.
     ping_button: gtk::Button,
+    /// The block explaining a check that produced no number, and its two
+    /// lines. Hidden whole while there is nothing to explain: an empty row in
+    /// the expanded card reads as a defect in the card rather than as a fact
+    /// about the server.
+    failure: gtk::Box,
+    failure_reason: gtk::Label,
+    failure_attempt: gtk::Label,
     expanded: Rc<Cell<bool>>,
     /// What the badge is currently showing. The age sweep re-pushes a state for
     /// every card every 15 s, so without this the whole grid would re-fade on
@@ -313,6 +325,7 @@ impl ServerCard {
             trust: on_trust,
             set_alias: on_set_alias,
             toggle_favourite,
+            show_logs: on_show_logs,
         } = handlers;
         let flag = flag_widget(server.country.as_deref(), 26, 20);
 
@@ -626,10 +639,52 @@ impl ServerCard {
         });
         header.add_controller(secondary_click);
 
+        // Why the last check produced no number, which the badge cannot say: it
+        // has a glyph, a tooltip and a pill to fit in, and "the server did not
+        // answer" covers a refused handshake, a wrong TLS parameter and a dead
+        // network alike. Hidden entirely while there is nothing to explain,
+        // rather than left as an empty row that reads as a defect.
+        let failure_reason = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(1)
+            .selectable(true)
+            .css_classes(["server-meta", "server-failure-reason"])
+            .build();
+        let failure_attempt = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(1)
+            .selectable(true)
+            .css_classes(["dim-label", "server-meta"])
+            .build();
+        // The rest of what happened is in the log, mixed with every other
+        // source on the machine. This is the only way to it that arrives
+        // already narrowed to the server being asked about.
+        // `flat` alone, without `server-action`: that class squares a button
+        // down to an icon's footprint, and this one carries words.
+        let failure_logs = gtk::Button::builder()
+            .label("Show in logs")
+            .halign(gtk::Align::Start)
+            .css_classes(["flat"])
+            .build();
+        failure_logs.connect_clicked(move |_| on_show_logs());
+        let failure = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        failure.set_visible(false);
+        failure.set_css_classes(&["server-failure"]);
+        failure.append(&failure_reason);
+        failure.append(&failure_attempt);
+        failure.append(&failure_logs);
+
         let metadata = gtk::Box::new(gtk::Orientation::Vertical, 6);
         metadata.append(&full_name);
         metadata.append(&meta);
         metadata.append(&alias);
+        metadata.append(&failure);
         let metadata_scroller = gtk::ScrolledWindow::builder()
             .child(&metadata)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -677,6 +732,9 @@ impl ServerCard {
             status,
             connect_button,
             ping_button,
+            failure,
+            failure_reason,
+            failure_attempt,
             expanded,
             last_latency: Rc::new(Cell::new(latency_state)),
             last_connection: Rc::new(Cell::new(CardConnectionState::Disconnected)),
@@ -765,6 +823,31 @@ impl ServerCard {
         out.play();
     }
 
+    /// Show, or stop showing, why the last check produced no number.
+    ///
+    /// Separate from [`Self::set_latency_state`] because the two answer
+    /// different questions for different readers: the badge is a glance at
+    /// every card in the grid, and this is the diagnosis on the one card
+    /// somebody opened. Pushing it through the badge's channel would have put
+    /// a `String` in a `Copy` state that the grid keeps one of per card.
+    pub fn set_failure_report(&self, report: Option<&FailureReport>) {
+        match report {
+            Some(report) => {
+                self.failure_reason.set_label(&report.reason);
+                self.failure_attempt.set_label(&report.attempt);
+                self.failure.set_visible(true);
+            }
+            None => {
+                self.failure.set_visible(false);
+                // Cleared rather than left standing behind the hidden box: the
+                // labels are selectable, and a reason from two checks ago is
+                // worse than none at all if anything ever reveals them again.
+                self.failure_reason.set_label("");
+                self.failure_attempt.set_label("");
+            }
+        }
+    }
+
     fn apply_latency(&self, state: LatencyState) {
         self.latency_spinner.set_spinning(false);
         for class in [
@@ -847,8 +930,8 @@ impl ServerCard {
     fn show_reading(&self, text: &str, tooltip: &str, age: LatencyAge) {
         match age {
             LatencyAge::Stale(minutes) => {
-                let unit = if minutes == 1 { "minute" } else { "minutes" };
-                self.show_label(text, &format!("{tooltip} · measured {minutes} {unit} ago"));
+                let ago = super::reduce::minutes_ago(minutes);
+                self.show_label(text, &format!("{tooltip} · measured {ago}"));
                 self.latency.add_css_class("latency-stale");
             }
             LatencyAge::Fresh | LatencyAge::Unknown => self.show_label(text, tooltip),

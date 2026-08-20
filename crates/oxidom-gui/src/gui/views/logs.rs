@@ -85,6 +85,12 @@ pub struct LogsView {
     /// too narrow to hold them in the toolbar.
     filters: gtk::Box,
     filter_slot: gtk::Box,
+    /// Held so another view can narrow the page to what it is asking about.
+    /// The text is set on the widget rather than on `filter` directly, so the
+    /// entry shows what is being filtered on and the user can clear or widen
+    /// it — a filter nothing on screen accounts for reads as a log that has
+    /// lost half its lines.
+    search: gtk::SearchEntry,
     overflow: gtk::MenuButton,
     overflow_popover: gtk::Popover,
     compact: Rc<Cell<bool>>,
@@ -237,6 +243,7 @@ impl LogsView {
             follow,
             filters,
             filter_slot,
+            search: search.clone(),
             overflow,
             overflow_popover,
             compact: Rc::new(Cell::new(false)),
@@ -581,6 +588,19 @@ impl LogsView {
     /// Fold the level and search controls into a menu when the window is too
     /// narrow for them. The source switcher stays out: it is the one control
     /// this page exists for.
+    /// Narrow the page to lines carrying `needle`, as though it had been
+    /// typed into the search entry.
+    ///
+    /// Setting the widget's text is what applies the filter: the change signal
+    /// is what redraws, and writing into `filter` directly would leave the
+    /// entry empty beside a page showing a fraction of its lines.
+    pub fn show_only(&self, needle: &str) {
+        if self.search.text() == needle {
+            return;
+        }
+        self.search.set_text(needle);
+    }
+
     pub fn set_ultra_compact(&self, enabled: bool) {
         if self.compact.get() == enabled {
             return;

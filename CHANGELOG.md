@@ -16,6 +16,22 @@ surface, packaging, or the CLI belongs here.
 
 ### Added
 
+- **An expanded card says why the last check failed.** A failed check left one dash and one
+  sentence, and "the server did not answer" covers a refused handshake, a wrong TLS
+  parameter and a dead network alike. Telling those apart is the whole diagnosis, and it
+  meant scrolling the log page with every other source on the machine mixed into it.
+
+  Opening a card now shows the reason the daemon gave, how the check was actually made —
+  the method really used, which is not always the one configured, and whether it went
+  through the tunnel — and how long ago. A check the user stopped is reported as stopped
+  rather than as a fault. A check in flight shows nothing, because the reason it would show
+  is about the measurement being replaced.
+
+  Beside it, one button opens the log page narrowed to that server, so the rest of what
+  happened is one press away instead of a search away. Nothing here is new information from
+  the daemon: the reading has carried the method, the route, the time and the detail all
+  along, and the card threw four of them away on the way to a badge.
+
 - **A profile can carry its own routing rules.** Everything oxidom generated said the same
   two things about where traffic goes — private addresses direct, and for a pool the rest
   to the balancer — and there was no way to say anything else short of not using oxidom.

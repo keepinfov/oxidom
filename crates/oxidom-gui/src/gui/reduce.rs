@@ -24,7 +24,7 @@ use oxidom_core::xray::core::Status;
 
 use super::operation::{UiOperation, UiOperationKind};
 use super::prefs::{GroupKind, ServerGroup};
-use super::server_card::{LatencyAge, LatencyState};
+use super::server_card::{LatencyAge, LatencyState, method_text};
 
 /// One round of daemon polling, produced off the main thread.
 pub(super) struct PolledSnapshot {
@@ -224,11 +224,42 @@ impl SnapshotState {
     /// so a card rebuilt from scratch, a card updated by the poll and a card
     /// swept for age cannot disagree about what the same reading means.
     pub fn card_state(&self, id: &str, now_unix_ms: u64) -> LatencyState {
-        let is_active = self
-            .route_target
+        let is_active = self.is_active(id);
+        latency_state(
+            self.shown_reading(id),
+            self.is_checking(id),
+            is_active,
+            now_unix_ms,
+        )
+    }
+
+    /// Why `id`'s last check produced no number, for the expanded card.
+    ///
+    /// Reads the same reading the badge above was decided from, deliberately:
+    /// two lookups that could pick differently would let a card show a dash
+    /// for one check and the reason from another. A check in flight reports
+    /// nothing — the previous reason is about a measurement that is being
+    /// replaced, and leaving it under a spinner reads as the reason the
+    /// spinner is spinning.
+    pub fn card_failure(&self, id: &str, now_unix_ms: u64) -> Option<FailureReport> {
+        if self.is_checking(id) {
+            return None;
+        }
+        failure_report(self.shown_reading(id), now_unix_ms)
+    }
+
+    /// Whether the tunnel is currently carried by this server, i.e. whether a
+    /// reading taken through it is still about anything.
+    fn is_active(&self, id: &str) -> bool {
+        self.route_target
             .as_ref()
-            .is_some_and(|target| target.server_id == id);
-        let reading = if is_active {
+            .is_some_and(|target| target.server_id == id)
+    }
+
+    /// The reading a card is showing: the proxied one while this server
+    /// carries the tunnel, its own otherwise.
+    fn shown_reading(&self, id: &str) -> Option<&LatencyReading> {
+        if self.is_active(id) {
             self.route_target
                 .as_ref()
                 .and_then(|target| proxied_reading(self, target))
@@ -241,8 +272,7 @@ impl SnapshotState {
                 })
         } else {
             self.readings.get(id)
-        };
-        latency_state(reading, self.is_checking(id), is_active, now_unix_ms)
+        }
     }
 
     /// A card is checking while a wait is live. A wait the deadline has given
@@ -1940,6 +1970,89 @@ pub(super) fn latency_state(
             None => LatencyState::Unmeasured,
         },
     }
+}
+
+/// What the expanded card says about a check that produced no number.
+///
+/// Separate from [`LatencyState`], which is the badge's business: a badge has a
+/// glyph, a tooltip and a pill to fit in, and the diagnosis fits in none of
+/// them. "The server did not answer" covers a refused handshake, a wrong TLS
+/// parameter and a dead network, and telling those apart is the whole
+/// diagnosis — which until now meant scrolling a log shared with every other
+/// source on the machine.
+///
+/// Nothing here is new information from the daemon. `LatencyReading` has
+/// carried the method, the route, the time and the detail all along; the card
+/// threw four of them away on the way to a pill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FailureReport {
+    /// What went wrong, in the words the CLI and the badge already use.
+    pub reason: String,
+    /// How the check was made and when. The pair is what decides whether the
+    /// reason describes the server or describes this machine's last five
+    /// minutes — a refusal measured through a tunnel that has since gone down
+    /// says nothing about the server at all.
+    pub attempt: String,
+}
+
+/// The report for the last reading, or `None` when there is nothing to explain.
+pub(super) fn failure_report(
+    reading: Option<&LatencyReading>,
+    now_unix_ms: u64,
+) -> Option<FailureReport> {
+    let reading = reading?;
+    // A number needs no excuse, and a card showing one must not also carry a
+    // reason left over from the check before it.
+    if reading.value.is_some() {
+        return None;
+    }
+    // `failure.is_some()` exactly when `value.is_none()` by the type's own
+    // contract, so a reading with neither comes from a daemon that broke it.
+    // Nothing to report beats something invented.
+    let failure = reading.failure?;
+    let reason = sentence(failure.message_with(reading.detail));
+    let how = match reading.route {
+        ProbeRoute::Direct => format!("Tried by {}", method_text(reading.method)),
+        ProbeRoute::Proxied => {
+            format!(
+                "Tried through the tunnel by {}",
+                method_text(reading.method)
+            )
+        }
+    };
+    let when = match age_of(reading, now_unix_ms) {
+        LatencyAge::Fresh => "just now".to_string(),
+        LatencyAge::Stale(minutes) => minutes_ago(minutes),
+        // A daemon that predates the timestamp, or two clocks that disagree.
+        // "Just now" would be the flattering answer rather than the true one,
+        // and how old the reason is decides whether it still describes
+        // anything.
+        LatencyAge::Unknown => "at an unrecorded time".to_string(),
+    };
+    Some(FailureReport {
+        reason,
+        attempt: format!("{how} · {when}"),
+    })
+}
+
+/// A message written to sit mid-sentence, promoted to standing on its own.
+///
+/// The wording lives on `ProbeFailure` and `ProbeDetail` so that the CLI, the
+/// badge and this card cannot describe one condition three ways. It is phrased
+/// as a fragment there because most of its readers append it to something;
+/// this is the one reader that does not.
+fn sentence(message: &str) -> String {
+    let mut chars = message.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// How long ago, in the one wording the interface uses for it.
+pub(super) fn minutes_ago(minutes: u16) -> String {
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!("{minutes} {unit} ago")
 }
 
 fn age_of(reading: &LatencyReading, now_unix_ms: u64) -> LatencyAge {
@@ -4478,5 +4591,255 @@ mod tests {
             true,
         );
         assert!(state.readings.contains_key("a"));
+    }
+
+    fn failed_at(
+        failure: ProbeFailure,
+        detail: Option<ProbeDetail>,
+        route: ProbeRoute,
+        method: LatencyMethod,
+        measured_at_unix_ms: u64,
+    ) -> LatencyReading {
+        let mut reading = match detail {
+            Some(detail) => LatencyReading::failed_locally(failure, detail, route, method),
+            None => LatencyReading::failed(failure, route, method),
+        };
+        reading.measured_at_unix_ms = measured_at_unix_ms;
+        reading
+    }
+
+    /// The four facts the card threw away. Every one of them is in the reading
+    /// the daemon already sends, and the badge kept none of them.
+    #[test]
+    fn a_failed_check_is_reported_with_how_it_was_made_and_when() {
+        let report = failure_report(
+            Some(&failed_at(
+                ProbeFailure::Unreachable,
+                None,
+                ProbeRoute::Direct,
+                LatencyMethod::Tcp,
+                NOW_MS,
+            )),
+            NOW_MS,
+        )
+        .expect("a failure has a report");
+        assert_eq!(report.reason, "The server did not answer");
+        assert_eq!(report.attempt, "Tried by TCP handshake · just now");
+    }
+
+    /// A refusal, a wrong TLS parameter and a dead network all read as "the
+    /// server did not answer" on the badge. The detail is the sentence that
+    /// tells them apart, and it is what the daemon sent.
+    #[test]
+    fn a_local_failure_is_reported_by_its_detail_rather_than_by_its_category() {
+        let report = failure_report(
+            Some(&failed_at(
+                ProbeFailure::Unknown,
+                Some(ProbeDetail::CertificateRejected),
+                ProbeRoute::Direct,
+                LatencyMethod::HttpGet,
+                NOW_MS,
+            )),
+            NOW_MS,
+        )
+        .expect("a failure has a report");
+        assert_eq!(report.reason, "The server's certificate was rejected");
+    }
+
+    /// The route decides whether the reason is about the server at all: a
+    /// refusal measured through a tunnel describes the tunnel.
+    #[test]
+    fn a_check_made_through_the_tunnel_says_so() {
+        let report = failure_report(
+            Some(&failed_at(
+                ProbeFailure::Timeout,
+                None,
+                ProbeRoute::Proxied,
+                LatencyMethod::HttpHead,
+                NOW_MS - 4 * 60_000,
+            )),
+            NOW_MS,
+        )
+        .expect("a failure has a report");
+        assert_eq!(report.reason, "The check ran out of time");
+        assert_eq!(
+            report.attempt,
+            "Tried through the tunnel by HTTP HEAD · 4 minutes ago"
+        );
+    }
+
+    #[test]
+    fn one_minute_is_singular_and_the_rest_are_not() {
+        let ago = |minutes: u64| {
+            failure_report(
+                Some(&failed_at(
+                    ProbeFailure::Unreachable,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Icmp,
+                    NOW_MS - minutes * 60_000,
+                )),
+                NOW_MS,
+            )
+            .expect("a failure has a report")
+            .attempt
+        };
+        assert!(ago(1).ends_with("· 1 minute ago"), "{}", ago(1));
+        assert!(ago(2).ends_with("· 2 minutes ago"), "{}", ago(2));
+        assert!(ago(0).ends_with("· just now"), "{}", ago(0));
+    }
+
+    /// A daemon that predates the timestamp, or two clocks that disagree.
+    /// "Just now" would be the flattering answer rather than the true one.
+    #[test]
+    fn a_reading_that_cannot_be_dated_is_not_reported_as_fresh() {
+        let report = failure_report(
+            Some(&failed_at(
+                ProbeFailure::Unreachable,
+                None,
+                ProbeRoute::Direct,
+                LatencyMethod::Tcp,
+                0,
+            )),
+            NOW_MS,
+        )
+        .expect("a failure has a report");
+        assert!(
+            report.attempt.ends_with("· at an unrecorded time"),
+            "{}",
+            report.attempt
+        );
+    }
+
+    /// A number needs no excuse. A card showing one must not also carry the
+    /// reason the check before it gave.
+    #[test]
+    fn a_reading_with_a_number_has_nothing_to_explain() {
+        assert_eq!(failure_report(Some(&reading(Some(41))), NOW_MS), None);
+        assert_eq!(failure_report(None, NOW_MS), None);
+    }
+
+    /// Stopping a check is the one reason here the user chose. It is still
+    /// reported — the card owes an answer for having no number — but as what
+    /// happened rather than as something that went wrong.
+    #[test]
+    fn a_check_the_user_stopped_is_reported_as_stopped() {
+        let report = failure_report(
+            Some(&failed_at(
+                ProbeFailure::Unknown,
+                Some(ProbeDetail::Cancelled),
+                ProbeRoute::Direct,
+                LatencyMethod::HttpGet,
+                NOW_MS,
+            )),
+            NOW_MS,
+        )
+        .expect("a stopped check still has to say why there is no number");
+        assert_eq!(report.reason, "The check was stopped before it ran");
+    }
+
+    /// Every reason the daemon can send has to stand on its own as a line of
+    /// the card, which means none of them may come out empty or lower-case.
+    /// The wording lives on the enums so the CLI and the card cannot drift;
+    /// this is what proves the promotion to a sentence holds for all of it.
+    #[test]
+    fn every_reason_the_daemon_can_send_stands_on_its_own() {
+        let details = [
+            None,
+            Some(ProbeDetail::NoCore),
+            Some(ProbeDetail::CertificateRejected),
+            Some(ProbeDetail::InsecureTlsUnsupported),
+            Some(ProbeDetail::ConfigRefused),
+            Some(ProbeDetail::GeoAssetsMissing),
+            Some(ProbeDetail::Cancelled),
+            Some(ProbeDetail::Other),
+        ];
+        let failures = [
+            ProbeFailure::Unreachable,
+            ProbeFailure::Timeout,
+            ProbeFailure::NoNetwork,
+            ProbeFailure::Unknown,
+        ];
+        for failure in failures {
+            for detail in details {
+                let report = failure_report(
+                    Some(&failed_at(
+                        failure,
+                        detail,
+                        ProbeRoute::Direct,
+                        LatencyMethod::Tcp,
+                        NOW_MS,
+                    )),
+                    NOW_MS,
+                )
+                .expect("every failure has a report");
+                let first = report.reason.chars().next().expect("a non-empty reason");
+                assert!(
+                    first.is_uppercase(),
+                    "{failure:?}/{detail:?} reads as a fragment: {}",
+                    report.reason
+                );
+                assert!(!report.attempt.is_empty());
+            }
+        }
+    }
+
+    /// The card's two answers about one check must come from one reading. Two
+    /// lookups that could pick differently would let a card show a dash for
+    /// this check and the reason from the one before it.
+    #[test]
+    fn the_reason_on_a_card_is_about_the_reading_its_badge_is_showing() {
+        let mut state = state();
+        fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probe(&[], &[("a", None)])),
+            Instant::now(),
+            true,
+        );
+        assert_eq!(state.card_state("a", NOW_MS), LatencyState::Unreachable);
+        let report = state
+            .card_failure("a", NOW_MS)
+            .expect("a card with no number owes a reason");
+        assert_eq!(report.reason, "The server did not answer");
+        assert_eq!(report.attempt, "Tried by HTTP GET · just now");
+
+        // And once a number arrives, the reason goes with the dash.
+        fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probe(&[], &[("a", Some(41))])),
+            Instant::now(),
+            true,
+        );
+        assert_eq!(state.card_failure("a", NOW_MS), None);
+    }
+
+    /// A check in flight is replacing the measurement the reason describes.
+    /// Left standing under a spinner, the reason reads as why the spinner is
+    /// spinning.
+    #[test]
+    fn a_check_in_flight_carries_no_reason_from_the_check_before_it() {
+        let mut state = state();
+        fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probe(&[], &[("a", None)])),
+            Instant::now(),
+            true,
+        );
+        assert!(state.card_failure("a", NOW_MS).is_some());
+        fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probe(&["a"], &[("a", None)])),
+            Instant::now(),
+            true,
+        );
+        assert_eq!(state.card_state("a", NOW_MS), LatencyState::Checking);
+        assert_eq!(state.card_failure("a", NOW_MS), None);
+    }
+
+    /// A server nobody has checked has nothing to explain — it is not a
+    /// failure, and saying anything here would invent one.
+    #[test]
+    fn a_server_that_was_never_checked_is_not_reported_as_having_failed() {
+        assert_eq!(state().card_failure("a", NOW_MS), None);
     }
 }
