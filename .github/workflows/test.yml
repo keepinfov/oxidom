@@ -4,12 +4,19 @@ name: test
 # headless. Tests that need a network, a live Xray core, root, or a display are
 # marked #[ignore] and are not run here; AGENTS.md says how to run those by hand.
 
+# No path filter, deliberately. `cargo-test` is a required status check, and a
+# required check that does not run is not a skipped check: GitHub waits for a
+# context that will never report, and the pull request cannot be merged at all.
+# A documentation-only branch hit exactly that. `format.yml`, which owns the two
+# jobs that were already required, carries no filter either.
+#
+# The filter was worth little anyway. This job is around a minute against a warm
+# cache, and the expensive one — `nix-build`, at twelve — is filtered and
+# deliberately *not* required, which is where the saving actually lives.
 on:
   push:
     branches: [master]
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.github/workflows/test.yml']
   pull_request:
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.github/workflows/test.yml']
 
 permissions:
   contents: read
