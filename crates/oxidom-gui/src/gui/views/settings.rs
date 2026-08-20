@@ -27,8 +27,8 @@ const SYSTEM_PROXY_SUBTITLE: &str =
 /// Says what the *other* setting would do, because "hold" only means something
 /// against the alternative — and the alternative is the one with a consequence
 /// worth spelling out.
-const HOLD_TRAFFIC_SUBTITLE: &str = "Keep the routes when the core dies, so traffic is dropped until it reconnects. Turn this \
-     off and apps fall back to your ordinary connection, with your own address, until it does";
+const HOLD_TRAFFIC_SUBTITLE: &str = "Traffic is dropped until the tunnel reconnects. Turned off, apps fall back to your \
+     ordinary connection — with your own address — until it does";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsValues {
@@ -276,6 +276,9 @@ impl SettingsView {
         let hold_traffic = adw::SwitchRow::builder()
             .title("Hold traffic if Xray exits")
             .subtitle(HOLD_TRAFFIC_SUBTITLE)
+            // Two lines, and said so: the default is one, and the second line of
+            // this subtitle is clipped by the row without it.
+            .subtitle_lines(2)
             .active(applied.hold_traffic)
             .build();
 

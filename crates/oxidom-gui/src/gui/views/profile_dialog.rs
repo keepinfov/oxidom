@@ -171,10 +171,10 @@ fn core_exit_choice(index: u32) -> Option<OnCoreExit> {
 /// nobody meant to pin.
 fn core_exit_subtitle(machine_holds: bool) -> String {
     let machine = if machine_holds { "hold" } else { "release" };
-    format!(
-        "A core that exits by itself is not a Disconnect. The machine is set to {machine} \
-         traffic; an explicit Disconnect always releases it."
-    )
+    // Same shape as the `[core]` rows below — "Follows the machine: Warning" —
+    // because it is the same idea, and because a longer subtitle steals the
+    // width the value needs to say "Inherited" without ellipsising.
+    format!("Follows the machine: {machine} traffic")
 }
 
 fn profile_from_dialog(values: DialogValues) -> Profile {
@@ -441,11 +441,10 @@ pub fn show_profile_dialog(
     // In the interface group because that is where the routes it decides the
     // fate of are configured — but it governs the desktop proxy setting too, so
     // it says "traffic" rather than "routes".
-    let core_exit_labels = gtk::StringList::new(&[
-        "Follow the machine setting",
-        "Hold traffic — drop it until this reconnects",
-        "Release traffic — fall back to the ordinary connection",
-    ]);
+    // Short values, like the `[core]` rows below: this row is narrow, and a
+    // sentence in the value slot ellipsises to "Foll…", which answers nothing.
+    // What each choice means belongs in the subtitle, where the core rows put it.
+    let core_exit_labels = gtk::StringList::new(&["Inherited", "Hold traffic", "Release traffic"]);
     let core_exit = adw::ComboRow::builder()
         .title("If Xray exits")
         .subtitle(core_exit_subtitle(machine_hold))
