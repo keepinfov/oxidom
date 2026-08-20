@@ -10,7 +10,7 @@ use oxidom_core::config::LatencyMethod;
 use oxidom_core::ipc::ProbeDetail;
 use oxidom_core::model::Server;
 
-use super::reduce::FailureReport;
+use super::reduce::{FailureReport, HistoryRow};
 use super::views::{
     dialog_content, icon_button, set_transient_parent, set_validation, validation_label,
 };
@@ -296,6 +296,8 @@ pub struct ServerCard {
     failure: gtk::Box,
     failure_reason: gtk::Label,
     failure_attempt: gtk::Label,
+    history: gtk::Box,
+    history_list: gtk::Box,
     expanded: Rc<Cell<bool>>,
     /// What the badge is currently showing. The age sweep re-pushes a state for
     /// every card every 15 s, so without this the whole grid would re-fade on
@@ -680,11 +682,29 @@ impl ServerCard {
         failure.append(&failure_attempt);
         failure.append(&failure_logs);
 
+        // The record behind the badge. One number cannot tell a steady server
+        // from one that is fast half the time, and choosing between servers is
+        // what the page is for. Rebuilt rather than reused row by row: the list
+        // is at most `PROBE_HISTORY_LIMIT` long and changes only when a check
+        // finishes on the one card that is open.
+        let history_title = gtk::Label::builder()
+            .xalign(0.0)
+            .label("Recent checks")
+            .css_classes(["server-meta", "server-history-title"])
+            .build();
+        let history_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let history = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        history.set_visible(false);
+        history.set_css_classes(&["server-history"]);
+        history.append(&history_title);
+        history.append(&history_list);
+
         let metadata = gtk::Box::new(gtk::Orientation::Vertical, 6);
         metadata.append(&full_name);
         metadata.append(&meta);
         metadata.append(&alias);
         metadata.append(&failure);
+        metadata.append(&history);
         let metadata_scroller = gtk::ScrolledWindow::builder()
             .child(&metadata)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -735,6 +755,8 @@ impl ServerCard {
             failure,
             failure_reason,
             failure_attempt,
+            history,
+            history_list,
             expanded,
             last_latency: Rc::new(Cell::new(latency_state)),
             last_connection: Rc::new(Cell::new(CardConnectionState::Disconnected)),
@@ -846,6 +868,50 @@ impl ServerCard {
                 self.failure_attempt.set_label("");
             }
         }
+    }
+
+    /// Show, or stop showing, what the recent checks measured.
+    ///
+    /// Pushed only for the card that is open, like the failure block above it
+    /// and for a sharper version of the same reason: this one is fetched from
+    /// the daemon by a call of its own rather than taken from the snapshot the
+    /// grid polls, so asking for every card would be one D-Bus round trip per
+    /// card twice a second.
+    pub fn set_history(&self, rows: &[HistoryRow]) {
+        while let Some(child) = self.history_list.first_child() {
+            self.history_list.remove(&child);
+        }
+        if rows.is_empty() {
+            self.history.set_visible(false);
+            return;
+        }
+        for row in rows {
+            // Fixed width on the number so the column lines up: "8 ms" and
+            // "1204 ms" in the same list otherwise leave the methods ragged,
+            // and the point of the list is comparing down it.
+            let value = gtk::Label::builder()
+                .xalign(0.0)
+                .label(&row.value)
+                .width_chars(8)
+                .selectable(true)
+                .css_classes(["server-meta"])
+                .build();
+            let taken = gtk::Label::builder()
+                .xalign(0.0)
+                .hexpand(true)
+                .label(&row.taken)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .max_width_chars(1)
+                .selectable(true)
+                .css_classes(["dim-label", "server-meta"])
+                .build();
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            line.append(&value);
+            line.append(&taken);
+            self.history_list.append(&line);
+        }
+        self.history.set_visible(true);
     }
 
     fn apply_latency(&self, state: LatencyState) {

@@ -417,6 +417,37 @@ pub struct ProbeState {
     pub proxied: std::collections::HashMap<String, LatencyReading>,
 }
 
+/// How many past readings the daemon keeps for one server.
+///
+/// Small on purpose. The panel exists to answer "is this server steady or is it
+/// fast half the time", and that question is answered by the last handful; a
+/// longer tail would be a graph, and a graph is a different feature. The bound
+/// also has to hold for a subscription of several hundred servers all of which
+/// have been swept, since the daemon carries every one of these lists at once.
+pub const PROBE_HISTORY_LIMIT: usize = 10;
+
+/// What a server's recent checks measured, newest first.
+///
+/// Deliberately **not** part of [`ProbeState`], which the GUI polls twice a
+/// second for the whole server list: putting `PROBE_HISTORY_LIMIT` readings per
+/// server in there would multiply that payload by ten to feed a panel that only
+/// one card — the expanded one — can show. This is fetched for that one server
+/// when the card opens, the way `RuntimeInfo` is fetched when Settings opens.
+///
+/// A struct rather than a bare `Vec`, so that a later field (a count of checks
+/// that have scrolled off, say) is additive rather than a wire break.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProbeHistory {
+    /// Newest first, at most [`PROBE_HISTORY_LIMIT`] long.
+    ///
+    /// Holds only checks that actually ran. A check called off before it got a
+    /// slot measured nothing about the server, and recording those would let
+    /// one press of Stop on a large sweep push every server's real history out
+    /// of a ten-deep list — erasing the record by way of filling it.
+    pub readings: Vec<LatencyReading>,
+}
+
 /// Result of applying settings daemon-side.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -640,6 +671,34 @@ mod tests {
         let reading: LatencyReading = serde_json::from_str(older).expect("parses");
         assert_eq!(reading.detail, None);
         assert_eq!(reading.failure, Some(ProbeFailure::Timeout));
+    }
+
+    /// The history is a second payload, not a field on the polled one, so the
+    /// compatibility question runs the other way: a client asks a daemon that
+    /// may answer nothing at all. An empty object is what `serde(default)` has
+    /// to turn into an empty history, because that is what a caller falls back
+    /// to when the method is missing entirely.
+    #[test]
+    fn an_empty_history_payload_parses_as_no_readings() {
+        let history: ProbeHistory = serde_json::from_str("{}").expect("parses");
+        assert!(history.readings.is_empty());
+        assert_eq!(history, ProbeHistory::default());
+    }
+
+    /// The polled snapshot is deliberately untouched by the history, and this
+    /// pins that: a client that has never heard of the history still parses a
+    /// current daemon's `ProbeState`, because there is nothing new in it.
+    #[test]
+    fn the_polled_snapshot_gained_no_field_for_the_history() {
+        let state = ProbeState {
+            version: PROBE_STATE_VERSION,
+            ..ProbeState::default()
+        };
+        let json = serde_json::to_string(&state).expect("serializes");
+        assert_eq!(
+            json,
+            r#"{"version":1,"running":[],"queued":[],"readings":{},"proxied":{}}"#
+        );
     }
 
     /// And a client that predates a *reason* must not choke on one it has

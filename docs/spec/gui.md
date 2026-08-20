@@ -23,7 +23,10 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   says it will stop something and then cannot is worse than the second press being ignored.
 - **Server card** (custom widget): country **flag**, server **name**, protocol **subtitle**
   (`transport_label`, e.g. "vless + xhttp + reality"), optional **latency badge** (green when
-  low). Whole card is a click target → selects that server. Every server carried by a connected
+  low). The **expanded** card additionally says why the last check produced no number and lists
+  the recent checks with the method and age of each — `docs/spec/latency.md` governs both, and the
+  list is fetched per server rather than polled with the grid. Whole card is a click target →
+  selects that server. Every server carried by a connected
   profile is visually marked; the one-profile case is unchanged.
 - **Groups:** a chip row above the grid — `All`, one chip per saved group, `+`. A group narrows
   **the one list**, and is never a second block of cards: rendering it as its own block

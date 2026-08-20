@@ -50,6 +50,24 @@ surface, packaging, or the CLI belongs here.
   the daemon: the reading has carried the method, the route, the time and the detail all
   along, and the card threw four of them away on the way to a badge.
 
+- **A card can show more than the newest reading.** One measurement said whether a server
+  answered once. It could not say whether it answers reliably, which is the actual question
+  behind choosing between two hundred of them: a server that is fast half the time and one
+  that is steady looked identical.
+
+  The daemon now keeps the last ten checks for each server, and an expanded card lists them
+  newest first with the method each was taken by and how long ago. Checks that ran and failed
+  keep their place in the list — a server that times out every other attempt is exactly what
+  the list is for, and hiding those rows would make it look steady. Checks called off before
+  they ran leave no row, so stopping a large sweep does not push a server's real record out
+  of a ten-deep list.
+
+  The list is fetched for the one card that is open, over a new `ProbeHistory` method on the
+  bus. It is deliberately not part of the snapshot the interface polls twice a second for
+  every server, and nothing about that snapshot changed: a client that has never heard of
+  the history still reads a current daemon exactly as before, and a daemon too old to keep
+  one is reported as having no checks rather than as an error.
+
 - **A profile can carry its own routing rules.** Everything oxidom generated said the same
   two things about where traffic goes — private addresses direct, and for a pool the rest
   to the balancer — and there was no way to say anything else short of not using oxidom.

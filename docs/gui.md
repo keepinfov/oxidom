@@ -110,6 +110,25 @@ The tooltip on a number also names the method actually used, which is not always
 the one configured: a TCP check of a Hysteria2 server falls back to ICMP, because
 Hysteria2 is QUIC over UDP and has no TCP port to open.
 
+**An expanded card says more than the badge can.** The badge has a glyph and a
+tooltip to work with, and "the server did not answer" covers a refused handshake,
+a wrong TLS parameter and a dead network alike. Opening a card whose last check
+produced no number shows the reason the daemon gave, how the check was made — the
+method really used, and whether it went through the tunnel — and how long ago.
+Beside it, **Show in logs** opens the log page narrowed to that server's address,
+which is what the core and the prober write into their lines. A check you stopped
+is reported as stopped, not as a fault; a check still running shows nothing,
+because the only reason it could show is about the measurement being replaced.
+
+**Recent checks** below it lists the last ten, newest first, with the method each
+was taken by and how long ago. One number says whether a server answered once; it
+cannot say whether it answers reliably, and that is usually the question. Checks
+that ran and failed keep their place in the list — a server that times out every
+other attempt is exactly what the list is for. Checks you called off before they
+ran leave no row, so stopping a sweep does not push a server's real record out of
+the list. A daemon from an older version kept no history and the list simply does
+not appear.
+
 Two controls start a check. The card's own ⟳ **Re-check latency** sits in the
 expanded card and in its right-click menu; the subscription header's ⚡ **Check
 latency of all servers** sweeps the whole block.
