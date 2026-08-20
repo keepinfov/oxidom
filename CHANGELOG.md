@@ -71,6 +71,19 @@ surface, packaging, or the CLI belongs here.
 
   `oxidom ping` still has no way to call one off.
 
+- **A wide window carries a fourth column of cards.** The Servers page stopped at three
+  columns, reached at 924 px of content, and every pixel past that went into making the
+  same three cards wider. Maximised on a wide screen this meant three fat columns where
+  four comfortable ones fit, and the page exists to compare servers against each other,
+  so how many are on screen at once is most of what makes the comparison possible.
+
+  A fourth column now appears at 1316 px of content — four cards at 320 px plus the
+  spacing between them. That 320 is the width a card already measures its own expanded
+  height at, so a column is never narrower than the measurement the layout is holding for
+  it. The count still moves with the same hysteresis as the other breakpoints, so a window
+  parked on the threshold keeps the grid it has rather than flickering between three and
+  four.
+
 - **A signed package repository**, so that installing oxidom is
   `apt install oxidom-gui` and upgrades arrive with the rest of the system
   rather than two files downloaded from a release page. Debian and Ubuntu add a
