@@ -80,6 +80,16 @@ surface, packaging, or the CLI belongs here.
 
 ### Changed
 
+- **The documentation now says which panel answers with which format.** oxidom reads
+  share-link lists, Xray JSON, sing-box JSON and Clash YAML, and the panel picks between
+  them from the client string it is sent — but nothing said which panel does what, so a
+  subscription that came back empty gave no way to tell an unsupported shape from a broken
+  one. Marzban, Marzneshin, Remnawave, 3x-ui, Hiddify Manager and V2Board/XBoard now have a
+  row in the manual and a test case named after them, including the one where a panel
+  answers with a web page because it did not recognise the client. None of the cases has
+  been tried against a live panel, and the table says so: each is written from the format
+  that panel is documented to serve, so the claim is no wider than what was tested.
+
 - **One system of quotation marks, and one case for a label.** Profile names were quoted with
   guillemets while groups, subscriptions and servers used curly quotes, so a single confirmation
   could ask `Connect «work» to “Europe”?` — two conventions in one sentence. Everything is quoted
