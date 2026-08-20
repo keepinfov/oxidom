@@ -52,6 +52,14 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFlags = ["-p" "oxidom-gui"];
+          # Named for the same reason the CLI derivation names its own: without
+          # it `buildRustPackage` tests the whole workspace, so `oxidom` and
+          # `oxidom-core` were compiled and run here as well as in the CLI
+          # derivation above and again in the `cargo-test` job. One check
+          # realised the suite three times for one answer. Each derivation now
+          # tests what it builds, and `cargo test --workspace` in `test.yml`
+          # remains the run that covers everything at once.
+          cargoTestFlags = ["-p" "oxidom-gui"];
           nativeBuildInputs = with pkgs; [pkg-config wrapGAppsHook4];
           # adwaita-icon-theme is a runtime dependency, not a link-time one:
           # naming it here is what puts it on the wrapper's XDG_DATA_DIRS. Left
