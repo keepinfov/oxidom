@@ -95,6 +95,29 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   That promise is about the position, not about following; gating the trim on following instead
   bounded the buffer only for the reader sitting at the bottom, who needed it least. Lines the
   daemon could not hand over are announced in place, not silently dropped.
+- **A problem report is assembled here (binding).** One action turns the **selected** lines —
+  or, when nothing is selected, everything visible — into a report carrying the same version
+  block the About dialog shows (`oxidom_core::versions`), what the connection is made of, the
+  subscription User-Agent, and those lines with everything identifying removed.
+  - **Removing is `oxidom_core::redact`, never the window.** The CLI must produce the same
+    report from the same rules, and a rule that lived in a widget could not be tested against a
+    corpus. It has no regular-expression engine: addresses are recognised by `std`'s own
+    parsers, the rest by hand, the way `link` parses links.
+  - **Every removal is marked in place.** `[address]`, `[host]`, `[uuid]`, `[share link]`,
+    `[redacted]`, `[machine]`, `[user]`. A line that never named an address and a line whose
+    address was taken out must not read the same, or a reader cannot tell a redaction from an
+    absence — and the report says so in its own words at the end.
+  - **Over-redaction is a failure too.** A report reading `[host] [address] [redacted]` on every
+    line is as useless as one that leaks. Loopback, the unspecified address and ports stay,
+    because they name nobody and are usually the point; a private address is marked
+    `[private address]` rather than `[address]`, since which side of the tunnel it was on is the
+    difference between a routing bug and a server bug; oxidom's own dotted names — the
+    application id, bus names, `geoip.dat` — are not hostnames however much they look like one.
+    Both directions are pinned by one corpus: shapes that must not survive, and lines that must
+    survive byte for byte.
+  - **No browser is opened.** The report goes on the clipboard and is offered a file. A
+    prefilled issue URL would carry the log through a third party's address bar and would submit
+    it before the reporter had read it, which is the opposite of what the redaction is for.
 
 Responsiveness: a breakpoint (~700px) collapses the split view and switches the grid to a single
 column, exposing the small sidebar toggle button (as annotated in the narrow mockup).

@@ -209,6 +209,10 @@ pub struct CardHandlers {
     /// check, because that is the one place where what the core printed is the
     /// next thing anybody wants and the log is where it went.
     pub show_logs: Rc<dyn Fn()>,
+    /// Turn what happened to this server into a problem report. Offered in the
+    /// same place and for the same reason as `show_logs`: beside a failed
+    /// check is where somebody decides they cannot fix this themselves.
+    pub report: Rc<dyn Fn()>,
 }
 
 /// What a server that stayed silent is called, wherever it is reported.
@@ -328,6 +332,7 @@ impl ServerCard {
             set_alias: on_set_alias,
             toggle_favourite,
             show_logs: on_show_logs,
+            report: on_report,
         } = handlers;
         let flag = flag_widget(server.country.as_deref(), 26, 20);
 
@@ -675,12 +680,25 @@ impl ServerCard {
             .css_classes(["flat"])
             .build();
         failure_logs.connect_clicked(move |_| on_show_logs());
+        // The step after reading the log, in the place somebody reaches it
+        // from. What it produces has every address, host name, account id and
+        // credential taken out and marked, so it can be pasted into a public
+        // issue without being read line by line first.
+        let failure_report = gtk::Button::builder()
+            .label("Report a problem")
+            .halign(gtk::Align::Start)
+            .css_classes(["flat"])
+            .build();
+        failure_report.connect_clicked(move |_| on_report());
+        let failure_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        failure_actions.append(&failure_logs);
+        failure_actions.append(&failure_report);
         let failure = gtk::Box::new(gtk::Orientation::Vertical, 4);
         failure.set_visible(false);
         failure.set_css_classes(&["server-failure"]);
         failure.append(&failure_reason);
         failure.append(&failure_attempt);
-        failure.append(&failure_logs);
+        failure.append(&failure_actions);
 
         // The record behind the badge. One number cannot tell a steady server
         // from one that is fast half the time, and choosing between servers is

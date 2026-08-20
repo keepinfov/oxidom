@@ -13,6 +13,8 @@ use crate::gui::logfeed::FeedBatch;
 type ClearCallback = Rc<dyn Fn()>;
 /// Told why the save produced no file, path included.
 type SaveFailedCallback = Rc<dyn Fn(String)>;
+/// Asked to turn these lines into a problem report.
+type ReportCallback = Rc<dyn Fn(Vec<String>)>;
 
 /// Lines kept in the widget before the oldest are dropped.
 ///
@@ -80,6 +82,7 @@ pub struct LogsView {
     copy: gtk::Button,
     clear: gtk::Button,
     save: gtk::Button,
+    report: gtk::Button,
     follow: gtk::Button,
     /// Level and search, so they can move into `overflow` when the window is
     /// too narrow to hold them in the toolbar.
@@ -105,6 +108,10 @@ pub struct LogsView {
     /// the failure outward rather than by walking up the widget tree for it.
     /// Same shape as `clear_callbacks`, for the same reason.
     save_failed_callbacks: Rc<RefCell<Vec<SaveFailedCallback>>>,
+    /// Handed outward for the same reason: assembling a report needs the
+    /// versions, the connection and the settings, none of which this page has
+    /// and none of which it should learn in order to draw a log.
+    report_callbacks: Rc<RefCell<Vec<ReportCallback>>>,
 }
 
 impl LogsView {
@@ -200,10 +207,19 @@ impl LogsView {
         let copy = icon_button("edit-copy-symbolic", "Copy the visible log");
         let clear = icon_button("edit-clear-all-symbolic", "Clear the log");
         let save = icon_button("document-save-symbolic", "Save the visible log to a file");
+        // Named for what it produces rather than for what it removes. The
+        // redaction is the reason it exists, but a button called "Redact" would
+        // read as an editing tool for the log rather than as the way to report
+        // a problem.
+        let report = icon_button(
+            "document-send-symbolic",
+            "Start a problem report from the selected lines",
+        );
         let follow = icon_button("go-bottom-symbolic", "Follow live logs");
         copy.set_sensitive(false);
         clear.set_sensitive(false);
         save.set_sensitive(false);
+        report.set_sensitive(false);
         follow.set_visible(false);
 
         let toolbar = gtk::Box::builder()
@@ -220,6 +236,7 @@ impl LogsView {
         toolbar.append(&filter_slot);
         toolbar.append(&overflow);
         toolbar.append(&follow);
+        toolbar.append(&report);
         toolbar.append(&save);
         toolbar.append(&copy);
         toolbar.append(&clear);
@@ -240,6 +257,7 @@ impl LogsView {
             copy,
             clear,
             save,
+            report,
             follow,
             filters,
             filter_slot,
@@ -253,6 +271,7 @@ impl LogsView {
             filter: Rc::new(RefCell::new(Filter::default())),
             clear_callbacks: Rc::new(RefCell::new(Vec::new())),
             save_failed_callbacks: Rc::new(RefCell::new(Vec::new())),
+            report_callbacks: Rc::new(RefCell::new(Vec::new())),
         };
         view.connect_signals(&sources, &levels, &search);
         view.follow_colours();
@@ -313,10 +332,7 @@ impl LogsView {
         });
         search.connect_search_changed({
             let view = self.clone();
-            move |search| {
-                view.filter.borrow_mut().needle = search.text().to_string();
-                view.redraw();
-            }
+            move |search| view.narrow_to(&search.text())
         });
         self.copy.connect_clicked({
             let view = self.clone();
@@ -330,6 +346,16 @@ impl LogsView {
         self.save.connect_clicked({
             let view = self.clone();
             move |_| view.save_to_file()
+        });
+        self.report.connect_clicked({
+            let view = self.clone();
+            move |_| {
+                let lines = view.report_lines();
+                let callbacks = view.report_callbacks.borrow().clone();
+                for callback in callbacks {
+                    callback(lines.clone());
+                }
+            }
         });
         self.clear.connect_clicked({
             let view = self.clone();
@@ -353,6 +379,13 @@ impl LogsView {
         self.save_failed_callbacks
             .borrow_mut()
             .push(Rc::new(callback));
+    }
+
+    /// Called when the reporter asks for a problem report, with the lines it
+    /// should carry. Nothing is redacted here — that is `oxidom_core::redact`,
+    /// so the CLI and this page cannot disagree about what a credential is.
+    pub fn connect_report_requested(&self, callback: impl Fn(Vec<String>) + 'static) {
+        self.report_callbacks.borrow_mut().push(Rc::new(callback));
     }
 
     /// Allows the controller to clear the daemon's book as well as the view.
@@ -533,6 +566,7 @@ impl LogsView {
         let any = self.buffer.start_iter() != self.buffer.end_iter();
         self.copy.set_sensitive(any);
         self.save.set_sensitive(any);
+        self.report.set_sensitive(any);
         self.clear.set_sensitive(!self.records.borrow().is_empty());
         self.stack
             .set_visible_child_name(if any { "log" } else { "empty" });
@@ -542,6 +576,26 @@ impl LogsView {
         self.buffer
             .text(&self.buffer.start_iter(), &self.buffer.end_iter(), false)
             .to_string()
+    }
+
+    /// The lines a report should carry: what is selected, or everything
+    /// visible when nothing is.
+    ///
+    /// Selecting is how a reporter says "these lines, not my whole evening",
+    /// and it is the page's own selection rather than a second checkbox column
+    /// because the text is already selectable and people already do it. Falling
+    /// back to the visible log — filters included — means the button does
+    /// something sensible for the reporter who narrowed by search instead, and
+    /// never produces a report with no log in it while the page is full.
+    pub fn report_lines(&self) -> Vec<String> {
+        let text = match self.buffer.selection_bounds() {
+            Some((start, end)) => self.buffer.text(&start, &end, false).to_string(),
+            None => self.visible_text(),
+        };
+        text.lines()
+            .map(str::to_string)
+            .filter(|line| !line.trim().is_empty())
+            .collect()
     }
 
     /// Write what is on screen — filters included — to a file the user picks.
@@ -591,14 +645,29 @@ impl LogsView {
     /// Narrow the page to lines carrying `needle`, as though it had been
     /// typed into the search entry.
     ///
-    /// Setting the widget's text is what applies the filter: the change signal
-    /// is what redraws, and writing into `filter` directly would leave the
-    /// entry empty beside a page showing a fraction of its lines.
+    /// Both halves are done here, and neither is enough alone. The entry's text
+    /// is set so the page shows what it is filtered by and the user can widen
+    /// it again; the filter is applied **without waiting for the entry's own
+    /// signal**, which a `GtkSearchEntry` emits after a delay so that typing
+    /// does not redraw on every keystroke. A caller that narrowed and then read
+    /// the page in the same turn — which is exactly what starting a report
+    /// about one server does — would otherwise read the log it had just asked
+    /// to leave behind.
     pub fn show_only(&self, needle: &str) {
         if self.search.text() == needle {
             return;
         }
         self.search.set_text(needle);
+        self.narrow_to(needle);
+    }
+
+    /// Apply a needle and redraw, unless it is the one already in force.
+    fn narrow_to(&self, needle: &str) {
+        if self.filter.borrow().needle == needle {
+            return;
+        }
+        self.filter.borrow_mut().needle = needle.to_string();
+        self.redraw();
     }
 
     pub fn set_ultra_compact(&self, enabled: bool) {

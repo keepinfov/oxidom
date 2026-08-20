@@ -16,6 +16,7 @@ use oxidom_core::logbook::{self, LogSlice};
 use oxidom_core::model::Subscription;
 use oxidom_core::pool::PoolQuery;
 use oxidom_core::profile::{Profile, ProfileProxy, ProfileSelect};
+use oxidom_core::redact;
 use oxidom_core::xray::core::Status;
 use oxidom_core::{paths, sysproxy};
 
@@ -1182,20 +1183,27 @@ impl Controller {
     /// The copied block is the dialog's own debug information page, which
     /// libadwaita gives a Copy and a Save button. Writing a third button here
     /// would have put the same text behind a control nobody recognises.
+    /// The three versions and the machine they run on.
+    ///
+    /// One assembly for the About dialog and for a problem report, so the block
+    /// a reporter pastes and the block they can read in the interface cannot
+    /// describe one machine two ways.
+    fn versions(&self) -> oxidom_core::versions::Versions {
+        let runtime = self.runtime.borrow();
+        oxidom_core::versions::Versions::here(
+            env!("CARGO_PKG_VERSION"),
+            runtime
+                .as_ref()
+                .and_then(|info| info.daemon_version.as_deref()),
+            runtime
+                .as_ref()
+                .and_then(|info| info.core_version.as_deref()),
+            Some(self.state.borrow().client.source()),
+        )
+    }
+
     fn show_about(self: &Rc<Self>) {
-        let versions = {
-            let runtime = self.runtime.borrow();
-            oxidom_core::versions::Versions::here(
-                env!("CARGO_PKG_VERSION"),
-                runtime
-                    .as_ref()
-                    .and_then(|info| info.daemon_version.as_deref()),
-                runtime
-                    .as_ref()
-                    .and_then(|info| info.core_version.as_deref()),
-                Some(self.state.borrow().client.source()),
-            )
-        };
+        let versions = self.versions();
         let dialog = adw::AboutDialog::builder()
             .application_name("oxidom")
             .application_icon(APP_ID)
@@ -1406,6 +1414,14 @@ impl Controller {
                     std::thread::spawn(move || {
                         let _ = client.clear_logs();
                     });
+                }
+            }
+        });
+        self.logs.connect_report_requested({
+            let weak = Rc::downgrade(self);
+            move |lines: Vec<String>| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.start_problem_report(lines);
                 }
             }
         });
@@ -1957,6 +1973,14 @@ impl Controller {
                     }
                 })
             },
+            report: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |id| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.report_server_problem(&id);
+                    }
+                })
+            },
             activate: {
                 let weak = Rc::downgrade(self);
                 Rc::new(move |id| {
@@ -2454,6 +2478,96 @@ impl Controller {
             self.logs.show_only(&address);
         }
         self.navigate_to(Page::Logs);
+    }
+
+    /// Open the log page narrowed to one server and start a report from it.
+    ///
+    /// The narrowing first, then the report, because a report of the whole log
+    /// is what a reporter produces by hand today and it is the part that takes
+    /// the reading. Going through the page rather than assembling from the
+    /// records directly is deliberate: the reporter sees the lines the report
+    /// will carry, on the page, before it is written — which is the only way
+    /// the instruction to read it through before sending it can be followed.
+    fn report_server_problem(self: &Rc<Self>, server_id: &str) {
+        self.show_server_in_logs(server_id);
+        self.start_problem_report(self.logs.report_lines());
+    }
+
+    /// Assemble a problem report, put it on the clipboard, and offer to save it.
+    ///
+    /// Nothing here decides what is identifying. `oxidom_core::redact` owns
+    /// that, so a report written by the CLI and one written here remove the
+    /// same shapes — and the rules are pinned by a corpus rather than by
+    /// whatever this window happens to pass in.
+    ///
+    /// No browser is opened. A prefilled issue URL would carry the log through
+    /// a third party's address bar and history, and it would submit before the
+    /// reporter had read what they were submitting.
+    fn start_problem_report(self: &Rc<Self>, lines: Vec<String>) {
+        let context = {
+            let state = self.state.borrow();
+            let transport = state.ui.connected_id.as_ref().and_then(|id| {
+                state
+                    .subscriptions
+                    .iter()
+                    .flat_map(|subscription| subscription.servers.iter())
+                    .find(|server| &server.id == id)
+                    .map(|server| server.transport_label.clone())
+            });
+            redact::ReportContext {
+                transport,
+                user_agent: self.settings.applied().subscription_user_agent,
+            }
+        };
+        let text = redact::report(
+            &self.versions(),
+            &context,
+            &lines,
+            &redact::Redactor::here(),
+        );
+        self.window.clipboard().set_text(&text);
+        self.save_problem_report(text);
+    }
+
+    /// Offer to write the report to a file the user picks.
+    ///
+    /// The clipboard already has it by the time this opens, so cancelling here
+    /// loses nothing — which is why the chooser is not asked about first.
+    fn save_problem_report(self: &Rc<Self>, text: String) {
+        let window = self.window.clone();
+        let chooser = gtk::FileChooserNative::new(
+            Some("Save the problem report"),
+            Some(&window),
+            gtk::FileChooserAction::Save,
+            Some("Save"),
+            Some("Cancel"),
+        );
+        chooser.set_current_name("oxidom-problem-report.txt");
+        // The chooser is native and asynchronous; it must outlive this call or
+        // it is destroyed before it can be answered.
+        let held = RefCell::new(Some(chooser.clone()));
+        let weak = Rc::downgrade(self);
+        chooser.connect_response(move |chooser, response| {
+            if response == gtk::ResponseType::Accept
+                && let Some(path) = chooser.file().and_then(|file| file.path())
+                && let Err(error) = std::fs::write(&path, text.as_bytes())
+                && let Some(controller) = weak.upgrade()
+            {
+                log::warn!(
+                    "could not save the problem report to {}: {error}",
+                    path.display()
+                );
+                controller.show_error(
+                    "Could not save the problem report",
+                    &format!("{}: {error}", path.display()),
+                );
+            }
+            held.borrow_mut().take();
+        });
+        chooser.show();
+        self.show_message(
+            "The problem report is on the clipboard. Read it through before sending it.",
+        );
     }
 
     /// Mark a card as checking and ask the daemon for a probe. Results come

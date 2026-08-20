@@ -76,6 +76,8 @@ pub struct CardCallbacks {
     /// card beside a failed check, where what the core printed is the next
     /// thing anybody wants.
     pub show_logs: Rc<dyn Fn(String)>,
+    /// Start a problem report about this server, from the log narrowed to it.
+    pub report: Rc<dyn Fn(String)>,
 }
 
 /// One subscription block. Cards live in independent vertical column boxes
@@ -846,6 +848,11 @@ impl ServersView {
                     let id = id.clone();
                     move || cb(id.clone())
                 };
+                let on_report = {
+                    let cb = callbacks.report.clone();
+                    let id = id.clone();
+                    move || cb(id.clone())
+                };
                 let connection_state = match (connected_profiles.get(&id), connected_id) {
                     (Some(profiles), _) if !profiles.connected.is_empty() => {
                         CardConnectionState::ConnectedHere
@@ -876,6 +883,7 @@ impl ServersView {
                             Rc::new(move || view.toggle_favourite(&id))
                         },
                         show_logs: Rc::new(on_show_logs),
+                        report: Rc::new(on_report),
                     },
                 );
                 let mut tooltip = format!(

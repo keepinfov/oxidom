@@ -265,6 +265,31 @@ stops, so lines arriving below never move what you are reading; the button at th
 bottom right returns you to live. If output arrives faster than it can be
 collected, the missing count is stated in place rather than passed over.
 
+### Reporting a problem
+
+**Report a problem** — the send icon in the toolbar — turns the lines you have
+**selected** into a report you can paste into a public issue. Select nothing and
+it takes everything visible, filters included. An expanded server card whose last
+check failed offers the same thing beside **Show in logs**: it narrows the page to
+that server first, then builds the report from what is left.
+
+The report carries the version block the About dialog shows — oxidom, the daemon,
+the core, how it was installed, the distribution and desktop — plus what the
+connection is made of and the subscription User-Agent, and then the lines.
+
+Everything identifying is taken out of those lines and **marked where it stood**:
+`[address]`, `[host]`, `[uuid]`, `[share link]`, `[redacted]`, `[machine]`,
+`[user]`. A bracket is a redaction, not an absence, so nothing quietly disappears.
+What is deliberately kept is what a report is written for: loopback addresses and
+port numbers, which name nobody; a private address marked as private, because
+which side of the tunnel it was on is often the bug; and oxidom's own names, so a
+line about `geoip.dat` still says `geoip.dat`.
+
+The report goes on the clipboard and a save dialog opens. **No browser opens and
+nothing is sent anywhere** — read it through, then paste it into the bug form
+yourself. A security flaw does not go in a public issue; `SECURITY.md` says how to
+report one privately.
+
 Raise what the core itself reports with **Settings › Core behaviour › Log level**.
 Raise what oxidom reports about itself with `RUST_LOG`, or `oxidom-gui --debug`.
 
