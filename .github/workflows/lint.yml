@@ -4,12 +4,19 @@ name: lint
 # the versions this project requires are newer than the runner images ship, so
 # this one goes through the flake's dev shell rather than apt.
 
+# No path filter, deliberately. `clippy` is a required status check, and a
+# required check that does not run is not a skipped check: GitHub waits for a
+# context that will never report, and the pull request cannot be merged at all.
+# A documentation-only branch hit exactly that. `format.yml`, which owns the two
+# jobs that were already required, carries no filter either.
+#
+# The filter was worth little anyway. This job is around a minute against a warm
+# cache, and the expensive one — `nix-build`, at twelve — is filtered and
+# deliberately *not* required, which is where the saving actually lives.
 on:
   push:
     branches: [master]
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.github/workflows/lint.yml']
   pull_request:
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'flake.nix', 'flake.lock', '.github/workflows/lint.yml']
 
 permissions:
   contents: read
