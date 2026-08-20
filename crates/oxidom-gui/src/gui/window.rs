@@ -1735,13 +1735,15 @@ impl Controller {
         // The last settings the daemon accepted, not the current draft: an
         // "inherited" row must name what the profile would really get, and an
         // unapplied edit on the Settings page is not that yet.
-        let machine_core = self.settings.applied().core;
+        let applied = self.settings.applied();
+        let machine_core = applied.core.clone();
         show_profile_dialog(
             &self.sessions.root,
             mode,
             &profiles,
             &choices,
             &machine_core,
+            applied.hold_traffic,
             callbacks,
         );
     }
@@ -2117,6 +2119,7 @@ impl Controller {
                     // survive it untouched. So must the routing block, which has
                     // no row anywhere.
                     core: entry.core.clone(),
+                    on_core_exit: entry.on_core_exit,
                     routing: entry.routing.clone(),
                 },
                 server_name,
@@ -2292,6 +2295,7 @@ impl Controller {
             // membership, not the core settings or the routing block the profile
             // was given.
             core: entry.core.clone(),
+            on_core_exit: entry.on_core_exit,
             routing: entry.routing.clone(),
         })
     }
@@ -2982,6 +2986,11 @@ impl Controller {
             http_port: values.http_port,
             system_proxy: values.system_proxy,
             reconnect: values.reconnect,
+            on_core_exit: if values.hold_traffic {
+                oxidom_core::config::OnCoreExit::Hold
+            } else {
+                oxidom_core::config::OnCoreExit::Release
+            },
             latency_method: values.latency_method,
             latency_test_url: values.latency_test_url.clone(),
             subscription_user_agent: values.subscription_user_agent.clone(),

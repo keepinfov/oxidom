@@ -14,6 +14,9 @@ pub struct Config {
     /// Off by default: a client that silently redials is a client that hides a
     /// server going bad, and the user asked for explicit modes throughout.
     pub reconnect: bool,
+    /// What happens to a session's routes when its core exits by itself.
+    /// A profile's own setting wins where it has one.
+    pub on_core_exit: OnCoreExit,
     pub latency_method: LatencyMethod,
     pub latency_test_url: String,
     /// User-Agent sent when fetching subscriptions. Many panels (Remnawave,
@@ -36,6 +39,31 @@ pub struct Config {
     pub core: CoreOptions,
 }
 
+/// What a session does with its routes when the core carrying its traffic exits
+/// on its own — a crash, an OOM kill, a server that dropped the connection.
+///
+/// This is not what an explicit `down` does. `down` is a person saying they want
+/// their ordinary connection back, and it releases everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnCoreExit {
+    /// Keep the TUN routes, the fwmark rule and the desktop proxy setting until
+    /// the session is either reconnected or explicitly taken down. Traffic that
+    /// would have used the tunnel is dropped instead.
+    ///
+    /// The default, and the only safe one. Releasing sends every application
+    /// straight back to the ordinary default route with the machine's own
+    /// address — silently, and while the interface still shows a tunnel that is
+    /// reconnecting. A remote service then sees the real address and country,
+    /// which is the exact outcome a tunnel exists to prevent.
+    #[default]
+    Hold,
+    /// Tear the routes down immediately, so applications fall back to the
+    /// ordinary route while the session is down. What oxidom did before the
+    /// choice existed.
+    Release,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LatencyMethod {
@@ -55,6 +83,7 @@ impl Default for Config {
             http_port: 10809,
             system_proxy: false,
             reconnect: false,
+            on_core_exit: OnCoreExit::default(),
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".to_string(),
             subscription_user_agent: "v2rayN/6.45".to_string(),

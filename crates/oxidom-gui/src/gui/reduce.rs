@@ -1352,15 +1352,31 @@ pub(super) fn session_rows(
                 .map(|session| &session.selection);
             let is_pool = running_pool.is_some() || entry.pool.is_some();
 
-            // The one warning that has to survive the row being collapsed: a
-            // stale pool is still carrying traffic, so nothing else says it.
-            let warning =
+            let holding = session.is_some_and(|session| session.holding_traffic);
+
+            // The warnings that have to survive the row being collapsed. Holding
+            // comes first and displaces the other: a stale pool is a tunnel
+            // carrying traffic it could carry better, while a held one is
+            // carrying none at all, and a user reading one pill should be given
+            // the more consequential fact.
+            let warning = if holding {
+                Some(SessionWarning {
+                    text: "holding traffic".to_string(),
+                    tooltip: Some(
+                        "The core exited. This tunnel's routes are still in place, so its \
+                         traffic is dropped instead of leaving with your own address. \
+                         Reconnect, or stop the session to release it."
+                            .to_string(),
+                    ),
+                })
+            } else {
                 running_pool
                     .filter(|selection| selection.stale)
                     .map(|_| SessionWarning {
                         text: "stale".to_string(),
                         tooltip: Some("Reconnect to pick up new servers".to_string()),
-                    });
+                    })
+            };
 
             let selection = match running_pool {
                 Some(selection) => pool_headline(selection),
@@ -1394,6 +1410,14 @@ pub(super) fn session_rows(
             // report was the one thing unreachable.
             if let Some(error) = session.and_then(|session| session.error.as_ref()) {
                 details.push(SessionDetail::new("Error", error.clone()).copyable());
+            }
+            // Directly below the failure, because it is the half of the failure
+            // that decides whether anything is leaving this machine unprotected.
+            if holding {
+                details.push(SessionDetail::new(
+                    "Traffic",
+                    "Held — the routes stay until this reconnects or is stopped",
+                ));
             }
             if let Some(session) = session {
                 details.push(
@@ -2107,6 +2131,7 @@ mod tests {
             interface: ProfileInterface::default(),
             pool: None,
             core: Default::default(),
+            on_core_exit: None,
             routing: None,
         }
     }
@@ -3107,6 +3132,61 @@ mod tests {
     /// The headline carries the same text, but a subtitle ellipsises and cannot
     /// be selected, so the failure was the one thing a bug report could not
     /// quote.
+    /// A network that is deliberately dead must not look like one that is
+    /// broken. The row says which it is without being expanded, because the
+    /// question it answers — is anything leaving this machine unprotected? — is
+    /// not one to make somebody go looking for.
+    #[test]
+    fn a_session_holding_traffic_says_so_on_the_collapsed_row() {
+        let work = profile("work", "shared");
+        let mut state = state();
+        let mut held = session("work", "error", "shared");
+        held.error = Some("Xray exited unexpectedly".to_string());
+        held.holding_traffic = true;
+        state.sessions = vec![held];
+
+        let rows = session_rows(&[work], &state, NOW_MS);
+        let warning = rows[0]
+            .warning
+            .as_ref()
+            .expect("holding is a warning, not a detail nobody sees");
+        assert_eq!(warning.text, "holding traffic");
+        assert!(
+            warning
+                .tooltip
+                .as_deref()
+                .is_some_and(|tooltip| tooltip.contains("dropped")),
+            "the pill has to say what holding does, not only that it happens"
+        );
+        assert!(
+            rows[0]
+                .details
+                .iter()
+                .any(|detail| detail.label == "Traffic"),
+            "and the expanded row explains it"
+        );
+    }
+
+    /// The failure it is paired with still reads as before: a session that lost
+    /// its core but had nothing installed to hold is an ordinary failed one.
+    #[test]
+    fn a_failed_session_that_holds_nothing_gains_no_warning() {
+        let work = profile("work", "shared");
+        let mut state = state();
+        let mut failed = session("work", "error", "shared");
+        failed.error = Some("Xray exited unexpectedly".to_string());
+        state.sessions = vec![failed];
+
+        let rows = session_rows(&[work], &state, NOW_MS);
+        assert!(rows[0].warning.is_none());
+        assert!(
+            rows[0]
+                .details
+                .iter()
+                .all(|detail| detail.label != "Traffic")
+        );
+    }
+
     #[test]
     fn a_failed_session_offers_its_error_as_a_copyable_detail() {
         let work = profile("work", "shared");

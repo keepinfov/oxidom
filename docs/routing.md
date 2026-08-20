@@ -239,6 +239,38 @@ provider's block means mapping its outbound tags onto oxidom's, and modelling
 rules properly is a separate piece of work; until then this block is how you say
 the same thing yourself.
 
+## When the core dies
+
+The Xray process can exit on its own — a crash, an out-of-memory kill, a server
+that dropped the connection. oxidom then **keeps** the tunnel's routes, its
+fwmark rule and its hold on the desktop proxy setting until the session either
+reconnects or you stop it.
+
+That means traffic for the tunnel is *dropped* during the outage, not sent out
+some other way. It looks like a dead network, and that is deliberate: the
+alternative is every application quietly falling back to your ordinary
+connection, with your own address and country, while the interface still shows a
+tunnel that is reconnecting. A remote service notices that long before you do.
+
+The session says so — the Sessions page marks it **holding traffic**, and
+`oxidom status` shows the state as `holding` — because a network that is
+deliberately dead must not be mistaken for a broken one.
+
+Two ways to change it:
+
+- **Settings → Hold traffic if Xray exits**, or `on_core_exit` in
+  `config.toml`, sets the machine's answer.
+- A profile's own `on_core_exit` overrides it, in the profile editor under
+  Interface or in the profile file.
+
+Turning it off restores the older behaviour: routes come down as soon as the
+core does, and applications reach the internet directly until the tunnel is
+back.
+
+An explicit `down` — the switch, `oxidom down` — always releases. Asking for
+your ordinary connection back is the one case where falling back to it is what
+you meant.
+
 ---
 
 Next: [profiles-and-pools.md](profiles-and-pools.md) · [troubleshooting.md](troubleshooting.md) · [architecture.md](architecture.md)

@@ -57,6 +57,11 @@ pub struct Profile {
     /// [`crate::core_options`].
     #[serde(skip_serializing_if = "CoreOptions::is_unset")]
     pub core: CoreOptions,
+    /// What this tunnel does with its routes when its core exits by itself.
+    /// Unset inherits `on_core_exit` from `config.toml`; see
+    /// [`crate::config::OnCoreExit`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_core_exit: Option<crate::config::OnCoreExit>,
     /// An Xray `routing` block, as written, spliced ahead of the rules oxidom
     /// generates. See [`crate::xray::routing`] for what is refused and why.
     ///

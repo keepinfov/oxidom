@@ -122,6 +122,34 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 
+- **A tunnel whose core died now holds its traffic instead of releasing it.** When the Xray
+  process of a session exited by itself, oxidom removed that session's TUN routes, its
+  fwmark rule and its hold on the desktop proxy setting *before* it started retrying — and
+  the retry backs off, so for the whole of that window every application fell back to the
+  ordinary default route and left with the machine's own address. Nothing in the interface
+  said so. The tunnel appeared to be reconnecting while a remote service was already seeing
+  the real address and country, which is the one outcome a tunnel exists to prevent.
+
+  A session now keeps its routes and its rule until it is either reconnected or explicitly
+  taken down, so traffic aimed at the tunnel is dropped rather than released. The same holds
+  for a core that is alive but has stopped answering. An explicit Disconnect is unchanged:
+  asking for the ordinary connection back is the one case where falling back to it is what
+  was meant.
+
+  This is the shipped default. `on_core_exit = "release"` in `config.toml` — **Settings ›
+  Hold traffic if Xray exits**, turned off — restores the old behaviour, and a profile can
+  answer for itself. The answer is fixed when the session comes up, so editing a profile
+  cannot change what happens to a tunnel already running.
+
+  Because the difference matters, it is visible: the Sessions page marks a held session
+  **holding traffic** and says the routes stay until it reconnects or is stopped, and
+  `oxidom status` prints its state as `holding` with a `holding_traffic` field in `--json`.
+  A network that is deliberately dead must not look like one that is broken.
+
+  A reconnect under a held interface adds nothing — the routes are already there — except
+  tun2socks, which is restarted if it did not survive the outage. A device left up with
+  nothing behind it would black-hole the tunnel for good, which is worse than the leak.
+
 - **A log that could not be saved says so.** Saving to a place that refuses the write — a
   directory without permission, most often — closed the file chooser exactly as a success
   does and left no file and no message. The only trace was a line in the very log the user

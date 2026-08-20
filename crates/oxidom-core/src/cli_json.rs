@@ -52,6 +52,10 @@ pub struct SessionOutput {
     pub latency_ms: Option<u32>,
     pub error: Option<String>,
     pub owns_system_proxy: bool,
+    /// The core is gone and this session is still holding its routes, so its
+    /// traffic is dropped rather than sent out unprotected. A script deciding
+    /// whether the machine is exposed reads this, not `state`.
+    pub holding_traffic: bool,
     pub interface: Option<InterfaceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<SelectionInfo>,
@@ -71,6 +75,7 @@ impl SessionOutput {
             latency_ms,
             error: session.error.clone(),
             owns_system_proxy: session.owns_system_proxy,
+            holding_traffic: session.holding_traffic,
             interface: session.interface.clone(),
             selection: (session.selection.kind == "pool").then(|| session.selection.clone()),
         }
@@ -564,6 +569,7 @@ mod tests {
             socks_port: 10808,
             http_port: 10809,
             owns_system_proxy: true,
+            holding_traffic: false,
             interface: Some(InterfaceInfo {
                 device: "oxi-work".to_string(),
                 address: "198.18.9.7".to_string(),
@@ -578,7 +584,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_string(&SessionOutput::new(&session, Some(84))).unwrap(),
-            r#"{"profile":"work","state":"connected","server_id":"0123456789abcdef","server_alias":"ch-trojan","server_name":"Swiss","address":"127.72.14.1","socks_port":10808,"http_port":10809,"latency_ms":84,"error":null,"owns_system_proxy":true,"interface":{"device":"oxi-work","address":"198.18.9.7","mtu":1500,"routes":"manual","table":28449,"mark":28449,"up":true}}"#
+            r#"{"profile":"work","state":"connected","server_id":"0123456789abcdef","server_alias":"ch-trojan","server_name":"Swiss","address":"127.72.14.1","socks_port":10808,"http_port":10809,"latency_ms":84,"error":null,"owns_system_proxy":true,"holding_traffic":false,"interface":{"device":"oxi-work","address":"198.18.9.7","mtu":1500,"routes":"manual","table":28449,"mark":28449,"up":true}}"#
         );
     }
 
@@ -619,6 +625,7 @@ mod tests {
             interface: Default::default(),
             pool: None,
             core: Default::default(),
+            on_core_exit: None,
             routing: None,
         }];
 

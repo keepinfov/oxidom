@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use oxidom_core::config::OnCoreExit;
 use oxidom_core::core_options::CoreOptions;
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
@@ -118,6 +119,9 @@ struct DialogValues {
     /// Only the sections this profile overrides; the rest is inherited from
     /// `config.toml` and never written here.
     core: CoreOptions,
+    /// `None` follows the machine's setting, the same "unset means inherit"
+    /// the `[core]` sections use.
+    on_core_exit: Option<OnCoreExit>,
     /// The profile's routing block, carried the way the noise packets are:
     /// there is no editor for it, the row below reports how many rules it holds,
     /// and a save writes back exactly what was loaded.
@@ -148,9 +152,40 @@ impl DialogValues {
             interface_routes: interface.routes,
             interface_list: interface.list.join(", "),
             core: entry.map(|entry| entry.core.clone()).unwrap_or_default(),
+            on_core_exit: entry.and_then(|entry| entry.on_core_exit),
             routing: entry.and_then(|entry| entry.routing.clone()),
         }
     }
+}
+
+/// Which row of the "If Xray exits" list a stored answer is.
+fn core_exit_index(setting: Option<OnCoreExit>) -> u32 {
+    match setting {
+        None => 0,
+        Some(OnCoreExit::Hold) => 1,
+        Some(OnCoreExit::Release) => 2,
+    }
+}
+
+fn core_exit_choice(index: u32) -> Option<OnCoreExit> {
+    match index {
+        1 => Some(OnCoreExit::Hold),
+        2 => Some(OnCoreExit::Release),
+        // Anything else is the first row, and a row this build does not know
+        // is safest read as "whatever the machine says".
+        _ => None,
+    }
+}
+
+/// What inheriting currently means, so nobody has to switch the row off the
+/// first entry to find out — which is how a profile ends up pinning a value
+/// nobody meant to pin.
+fn core_exit_subtitle(machine_holds: bool) -> String {
+    let machine = if machine_holds { "hold" } else { "release" };
+    // Same shape as the `[core]` rows below — "Follows the machine: Warning" —
+    // because it is the same idea, and because a longer subtitle steals the
+    // width the value needs to say "Inherited" without ellipsising.
+    format!("Follows the machine: {machine} traffic")
 }
 
 /// What the routing row says about a block nobody can edit here.
@@ -191,6 +226,7 @@ fn profile_from_dialog(values: DialogValues) -> Profile {
             list: parse_subnets(&values.interface_list),
         },
         core: values.core,
+        on_core_exit: values.on_core_exit,
         routing: values.routing,
     }
 }
@@ -203,6 +239,9 @@ pub fn show_profile_dialog(
     // The machine's `[core]`, so every section this profile does not override
     // can show what it inherits instead of standing blank.
     machine_core: &CoreOptions,
+    // What "follow the machine setting" currently resolves to, so the row can
+    // say it instead of making the reader go and look.
+    machine_hold: bool,
     callbacks: ProfileDialogCallbacks,
 ) {
     let (title, edit_name, initial) = match mode {
@@ -429,6 +468,20 @@ pub fn show_profile_dialog(
         .build();
     interface_group.add(&routed_subnets);
 
+    // In the interface group because that is where the routes it decides the
+    // fate of are configured — but it governs the desktop proxy setting too, so
+    // it says "traffic" rather than "routes".
+    // Short values, like the `[core]` rows below: this row is narrow, and a
+    // sentence in the value slot ellipsises to "Foll…", which answers nothing.
+    // What each choice means belongs in the subtitle, where the core rows put it.
+    let core_exit_labels = gtk::StringList::new(&["Inherited", "Hold traffic", "Release traffic"]);
+    let core_exit = adw::ComboRow::builder()
+        .title("If Xray exits")
+        .subtitle(core_exit_subtitle(machine_hold))
+        .model(&core_exit_labels)
+        .selected(core_exit_index(initial.on_core_exit))
+        .build();
+    interface_group.add(&core_exit);
     // No editor, for the same reason the noise packets have none: a routing
     // block is hand-written JSON with no useful default, and a blind round trip
     // through a form that could not show it would be worse than saying so. The
@@ -511,6 +564,7 @@ pub fn show_profile_dialog(
     let interface_address = initial.interface_address.clone();
     let collect_profile: Rc<dyn Fn() -> Option<(String, Profile)>> = Rc::new({
         let core_editor = core_editor.clone();
+        let core_exit = core_exit.clone();
         let name_entry = name_entry.clone();
         let edit_name = edit_name.clone();
         let description_entry = description_entry.clone();
@@ -566,6 +620,7 @@ pub fn show_profile_dialog(
                 interface_routes: route_mode(routes.selected()),
                 interface_list: routed_subnets.text().to_string(),
                 core: core_editor.values(),
+                on_core_exit: core_exit_choice(core_exit.selected()),
                 routing: carried_routing.clone(),
             };
             Some((name, profile_from_dialog(values)))
@@ -1114,6 +1169,10 @@ mod tests {
                 },
                 ..CoreOptions::default()
             },
+            // The row for this shows three choices, and "follow the machine" is
+            // one of them — so a save has to be able to write back a deliberate
+            // answer *and* a deliberate absence of one.
+            on_core_exit: Some(OnCoreExit::Release),
             // No editor at all, so this is the field with the most to lose: a
             // dialog that dropped it would return a routed profile to the two
             // rules oxidom installs, and say nothing.
@@ -1126,6 +1185,7 @@ mod tests {
         let saved = profile_from_dialog(DialogValues::new(Some(&entry)));
         assert_eq!(saved.interface, entry.interface);
         assert_eq!(saved.core, entry.core);
+        assert_eq!(saved.on_core_exit, entry.on_core_exit);
         assert_eq!(saved.routing, entry.routing);
         assert_eq!(saved.description, entry.description);
         assert_eq!(saved.select.server, entry.server);
@@ -1133,6 +1193,19 @@ mod tests {
         assert_eq!(saved.proxy.socks_port, entry.socks_port);
         assert_eq!(saved.proxy.http_port, entry.http_port);
         saved.validate(&entry.name).unwrap();
+    }
+
+    /// Three rows, and the first is the absence of an answer rather than an
+    /// answer of its own. A row this build does not know reads as that too:
+    /// following the machine is the only safe guess.
+    #[test]
+    fn the_core_exit_row_round_trips_including_the_inherited_choice() {
+        for setting in [None, Some(OnCoreExit::Hold), Some(OnCoreExit::Release)] {
+            assert_eq!(core_exit_choice(core_exit_index(setting)), setting);
+        }
+        assert_eq!(core_exit_choice(9), None);
+        assert!(core_exit_subtitle(true).contains("hold"));
+        assert!(core_exit_subtitle(false).contains("release"));
     }
 
     #[test]
