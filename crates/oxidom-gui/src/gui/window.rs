@@ -24,9 +24,8 @@ use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
     SwitcherItem, active_latency_for, card_action, human_bytes, latency_states,
-    missing_core_message, other_profiles_message, pool_action, pool_for_profile, pool_short_label,
-    press_stops, reduce, selected_status, session_for, session_rows, switcher_items,
-    switcher_visible,
+    missing_core_message, other_profiles_message, pool_action, pool_short_label, press_stops,
+    reduce, selected_status, session_for, session_rows, switcher_items, switcher_visible,
 };
 use super::server_card::{self, LatencyState};
 use super::sidebar::{Page, Sidebar};
@@ -1933,9 +1932,9 @@ impl Controller {
             },
             connect_pool: {
                 let weak = Rc::downgrade(self);
-                Rc::new(move |query| {
+                Rc::new(move |query, members| {
                     if let Some(controller) = weak.upgrade() {
-                        controller.connect_pool(query);
+                        controller.connect_pool(query, members);
                     }
                 })
             },
@@ -2170,134 +2169,47 @@ impl Controller {
         dialog.present(Some(&self.window));
     }
 
-    /// Run a group as the selected profile's pool.
+    /// Run the visible selection, writing nothing.
     ///
-    /// The same rule a card click follows: the selected profile is what gets
-    /// pointed somewhere. A group is not a second kind of connection — it is
-    /// what a profile selects — so this reuses `repoint_and_up` rather than
-    /// inventing a parallel path that could disagree with it.
-    fn connect_pool(self: &Rc<Self>, query: PoolQuery) {
+    /// The session is the daemon's `default`, the same one a card click uses —
+    /// so this is the pool counterpart of connecting a single server, and like
+    /// that one it modifies no profile file. Saving a selection is a separate,
+    /// deliberate act: **Save as a profile** on the same bar.
+    fn connect_pool(self: &Rc<Self>, query: PoolQuery, members: Vec<String>) {
         let action = {
             let state = self.state.borrow();
-            pool_action(&state.profiles, &state.ui, &query)
+            pool_action(&state.ui, &members)
         };
-        let (profile_name, replaces_server, replaces_pool) = match action {
-            PoolAction::UpProfile(name) => {
-                self.up_profile(name);
-                return;
-            }
-            PoolAction::DownProfile(name) => {
-                self.down_profile(name);
-                return;
-            }
-            PoolAction::NoProfile(name) => {
-                self.show_message(&format!(
-                    "“{name}” has no profile to write. Create one on the Profiles page first."
-                ));
-                return;
-            }
-            // Same servers, different rotation width. Nothing is replaced, so
-            // there is nothing to confirm — but the write is still a write, and
-            // a toast is what keeps it from being silent.
-            PoolAction::RetuneAndUp { profile, expected } => {
-                if let Some(rewritten) = self.profile_with_pool(&profile, query.clone()) {
-                    self.show_message(&match expected {
-                        0 => format!("“{profile}” now rotates over every live node"),
-                        count => format!("“{profile}” now rotates over {count} nodes"),
-                    });
-                    self.repoint_and_up(profile, rewritten);
+        match action {
+            // Started from here, stopped from here — whichever page it was
+            // started on, and whatever profile happens to be selected now.
+            PoolAction::Stop(profile) => {
+                if profile == "default" {
+                    self.disconnect();
+                } else {
+                    self.down_profile(profile);
                 }
-                return;
             }
-            PoolAction::RepointAndUp {
-                profile,
-                replaces_server,
-                replaces_pool,
-            } => (profile, replaces_server, replaces_pool),
-        };
+            PoolAction::ConnectSelection => self.connect_selection(query),
+        }
+    }
 
-        let Some(profile) = self.profile_with_pool(&profile_name, query.clone()) else {
-            return;
-        };
-        let group = if query.name.is_empty() {
-            "this group".to_string()
+    fn connect_selection(self: &Rc<Self>, query: PoolQuery) {
+        let label = if query.name.is_empty() {
+            "the selection".to_string()
         } else {
             format!("“{}”", query.name)
         };
-        let nodes = {
-            let state = self.state.borrow();
-            oxidom_core::pool::resolve(&query, &state.subscriptions)
-                .map(|members| members.len())
-                .unwrap_or_default()
-        };
-        let body = match (replaces_pool, replaces_server.as_deref()) {
-            (true, _) => format!(
-                "“{profile_name}” will run {group} across {nodes} servers instead of its current \
-                 pool. It will reconnect, and existing connections will close."
-            ),
-            (false, Some(server)) => format!(
-                "“{profile_name}” points at {server}. Connecting {group} replaces that with a \
-                 pool of {nodes} servers, and rewrites the saved selection."
-            ),
-            (false, None) => format!(
-                "“{profile_name}” will run {group} across {nodes} servers, and the saved \
-                 selection is rewritten."
-            ),
-        };
-        let title = format!("Connect “{profile_name}” to {group}?");
-        let dialog = adw::AlertDialog::new(Some(title.as_str()), Some(body.as_str()));
-        dialog.add_responses(&[("cancel", "Cancel"), ("connect", "Connect")]);
-        dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        dialog.connect_response(None, {
-            let weak = Rc::downgrade(self);
-            move |dialog, response| {
-                dialog.close();
-                if response != "connect" {
-                    return;
+        self.client_job(
+            UiOperation::new(UiOperationKind::UpProfile),
+            move |client| client.connect_pool(&query).map(|_| ()),
+            move |controller, result| match result {
+                Ok(()) => controller.refresh_status(),
+                Err(error) => {
+                    controller.show_message(&format!("Could not connect {label}: {error:#}"));
                 }
-                if let Some(controller) = weak.upgrade() {
-                    controller.repoint_and_up(profile_name.clone(), profile.clone());
-                }
-            }
-        });
-        dialog.present(Some(&self.window));
-    }
-
-    /// The named profile with its selection replaced by `query`, everything
-    /// else — ports, description, interface — carried through untouched.
-    fn profile_with_pool(self: &Rc<Self>, name: &str, query: PoolQuery) -> Option<Profile> {
-        let state = self.state.borrow();
-        let Some(entry) = state.profiles.iter().find(|entry| entry.name == name) else {
-            drop(state);
-            self.show_message(&format!("Profile “{name}” no longer exists"));
-            return None;
-        };
-        Some(Profile {
-            description: entry.description.clone(),
-            // A pool and a server are the two halves of one choice, so taking
-            // the pool means clearing the server; leaving both set is the one
-            // shape `Profile::validate` refuses.
-            select: ProfileSelect {
-                server: String::new(),
-                // The bar chooses membership and strategy; the pool's tuning —
-                // node cap, rotation width, probe interval — is the profile
-                // editor's, and connecting a group must not quietly reset it.
-                pool: Some(pool_for_profile(Some(entry), query)),
             },
-            proxy: ProfileProxy {
-                socks_port: entry.socks_port,
-                http_port: entry.http_port,
-            },
-            interface: entry.interface.clone(),
-            // As with the pool's tuning above: connecting a group changes the
-            // membership, not the core settings or the routing block the profile
-            // was given.
-            core: entry.core.clone(),
-            on_core_exit: entry.on_core_exit,
-            routing: entry.routing.clone(),
-        })
+        );
     }
 
     fn disconnect_if_active(self: &Rc<Self>) {

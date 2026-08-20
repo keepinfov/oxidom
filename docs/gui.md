@@ -67,10 +67,24 @@ when no group is selected, rather than present and dead.
 
 ### Connecting
 
+Connect on a group's bar runs what is on screen, straight away. It writes no
+profile, asks nothing, and needs none selected — "connect me to one of these" is
+what the page is for, and it used to cost a profile write plus a dialog about
+profiles, or a trip to another page when none was selected.
+
+Pressing it again stops the session running that selection. Which session that
+is, is decided by the servers rather than by the name, so a saved group and the
+same servers picked by hand are the same run.
+
+**Save as group** keeps the selection as a chip. **New profile from this…** in
+the bar's menu makes a profile out of it — for a systemd unit, or the CLI, or an
+interface of its own. Both are deliberate acts, and neither happens by
+connecting. Connecting a *profile*, from the Profiles page, still repoints and
+still asks first.
+
 The Connect bar carries a rotation width — how many of a group's servers stay in
 rotation at once, default 6. It is deliberately not stored on the group: a group answers
-*which* servers, the width answers *how many at once, this run*. Changing it
-rewrites without a dialog and says so in a toast.
+*which* servers, the width answers *how many at once, this run*.
 
 Per-subscription latency checks and sorting live on this page too.
 

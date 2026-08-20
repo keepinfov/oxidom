@@ -33,8 +33,9 @@ const LEAST_PING_WARNING: &str = "leastPing concentrates traffic on one node and
     spreading activity across IPs.";
 const NEW_CONNECTIONS_HINT: &str = "Switching between the group's servers affects only new \
     connections; existing connections do not migrate.";
-const POOL_FROM_GROUPS_HINT: &str = "To run several servers at once, save a group on the Servers \
-    page and press Connect on it.";
+const POOL_FROM_GROUPS_HINT: &str = "To run several servers at once, pick them on the Servers \
+    page and press Connect — that needs no profile. A profile is for a systemd unit, the CLI, or \
+    an interface of its own.";
 /// Same words as the noise-packet row in the core editor: the two are the same
 /// promise, and a user meeting one after the other should not have to work out
 /// whether they mean different things.

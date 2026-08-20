@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
 use crate::ipc::{
@@ -464,6 +464,27 @@ impl DaemonClient {
             Ok(_) => true,
             Err(error) => !is_unknown_method(&error),
         }
+    }
+
+    /// Run a selection now, writing no profile. Returns the session's name.
+    ///
+    /// A daemon too old to know the verb answers `UnknownMethod`, which is not
+    /// a sentence anyone can act on — so it is translated here, next to the
+    /// method it belongs to, the way `profiles_unsupported` already is.
+    pub fn connect_pool(&self, query: &crate::pool::PoolQuery) -> Result<String> {
+        let payload = serde_json::to_string(query)?;
+        self.proxy
+            .call("ConnectPool", &(payload.as_str(),))
+            .map_err(|error| {
+                if is_unknown_method(&error) {
+                    anyhow!(
+                        "this daemon is too old to run a group without saving it first; \
+                         update oxidom, or save the group to a profile and connect that"
+                    )
+                } else {
+                    friendly(error)
+                }
+            })
     }
 
     pub fn probe_state(&self) -> Result<ProbeState> {
