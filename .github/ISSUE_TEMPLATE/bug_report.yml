@@ -110,7 +110,10 @@ body:
     attributes:
       label: Log lines
       description: >
-        From the Logs page in the interface, which has Copy and Save buttons.
+        From the Logs page in the interface. Select the lines and press
+        **Report a problem**: that fills in everything above as well, and takes
+        every address, host name, account id and credential out of the lines,
+        marking where each stood. Copy and Save take the lines as they are.
         Headless, the daemon logs to the journal: `journalctl -u oxidom.service`
         for the system daemon, `journalctl --user` for a session one. The log is
         written to be safe to paste — secrets never reach a log line — but read

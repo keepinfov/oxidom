@@ -50,6 +50,33 @@ surface, packaging, or the CLI belongs here.
   the daemon: the reading has carried the method, the route, the time and the detail all
   along, and the card threw four of them away on the way to a badge.
 
+- **A problem report is assembled from the log page, with nothing identifying in it.**
+  Reporting a bug meant copying log lines by hand and hoping nothing in them was a live
+  credential, then going and looking up five things the application already knew. The bug
+  form asks the reporter to guarantee that no share link, UUID, password or server address
+  is in what they send, and the only way to keep that promise was to read every line.
+
+  Select lines on the Logs page and press **Report a problem**. The report carries the
+  version block the About dialog shows, what the connection is made of and the subscription
+  User-Agent, then the lines with every address, host name, account id, share link,
+  subscription URL, password, machine name and account name taken out. Each removal is
+  **marked where it stood** — `[address]`, `[host]`, `[uuid]`, `[share link]`, `[redacted]`,
+  `[machine]`, `[user]` — so a bracket reads as a redaction rather than as an absence.
+
+  Over-redaction was treated as a failure too, because a report reading `[host] [address]`
+  on every line helps nobody: loopback addresses and port numbers stay, a private address is
+  marked as private rather than blanked, and `geoip.dat` is still `geoip.dat`. The rules are
+  in `oxidom-core`, so a report the CLI writes will remove the same things, and they are
+  pinned in both directions by a corpus — shapes that must not survive, and lines that must
+  survive byte for byte.
+
+  The report goes on the clipboard and offers itself a file. **No browser is opened and
+  nothing is sent anywhere**: a prefilled issue URL would carry the log through a third
+  party's address bar and would submit it before the reporter had read it.
+
+  An expanded card whose last check failed offers the same action beside **Show in logs**,
+  narrowing the page to that server first.
+
 - **A card can show more than the newest reading.** One measurement said whether a server
   answered once. It could not say whether it answers reliably, which is the actual question
   behind choosing between two hundred of them: a server that is fast half the time and one

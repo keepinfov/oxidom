@@ -20,6 +20,7 @@ pub mod pool;
 pub mod probe;
 pub mod proc;
 pub mod profile;
+pub mod redact;
 pub mod resolve;
 pub mod run;
 pub mod state;
