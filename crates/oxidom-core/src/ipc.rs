@@ -110,6 +110,16 @@ pub struct SessionInfo {
     pub http_port: u16,
     /// Whether this session is the logical owner of the desktop system proxy.
     pub owns_system_proxy: bool,
+    /// The core is gone and this session's routes, fwmark rule and desktop proxy
+    /// setting are still installed, so traffic aimed at the tunnel is dropped
+    /// rather than sent out unprotected.
+    ///
+    /// Additive and serde-defaulted, so a daemon that sends it and a client that
+    /// has never heard of it still understand each other. A client that does not
+    /// show it reads a held session as an ordinary failed one, which is what it
+    /// showed before this existed.
+    #[serde(default)]
+    pub holding_traffic: bool,
     pub interface: Option<InterfaceInfo>,
     /// Additive selection detail. Legacy server fields above keep their exact
     /// meaning; a pool never fills them with an arbitrary member.
@@ -521,6 +531,16 @@ pub struct ProfileEntry {
     /// dropped them would quietly un-fragment a profile that needed it.
     #[serde(default, skip_serializing_if = "CoreOptions::is_unset")]
     pub core: CoreOptions,
+    /// What this profile does with its routes when its core exits, carried for
+    /// the same reason as the sections above: an editor that rewrites the
+    /// profile from this entry would otherwise drop the answer on every save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_core_exit: Option<crate::config::OnCoreExit>,
+    /// The profile's `routing` block, carried for the same reason: the editor
+    /// does not show it, and a save that dropped it would silently return a
+    /// routed profile to the two rules oxidom installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<String>,
 }
 
 /// The selected server returned after bringing a profile up.

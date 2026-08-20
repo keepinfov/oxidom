@@ -43,7 +43,10 @@ is an argv-normalized synonym (`oxidom work up`); a real subcommand in the first
 wins. `oxidom env` prints POSIX `export` statements for both SOCKS and HTTP endpoints.
 
 Data goes only to stdout; warnings, errors, and ambiguous-handle candidates go to stderr. JSON
-uses the fixed DTOs in `oxidom-core/src/cli_json.rs`. Exit codes are binding:
+uses the fixed DTOs in `oxidom-core/src/cli_json.rs`. `SessionOutput` carries `holding_traffic`
+beside `state`: a session whose core exited while it kept its routes is in `error` and dropping
+traffic, which is a different claim from `error` alone, and the sessions table prints its `STATE`
+as `holding`. Exit codes are binding:
 
 | Code | Meaning |
 |---:|---|

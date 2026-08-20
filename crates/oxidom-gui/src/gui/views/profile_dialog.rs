@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
+use oxidom_core::config::OnCoreExit;
 use oxidom_core::core_options::CoreOptions;
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
@@ -35,6 +36,12 @@ const NEW_CONNECTIONS_HINT: &str = "Switching between the group's servers affect
 const POOL_FROM_GROUPS_HINT: &str = "To run several servers at once, pick them on the Servers \
     page and press Connect — that needs no profile. A profile is for a systemd unit, the CLI, or \
     an interface of its own.";
+/// Same words as the noise-packet row in the core editor: the two are the same
+/// promise, and a user meeting one after the other should not have to work out
+/// whether they mean different things.
+const ROUTING_HINT: &str =
+    "Edited in the profile file, ahead of the rules oxidom generates. Saved from here untouched.";
+
 const LIST_MEMBERSHIP_HINT: &str = "A fixed list. New servers do not join it on their own. Change \
     which servers are in it from the group chips on the Servers page.";
 const RULE_MEMBERSHIP_HINT: &str = "A rule, so servers a future refresh adds can join it. Change \
@@ -113,6 +120,13 @@ struct DialogValues {
     /// Only the sections this profile overrides; the rest is inherited from
     /// `config.toml` and never written here.
     core: CoreOptions,
+    /// `None` follows the machine's setting, the same "unset means inherit"
+    /// the `[core]` sections use.
+    on_core_exit: Option<OnCoreExit>,
+    /// The profile's routing block, carried the way the noise packets are:
+    /// there is no editor for it, the row below reports how many rules it holds,
+    /// and a save writes back exactly what was loaded.
+    routing: Option<String>,
 }
 
 impl DialogValues {
@@ -139,7 +153,57 @@ impl DialogValues {
             interface_routes: interface.routes,
             interface_list: interface.list.join(", "),
             core: entry.map(|entry| entry.core.clone()).unwrap_or_default(),
+            on_core_exit: entry.and_then(|entry| entry.on_core_exit),
+            routing: entry.and_then(|entry| entry.routing.clone()),
         }
+    }
+}
+
+/// Which row of the "If Xray exits" list a stored answer is.
+fn core_exit_index(setting: Option<OnCoreExit>) -> u32 {
+    match setting {
+        None => 0,
+        Some(OnCoreExit::Hold) => 1,
+        Some(OnCoreExit::Release) => 2,
+    }
+}
+
+fn core_exit_choice(index: u32) -> Option<OnCoreExit> {
+    match index {
+        1 => Some(OnCoreExit::Hold),
+        2 => Some(OnCoreExit::Release),
+        // Anything else is the first row, and a row this build does not know
+        // is safest read as "whatever the machine says".
+        _ => None,
+    }
+}
+
+/// What inheriting currently means, so nobody has to switch the row off the
+/// first entry to find out — which is how a profile ends up pinning a value
+/// nobody meant to pin.
+fn core_exit_subtitle(machine_holds: bool) -> String {
+    let machine = if machine_holds { "hold" } else { "release" };
+    // Same shape as the `[core]` rows below — "Follows the machine: Warning" —
+    // because it is the same idea, and because a longer subtitle steals the
+    // width the value needs to say "Inherited" without ellipsising.
+    format!("Follows the machine: {machine} traffic")
+}
+
+/// What the routing row says about a block nobody can edit here.
+///
+/// A count, because that is the honest amount a row can carry about arbitrary
+/// JSON, and it is enough to notice that a save kept it.
+fn describe_routing(routing: Option<&str>) -> String {
+    let Some(raw) = routing else {
+        return "No routing rules".to_string();
+    };
+    match oxidom_core::xray::routing::rule_count(raw) {
+        Some(0) => "A routing block with no rules".to_string(),
+        Some(1) => "1 routing rule".to_string(),
+        Some(many) => format!("{many} routing rules"),
+        // Saving is refused with the parse error, so this row only has to avoid
+        // claiming a count it does not have.
+        None => "A routing block that does not parse".to_string(),
     }
 }
 
@@ -163,6 +227,8 @@ fn profile_from_dialog(values: DialogValues) -> Profile {
             list: parse_subnets(&values.interface_list),
         },
         core: values.core,
+        on_core_exit: values.on_core_exit,
+        routing: values.routing,
     }
 }
 
@@ -174,6 +240,9 @@ pub fn show_profile_dialog(
     // The machine's `[core]`, so every section this profile does not override
     // can show what it inherits instead of standing blank.
     machine_core: &CoreOptions,
+    // What "follow the machine setting" currently resolves to, so the row can
+    // say it instead of making the reader go and look.
+    machine_hold: bool,
     callbacks: ProfileDialogCallbacks,
 ) {
     let (title, edit_name, initial) = match mode {
@@ -400,12 +469,46 @@ pub fn show_profile_dialog(
         .build();
     interface_group.add(&routed_subnets);
 
+    // In the interface group because that is where the routes it decides the
+    // fate of are configured — but it governs the desktop proxy setting too, so
+    // it says "traffic" rather than "routes".
+    // Short values, like the `[core]` rows below: this row is narrow, and a
+    // sentence in the value slot ellipsises to "Foll…", which answers nothing.
+    // What each choice means belongs in the subtitle, where the core rows put it.
+    let core_exit_labels = gtk::StringList::new(&["Inherited", "Hold traffic", "Release traffic"]);
+    let core_exit = adw::ComboRow::builder()
+        .title("If Xray exits")
+        .subtitle(core_exit_subtitle(machine_hold))
+        .model(&core_exit_labels)
+        .selected(core_exit_index(initial.on_core_exit))
+        .build();
+    interface_group.add(&core_exit);
+    // No editor, for the same reason the noise packets have none: a routing
+    // block is hand-written JSON with no useful default, and a blind round trip
+    // through a form that could not show it would be worse than saying so. The
+    // row reports how many rules it holds and the value is written back
+    // untouched, exactly as the pool membership is above.
+    // "Routing rules", not "Routing": the profile row on the Profiles page
+    // already carries a Routing detail, and it answers a different question —
+    // whether this profile captures the machine or only offers local proxies.
+    let routing_group = adw::PreferencesGroup::builder()
+        .title("Routing rules")
+        .build();
+    let routing_row = adw::ActionRow::builder()
+        .title(describe_routing(initial.routing.as_deref()))
+        .subtitle(ROUTING_HINT)
+        .subtitle_lines(2)
+        .activatable(false)
+        .build();
+    routing_group.add(&routing_row);
+
     let core_editor = CoreEditor::new(CoreLevel::Profile, machine_core, &initial.core);
 
     let groups = gtk::Box::new(gtk::Orientation::Vertical, 24);
     groups.append(&profile_group);
     groups.append(&pool_group);
     groups.append(&interface_group);
+    groups.append(&routing_group);
     groups.append(&core_editor.group);
     if let Some(name) = edit_name.as_deref() {
         let remove_group = adw::PreferencesGroup::builder().title("Remove").build();
@@ -462,6 +565,7 @@ pub fn show_profile_dialog(
     let interface_address = initial.interface_address.clone();
     let collect_profile: Rc<dyn Fn() -> Option<(String, Profile)>> = Rc::new({
         let core_editor = core_editor.clone();
+        let core_exit = core_exit.clone();
         let name_entry = name_entry.clone();
         let edit_name = edit_name.clone();
         let description_entry = description_entry.clone();
@@ -470,6 +574,7 @@ pub fn show_profile_dialog(
         let picker_entries = picker_entries.clone();
         let strategy = strategy.clone();
         let carried = initial_pool.clone();
+        let carried_routing = initial.routing.clone();
         let pool_max = pool_max.clone();
         let pool_expected = pool_expected.clone();
         let pool_probe_interval = pool_probe_interval.clone();
@@ -516,6 +621,8 @@ pub fn show_profile_dialog(
                 interface_routes: route_mode(routes.selected()),
                 interface_list: routed_subnets.text().to_string(),
                 core: core_editor.values(),
+                on_core_exit: core_exit_choice(core_exit.selected()),
+                routing: carried_routing.clone(),
             };
             Some((name, profile_from_dialog(values)))
         }
@@ -1063,17 +1170,43 @@ mod tests {
                 },
                 ..CoreOptions::default()
             },
+            // The row for this shows three choices, and "follow the machine" is
+            // one of them — so a save has to be able to write back a deliberate
+            // answer *and* a deliberate absence of one.
+            on_core_exit: Some(OnCoreExit::Release),
+            // No editor at all, so this is the field with the most to lose: a
+            // dialog that dropped it would return a routed profile to the two
+            // rules oxidom installs, and say nothing.
+            routing: Some(
+                r#"{"rules":[{"domain":["geosite:category-ads-all"],"outboundTag":"block"}]}"#
+                    .to_string(),
+            ),
         };
 
         let saved = profile_from_dialog(DialogValues::new(Some(&entry)));
         assert_eq!(saved.interface, entry.interface);
         assert_eq!(saved.core, entry.core);
+        assert_eq!(saved.on_core_exit, entry.on_core_exit);
+        assert_eq!(saved.routing, entry.routing);
         assert_eq!(saved.description, entry.description);
         assert_eq!(saved.select.server, entry.server);
         assert_eq!(saved.select.pool, entry.pool);
         assert_eq!(saved.proxy.socks_port, entry.socks_port);
         assert_eq!(saved.proxy.http_port, entry.http_port);
         saved.validate(&entry.name).unwrap();
+    }
+
+    /// Three rows, and the first is the absence of an answer rather than an
+    /// answer of its own. A row this build does not know reads as that too:
+    /// following the machine is the only safe guess.
+    #[test]
+    fn the_core_exit_row_round_trips_including_the_inherited_choice() {
+        for setting in [None, Some(OnCoreExit::Hold), Some(OnCoreExit::Release)] {
+            assert_eq!(core_exit_choice(core_exit_index(setting)), setting);
+        }
+        assert_eq!(core_exit_choice(9), None);
+        assert!(core_exit_subtitle(true).contains("hold"));
+        assert!(core_exit_subtitle(false).contains("release"));
     }
 
     #[test]

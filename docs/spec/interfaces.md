@@ -30,6 +30,20 @@ the daemon's own signal handler, and anything that leaks is reaped on the next s
 - Ordinary `down` stops tun2socks and removes oxidom routes/rule but leaves the persistent device,
   preserving hand-written routes across reconnects. `tun --down` and crash recovery additionally
   delete the device only when oxidom created it.
+- **A core exiting is not a `down` (binding).** When the Xray process of a session exits by itself
+  — or a live core stops answering and the watchdog revives it — the session keeps its routes, its
+  fwmark rule and its ownership of the desktop proxy setting until it is either reconnected or
+  explicitly taken down. Traffic aimed at the tunnel is dropped for that window rather than
+  released onto the ordinary default route, where it would leave with the machine's own address
+  while the interface still showed a tunnel reconnecting. This is the shipped default,
+  `on_core_exit = "hold"`; `"release"` reproduces the teardown-first behaviour, and a profile's
+  own setting wins over the machine's. The answer is snapshotted when the session comes up, so a
+  profile edited mid-session does not change what happens to the tunnel already running.
+- A reconnect under a held interface **adds nothing**: `start_interface` finds it already up and
+  returns. Its tun2socks is the exception — the one part of an interface that is a process rather
+  than kernel state — and is restarted alone if it did not survive the outage, leaving every route
+  where it was. A device left up with nothing servicing it black-holes the tunnel for good, which
+  is worse than the release this holding prevents.
 - Per-process routing uses a transient `systemd --user` scope below
   `oxidom-<profile>.slice`. The daemon atomically owns one `socket cgroupv2` mark rule per session
   in `table inet oxidom`; the CLI verifies `/proc/self/cgroup` inside the scope before `exec`.

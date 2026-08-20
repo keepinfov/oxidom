@@ -57,6 +57,21 @@ pub struct Profile {
     /// [`crate::core_options`].
     #[serde(skip_serializing_if = "CoreOptions::is_unset")]
     pub core: CoreOptions,
+    /// What this tunnel does with its routes when its core exits by itself.
+    /// Unset inherits `on_core_exit` from `config.toml`; see
+    /// [`crate::config::OnCoreExit`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_core_exit: Option<crate::config::OnCoreExit>,
+    /// An Xray `routing` block, as written, spliced ahead of the rules oxidom
+    /// generates. See [`crate::xray::routing`] for what is refused and why.
+    ///
+    /// Deliberately not a `[core]` key. `[core]` resolves machine over profile
+    /// and a probe resolves the machine level alone, so a rule that lived there
+    /// would reach probe cores too — and a rule sending the probe out `direct`
+    /// would measure the machine's own path and report a dead server as fast.
+    /// A profile-level key cannot reach a probe at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -114,6 +129,22 @@ impl Default for ProfileProxy {
 }
 
 impl Profile {
+    /// The profile's `routing` block, checked and parsed.
+    ///
+    /// `Ok(None)` means the profile carries none, which is the ordinary case
+    /// and generates exactly the rules it always did.
+    pub fn routing_block(&self) -> Result<Option<serde_json::Value>> {
+        let Some(raw) = &self.routing else {
+            return Ok(None);
+        };
+        let shape = if self.select.pool.is_some() {
+            crate::xray::routing::Shape::Pool
+        } else {
+            crate::xray::routing::Shape::SingleServer
+        };
+        crate::xray::routing::validate(raw, shape).map(Some)
+    }
+
     pub fn validate(&self, name: &str) -> Result<()> {
         if !self.select.server.is_empty() && self.select.pool.is_some() {
             bail!("a profile selects either a server or a pool, not both");
@@ -141,6 +172,11 @@ impl Profile {
                 );
             }
         }
+        // Refused here rather than at spawn, where the reason would be an Xray
+        // exit code. The block itself is never quoted back: it is the user's own
+        // text, it can be long, and the reason already names what is wrong.
+        self.routing_block()
+            .with_context(|| format!("profile {name:?} carries a routing block it cannot use"))?;
         if self.proxy.socks_port == 0 || self.proxy.http_port == 0 {
             bail!("profile ports must be between 1 and 65535");
         }
@@ -422,6 +458,84 @@ http_port = 12081
         let encoded = toml::to_string_pretty(&profile)?;
         assert_eq!(toml::from_str::<Profile>(&encoded)?, profile);
         Ok(())
+    }
+
+    /// The key is a string holding JSON, so TOML's own multi-line literal
+    /// string is what a hand-written profile uses, and a round trip must not
+    /// reflow or re-escape what the user typed.
+    #[test]
+    fn a_routing_block_survives_the_file_it_was_written_in() -> Result<()> {
+        let input = r#"
+description = "work"
+routing = '''
+{ "rules": [ { "domain": ["geosite:category-ads-all"], "outboundTag": "block" } ] }
+'''
+
+[select]
+server = "ch-trojan"
+
+[proxy]
+socks_port = 12080
+http_port = 12081
+"#;
+        let profile: Profile = toml::from_str(input)?;
+        let raw = profile.routing.as_deref().expect("the block is carried");
+        assert!(raw.contains("geosite:category-ads-all"));
+        profile.validate("work")?;
+        assert_eq!(
+            profile
+                .routing_block()?
+                .expect("a checked block")
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let encoded = toml::to_string_pretty(&profile)?;
+        assert_eq!(toml::from_str::<Profile>(&encoded)?, profile);
+        Ok(())
+    }
+
+    /// A profile with no block gains no key: the file keeps the shape its owner
+    /// gave it, the same promise `[core]` makes.
+    #[test]
+    fn a_profile_without_a_routing_block_gains_no_routing_key() -> Result<()> {
+        let profile = Profile {
+            description: "plain".to_string(),
+            ..Profile::default()
+        };
+        assert!(!toml::to_string_pretty(&profile)?.contains("routing"));
+        Ok(())
+    }
+
+    /// Refused where the reason can still be shown, rather than at spawn where
+    /// it would be an Xray exit code. The profile name is in the message
+    /// because a systemd unit failing to start is where this surfaces.
+    #[test]
+    fn a_routing_block_a_pool_cannot_use_is_refused_by_the_profile_it_is_on() {
+        let mut profile = Profile {
+            select: ProfileSelect {
+                server: String::new(),
+                pool: Some(PoolQuery {
+                    countries: vec!["ch".to_string()],
+                    ..PoolQuery::default()
+                }),
+            },
+            routing: Some(
+                r#"{"rules":[{"domain":["example.com"],"outboundTag":"proxy"}]}"#.to_string(),
+            ),
+            ..Profile::default()
+        };
+        let error = format!("{:#}", profile.validate("spread").unwrap_err());
+        assert!(error.contains("spread"), "got: {error}");
+        assert!(error.contains("no outbound for"), "got: {error}");
+
+        // The same block on a profile that selects one server is fine: there is
+        // a `proxy` outbound then.
+        profile.select.pool = None;
+        profile.select.server = "ch-trojan".to_string();
+        profile.validate("work").unwrap();
     }
 
     #[test]

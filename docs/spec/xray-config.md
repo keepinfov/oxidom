@@ -13,8 +13,9 @@ when nothing is set.
   the session's stable loopback address, `sniffing` enabled (`http`, `tls`).
 - `outbounds`: `[ <selected server outbound>, { protocol: "freedom", tag: "direct" },
   { protocol: "blackhole", tag: "block" } ]`.
-- `routing`: default rules (v1: everything through proxy; direct for private IPs). A full rules
-  editor is not implemented yet.
+- `routing`: default rules (v1: everything through proxy; direct for private IPs), preceded by
+  whatever the profile's own `routing` block carries. A rules editor is not implemented yet; the
+  block is the way to say anything the generator does not.
 
 Generate the protocol-specific `outbounds[0]` from `OutboundSpec` (streamSettings for
 tcp/ws/grpc/xhttp; tlsSettings/realitySettings/xtls as needed).
@@ -40,9 +41,40 @@ reachable" is `expected = <pool size>`, which is what `expected = 0` resolves to
 emits `settings` only for `leastLoad`; emitting it elsewhere would imply a filtering that the
 other strategies do not perform.
 
+### A profile's own routing block (binding)
+
+`profile.routing` holds an Xray `routing` object as written. Its rules are spliced into
+`routing.rules` **ahead of the ones oxidom installs** — a user rule about a private address wins
+over the built-in `geoip:private` rule below it, which is the entire point of carrying one — and
+anything else in the block (`domainMatcher`, say) is copied onto the routing object verbatim. The
+two positions below keep theirs regardless.
+
+`xray::routing::validate` refuses four things, at `SaveProfile` and again at `UpProfile`, so the
+reason is a sentence rather than an Xray exit code:
+
+- **`balancers`, and any rule with a `balancerTag`.** Balancing is oxidom's. A selector is a prefix
+  match over outbound tags, and one that resolved to `direct` would send the tunnel out in the
+  clear while the interface said Connected — the same reason imported outbounds are re-tagged.
+- **`domainStrategy`**, which `[core] domain_strategy` already owns at two levels with a defined
+  precedence. A second spelling that silently won would make the editor lie.
+- **An `outboundTag` naming an outbound that will not exist.** The tags oxidom emits are `direct`,
+  `block`, and — for a single-server profile only — `proxy`; a pool reaches its members through the
+  balancer, so a rule aimed at `proxy` there is refused naming that as the reason.
+- **A rule with no `outboundTag`**, which decides nothing.
+
+The block is **not** a `[core]` key, and `CoreOptions::resolve` never fills
+`ResolvedCore::routing`. That is what keeps it away from probes: a probe folds the machine-wide
+`[core]` with no profile, and a rule that reached one could send the measurement out `direct` and
+report a dead server as fast. `Engine::configure_core` is the only writer.
+
+The interface has no editor for it. The profile dialog reports how many rules it holds and writes
+back what it loaded, the same call as the pool membership beside it and the noise packets below it.
+
 Three further details are binding:
 
-- The `api-in → api` rule comes **first** in `routing.rules`, ahead of the `balancerTag` rule.
+- The `api-in → api` rule comes **first** in `routing.rules`, ahead of the `balancerTag` rule and
+  ahead of the profile's own rules: a user rule matching that inbound would hang `xray api bi`, and
+  nothing a user writes is about it.
   Otherwise API traffic falls into the balancer and `xray api bi` hangs.
 - `selector: ["s-"]` is a prefix match, so no other outbound may start with `s-`. That is the
   whole reason for the tag scheme.

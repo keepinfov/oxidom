@@ -60,10 +60,13 @@ pub fn generate(
             // the selector can only ever resolve to a proxy outbound.
             let namespaced = namespace_outbounds(proxy_outbounds);
             let mut config = scaffold(bind, socks_port, http_port, namespaced, core);
-            config["routing"]["rules"] = json!([
-                { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
-                { "type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG }
-            ]);
+            install_rules(
+                &mut config,
+                core,
+                None,
+                vec![json!({ "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" })],
+                Some(json!({ "type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG })),
+            );
             config["routing"]["balancers"] = json!([{
                 "tag": BALANCER_TAG,
                 "selector": [SELECTABLE_TAG_PREFIX],
@@ -87,9 +90,13 @@ pub fn generate(
         }
         _ => {
             let mut config = scaffold(bind, socks_port, http_port, vec![outbound(server)], core);
-            config["routing"]["rules"] = json!([
-                { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" }
-            ]);
+            install_rules(
+                &mut config,
+                core,
+                None,
+                vec![json!({ "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" })],
+                None,
+            );
             config
         }
     }
@@ -165,13 +172,17 @@ pub fn generate_pool(
         "selector": [SELECTABLE_TAG_PREFIX],
         "strategy": strategy_value
     }]);
-    // This rule must precede the catch-all balancer rule or `xray api bi`
-    // routes its own request into the pool and waits until it times out.
-    config["routing"]["rules"] = json!([
-        { "type": "field", "inboundTag": ["api-in"], "outboundTag": "api" },
-        { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
-        { "type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG }
-    ]);
+    // The api rule must precede the catch-all balancer rule or `xray api bi`
+    // routes its own request into the pool and waits until it times out. It also
+    // precedes the profile's own rules: a user rule matching the api request
+    // would break the same call, and nothing a user writes is about that inbound.
+    install_rules(
+        &mut config,
+        core,
+        Some(json!({ "type": "field", "inboundTag": ["api-in"], "outboundTag": "api" })),
+        vec![json!({ "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" })],
+        Some(json!({ "type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG })),
+    );
     config["burstObservatory"] = json!({
         "subjectSelector": [SELECTABLE_TAG_PREFIX],
         "pingConfig": {
@@ -235,6 +246,40 @@ fn import_strategy(balancers: &[Value], balancer_tag: &str) -> Value {
         strategy["settings"] = json!({ "expected": expected });
     }
     strategy
+}
+
+/// Assemble `routing.rules`, with the profile's own block spliced in.
+///
+/// Order is the whole of this function: the api rule first when there is one,
+/// then whatever the profile carries, then the rules oxidom installs, then the
+/// balancer's catch-all last. A user's rule therefore wins over the
+/// private-address rule below it — which is the point of carrying one — while
+/// the two positions `docs/spec/xray-config.md` calls binding keep theirs.
+///
+/// Anything else in the block (`domainMatcher`, say) is copied onto the routing
+/// object as written. `crate::xray::routing::validate` has already refused the
+/// keys that must not survive the trip.
+fn install_rules(
+    config: &mut Value,
+    core: &ResolvedCore,
+    api: Option<Value>,
+    built_in: Vec<Value>,
+    balancer: Option<Value>,
+) {
+    let (profile_rules, rest) = core
+        .routing
+        .as_ref()
+        .map(crate::xray::routing::parts)
+        .unwrap_or_default();
+    for (key, value) in rest {
+        config["routing"][key] = value;
+    }
+    let mut rules = Vec::new();
+    rules.extend(api);
+    rules.extend(profile_rules);
+    rules.extend(built_in);
+    rules.extend(balancer);
+    config["routing"]["rules"] = Value::Array(rules);
 }
 
 fn scaffold(
@@ -605,7 +650,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{DIALER_TAG, PoolSpec, SELECTABLE_TAG_PREFIX, generate, generate_pool};
+    use super::{
+        BALANCER_TAG, DIALER_TAG, PoolSpec, SELECTABLE_TAG_PREFIX, generate, generate_pool,
+    };
     use crate::core_options::{
         CoreOptions, DestOverride, DnsOptions, DomainStrategy, FragmentOptions, LogLevel,
         MuxOptions, Noise, NoiseKind, QueryStrategy, ResolvedCore, SniffingOptions, XudpMode,
@@ -613,6 +660,7 @@ mod tests {
     use crate::model::{
         Hysteria2Obfs, Hysteria2Settings, OutboundSpec, PortRange, Protocol, Server, StreamSettings,
     };
+    use crate::xray::routing;
 
     #[test]
     fn balanced_profile_keeps_local_inbounds_and_safe_routing() {
@@ -1517,6 +1565,110 @@ mod tests {
         );
         assert_eq!(out["streamSettings"]["network"], "tcp");
         assert_eq!(out["streamSettings"]["security"], "tls");
+    }
+
+    /// A profile's own rules go ahead of the ones oxidom installs, so a rule the
+    /// user wrote about a private address wins over the built-in one below it —
+    /// which is the whole reason for carrying a block.
+    #[test]
+    fn a_profile_routing_block_is_spliced_ahead_of_the_generated_rules() {
+        let core = with_routing(
+            r#"{"rules":[
+                 {"domain":["geosite:category-ads-all"],"outboundTag":"block"},
+                 {"ip":["geoip:ch"],"outboundTag":"direct"}
+               ]}"#,
+            routing::Shape::SingleServer,
+        );
+        let config = generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809, &core);
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0]["domain"][0], "geosite:category-ads-all");
+        assert_eq!(rules[1]["ip"][0], "geoip:ch");
+        assert_eq!(
+            rules[2]["ip"][0], "geoip:private",
+            "the built-in rule stays, and stays below the profile's own"
+        );
+    }
+
+    /// The two binding positions survive a block: the api rule cannot move off
+    /// the front — `xray api bi` hangs the moment its request falls into the
+    /// balancer — and the balancer's catch-all cannot move off the back.
+    #[test]
+    fn a_pool_keeps_its_api_rule_first_and_its_balancer_rule_last() {
+        let core = with_routing(
+            r#"{"rules":[{"domain":["example.com"],"outboundTag":"block"}]}"#,
+            routing::Shape::Pool,
+        );
+        let members = country_sized_pool();
+        let refs: Vec<&Server> = members.iter().collect();
+        let config = generate_pool(
+            &PoolSpec {
+                members: &refs,
+                strategy: "leastLoad",
+                expected: 0,
+                probe_interval: "5m",
+            },
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            10810,
+            &core,
+        )
+        .unwrap();
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["inboundTag"][0], "api-in");
+        assert_eq!(rules[1]["domain"][0], "example.com");
+        assert_eq!(rules[2]["ip"][0], "geoip:private");
+        assert_eq!(rules.last().unwrap()["balancerTag"], BALANCER_TAG);
+    }
+
+    /// Anything in the block that is not a rule lands on the routing object as
+    /// written: the block is carried, not modelled.
+    #[test]
+    fn the_rest_of_a_routing_block_reaches_the_config_as_written() {
+        let core = with_routing(
+            r#"{"domainMatcher":"hybrid","rules":[]}"#,
+            routing::Shape::SingleServer,
+        );
+        let config = generate(&socks_server(), Ipv4Addr::LOCALHOST, 10808, 10809, &core);
+        assert_eq!(config["routing"]["domainMatcher"], "hybrid");
+        assert_eq!(
+            config["routing"]["domainStrategy"], "IPIfNonMatch",
+            "the [core] setting still owns the key the block may not spell"
+        );
+    }
+
+    /// A probe measures a server, not a route. `CoreOptions::resolve` is the
+    /// only thing a probe builds its core from, and it leaves `routing` unset —
+    /// a rule that reached one could send the measurement out direct and report
+    /// a dead server as fast.
+    #[test]
+    fn a_resolved_core_never_carries_routing_so_a_probe_cannot_inherit_one() {
+        let resolved = CoreOptions::resolve(
+            &CoreOptions {
+                log_level: Some(LogLevel::Debug),
+                ..CoreOptions::default()
+            },
+            &CoreOptions::default(),
+        );
+        assert!(resolved.routing.is_none());
+        let config = generate(
+            &socks_server(),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &resolved,
+        );
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["ip"][0], "geoip:private");
+    }
+
+    fn with_routing(raw: &str, shape: routing::Shape) -> ResolvedCore {
+        ResolvedCore {
+            routing: Some(routing::validate(raw, shape).unwrap()),
+            ..ResolvedCore::default()
+        }
     }
 
     /// The only check that proves the generated JSON against a real core.

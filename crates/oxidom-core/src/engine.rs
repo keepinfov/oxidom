@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::config::Config;
+use crate::config::{Config, OnCoreExit};
 use crate::core_options::{CoreOptions, ResolvedCore};
 use crate::model::{Server, Subscription};
 use crate::nft::Nft;
@@ -440,6 +440,17 @@ pub struct Session {
     /// label is: the session keeps generating the config it was brought up
     /// with, whatever the files say afterwards.
     pub core_options: ResolvedCore,
+    /// Whether a core exiting on its own leaves this session's routes in place.
+    /// Snapshotted at `up` like the settings above: a profile edited while a
+    /// tunnel runs must not change what happens to the tunnel already up.
+    pub holds_traffic: bool,
+    /// True while that is actually the case — the core is gone and the routes,
+    /// the rule and the desktop proxy setting are still installed, so traffic
+    /// aimed at the tunnel is dropped rather than released.
+    ///
+    /// Reported to clients, because a network that is deliberately dead must not
+    /// look like one that is broken.
+    pub holding_traffic: bool,
 }
 
 impl Session {
@@ -467,6 +478,8 @@ impl Session {
             pool_stale: false,
             interface: None,
             core_options,
+            holds_traffic: true,
+            holding_traffic: false,
         }
     }
 
@@ -477,6 +490,10 @@ impl Session {
         self.core
             .connect(server, self.address, &self.profile, &self.core_options)?;
         self.selection = Some(SessionSelection::Server(server.id.clone()));
+        // A core is carrying traffic again, so the session is no longer holding
+        // it. Cleared here rather than by whoever reconnected, because this is
+        // the one place both a first connect and a reconnect pass through.
+        self.holding_traffic = false;
         self.api_port = 0;
         self.pool_name.clear();
         self.pool_expected = 0;
@@ -508,6 +525,7 @@ impl Session {
             members.iter().map(|server| server.id.clone()).collect(),
             pool.strategy.to_string(),
         ));
+        self.holding_traffic = false;
         self.api_port = pool.api_port;
         self.pool_name = pool.name.to_string();
         self.pool_expected = pool.expected;
@@ -984,11 +1002,71 @@ impl Engine {
     /// [`Engine::configure_interface`] is: a bare `Connect` has no profile file
     /// to read, and a session that was never configured has to keep working off
     /// the global settings alone.
-    pub fn configure_core(&mut self, profile: &str, requested: &CoreOptions) {
-        let resolved = CoreOptions::resolve(&self.registry.config.core, requested);
+    /// `routing` is the profile's own block, already checked by
+    /// [`crate::profile::Profile::routing_block`]. It is passed separately
+    /// because it is not a `[core]` key and must never be resolved like one: a
+    /// probe folds the machine-wide `[core]` alone, and a rule that reached a
+    /// probe core would measure the route it chose rather than the server.
+    pub fn configure_core(
+        &mut self,
+        profile: &str,
+        requested: &CoreOptions,
+        routing: Option<serde_json::Value>,
+    ) {
+        let mut resolved = CoreOptions::resolve(&self.registry.config.core, requested);
+        resolved.routing = routing;
         if let Some(session) = self.sessions.get_mut(profile) {
             session.core_options = resolved;
         }
+    }
+
+    /// Fix what a core exiting by itself will do to this session's routes.
+    ///
+    /// Snapshotted here, at `up`, rather than read when the core dies: the
+    /// profile file may have been edited or removed in between, and a tunnel
+    /// that changed its failure behaviour underneath a running session would be
+    /// the least predictable moment to learn a setting exists.
+    pub fn configure_hold_traffic(&mut self, profile: &str, requested: Option<OnCoreExit>) {
+        let policy = requested.unwrap_or(self.registry.config.on_core_exit);
+        if let Some(session) = self.sessions.get_mut(profile) {
+            session.holds_traffic = policy == OnCoreExit::Hold;
+        }
+    }
+
+    /// Keep a dead session's routes, and record that this is what happened.
+    ///
+    /// The counterpart to [`Engine::stop_session`], for the path where nobody
+    /// asked for anything: the core exited on its own. `stop_interface` and
+    /// `release_system_proxy` are deliberately *not* called — that is the whole
+    /// change — so the TUN routes, the fwmark rule and the desktop proxy setting
+    /// stay installed and traffic aimed at the tunnel is dropped rather than
+    /// leaving with the machine's own address.
+    ///
+    /// Returns whether the session held. A session set to release, or one with
+    /// nothing installed to hold, is torn down here as before.
+    pub fn note_core_exit(&mut self, profile: &str) -> bool {
+        let holds = self
+            .sessions
+            .get(profile)
+            .is_some_and(|session| session.holds_traffic);
+        if !holds {
+            if let Err(error) = self.stop_interface(profile) {
+                log::warn!(
+                    "could not clean the interface after profile {profile:?}'s core exited: \
+                     {error:#}"
+                );
+            }
+            self.sessions.release_system_proxy(profile);
+            return false;
+        }
+        if let Some(session) = self.sessions.get_mut(profile) {
+            session.holding_traffic = true;
+        }
+        log::warn!(
+            "profile {profile:?} lost its core and is holding its routes: traffic for this \
+             tunnel is dropped, not sent out unprotected"
+        );
+        true
     }
 
     /// Attach the profile's requested interface plan to an existing session.
@@ -1229,11 +1307,48 @@ impl Engine {
             return Ok(());
         };
         if interface.up {
+            // A session that held its traffic across a core death still has its
+            // device, routes and rule installed, so a reconnect finds this
+            // already up and there is nothing to add — adding it twice is what
+            // "leaves no rule behind" means here.
+            //
+            // Its tun2socks is the exception. It is the one part of an interface
+            // that is a process rather than kernel state, and it spent the whole
+            // outage dialling a SOCKS port nothing was listening on. If it did
+            // not survive that, the device stays up with nothing servicing it
+            // and the tunnel is black-holed for good — worse than the leak the
+            // holding prevents. Restarting only the helper leaves every route
+            // exactly where it was.
+            let result = if interface.tun2socks.is_alive() {
+                Ok(())
+            } else {
+                let proxy = self
+                    .sessions
+                    .get(profile)
+                    .map(Session::socks_endpoint)
+                    .expect("the session existed above");
+                log::warn!(
+                    "profile {profile:?} kept its routes but lost tun2socks; restarting it \
+                     rather than leaving the device with nothing behind it"
+                );
+                interface
+                    .tun2socks
+                    .start(&interface.device, proxy, interface.mtu)
+            };
+            if result.is_ok()
+                // The recovery PID moved, and a daemon that died now would reap
+                // the wrong process — or none.
+                && let Err(error) = self.persist_interface_state(profile, &interface)
+            {
+                log::warn!(
+                    "could not record the restarted tun2socks for profile {profile:?}: {error:#}"
+                );
+            }
             self.sessions
                 .get_mut(profile)
                 .expect("the session existed above")
                 .interface = Some(interface);
-            return Ok(());
+            return result;
         }
         if !crate::tun::caps::has_net_admin() {
             let error = anyhow!(crate::tun::caps::missing_capability_error(profile));
@@ -1487,6 +1602,9 @@ impl Engine {
         }
         if let Some(session) = self.sessions.get_mut(profile) {
             session.disconnect();
+            // Asked for, so released: a session that was holding traffic has
+            // just had its routes removed by the line above.
+            session.holding_traffic = false;
         }
         self.sessions.release_system_proxy(profile);
         self.sync_session(profile);
@@ -2211,6 +2329,63 @@ mod tests {
 
         assert_eq!(loaded.sessions.len(), 1);
         assert_eq!(loaded.sessions[0].interface.as_ref(), Some(&interface));
+        Ok(())
+    }
+
+    /// The change itself, at the level it happens: a core exiting no longer
+    /// takes the interface with it. The routes, the rule and the device stay
+    /// installed, so traffic aimed at the tunnel is dropped for as long as the
+    /// reconnect takes instead of leaving with the machine's own address.
+    #[test]
+    fn a_held_session_keeps_the_interface_its_core_died_under() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("hold-keeps-interface")?;
+        let mut engine = Engine::load();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 14, 1), 12080, 12081)?;
+        engine.configure_hold_traffic("work", None);
+        // Built here rather than planned through `configure_interface`, which
+        // refuses without CAP_NET_ADMIN. What matters to this test is the state
+        // a live interface is in: `up`, with its plan recorded.
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(Interface {
+            profile: "work".to_string(),
+            device: "oxi-work".to_string(),
+            address: Ipv4Addr::new(198, 18, 9, 7),
+            mtu: 1500,
+            table: 0x6f21,
+            mark: 0x6f21,
+            routes: RouteMode::Manual,
+            created: true,
+            tun2socks: Tun2socks::new("work".to_string(), String::new()),
+            nft_binary: String::new(),
+            cgroup: None,
+            nft_active: false,
+            plan: RoutePlan {
+                private: Vec::new(),
+                system: Vec::new(),
+                rule: RuleSpec {
+                    mark: 0x6f21,
+                    table: 0x6f21,
+                    priority: 0x6f21,
+                },
+            },
+            up: true,
+            fresh: false,
+        });
+
+        assert!(engine.note_core_exit("work"), "the default is to hold");
+
+        let session = engine.sessions.get("work").context("session")?;
+        assert!(session.holding_traffic);
+        let interface = session.interface.as_ref().context("interface")?;
+        assert!(
+            interface.up,
+            "the routes and the rule are still installed, so the tunnel drops traffic \
+             rather than releasing it"
+        );
         Ok(())
     }
 

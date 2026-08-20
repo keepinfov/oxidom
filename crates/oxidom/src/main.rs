@@ -448,7 +448,15 @@ fn session_table(sessions: &[SessionOutput]) -> String {
     rows.extend(sessions.iter().map(|session| {
         let mut row = vec![
             session.profile.clone(),
-            session.state.clone(),
+            // A held session is in `error` — its core is gone — but saying only
+            // that invites the reading that traffic is flowing some other way.
+            // It is not: the routes are still installed and the traffic is being
+            // dropped, which is a different thing to know.
+            if session.holding_traffic {
+                "holding".to_string()
+            } else {
+                session.state.clone()
+            },
             session
                 .server_alias
                 .clone()
@@ -1068,6 +1076,7 @@ mod tests {
                 latency_ms: Some(84),
                 error: None,
                 owns_system_proxy: false,
+                holding_traffic: false,
                 interface: None,
                 selection: None,
             },
@@ -1083,6 +1092,7 @@ mod tests {
                 latency_ms: Some(112),
                 error: None,
                 owns_system_proxy: false,
+                holding_traffic: false,
                 interface: None,
                 selection: None,
             },
@@ -1111,6 +1121,7 @@ mod tests {
                 latency_ms: Some(84),
                 error: None,
                 owns_system_proxy: false,
+                holding_traffic: false,
                 interface: Some(oxidom_core::ipc::InterfaceInfo {
                     device: "oxi-default".to_string(),
                     ..Default::default()
@@ -1129,6 +1140,7 @@ mod tests {
                 latency_ms: None,
                 error: None,
                 owns_system_proxy: false,
+                holding_traffic: false,
                 interface: None,
                 selection: None,
             },

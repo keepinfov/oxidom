@@ -144,7 +144,13 @@ Selecting a profile makes the header, the cards and the tray follow it, so
 A profile connected to a group shows its live exit rather than naming the group's
 first server, because the first server is not the exit.
 
-Per-profile interface settings are edited from here.
+Per-profile interface settings are edited from here, including what happens to
+the tunnel's routes if Xray exits — hold them and drop the traffic, release them
+and fall back to the ordinary connection, or follow the machine's setting.
+
+A session whose core exited while holding its routes is marked **holding
+traffic**, and the expanded row says the routes stay until it reconnects or is
+stopped. A deliberately dead network should not be mistaken for a broken one.
 
 A profile that is up is a **session**; that is the word the CLI, systemd and the
 logs use for it.
@@ -210,6 +216,7 @@ repointing it.
 | **Local proxy** — SOCKS and HTTP ports | Locked, with an explanation, when the daemon's unit pinned them. |
 | **System proxy** | "Send the whole desktop's traffic through oxidom while connected (GNOME)". See [routing.md](routing.md#gnome-system-proxy). |
 | **Reconnect automatically** | "Reconnect only when Xray exits unexpectedly, never after Disconnect". |
+| **Hold traffic if Xray exits** | On by default. The routes stay when the core dies, so the tunnel's traffic is dropped until it comes back rather than falling back to your ordinary connection with your own address. A profile can answer for itself, in the profile editor under Interface. See [when the core dies](routing.md#when-the-core-dies). |
 | **Latency method** | `icmp`, `tcp`, `http_head`, `http_get`. |
 | **Latency check URL** | Target for the HTTP methods. |
 | **Subscription User-Agent** | Free text, plus a **Client preset** list that fills it. |
