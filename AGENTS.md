@@ -113,10 +113,15 @@ separate commit rather than folding it into yours.
 
 ## Testing obligations
 
-The suite is 577 tests, plus eight marked `#[ignore]`, and takes seven seconds
-warm. There is no excuse for sending an untested change. The count is whatever
-`cargo test --workspace` prints, summed across its test binaries — read it
-there rather than trusting this line, which has been wrong before.
+The suite runs in about seven seconds warm, so there is no excuse for sending an
+untested change. How many tests it holds is whatever `cargo test --workspace`
+prints, summed across its test binaries; the handful marked `#[ignore]` need a
+network, a live core or root, and are listed by that attribute rather than here.
+
+This paragraph used to name a figure. It was wrong twice — 521 against a suite
+of 577 — because every change that adds a test invalidates it and no check
+compares the two. A number that only a person can notice going stale is not a
+fact this document can keep.
 
 - **Every bug fix ships with a regression test that fails without the fix.**
   Write the test first and watch it fail; a test that passes before your change
