@@ -23,7 +23,7 @@ use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
-    SwitcherItem, active_latency_for, card_action, human_bytes, latency_states,
+    SwitcherItem, about_comments, active_latency_for, card_action, human_bytes, latency_states,
     missing_core_message, other_profiles_message, pool_action, pool_short_label, press_stops,
     reduce, selected_status, session_for, session_rows, switcher_items, switcher_visible,
 };
@@ -769,6 +769,24 @@ fn build(
         "Choose connection profile",
     )]);
 
+    // The primary menu, and the first one in this window that is not about a
+    // page: everything else in the header appears and disappears with the
+    // view. It carries the two things that are true wherever the user is.
+    let primary_menu = gtk::gio::Menu::new();
+    let window_section = gtk::gio::Menu::new();
+    window_section.append(Some("_Quit"), Some("win.quit"));
+    primary_menu.append_section(None, &window_section);
+    let about_section = gtk::gio::Menu::new();
+    about_section.append(Some("_About oxidom"), Some("win.about"));
+    primary_menu.append_section(None, &about_section);
+    let primary_menu_button = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .tooltip_text("Main menu")
+        .menu_model(&primary_menu)
+        .css_classes(["flat"])
+        .build();
+    primary_menu_button.update_property(&[gtk::accessible::Property::Label("Main menu")]);
+
     let header = adw::HeaderBar::new();
     header.pack_start(&sidebar_toggle);
     header.pack_start(&search_toggle);
@@ -780,6 +798,12 @@ fn build(
     // that it belonged beside the search because both are "find the servers I
     // mean". It cost nothing vertically and nobody found it. It now lives at
     // the head of the chip row, where the scopes it builds are.
+
+    // The primary menu is packed before the page menus so that it is the
+    // outermost button on the right: the one control that does not move as the
+    // view changes should not be the one that shifts when a page menu appears
+    // beside it.
+    header.pack_end(&primary_menu_button);
     header.pack_end(&profile_actions);
     header.pack_end(&subscription_actions);
     header.pack_end(&settings_actions);
@@ -1105,6 +1129,9 @@ impl Controller {
             &["<Control>q"],
             Box::new(|controller| controller.request_quit()),
         );
+        // No accelerator: F1 belongs to help, which this is not, and every
+        // other free chord would be one a user has to be told about.
+        add("about", &[], Box::new(|controller| controller.show_about()));
         add(
             "close",
             &["<Control>w"],
@@ -1130,6 +1157,48 @@ impl Controller {
         }
 
         self.window.insert_action_group("win", Some(&actions));
+    }
+
+    /// The About window: the only place in the interface that says which
+    /// versions are running.
+    ///
+    /// The daemon's answer is taken from the copy fetched at startup rather
+    /// than asked for again, because `RuntimeInfo` blocks — it walks `$PATH`
+    /// and spawns the core — and this is the main thread. `None` there is read
+    /// the same way the core banner reads it: a daemon that cannot answer
+    /// `RuntimeInfo` at all predates the method, so it also predates the
+    /// versions, and the skew sentence says so.
+    ///
+    /// The copied block is the dialog's own debug information page, which
+    /// libadwaita gives a Copy and a Save button. Writing a third button here
+    /// would have put the same text behind a control nobody recognises.
+    fn show_about(self: &Rc<Self>) {
+        let versions = {
+            let runtime = self.runtime.borrow();
+            oxidom_core::versions::Versions::here(
+                env!("CARGO_PKG_VERSION"),
+                runtime
+                    .as_ref()
+                    .and_then(|info| info.daemon_version.as_deref()),
+                runtime
+                    .as_ref()
+                    .and_then(|info| info.core_version.as_deref()),
+                Some(self.state.borrow().client.source()),
+            )
+        };
+        let dialog = adw::AboutDialog::builder()
+            .application_name("oxidom")
+            .application_icon(APP_ID)
+            .developer_name("keepinfov")
+            .version(&versions.app)
+            .comments(about_comments(&versions))
+            .license_type(gtk::License::MitX11)
+            .website("https://github.com/keepinfov/oxidom")
+            .issue_url("https://github.com/keepinfov/oxidom/issues")
+            .debug_info(versions.clipboard())
+            .debug_info_filename("oxidom-versions.txt")
+            .build();
+        dialog.present(Some(&self.window));
     }
 
     /// Ctrl+V anywhere but a text field: take whatever is on the clipboard and

@@ -29,6 +29,7 @@ pub mod sync;
 pub mod sysproxy;
 pub mod tls_pin;
 pub mod tun;
+pub mod versions;
 pub mod xray;
 
 pub const APP_ID: &str = "dev.keepinfov.oxidom";

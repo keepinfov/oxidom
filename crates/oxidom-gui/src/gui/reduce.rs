@@ -20,6 +20,7 @@ use oxidom_core::logbook::LogSlice;
 use oxidom_core::model::{OutboundSpec, Subscription};
 use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
 use oxidom_core::profile::RouteMode;
+use oxidom_core::versions::Versions;
 use oxidom_core::xray::core::Status;
 
 use super::operation::{UiOperation, UiOperationKind};
@@ -1732,6 +1733,39 @@ pub(super) fn missing_core_message(runtime: Option<&RuntimeInfo>) -> Option<Stri
     }
     None
 }
+
+/// The summary the About window carries under the application's name.
+///
+/// `AdwAboutDialog` holds one version as a property, and this window runs
+/// three programs: itself, the daemon and the core. The other two go here,
+/// where they are read on the page that opens rather than behind a
+/// Troubleshooting link — the whole complaint the About window answers is that
+/// finding out what is running takes going somewhere else.
+///
+/// The skew sentence goes last and only when there is one. A window that warns
+/// about something every time it opens is a window whose warnings stop being
+/// read.
+pub(super) fn about_comments(versions: &Versions) -> String {
+    let daemon = match versions.daemon.as_deref() {
+        Some(version) => format!("Daemon {version} — {}", versions.daemon_kind()),
+        None => format!("Daemon version unknown — {}", versions.daemon_kind()),
+    };
+    let core = match versions.core.as_deref() {
+        Some(core) => core.to_string(),
+        None => "No Xray core".to_string(),
+    };
+    let mut text = format!("{APP_SUMMARY}\n\n{daemon}\n{core}");
+    if let Some(skew) = versions.skew() {
+        text.push_str("\n\n");
+        text.push_str(&skew);
+    }
+    text
+}
+
+/// The same sentence the AppStream metadata carries as `<summary>`. Kept
+/// identical on purpose: a user meets it in a software centre before install
+/// and in this window afterwards, and two wordings would read as two programs.
+pub(super) const APP_SUMMARY: &str = "Xray client for the GNOME desktop";
 
 /// What Settings can offer for the geo data, which is not the same question as
 /// whether the data is missing.
@@ -4478,5 +4512,64 @@ mod tests {
             true,
         );
         assert!(state.readings.contains_key("a"));
+    }
+
+    fn versions(daemon: Option<&str>, core: Option<&str>) -> Versions {
+        Versions {
+            app: "0.2.0".to_string(),
+            daemon: daemon.map(str::to_string),
+            core: core.map(str::to_string),
+            source: Some(DaemonSource::System),
+            install: oxidom_core::versions::Install::Package,
+            distribution: Some("Fedora Linux 42".to_string()),
+            desktop: Some("GNOME, wayland".to_string()),
+        }
+    }
+
+    /// The dialog carries this window's own version as a property. The two
+    /// programs it has no property for are the two a reporter is asked about
+    /// and cannot see, so they are the ones this text exists to name.
+    #[test]
+    fn the_about_summary_names_the_daemon_and_the_core() {
+        assert_eq!(
+            about_comments(&versions(Some("0.2.0"), Some("Xray 26.3.27"))),
+            "Xray client for the GNOME desktop\n\n\
+             Daemon 0.2.0 — the system daemon\n\
+             Xray 26.3.27"
+        );
+    }
+
+    /// A window that warns every time it opens is a window whose warnings are
+    /// not read, so a daemon of this build gets no sentence at all.
+    #[test]
+    fn a_daemon_of_this_build_draws_no_warning() {
+        let text = about_comments(&versions(Some("0.2.0"), Some("Xray 26.3.27")));
+        assert!(!text.contains("older"), "{text}");
+        assert!(!text.contains("restarted"), "{text}");
+    }
+
+    #[test]
+    fn a_daemon_from_another_build_is_named_as_such_at_the_end() {
+        let text = about_comments(&versions(Some("0.1.0"), Some("Xray 26.3.27")));
+        assert!(
+            text.ends_with("Some controls will be missing until it is restarted."),
+            "{text}"
+        );
+        assert!(text.contains("Daemon 0.1.0 — the system daemon"), "{text}");
+    }
+
+    /// Both unknowns say what is not known rather than leaving the line out.
+    /// A summary with a line missing reads as a defect in the window; one that
+    /// says "unknown" is a fact about the machine, and it is the fact the
+    /// reporter needs.
+    #[test]
+    fn nothing_unknown_is_left_out_of_the_about_summary() {
+        let text = about_comments(&versions(None, None));
+        assert!(
+            text.contains("Daemon version unknown — the system daemon"),
+            "{text}"
+        );
+        assert!(text.contains("No Xray core"), "{text}");
+        assert!(text.contains("older than this window"), "{text}");
     }
 }
