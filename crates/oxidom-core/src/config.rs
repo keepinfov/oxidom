@@ -24,6 +24,19 @@ pub struct Config {
     /// "app not supported" page to unknown clients, so we default to a widely
     /// recognized client identifier rather than our own.
     pub subscription_user_agent: String,
+    /// Where the geo lists are fetched from.
+    ///
+    /// A setting rather than a constant because the published lists differ in
+    /// what they cover, and for some users a regional list is the difference
+    /// between routing that works and routing that does not. The digest is
+    /// always the `.sha256sum` sidecar beside whichever file is named, so a
+    /// source that publishes none is refused rather than trusted.
+    ///
+    /// Empty means the built-in default — which is how a config file written
+    /// before these existed reads, and how the settings page clears a custom
+    /// address back to the default without needing a second flag.
+    pub geoip_url: String,
+    pub geosite_url: String,
     /// Path (or bare command name) of the Xray core. Empty falls back to
     /// `$OXIDOM_XRAY_BIN` — set by the nix wrapper — and then `xray` on `$PATH`.
     pub xray_binary: String,
@@ -87,6 +100,8 @@ impl Default for Config {
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".to_string(),
             subscription_user_agent: "v2rayN/6.45".to_string(),
+            geoip_url: String::new(),
+            geosite_url: String::new(),
             xray_binary: String::new(),
             tun2socks_binary: String::new(),
             nft_binary: String::new(),
@@ -96,6 +111,19 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Where one geo list is fetched from: the configured address, or the
+    /// built-in default when the setting is empty.
+    ///
+    /// One reader for both, so the daemon that downloads and the dialog that
+    /// says what will be contacted cannot name different hosts.
+    pub fn geo_url(&self, asset: crate::xray::assets::GeoAsset) -> &str {
+        let configured = match asset {
+            crate::xray::assets::GeoAsset::GeoIp => &self.geoip_url,
+            crate::xray::assets::GeoAsset::GeoSite => &self.geosite_url,
+        };
+        crate::xray::assets::resolve_url(asset, configured)
+    }
+
     pub fn load() -> Config {
         let Ok(path) = paths::config_file() else {
             return Config::default();
@@ -128,5 +156,59 @@ mod tests {
     #[test]
     fn reconnect_off_by_default() {
         assert!(!Config::default().reconnect);
+    }
+
+    /// Empty means the built-in default rather than "no source at all", which
+    /// is what makes a config file written before the setting existed behave
+    /// exactly as it did — and what lets the settings page clear a custom
+    /// address back to the default without a second flag to mean "unset".
+    #[test]
+    fn an_unset_geo_source_is_the_built_in_one() {
+        use crate::xray::assets::GeoAsset;
+        let mut config = Config::default();
+        assert_eq!(
+            config.geo_url(GeoAsset::GeoIp),
+            GeoAsset::GeoIp.default_url()
+        );
+        assert_eq!(
+            config.geo_url(GeoAsset::GeoSite),
+            GeoAsset::GeoSite.default_url()
+        );
+
+        config.geoip_url = "   ".to_string();
+        assert_eq!(
+            config.geo_url(GeoAsset::GeoIp),
+            GeoAsset::GeoIp.default_url(),
+            "an address of nothing but spaces is not an address"
+        );
+
+        config.geoip_url = "https://example.invalid/geoip.dat".to_string();
+        assert_eq!(
+            config.geo_url(GeoAsset::GeoIp),
+            "https://example.invalid/geoip.dat"
+        );
+        assert_eq!(
+            config.geo_url(GeoAsset::GeoSite),
+            GeoAsset::GeoSite.default_url(),
+            "the two lists are chosen separately"
+        );
+    }
+
+    /// A file written before these existed must still load, and must load as
+    /// the source it was actually using.
+    #[test]
+    fn a_config_written_before_the_geo_source_existed_still_loads() {
+        let older = r#"
+            socks_port = 10808
+            http_port = 10809
+            subscription_user_agent = "v2rayN/6.45"
+        "#;
+        let config: Config = toml::from_str(older).expect("parses");
+        assert_eq!(config.socks_port, 10808);
+        assert!(config.geoip_url.is_empty());
+        assert_eq!(
+            config.geo_url(crate::xray::assets::GeoAsset::GeoIp),
+            crate::xray::assets::GeoAsset::GeoIp.default_url()
+        );
     }
 }

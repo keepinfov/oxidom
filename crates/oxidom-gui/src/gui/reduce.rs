@@ -21,6 +21,7 @@ use oxidom_core::model::{OutboundSpec, Subscription};
 use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
 use oxidom_core::profile::RouteMode;
 use oxidom_core::versions::Versions;
+use oxidom_core::xray::assets;
 use oxidom_core::xray::core::Status;
 
 use super::operation::{UiOperation, UiOperationKind};
@@ -2126,6 +2127,63 @@ pub(super) fn history_rows(history: &ProbeHistory, now_unix_ms: u64) -> Vec<Hist
             }
         })
         .collect()
+}
+
+/// What the confirmation says before anything is fetched.
+///
+/// A mapper rather than a format string at the call site, because the source is
+/// a setting now and every sentence in it used to assume one: it named GitHub,
+/// and it quoted the sizes of two particular files. Pointed somewhere else,
+/// each of those becomes a confident lie in a dialog whose whole job is to say
+/// what is about to be contacted.
+///
+/// The sizes survive only for the built-in pair, which is the one case where
+/// they are known. A source oxidom has never fetched from is described by its
+/// address and nothing else.
+pub(super) fn geo_download_prompt(
+    geoip: &str,
+    geosite: &str,
+    dir: &str,
+    connected: bool,
+) -> String {
+    let geoip = assets::resolve_url(assets::GeoAsset::GeoIp, geoip);
+    let geosite = assets::resolve_url(assets::GeoAsset::GeoSite, geosite);
+    let default_pair = geoip == assets::GeoAsset::GeoIp.default_url()
+        && geosite == assets::GeoAsset::GeoSite.default_url();
+
+    let hosts: Vec<String> = [geoip, geosite]
+        .iter()
+        .filter_map(|url| assets::host_of(url))
+        .collect();
+    let named = match hosts.as_slice() {
+        [] => "the addresses below".to_string(),
+        [one] => one.clone(),
+        [first, second] if first == second => first.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => "the addresses below".to_string(),
+    };
+    let (geoip_size, geosite_size) = if default_pair {
+        ("\u{2003}about 22 MB", "\u{2003}about 2 MB")
+    } else {
+        ("", "")
+    };
+    let tunnel = if connected {
+        " \u{2014} \"Through the tunnel\" below sends the request over your connection instead."
+    } else {
+        ", and connecting first would let oxidom fetch them through the tunnel."
+    };
+    format!(
+        "oxidom will contact {named} over HTTPS and fetch two files:\n\n\
+         \u{2003}{geoip}\n\u{2003}\u{2192} {dir}/geoip.dat{geoip_size}\n\n\
+         \u{2003}{geosite}\n\u{2003}\u{2192} {dir}/geosite.dat{geosite_size}\n\n\
+         These are the IP and domain lists the core reads to tell your local network \
+         apart from the tunnel. Every configuration oxidom generates needs them.\n\n\
+         {named} is blocked on some networks and in some countries. If this fails, that \
+         is the likely reason{tunnel}\n\n\
+         Each file is checked against the SHA-256 published beside it. That catches a \
+         broken download, not a compromised release \u{2014} there is no signature to \
+         verify. Nothing is executed."
+    )
 }
 
 /// A message written to sit mid-sentence, promoted to standing on its own.
@@ -5062,5 +5120,59 @@ mod tests {
         };
         let rows = history_rows(&history, NOW_MS);
         assert_eq!(rows[0].taken, "HTTP GET · at an unrecorded time");
+    }
+
+    /// Every sentence in this dialog used to assume one source: it named
+    /// GitHub, and it quoted the sizes of two particular files. The address is
+    /// a setting now, so both had to stop being assumptions.
+    #[test]
+    fn the_confirmation_names_the_host_it_will_actually_contact() {
+        let text = geo_download_prompt(
+            "https://mirror.example.invalid/geoip.dat",
+            "https://mirror.example.invalid/geosite.dat",
+            "/var/lib/oxidom/assets",
+            false,
+        );
+        assert!(
+            text.contains("contact mirror.example.invalid over HTTPS"),
+            "{text}"
+        );
+        assert!(
+            text.contains("mirror.example.invalid is blocked on some networks"),
+            "{text}"
+        );
+        assert!(!text.contains("GitHub"), "{text}");
+        assert!(
+            !text.contains("22 MB") && !text.contains("2 MB"),
+            "a size is only known for the list oxidom ships a default for: {text}"
+        );
+    }
+
+    /// Two sources may be two hosts, and saying one of them would be a promise
+    /// about a request that is not the only one being made.
+    #[test]
+    fn two_sources_on_two_hosts_are_both_named() {
+        let text = geo_download_prompt(
+            "https://one.example.invalid/geoip.dat",
+            "https://two.example.invalid/geosite.dat",
+            "/var/lib/oxidom/assets",
+            false,
+        );
+        assert!(
+            text.contains("contact one.example.invalid and two.example.invalid over HTTPS"),
+            "{text}"
+        );
+    }
+
+    /// Unset means the built-in pair, which is the one case where the sizes are
+    /// known — and the wording people already read must not change under them.
+    #[test]
+    fn the_built_in_source_still_says_what_it_always_said() {
+        let text = geo_download_prompt("", "", "/var/lib/oxidom/assets", true);
+        assert!(text.contains("contact github.com over HTTPS"), "{text}");
+        assert!(text.contains("about 22 MB"), "{text}");
+        assert!(text.contains("about 2 MB"), "{text}");
+        assert!(text.contains("Through the tunnel"), "{text}");
+        assert!(text.contains("/var/lib/oxidom/assets/geoip.dat"), "{text}");
     }
 }

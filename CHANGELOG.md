@@ -50,6 +50,30 @@ surface, packaging, or the CLI belongs here.
   the daemon: the reading has carried the method, the route, the time and the detail all
   along, and the card threw four of them away on the way to a badge.
 
+- **Where the geo data comes from is a setting.** The IP and domain lists the core reads to
+  tell your local network apart from the tunnel were fetched from one hardcoded source. The
+  published lists differ in what they cover, and for some countries a regional one is the
+  difference between routing that works and routing that does not — there was no way to say so
+  short of installing the files by hand.
+
+  **Settings › Xray core › Where the geo data comes from** now offers three sources by name —
+  v2fly (the default and unchanged), Loyalsoldier, and runetfreedom for Russia — and accepts any
+  address that publishes the same shape. The two lists are chosen separately, and `config.toml`
+  gains `geoip_url` and `geosite_url`; empty means the built-in source, so a file written before
+  this fetches exactly what it fetched before.
+
+  Two rules hold whatever you point at. **Only `https`**, refused before anything is fetched:
+  the list and the SHA-256 that vouches for it come down the same connection, so over plain HTTP
+  whoever sits between the two machines rewrites both and the check still passes. And **a digest
+  or nothing** — always the `.sha256sum` published beside the file named, so a source offering
+  none is refused rather than installed unverified.
+
+  The confirmation before a download now names the host it will actually contact, and quotes the
+  file sizes only for the built-in pair; it used to say "GitHub" and give two fixed sizes, both
+  of which would have been confident lies pointed anywhere else. The copyable recipe offered to
+  a daemon that cannot install the files itself quotes the configured addresses for the same
+  reason.
+
 - **A problem report is assembled from the log page, with nothing identifying in it.**
   Reporting a bug meant copying log lines by hand and hoping nothing in them was a live
   credential, then going and looking up five things the application already knew. The bug
