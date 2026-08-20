@@ -32,8 +32,9 @@ const LEAST_PING_WARNING: &str = "leastPing concentrates traffic on one node and
     spreading activity across IPs.";
 const NEW_CONNECTIONS_HINT: &str = "Switching between the group's servers affects only new \
     connections; existing connections do not migrate.";
-const POOL_FROM_GROUPS_HINT: &str = "To run several servers at once, save a group on the Servers \
-    page and press Connect on it.";
+const POOL_FROM_GROUPS_HINT: &str = "To run several servers at once, pick them on the Servers \
+    page and press Connect — that needs no profile. A profile is for a systemd unit, the CLI, or \
+    an interface of its own.";
 const LIST_MEMBERSHIP_HINT: &str = "A fixed list. New servers do not join it on their own. Change \
     which servers are in it from the group chips on the Servers page.";
 const RULE_MEMBERSHIP_HINT: &str = "A rule, so servers a future refresh adds can join it. Change \

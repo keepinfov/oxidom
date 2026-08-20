@@ -1410,11 +1410,15 @@ impl ServersView {
         self.connect_button
             .set_tooltip_text(Some(&match (visible, choice.as_ref()) {
                 (0, _) => "Nothing to connect: this selection shows no servers.".to_string(),
+                // No profile is named because none is touched. The strategy's
+                // own sentence ends in a full stop; the one before it has to as
+                // well, or the two run together into a line with no punctuation
+                // between them.
                 (_, Some(choice)) => format!(
-                    "Point the selected profile at these {visible} servers. {} {}",
+                    "Run these {visible} servers now, without saving anything. {}: {}",
                     choice.label, choice.detail
                 ),
-                (_, None) => format!("Point the selected profile at these {visible} servers."),
+                (_, None) => format!("Run these {visible} servers now, without saving anything."),
             }));
         self.connect_save.set_visible(unsaved);
         self.connect_save.set_sensitive(visible > 0);
