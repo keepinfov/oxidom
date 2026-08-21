@@ -13,7 +13,7 @@ use crate::model::{Hysteria2Settings, OutboundSpec, Server, StreamSettings};
 /// `scaffold` always appends `direct` and `block`. Keeping the selectable
 /// outbounds under one prefix oxidom owns is what stops a selector from
 /// resolving to either of those.
-const SELECTABLE_TAG_PREFIX: &str = "s-";
+pub(crate) const SELECTABLE_TAG_PREFIX: &str = "s-";
 
 /// Balancer tag oxidom's own catch-all routing rule dispatches to.
 const BALANCER_TAG: &str = "pool";
