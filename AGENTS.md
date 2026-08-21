@@ -265,6 +265,16 @@ describing is somebody reading the branch and deciding to merge it, and that is
 what it now says. Nothing is loosened: the wait is the same wait, and an agent
 that has pushed a branch is not finished with it until someone else has looked.
 
+The forge is configured to match, and it is written down here because nothing
+in the tree records it: merging is restricted to a merge commit, the merge
+subject is taken from the pull request's title and its body left empty, and the
+branch is deleted on merge. Two places carry the list of permitted methods — the
+repository's own toggles and the branch ruleset — and GitHub honours only what
+**both** allow, so changing one without the other leaves nothing mergeable at
+all. That is the same shape of trap as a required status check whose workflow
+cannot run: the setting looks right in the place you are looking, and the
+pull request is blocked from somewhere else.
+
 Nothing is pushed to `master` directly, nothing is force-pushed, and no
 published history is rewritten.
 
