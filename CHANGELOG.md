@@ -255,6 +255,21 @@ surface, packaging, or the CLI belongs here.
   word matches the CLI, which only ever said remove.
 
 ### Fixed
+- **The server grid opens at the width it has.** Every launch laid the cards out in a single
+  column down the left of a wide window, and the only way to discover the application could
+  do better was to resize it for some unrelated reason. The column arithmetic was right all
+  along; the width was pushed to it exactly once, before the window had its final size, and
+  nothing ever ran it again.
+
+  The width is now pushed at three moments — when the surface is created, on the first turn
+  of the main loop after the window is mapped, and on every later resize — into a setter that
+  does nothing unless the count actually changes. No single one of them has to be right.
+
+  The first count also applies immediately instead of waiting for an idle turn. Deferring it
+  put the opening frame on screen at the starting value of one and repacked afterwards, so a
+  single column flashed on every launch. That was there all along, hidden behind the larger
+  defect while the count never changed at all.
+
 
 - **A tunnel whose core died now holds its traffic instead of releasing it.** When the Xray
   process of a session exited by itself, oxidom removed that session's TUN routes, its

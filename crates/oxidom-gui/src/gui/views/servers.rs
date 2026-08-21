@@ -539,6 +539,19 @@ impl ServersView {
 
     fn schedule_columns(&self, count: usize) {
         self.pending_columns.set(count);
+        // Before any block exists there is nothing to repack and nothing to
+        // coalesce with, so the first count is applied at once. Deferring it
+        // is what put the opening frame on screen at the starting value of
+        // one: the width arrived, computed two, and the repack landed an idle
+        // turn later — a visible flash of a single column on every launch,
+        // separate from the width never being pushed again and hidden behind
+        // it until that was fixed. Cards are built against `columns`, so
+        // settling it before they exist is what makes the first frame right
+        // rather than corrected.
+        if self.blocks.borrow().is_empty() {
+            self.set_columns(count);
+            return;
+        }
         if self.column_update_scheduled.replace(true) {
             return;
         }
