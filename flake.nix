@@ -4,88 +4,131 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs = {
     self,
     flake-parts,
+    crane,
     ...
   } @ inputs:
     flake-parts.lib.mkFlake {inherit inputs;} {
       systems = ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
-      perSystem = {pkgs, ...}: let
+      perSystem = {
+        pkgs,
+        lib,
+        ...
+      }: let
         # Cargo.toml is the one place the version is written. Repeating it here
         # meant a release had to remember two files, and a release that forgot
         # produced packages whose name disagreed with the binary inside them.
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
-        oxidom-cli = pkgs.rustPlatform.buildRustPackage {
-          pname = "oxidom";
-          inherit version;
+
+        # Spliced against this flake's nixpkgs, so the builds, the dev shell and
+        # CI all compile with the same toolchain rather than a second one pinned
+        # by crane's own lock.
+        craneLib = crane.mkLib pkgs;
+
+        # `cleanCargoSource` keeps only cargo's inputs, so the data/ assets the
+        # packages install (icons, desktop entry, metainfo, D-Bus policy) would
+        # be dropped and the postInstall steps below would have nothing to copy.
+        # Start from the default source filter — which strips VCS, editor and
+        # generated files — then keep cargo sources plus everything under data/.
+        src = lib.cleanSourceWith {
           src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          cargoBuildFlags = ["-p" "oxidom"];
-          cargoTestFlags = ["-p" "oxidom" "-p" "oxidom-core"];
-          nativeBuildInputs = with pkgs; [pkg-config makeWrapper];
-          # Without wrapGAppsHook4 there is no gappsWrapperArgs, so point the daemon at
-          # the nix-provided core by hand: an unwrapped binary falls back to `xray` on
-          # $PATH and a systemd unit has none.
-          postFixup = ''
-            wrapProgram $out/bin/oxidom \
-              --set-default OXIDOM_XRAY_BIN ${pkgs.xray}/bin/xray \
-              --set-default OXIDOM_TUN2SOCKS_BIN ${pkgs.tun2socks}/bin/tun2socks \
-              --set-default OXIDOM_NFT_BIN ${pkgs.nftables}/bin/nft
-          '';
-          postInstall = ''
-            install -Dm444 data/dev.keepinfov.oxidom.Daemon.conf \
-              $out/share/dbus-1/system.d/dev.keepinfov.oxidom.Daemon.conf
-            install -Dm444 data/dev.keepinfov.oxidom.Daemon.service \
-              $out/share/dbus-1/system-services/dev.keepinfov.oxidom.Daemon.service
-          '';
-          # Two binaries end up in the joined package, so nothing can infer which
-          # one `nix run` and `nix bundle` mean. Naming it is also what lets the
-          # AppImage be built straight from this derivation.
-          meta.mainProgram = "oxidom";
+          filter = path: type:
+            lib.cleanSourceFilter path type
+            && (craneLib.filterCargoSources path type
+              || lib.hasPrefix "${toString ./.}/data" (toString path));
         };
-        oxidom-gui = pkgs.rustPlatform.buildRustPackage {
+
+        cliCommon = {
+          inherit src version;
+          pname = "oxidom";
+          nativeBuildInputs = with pkgs; [pkg-config makeWrapper];
+        };
+
+        cliDeps = craneLib.buildDepsOnly (cliCommon
+          // {
+            # Deps for the two crates the CLI builds and tests; oxidom-gui's gtk
+            # stack stays out of the headless package.
+            cargoExtraArgs = "--locked -p oxidom -p oxidom-core";
+          });
+
+        oxidom-cli = craneLib.buildPackage (cliCommon
+          // {
+            cargoArtifacts = cliDeps;
+            cargoBuildExtraArgs = "-p oxidom";
+            cargoTestExtraArgs = "-p oxidom -p oxidom-core";
+            # Without wrapGAppsHook4 there is no gappsWrapperArgs, so point the daemon at
+            # the nix-provided core by hand: an unwrapped binary falls back to `xray` on
+            # $PATH and a systemd unit has none.
+            postFixup = ''
+              wrapProgram $out/bin/oxidom \
+                --set-default OXIDOM_XRAY_BIN ${pkgs.xray}/bin/xray \
+                --set-default OXIDOM_TUN2SOCKS_BIN ${pkgs.tun2socks}/bin/tun2socks \
+                --set-default OXIDOM_NFT_BIN ${pkgs.nftables}/bin/nft
+            '';
+            postInstall = ''
+              install -Dm444 data/dev.keepinfov.oxidom.Daemon.conf \
+                $out/share/dbus-1/system.d/dev.keepinfov.oxidom.Daemon.conf
+              install -Dm444 data/dev.keepinfov.oxidom.Daemon.service \
+                $out/share/dbus-1/system-services/dev.keepinfov.oxidom.Daemon.service
+            '';
+            # Two binaries end up in the joined package, so nothing can infer which
+            # one `nix run` and `nix bundle` mean. Naming it is also what lets the
+            # AppImage be built straight from this derivation.
+            meta.mainProgram = "oxidom";
+          });
+
+        guiCommon = {
+          inherit src version;
           pname = "oxidom-gui";
-          inherit version;
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          cargoBuildFlags = ["-p" "oxidom-gui"];
-          # Named for the same reason the CLI derivation names its own: without
-          # it `buildRustPackage` tests the whole workspace, so `oxidom` and
-          # `oxidom-core` were compiled and run here as well as in the CLI
-          # derivation above and again in the `cargo-test` job. One check
-          # realised the suite three times for one answer. Each derivation now
-          # tests what it builds, and `cargo test --workspace` in `test.yml`
-          # remains the run that covers everything at once.
-          cargoTestFlags = ["-p" "oxidom-gui"];
           nativeBuildInputs = with pkgs; [pkg-config wrapGAppsHook4];
           # adwaita-icon-theme is a runtime dependency, not a link-time one:
           # naming it here is what puts it on the wrapper's XDG_DATA_DIRS. Left
           # out, every symbolic icon in the app falls back to a broken square on
           # a target that has no icon theme installed system-wide.
           buildInputs = with pkgs; [gtk4 libadwaita glib adwaita-icon-theme];
-          preFixup = ''
-            gappsWrapperArgs+=(
-              --set-default OXIDOM_XRAY_BIN ${pkgs.xray}/bin/xray
-              --set-default OXIDOM_BIN ${oxidom-cli}/bin/oxidom
-            )
-          '';
-          postInstall = ''
-            install -Dm444 data/dev.keepinfov.oxidom.svg \
-              $out/share/icons/hicolor/scalable/apps/dev.keepinfov.oxidom.svg
-            install -Dm444 data/dev.keepinfov.oxidom-symbolic.svg \
-              $out/share/icons/hicolor/symbolic/apps/dev.keepinfov.oxidom-symbolic.svg
-            install -Dm444 data/icons/oxidom-funnel-symbolic.svg \
-              $out/share/icons/hicolor/scalable/actions/oxidom-funnel-symbolic.svg
-            install -Dm444 data/dev.keepinfov.oxidom.desktop \
-              $out/share/applications/dev.keepinfov.oxidom.desktop
-            install -Dm444 data/dev.keepinfov.oxidom.metainfo.xml \
-              $out/share/metainfo/dev.keepinfov.oxidom.metainfo.xml
-          '';
-          meta.mainProgram = "oxidom-gui";
         };
+
+        guiDeps = craneLib.buildDepsOnly (guiCommon
+          // {
+            cargoExtraArgs = "--locked -p oxidom-gui";
+          });
+
+        oxidom-gui = craneLib.buildPackage (guiCommon
+          // {
+            cargoArtifacts = guiDeps;
+            cargoBuildExtraArgs = "-p oxidom-gui";
+            # Named for the same reason the CLI derivation names its own: without
+            # it the build compiles the whole workspace, so oxidom and oxidom-core
+            # were compiled and run here as well as in the CLI derivation above.
+            # Each derivation now tests what it builds, and `cargo test
+            # --workspace` in `test.yml` remains the run that covers everything.
+            cargoTestExtraArgs = "-p oxidom-gui";
+            preFixup = ''
+              gappsWrapperArgs+=(
+                --set-default OXIDOM_XRAY_BIN ${pkgs.xray}/bin/xray
+                --set-default OXIDOM_BIN ${oxidom-cli}/bin/oxidom
+              )
+            '';
+            postInstall = ''
+              install -Dm444 data/dev.keepinfov.oxidom.svg \
+                $out/share/icons/hicolor/scalable/apps/dev.keepinfov.oxidom.svg
+              install -Dm444 data/dev.keepinfov.oxidom-symbolic.svg \
+                $out/share/icons/hicolor/symbolic/apps/dev.keepinfov.oxidom-symbolic.svg
+              install -Dm444 data/icons/oxidom-funnel-symbolic.svg \
+                $out/share/icons/hicolor/scalable/actions/oxidom-funnel-symbolic.svg
+              install -Dm444 data/dev.keepinfov.oxidom.desktop \
+                $out/share/applications/dev.keepinfov.oxidom.desktop
+              install -Dm444 data/dev.keepinfov.oxidom.metainfo.xml \
+                $out/share/metainfo/dev.keepinfov.oxidom.metainfo.xml
+            '';
+            meta.mainProgram = "oxidom-gui";
+          });
+
         oxidom = pkgs.symlinkJoin {
           name = "oxidom";
           paths = [oxidom-cli oxidom-gui];
