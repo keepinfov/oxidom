@@ -653,63 +653,6 @@ impl ServerCard {
         action_row.append(&action_spacer);
         action_row.append(&connect_button);
 
-        // Right-click used to be a second way to expand the card, which made it
-        // the only pointer gesture in the app that did nothing a left click did
-        // not already do. The actions it now offers are the buttons above,
-        // driven by `emit_clicked` rather than re-implemented: a menu that
-        // copied their logic would be a second place for it to drift, and this
-        // way each item inherits its source button's sensitivity for free.
-        let context_menu: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
-        let secondary_click = gtk::GestureClick::new();
-        secondary_click.set_button(gtk::gdk::BUTTON_SECONDARY);
-        secondary_click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        secondary_click.connect_pressed({
-            let context_menu = context_menu.clone();
-            let header = header.clone();
-            let connect_button = connect_button.clone();
-            let favourite_button = favourite_button.clone();
-            let edit_alias = edit_alias.clone();
-            let copy_button = copy_button.clone();
-            let ping_button = ping_button.clone();
-            move |_, n_press, x, y| {
-                if click_plan_for_press(gtk::gdk::BUTTON_SECONDARY, n_press)
-                    != ClickPlan::ContextMenu
-                {
-                    return;
-                }
-                let mut slot = context_menu.borrow_mut();
-                let popover = slot.get_or_insert_with(|| {
-                    // Built on first use: a card is recreated on every rebuild,
-                    // and a subscription of six hundred servers should not pay
-                    // for six hundred popovers nobody opens.
-                    let popover = context_popover(&items(
-                        &connect_button,
-                        favourite_button.upcast_ref(),
-                        &edit_alias,
-                        &copy_button,
-                        &ping_button,
-                        pinnable.then_some(&trust_button),
-                    ));
-                    popover.set_parent(&header);
-                    popover
-                });
-                sync_context_labels(
-                    popover,
-                    &items(
-                        &connect_button,
-                        favourite_button.upcast_ref(),
-                        &edit_alias,
-                        &copy_button,
-                        &ping_button,
-                        pinnable.then_some(&trust_button),
-                    ),
-                );
-                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                popover.popup();
-            }
-        });
-        header.add_controller(secondary_click);
-
         // Why the last check produced no number, which the badge cannot say: it
         // has a glyph, a tooltip and a pill to fit in, and "the server did not
         // answer" covers a refused handshake, a wrong TLS parameter and a dead
@@ -815,6 +758,77 @@ impl ServerCard {
         shell.set_hexpand(true);
         shell.append(&header);
         shell.append(&detail_region);
+
+        // Right-click used to be a second way to expand the card, which made it
+        // the only pointer gesture in the app that did nothing a left click did
+        // not already do. The actions it now offers are the buttons above,
+        // driven by `emit_clicked` rather than re-implemented: a menu that
+        // copied their logic would be a second place for it to drift, and this
+        // way each item inherits its source button's sensitivity for free.
+        //
+        // The gesture sits on `shell` rather than on `header`. `header` is a
+        // button fixed at `COMPACT_CARD_HEIGHT` and is `detail_region`'s
+        // sibling, so it is never on the event path for a press that lands in
+        // the detail region — and the menu carries actions that exist nowhere
+        // else while the card is open. `shell` is the parent of both, so it is
+        // on the path for the whole card at either height.
+        //
+        // Bubble, not capture: the seven metadata labels below are selectable
+        // and install GTK's own text menu, which is the one that must win over
+        // text. They are selectable so an address or a failure reason can be
+        // copied out, and a card menu that took the press first would remove
+        // the only way to do it. Bubble runs target to root, so text keeps its
+        // menu and everything else gets the card's.
+        let context_menu: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
+        let secondary_click = gtk::GestureClick::new();
+        secondary_click.set_button(gtk::gdk::BUTTON_SECONDARY);
+        secondary_click.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        secondary_click.connect_pressed({
+            let context_menu = context_menu.clone();
+            let shell = shell.clone();
+            let connect_button = connect_button.clone();
+            let favourite_button = favourite_button.clone();
+            let edit_alias = edit_alias.clone();
+            let copy_button = copy_button.clone();
+            let ping_button = ping_button.clone();
+            move |_, n_press, x, y| {
+                if click_plan_for_press(gtk::gdk::BUTTON_SECONDARY, n_press)
+                    != ClickPlan::ContextMenu
+                {
+                    return;
+                }
+                let mut slot = context_menu.borrow_mut();
+                let popover = slot.get_or_insert_with(|| {
+                    // Built on first use: a card is recreated on every rebuild,
+                    // and a subscription of six hundred servers should not pay
+                    // for six hundred popovers nobody opens.
+                    let popover = context_popover(&items(
+                        &connect_button,
+                        favourite_button.upcast_ref(),
+                        &edit_alias,
+                        &copy_button,
+                        &ping_button,
+                        pinnable.then_some(&trust_button),
+                    ));
+                    popover.set_parent(&shell);
+                    popover
+                });
+                sync_context_labels(
+                    popover,
+                    &items(
+                        &connect_button,
+                        favourite_button.upcast_ref(),
+                        &edit_alias,
+                        &copy_button,
+                        &ping_button,
+                        pinnable.then_some(&trust_button),
+                    ),
+                );
+                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover.popup();
+            }
+        });
+        shell.add_controller(secondary_click);
 
         let root = CardFrame::new(&shell);
         root.set_hexpand(true);

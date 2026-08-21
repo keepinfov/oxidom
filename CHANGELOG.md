@@ -14,6 +14,21 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- **The context menu covers the whole card.** Right-clicking an expanded card opened the menu
+  only in its top 64 pixels; below that nothing happened. The menu is where favouriting,
+  re-checking and the alias dialog live while a card is open — the card's own check button sits
+  in the region a collapsed card hides, which is why the menu borrows it — so for most of the
+  card a user was looking at, those actions were unreachable.
+
+  The gesture was carried by the header, a button of fixed height sitting beside the detail
+  region rather than around it, so a press below the header was never on its path. It is now
+  carried by the box that holds both, and the popover points at where the click happened.
+
+  Selectable text keeps its own menu: the metadata labels are selectable so an address or a
+  failure reason can be copied out, and a card menu that took the press first would have removed
+  the only way to do it.
+
 ## [0.2.0] - 2026-08-21
 
 ### Added
