@@ -106,10 +106,12 @@ const OXIDOM_HOSTS: &[&str] = &[
     "raw.githubusercontent.com",
     "objects.githubusercontent.com",
     // The two reachability targets oxidom ships as defaults: the pool
-    // observatory's `POOL_PROBE_DESTINATION`, which no setting can change, and
-    // the default `latency_test_url`. A user who points the second somewhere
-    // else no longer matches this list, and their host is taken out as any
-    // other is.
+    // observatory's `core_options::DEFAULT_POOL_PROBE` and the default
+    // `latency_test_url`. Both are settings, so a user who points either
+    // somewhere else no longer matches this list, and their host is taken out
+    // as any other is. Kept as defaults rather than resolved from the live
+    // config because this list is about what oxidom ships: a redactor built by
+    // the CLI and one built by the window must produce the same report.
     "connectivitycheck.gstatic.com",
     "www.gstatic.com",
 ];
