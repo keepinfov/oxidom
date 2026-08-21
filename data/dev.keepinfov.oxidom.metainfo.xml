@@ -43,6 +43,33 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.2.0" date="2026-08-21">
+      <description>
+        <p>
+          This release is about the application accounting for itself. An About
+          dialog names the versions of the interface, the daemon and the Xray
+          core, and says so plainly when they disagree. A failed latency check
+          now states its reason on the card, how the check was actually made and
+          how long ago, and the card lists the recent checks rather than the
+          newest number alone.
+        </p>
+        <p>
+          A problem report can be assembled from the log page with addresses,
+          host names, account ids and credentials taken out and marked where
+          they stood, so a log can be attached to a bug report without being
+          read line by line first.
+        </p>
+        <p>
+          A latency check can be called off. A profile can carry its own routing
+          rules. The source of the geo data is a setting. Connecting a group of
+          servers saves nothing and rewrites nothing. The server grid opens at
+          the width it has instead of one column, and a wide window carries a
+          fourth column. A tunnel whose core dies holds its traffic instead of
+          releasing it unprotected. oxidom is also installable from a signed
+          package repository.
+        </p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-08-18">
       <description>
         <p>

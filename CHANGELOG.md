@@ -14,6 +14,8 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-21
+
 ### Added
 - **An import says what it did not take.** Providers ship routing alongside their nodes —
   advertising blocked, one country direct, the rest through the proxy. oxidom reads the
