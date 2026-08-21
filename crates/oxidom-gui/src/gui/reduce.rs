@@ -1760,6 +1760,59 @@ pub(super) enum PoolAction {
     Stop(String),
 }
 
+/// The session a group Connect runs the selection in.
+///
+/// One name, in one place, because it is now written on the bar, in the
+/// tooltip, and in the banner over the page.
+pub(super) const GROUP_CONNECT_SESSION: &str = "default";
+
+/// What the Connect button promises, naming the session it will use.
+///
+/// The tooltip used to say "without saving anything" and name no session, on
+/// the strength of a comment claiming no profile is touched. No profile *file*
+/// is written, which is what that was reaching for — but the session is the
+/// daemon's `default`, and `default.toml`'s ports, its interface, its `[core]`
+/// and its routing block are the ones that apply. Which session runs decides
+/// which ports open and which routing holds, so it is not a detail the button
+/// may leave out.
+pub(super) fn connect_button_tooltip(
+    visible: usize,
+    choice: Option<&ConnectChoice>,
+    selected_profile: &str,
+) -> String {
+    if visible == 0 {
+        return "Nothing to connect: this selection shows no servers.".to_string();
+    }
+    let mut text = format!(
+        "Run these {visible} servers now, in the {GROUP_CONNECT_SESSION} session. \
+         No profile is saved or changed."
+    );
+    if selected_profile != GROUP_CONNECT_SESSION {
+        text.push_str(&format!(" “{selected_profile}” is not used."));
+    }
+    // The strategy's own sentence ends in a full stop; the one before it has to
+    // as well, or the two run together into a line with no punctuation between
+    // them.
+    if let Some(choice) = choice {
+        text.push_str(&format!(" {}: {}", choice.label, choice.detail));
+    }
+    text
+}
+
+/// The line under the bar's title, present only when the header names a profile
+/// this button will not touch.
+///
+/// When the header already says `default` the tooltip has said everything and a
+/// second line would be noise. When it does not, the header is showing a
+/// selected profile with a `Profile: <name>` tooltip beside a button that will
+/// ignore it, and the contradiction belongs where it is caused rather than in a
+/// tooltip nobody hovers.
+pub(super) fn connect_bar_session_note(selected_profile: &str) -> Option<String> {
+    (selected_profile != GROUP_CONNECT_SESSION).then(|| {
+        format!("Runs in the {GROUP_CONNECT_SESSION} session, not in “{selected_profile}”")
+    })
+}
+
 /// Decide what connecting a group does. Nothing here writes anything.
 ///
 /// `members` is the selection as the page resolved it — the server ids the query
@@ -1959,6 +2012,23 @@ pub(super) fn other_profiles_message(
         .iter()
         .filter(|session| session.profile != selected_profile)
         .count();
+    // A group Connect raises its pool in `default`, which is not a profile the
+    // user named and not something out of sight — the bar that started it is on
+    // screen. Reported as "1 more profile is running", it read as the
+    // connection having happened somewhere else entirely.
+    let others: Vec<&SessionInfo> = sessions
+        .iter()
+        .filter(|session| session.profile != selected_profile)
+        .collect();
+    if !others.is_empty()
+        && others.iter().all(|session| {
+            session.profile == GROUP_CONNECT_SESSION && session.selection.kind == "pool"
+        })
+    {
+        return Some(format!(
+            "A group is running in the {GROUP_CONNECT_SESSION} session"
+        ));
+    }
     match count {
         0 => None,
         1 => Some("1 more profile is running".to_string()),
@@ -4200,6 +4270,78 @@ mod tests {
                 .count(),
             1,
             "two failures of the same machine are one piece of news"
+        );
+    }
+
+    /// The bar promised "without saving anything" and named no session, while
+    /// the header could be showing a profile the button would not use. Which
+    /// session runs decides which ports open and which routing applies, so it
+    /// is not a detail a button may leave out.
+    #[test]
+    fn the_connect_bar_names_the_session_it_will_run_in() {
+        let tooltip = connect_button_tooltip(4, None, "default");
+        assert!(
+            tooltip.contains("in the default session"),
+            "the session is unnamed: {tooltip}"
+        );
+        assert!(
+            !tooltip.contains("is not used"),
+            "the header already says default; there is nothing to contradict: {tooltip}"
+        );
+
+        let elsewhere = connect_button_tooltip(4, None, "work");
+        assert!(
+            elsewhere.contains("in the default session")
+                && elsewhere.contains("“work” is not used"),
+            "the selected profile is not named as the one being ignored: {elsewhere}"
+        );
+    }
+
+    /// An empty selection has no session to talk about, and the strategy's own
+    /// sentence still follows the one before it.
+    #[test]
+    fn an_empty_selection_says_there_is_nothing_to_connect() {
+        assert_eq!(
+            connect_button_tooltip(0, None, "work"),
+            "Nothing to connect: this selection shows no servers."
+        );
+        let choice = connect_choices().into_iter().next().expect("a strategy");
+        let tooltip = connect_button_tooltip(2, Some(&choice), "default");
+        assert!(
+            tooltip.contains(choice.label) && tooltip.contains(choice.detail),
+            "the strategy is missing from the tooltip: {tooltip}"
+        );
+    }
+
+    /// The note belongs on the bar rather than only in a tooltip, and only when
+    /// there is a contradiction to resolve.
+    #[test]
+    fn the_bar_says_so_only_when_the_header_names_another_profile() {
+        assert_eq!(connect_bar_session_note("default"), None);
+        assert_eq!(
+            connect_bar_session_note("work").as_deref(),
+            Some("Runs in the default session, not in “work”")
+        );
+    }
+
+    /// After connecting a group, the header went on reporting the selected
+    /// profile as idle and a banner announced "1 more profile is running" — so
+    /// the connection the user had just started read as having happened
+    /// somewhere else. `default` is not a profile they named, and the bar that
+    /// started it is on screen.
+    #[test]
+    fn a_group_in_the_default_session_is_not_reported_as_another_profile() {
+        let mut pool = session("default", "connected", "a");
+        pool.selection.kind = "pool".to_string();
+        assert_eq!(
+            other_profiles_message(&[pool.clone()], "work").as_deref(),
+            Some("A group is running in the default session")
+        );
+
+        // A named profile beside it is out of sight and still counted.
+        assert_eq!(
+            other_profiles_message(&[pool, session("home", "connected", "b")], "work").as_deref(),
+            Some("2 more profiles are running")
         );
     }
 

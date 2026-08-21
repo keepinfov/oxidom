@@ -50,8 +50,23 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   written or confirmed, and the session is the daemon's `default` — the same one a bare `Connect`
   on a single server uses, over `ConnectPool`, its pool counterpart. Pressing it again stops the
   session running that selection, matched on the server ids rather than on the query, so a saved
-  group and the same servers arrived at by hand are one session. Saving stays explicit and stays
-  separate: **New profile from this…**. Repointing a saved profile still rewrites a file and still
+  group and the same servers arrived at by hand are one session.
+  - **The bar names the session (binding).** "Writing nothing" is not "touching nothing":
+    `default.toml`'s ports, its interface, its `[core]` and its routing block are the ones that
+    apply, and which session runs decides which ports are opened and which routing holds. The
+    button says which session it will use, and where the header is showing a different profile the
+    bar says on its face — not only in a tooltip — that the shown profile is not the one used.
+  - **The header's selection governs the single-server click and not this one.** A card click
+    honours the selection and offers to repoint the profile; a group Connect does not read it at
+    all. Two adjacent controls reading one selection two ways is allowed, and stated here, but not
+    left to be discovered: the header goes on reporting the selected profile's own status, which is
+    true, and the bar carries the difference.
+  - **A `default` session running a pool is reported as a group, not as another profile.** The
+    banner exists to name what is out of sight; a pool raised by the bar on screen is not, and
+    `default` is not a profile anybody named. Reported by count, it read as the connection having
+    happened somewhere else.
+
+  Saving stays explicit and stays separate: **New profile from this…**. Repointing a saved profile still rewrites a file and still
   asks first, which is what connecting a *profile* means. Favourites is a built-in list; the card's star is what fills it, and it
   cannot be deleted because the star would have nowhere to put things.
 - **Server grid:** a top block of "loose"/favorite servers, then one **block per subscription**:

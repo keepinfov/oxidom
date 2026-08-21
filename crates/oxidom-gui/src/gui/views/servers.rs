@@ -12,10 +12,11 @@ use oxidom_core::pool::PoolQuery;
 use super::super::group::subscription_description;
 use super::super::prefs::{FAVOURITES_ID, GroupKind, GuiPrefs, ServerGroup};
 use super::super::reduce::{
-    FailureReport, FilterOption, HistoryRow, ServerProfiles, available_countries,
-    available_protocols, available_subscriptions, connect_choices, describe_rule,
-    excludable_servers, filtered_ids, filters_to_query, group_member_ids, groups_holding,
-    moved_in_order, ordered_subscriptions, query_equals_group, toggled_member, upsert_group,
+    FailureReport, FilterOption, GROUP_CONNECT_SESSION, HistoryRow, ServerProfiles,
+    available_countries, available_protocols, available_subscriptions, connect_bar_session_note,
+    connect_button_tooltip, connect_choices, describe_rule, excludable_servers, filtered_ids,
+    filters_to_query, group_member_ids, groups_holding, moved_in_order, ordered_subscriptions,
+    query_equals_group, toggled_member, upsert_group,
 };
 use super::super::server_card::{
     CARD_MEASURE_WIDTH, COMPACT_CARD_HEIGHT, CardConnectionState, CardHandlers, LatencyState,
@@ -242,6 +243,9 @@ pub struct ServersView {
     /// being ignored as it was before. Set once at startup from the D-Bus
     /// capability, the way Settings decides whether to offer a geo download.
     can_cancel_probes: Rc<Cell<bool>>,
+    /// The profile the header is showing, which a group Connect deliberately
+    /// does not use. Kept here so the bar can say so.
+    selected_profile: RefCell<String>,
     subscriptions: Rc<RefCell<Vec<Subscription>>>,
     /// Lowercased "name transport protocol address:port country" per server.
     /// The search matches this, never transient widget text like the
@@ -294,6 +298,7 @@ pub struct ServersView {
     /// strip on every keystroke.
     connect_bar: gtk::Box,
     connect_title: gtk::Label,
+    connect_session: gtk::Label,
     connect_button: adw::SplitButton,
     /// Offered beside Connect only for a scope that is not saved yet: it is the
     /// answer to "and how do I keep this?", asked exactly where it comes up.
@@ -396,6 +401,22 @@ impl ServersView {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .single_line_mode(true)
             .build();
+        // Which session the button will use, said on the bar rather than only in
+        // the tooltip: the header can be showing a different profile at the same
+        // moment, and a contradiction nobody hovers over is one nobody sees.
+        let connect_session = gtk::Label::builder()
+            .xalign(0.0)
+            .visible(false)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let connect_heading = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .hexpand(true)
+            .build();
+        connect_heading.append(&connect_title);
+        connect_heading.append(&connect_session);
         let connect_button = adw::SplitButton::builder()
             .label("Connect")
             .css_classes(["suggested-action"])
@@ -420,7 +441,7 @@ impl ServersView {
             .visible(false)
             .css_classes(["group-connect-bar"])
             .build();
-        connect_bar.append(&connect_title);
+        connect_bar.append(&connect_heading);
         connect_bar.append(&connect_rotation);
         connect_bar.append(&connect_save);
         connect_bar.append(&connect_button);
@@ -458,11 +479,13 @@ impl ServersView {
             // Assumed absent until told otherwise: an unasked question must not
             // paint a control that cannot work.
             can_cancel_probes: Rc::new(Cell::new(false)),
+            selected_profile: RefCell::new(GROUP_CONNECT_SESSION.to_string()),
             chip_bar,
             chip_scroll,
             chip_hint,
             connect_bar,
             connect_title,
+            connect_session,
             connect_button,
             connect_save,
             connect_strategy: Rc::new(Cell::new(0)),
@@ -1446,19 +1469,20 @@ impl ServersView {
             .into_iter()
             .nth(self.connect_strategy.get());
         self.connect_button.set_sensitive(visible > 0);
+        let selected_profile = self.selected_profile.borrow().clone();
         self.connect_button
-            .set_tooltip_text(Some(&match (visible, choice.as_ref()) {
-                (0, _) => "Nothing to connect: this selection shows no servers.".to_string(),
-                // No profile is named because none is touched. The strategy's
-                // own sentence ends in a full stop; the one before it has to as
-                // well, or the two run together into a line with no punctuation
-                // between them.
-                (_, Some(choice)) => format!(
-                    "Run these {visible} servers now, without saving anything. {}: {}",
-                    choice.label, choice.detail
-                ),
-                (_, None) => format!("Run these {visible} servers now, without saving anything."),
-            }));
+            .set_tooltip_text(Some(&connect_button_tooltip(
+                visible,
+                choice.as_ref(),
+                &selected_profile,
+            )));
+        match connect_bar_session_note(&selected_profile) {
+            Some(note) => {
+                self.connect_session.set_label(&note);
+                self.connect_session.set_visible(true);
+            }
+            None => self.connect_session.set_visible(false),
+        }
         self.connect_save.set_visible(unsaved);
         self.connect_save.set_sensitive(visible > 0);
         self.connect_bar.set_visible(true);
@@ -2569,6 +2593,16 @@ impl ServersView {
                 }
             }
         }
+    }
+
+    /// Record which profile the header is showing, so the Connect bar can say
+    /// that it will not be the one used.
+    pub fn set_selected_profile(&self, profile: &str) {
+        if self.selected_profile.borrow().as_str() == profile {
+            return;
+        }
+        *self.selected_profile.borrow_mut() = profile.to_string();
+        self.sync_connect_bar();
     }
 
     /// Record whether the daemon can call a check off, which decides whether
