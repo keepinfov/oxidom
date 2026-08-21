@@ -26,8 +26,21 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   low). The **expanded** card additionally says why the last check produced no number and lists
   the recent checks with the method and age of each — `docs/spec/latency.md` governs both, and the
   list is fetched per server rather than polled with the grid. Whole card is a click target →
-  selects that server. Every server carried by a connected
-  profile is visually marked; the one-profile case is unchanged.
+  selects that server. Every server carried by a connected profile is visually marked; the
+  one-profile case is unchanged.
+  - **An expansion owns the card until it finishes (binding).** The revealed region fades in
+    while the card grows, and the two are guarded separately: a fresh measurement — of the
+    content, or of a new column width — aims the height animation somewhere else rather than
+    replacing it. Guarding both on one generation meant that the pushes which feed an open
+    card, arriving in the same main-loop iteration as the click and one poll later, cancelled
+    the fade; a fade with no terminal write then left the region at the opacity it was built
+    with, and every expanded card in the application was blank while measuring its real
+    contents. Every animation that can be superseded writes its end state on completion, and
+    every push says whether what it draws changed rather than being re-measured for having
+    landed on an open card.
+  - **A region that is not drawn takes no clicks.** Opacity alone does not stop a widget being
+    targeted, so the detail region becomes targetable when the fade finishes and stops being
+    targetable when the card collapses.
 - **Groups:** a chip row above the grid — `All`, one chip per saved group, `+`. A group narrows
   **the one list**, and is never a second block of cards: rendering it as its own block
   shows the same server two or three times and leaves no way to tell which card is real, and

@@ -2079,6 +2079,7 @@ fn when_text(reading: &LatencyReading, now_unix_ms: u64) -> String {
 }
 
 /// One past check, as the expanded card states it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct HistoryRow {
     /// `"41 ms"`, or an em dash when the check produced no number. Never blank:
     /// a row with nothing in this column reads as a rendering fault rather than

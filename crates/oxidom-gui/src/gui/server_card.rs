@@ -106,6 +106,53 @@ impl CardFrame {
             self.queue_resize();
         }
     }
+
+    /// The height the frame is drawing at right now.
+    ///
+    /// `allocated_height` lags this by a layout pass while an animation is
+    /// running, and a refresh that arrives mid-expansion has to start from
+    /// where the card actually stands or the card jumps backwards.
+    fn animated_height(&self) -> i32 {
+        self.imp().height.get()
+    }
+}
+
+/// What a re-measure does to a card that is already open.
+///
+/// Lifted out of the wiring because it is the whole of the defect: the old
+/// code had one branch, [`HeightRefresh::Set`], and took it while an expansion
+/// was in flight. `Set` bumps the generation that both the height animation and
+/// the fade were guarded by, so the card jumped to its full height with its
+/// contents still at zero opacity — a measured, empty card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HeightRefresh {
+    /// Nothing to do: the card is not open, or it already stands at — or is
+    /// already on its way to — that height.
+    Ignore,
+    /// Write the height out: nothing is moving.
+    Set,
+    /// Aim the running animation somewhere else, from where it stands. The
+    /// expansion continues; only its destination changes.
+    Retarget,
+}
+
+/// Decide what a re-measure does. `standing` is where the card is, or where it
+/// is already heading — not where it is drawn this frame, or a refresh
+/// arriving mid-expansion would read the animation's own progress as a change
+/// and restart it on every poll.
+pub(super) fn height_refresh(
+    open: bool,
+    animating: bool,
+    standing: i32,
+    target: i32,
+) -> HeightRefresh {
+    if !open || standing == target {
+        HeightRefresh::Ignore
+    } else if animating {
+        HeightRefresh::Retarget
+    } else {
+        HeightRefresh::Set
+    }
 }
 
 /// How old a reading is, in whole minutes.
@@ -314,6 +361,23 @@ pub struct ServerCard {
     latency_predates_failure: Rc<Cell<bool>>,
     latency_generation: Rc<Cell<u64>>,
     height_generation: Rc<Cell<u64>>,
+    /// Guards the fade separately from the height. One generation for both
+    /// meant that re-measuring the card — which happens on every selection,
+    /// because the history arrives a poll later — cancelled the fade that had
+    /// just started, and nothing ever wrote the opacity again.
+    opacity_generation: Rc<Cell<u64>>,
+    /// Whether a height animation is running, so a re-measure can aim it
+    /// somewhere else instead of cancelling it.
+    height_animating: Rc<Cell<bool>>,
+    /// Where the card stands, or where it is heading. Compared against a fresh
+    /// measurement to tell a real content change from the animation's own
+    /// progress.
+    height_target: Rc<Cell<i32>>,
+    /// What the failure block and the recent-checks list are drawing. The
+    /// re-measure used to be gated on `is_expanded()` alone, so opening a card
+    /// re-measured it whether or not anything had changed.
+    failure_shown: Rc<RefCell<Option<FailureReport>>>,
+    history_shown: Rc<RefCell<Vec<HistoryRow>>>,
 }
 
 impl ServerCard {
@@ -781,6 +845,11 @@ impl ServerCard {
             latency_predates_failure: Rc::new(Cell::new(false)),
             latency_generation: Rc::new(Cell::new(0)),
             height_generation: Rc::new(Cell::new(0)),
+            opacity_generation: Rc::new(Cell::new(0)),
+            height_animating: Rc::new(Cell::new(false)),
+            height_target: Rc::new(Cell::new(COMPACT_CARD_HEIGHT)),
+            failure_shown: Rc::new(RefCell::new(None)),
+            history_shown: Rc::new(RefCell::new(Vec::new())),
         };
         card.apply_latency(latency_state);
         card.set_connection_state(connection_state);
@@ -870,7 +939,15 @@ impl ServerCard {
     /// every card in the grid, and this is the diagnosis on the one card
     /// somebody opened. Pushing it through the badge's channel would have put
     /// a `String` in a `Copy` state that the grid keeps one of per card.
-    pub fn set_failure_report(&self, report: Option<&FailureReport>) {
+    ///
+    /// Returns whether what is drawn changed, which is what decides a
+    /// re-measure. The caller used to re-measure whenever the card was open,
+    /// so every selection disturbed the expansion it had just started.
+    pub fn set_failure_report(&self, report: Option<&FailureReport>) -> bool {
+        if self.failure_shown.borrow().as_ref() == report {
+            return false;
+        }
+        self.failure_shown.replace(report.cloned());
         match report {
             Some(report) => {
                 self.failure_reason.set_label(&report.reason);
@@ -886,6 +963,7 @@ impl ServerCard {
                 self.failure_attempt.set_label("");
             }
         }
+        true
     }
 
     /// Show, or stop showing, what the recent checks measured.
@@ -895,13 +973,22 @@ impl ServerCard {
     /// the daemon by a call of its own rather than taken from the snapshot the
     /// grid polls, so asking for every card would be one D-Bus round trip per
     /// card twice a second.
-    pub fn set_history(&self, rows: &[HistoryRow]) {
+    ///
+    /// Returns whether what is drawn changed, for the same reason as
+    /// [`Self::set_failure_report`] — and with more force here, since the poll
+    /// that feeds this list runs twice a second and rebuilding the rows would
+    /// otherwise re-measure the card on every tick.
+    pub fn set_history(&self, rows: &[HistoryRow]) -> bool {
+        if self.history_shown.borrow().as_slice() == rows {
+            return false;
+        }
+        self.history_shown.replace(rows.to_vec());
         while let Some(child) = self.history_list.first_child() {
             self.history_list.remove(&child);
         }
         if rows.is_empty() {
             self.history.set_visible(false);
-            return;
+            return true;
         }
         for row in rows {
             // Fixed width on the number so the column lines up: "8 ms" and
@@ -930,6 +1017,7 @@ impl ServerCard {
             self.history_list.append(&line);
         }
         self.history.set_visible(true);
+        true
     }
 
     fn apply_latency(&self, state: LatencyState) {
@@ -1124,17 +1212,49 @@ impl ServerCard {
         COMPACT_CARD_HEIGHT.saturating_add(natural.max(minimum).max(0))
     }
 
+    /// Take a fresh measurement of an open card.
+    ///
+    /// Called both when the content under the header changed and when the
+    /// column width did, and in either case it may land in the middle of the
+    /// expansion that is drawing the card. It must not cancel that expansion:
+    /// the fade the expansion started is what makes the region visible at all.
     pub fn resize_expanded(&self, target_height: i32) {
-        if self.expanded.get() {
-            self.height_generation
-                .set(self.height_generation.get().wrapping_add(1));
-            self.root.set_animated_height(target_height);
+        match height_refresh(
+            self.expanded.get(),
+            self.height_animating.get(),
+            self.height_target.get(),
+            target_height,
+        ) {
+            HeightRefresh::Ignore => {}
+            HeightRefresh::Set => {
+                self.height_generation
+                    .set(self.height_generation.get().wrapping_add(1));
+                self.height_animating.set(false);
+                self.height_target.set(target_height);
+                self.root.set_animated_height(target_height);
+            }
+            HeightRefresh::Retarget => {
+                let generation = self.height_generation.get().wrapping_add(1);
+                self.height_generation.set(generation);
+                self.height_target.set(target_height);
+                self.animate_height(
+                    generation,
+                    HeightTransition {
+                        from: self.root.animated_height(),
+                        to: target_height,
+                        duration: EXPAND_DURATION_MS,
+                        easing: adw::Easing::EaseOutCubic,
+                    },
+                    None,
+                );
+            }
         }
     }
 
     pub fn set_expanded_immediately(&self, target_height: i32) {
-        self.height_generation
-            .set(self.height_generation.get().wrapping_add(1));
+        self.bump_generations();
+        self.height_animating.set(false);
+        self.height_target.set(target_height);
         self.expanded.set(true);
         self.root.set_valign(gtk::Align::Start);
         self.root.set_animated_height(target_height);
@@ -1151,26 +1271,40 @@ impl ServerCard {
     /// Cancel any in-flight height animation and snap straight to the compact
     /// state. Used when the card leaves the layout (e.g. filtered out).
     pub fn collapse_immediately(&self) {
-        self.height_generation
-            .set(self.height_generation.get().wrapping_add(1));
+        self.bump_generations();
         self.finish_collapse();
     }
 
+    /// Invalidate every animation in flight on this card at once. Used where
+    /// the card is put into a state directly, so that neither a height frame
+    /// nor a fade frame can arrive afterwards and undo it.
+    fn bump_generations(&self) {
+        self.height_generation
+            .set(self.height_generation.get().wrapping_add(1));
+        self.opacity_generation
+            .set(self.opacity_generation.get().wrapping_add(1));
+    }
+
     pub fn expand(&self, target_height: i32, on_done: Option<Box<dyn FnOnce()>>) {
-        let generation = self.height_generation.get().wrapping_add(1);
-        self.height_generation.set(generation);
+        self.bump_generations();
+        let generation = self.height_generation.get();
         self.expanded.set(true);
-        let current_height = self.root.allocated_height().max(COMPACT_CARD_HEIGHT);
+        self.height_target.set(target_height);
+        let current_height = self.root.animated_height().max(COMPACT_CARD_HEIGHT);
 
         self.root.set_valign(gtk::Align::Start);
         self.root.set_animated_height(current_height);
         self.root.add_css_class("selected-server");
         self.detail_region.set_visible(true);
-        self.detail_region.set_can_target(true);
+        // Not targetable until it is drawn. A region at zero opacity still
+        // takes a click, so the buttons under it were reachable through what
+        // looked like blank space.
+        self.detail_region.set_can_target(false);
 
         if !adw::is_animations_enabled(&self.root) {
+            self.height_animating.set(false);
             self.root.set_animated_height(target_height);
-            self.detail_region.set_opacity(1.0);
+            self.show_detail_region();
             if let Some(on_done) = on_done {
                 on_done();
             }
@@ -1187,7 +1321,7 @@ impl ServerCard {
             on_done,
         );
         self.animate_detail_opacity(
-            generation,
+            self.opacity_generation.get(),
             self.detail_region.opacity(),
             1.0,
             DETAIL_FADE_IN_DURATION_MS,
@@ -1195,14 +1329,24 @@ impl ServerCard {
         );
     }
 
+    /// The end state of a fade in, written whole. Reached from the animation's
+    /// completion and from the path that has no animations to run, so that
+    /// there is exactly one description of what a shown detail region is.
+    fn show_detail_region(&self) {
+        self.detail_region.set_opacity(1.0);
+        self.detail_region.set_can_target(true);
+    }
+
     /// Collapse back to the compact height. `on_shrink` receives the height
     /// delta of every animation frame; the servers view uses it to compensate
     /// the scroll position so the selected card stays pinned on screen while a
     /// card above it shrinks.
     pub fn collapse(&self, on_shrink: Option<Rc<dyn Fn(i32)>>) {
-        let generation = self.height_generation.get().wrapping_add(1);
-        self.height_generation.set(generation);
-        let current_height = self.root.allocated_height().max(COMPACT_CARD_HEIGHT);
+        self.bump_generations();
+        let generation = self.height_generation.get();
+        self.height_animating.set(false);
+        self.height_target.set(COMPACT_CARD_HEIGHT);
+        let current_height = self.root.animated_height().max(COMPACT_CARD_HEIGHT);
 
         if !adw::is_animations_enabled(&self.root) {
             self.finish_collapse();
@@ -1258,6 +1402,8 @@ impl ServerCard {
     }
 
     fn finish_collapse(&self) {
+        self.height_animating.set(false);
+        self.height_target.set(COMPACT_CARD_HEIGHT);
         self.root.set_animated_height(COMPACT_CARD_HEIGHT);
         self.root.remove_css_class("selected-server");
         self.detail_region.set_opacity(0.0);
@@ -1290,22 +1436,39 @@ impl ServerCard {
         let animation =
             adw::TimedAnimation::new(&self.root, f64::from(from), f64::from(to), duration, target);
         animation.set_easing(easing);
-        if let Some(on_done) = on_done {
-            let completion: Completion = Rc::new(RefCell::new(Some(on_done)));
-            animation.connect_done({
-                let card = self.clone();
-                move |_| {
-                    if card.height_generation.get() == generation
-                        && let Some(on_done) = completion.borrow_mut().take()
-                    {
-                        on_done();
-                    }
+        let completion: Completion = Rc::new(RefCell::new(on_done));
+        animation.connect_done({
+            let card = self.clone();
+            move |_| {
+                // A superseded animation still reports itself done, so the
+                // flag is cleared only by the animation that is still the
+                // current one — otherwise a retarget would immediately be
+                // treated as finished.
+                if card.height_generation.get() != generation {
+                    return;
                 }
-            });
-        }
+                card.height_animating.set(false);
+                // The end value, written out: a timed animation's last frame
+                // is whatever the frame clock happened to land on, and the
+                // card must stand exactly at the height that was measured.
+                card.root.set_animated_height(to);
+                if let Some(on_done) = completion.borrow_mut().take() {
+                    on_done();
+                }
+            }
+        });
+        self.height_animating.set(true);
         animation.play();
     }
 
+    /// Fade the detail region, guarded by [`Self::opacity_generation`] and
+    /// **finished by a terminal write**.
+    ///
+    /// Both halves are the defect. Guarding the fade on the height generation
+    /// meant a re-measure cancelled it; having no `connect_done` meant a fade
+    /// that was cancelled before its first frame-clock tick left the region at
+    /// the opacity it was built with, which is zero. Either alone is a blank
+    /// card, and the card measured its real contents the whole time.
     fn animate_detail_opacity(
         &self,
         generation: u64,
@@ -1317,13 +1480,26 @@ impl ServerCard {
         let target = adw::CallbackAnimationTarget::new({
             let card = self.clone();
             move |value| {
-                if card.height_generation.get() == generation {
+                if card.opacity_generation.get() == generation {
                     card.detail_region.set_opacity(value);
                 }
             }
         });
         let animation = adw::TimedAnimation::new(&self.detail_region, from, to, duration, target);
         animation.set_easing(easing);
+        animation.connect_done({
+            let card = self.clone();
+            move |_| {
+                if card.opacity_generation.get() != generation {
+                    return;
+                }
+                if to >= 1.0 {
+                    card.show_detail_region();
+                } else {
+                    card.detail_region.set_opacity(to);
+                }
+            }
+        });
         animation.play();
     }
 }
@@ -1546,9 +1722,51 @@ pub(crate) fn flag_widget(country: Option<&str>, flag_size: i32, globe_size: i32
 #[cfg(test)]
 mod tests {
     use super::{
-        ALIAS_ERROR, CardConnectionState, ClickPlan, LatencyAge, LatencyMethod, LatencyState,
-        alias_validation, click_plan_for_press,
+        ALIAS_ERROR, COMPACT_CARD_HEIGHT, CardConnectionState, ClickPlan, HeightRefresh,
+        LatencyAge, LatencyMethod, LatencyState, alias_validation, click_plan_for_press,
+        height_refresh,
     };
+
+    /// A re-measure that arrives while the card is opening must aim the
+    /// expansion somewhere else, never replace it.
+    ///
+    /// This is the defect in one line. The old code took the `Set` branch
+    /// unconditionally, and `Set` bumps the generation that guarded the fade as
+    /// well as the height — so the card jumped to its measured height with its
+    /// contents still at the opacity they were built with, which is zero. Both
+    /// pushes that feed an open card land in exactly this window: the failure
+    /// block in the same main-loop iteration as the click, the recent checks a
+    /// poll later.
+    #[test]
+    fn a_measurement_that_lands_mid_expansion_aims_it_rather_than_replacing_it() {
+        assert_eq!(
+            height_refresh(true, true, 280, 340),
+            HeightRefresh::Retarget
+        );
+        assert_eq!(height_refresh(true, false, 280, 340), HeightRefresh::Set);
+    }
+
+    /// Nothing is disturbed by a measurement that agrees with where the card
+    /// already stands, or is already going. The comparison is against the
+    /// destination and not against the height being drawn this frame: an
+    /// expansion passes through every height between the two, and comparing
+    /// against the drawn one would read the animation's own progress as a
+    /// change and restart it on every poll.
+    #[test]
+    fn a_measurement_that_changes_nothing_disturbs_nothing() {
+        assert_eq!(height_refresh(true, true, 340, 340), HeightRefresh::Ignore);
+        assert_eq!(height_refresh(true, false, 340, 340), HeightRefresh::Ignore);
+        assert_eq!(
+            height_refresh(false, false, COMPACT_CARD_HEIGHT, 340),
+            HeightRefresh::Ignore,
+            "a card that is not open has no expanded height to refresh"
+        );
+        assert_eq!(
+            height_refresh(false, true, COMPACT_CARD_HEIGHT, 340),
+            HeightRefresh::Ignore,
+            "nor while it is collapsing"
+        );
+    }
 
     #[test]
     fn primary_click_toggles_double_click_activates_and_secondary_opens_the_menu() {

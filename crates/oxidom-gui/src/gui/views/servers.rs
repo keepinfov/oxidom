@@ -2629,10 +2629,11 @@ impl ServersView {
     /// is already open at a fixed height.
     pub fn set_failure_report(&self, server_id: &str, report: Option<&FailureReport>) {
         let changed = match self.cards.borrow().get(server_id) {
-            Some(card) => {
-                card.set_failure_report(report);
-                card.is_expanded()
-            }
+            // `is_expanded()` alone was the test here, so every selection
+            // re-measured the expansion it had just started even when the
+            // block it draws had not moved. The push itself says whether
+            // anything changed.
+            Some(card) => card.set_failure_report(report) && card.is_expanded(),
             None => false,
         };
         if changed {
@@ -2647,10 +2648,7 @@ impl ServersView {
     /// and the list growing a row is a content change under a fixed height.
     pub fn set_history(&self, server_id: &str, rows: &[HistoryRow]) {
         let changed = match self.cards.borrow().get(server_id) {
-            Some(card) => {
-                card.set_history(rows);
-                card.is_expanded()
-            }
+            Some(card) => card.set_history(rows) && card.is_expanded(),
             None => false,
         };
         if changed {
