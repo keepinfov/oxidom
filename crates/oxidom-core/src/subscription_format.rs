@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use base64::Engine as _;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -50,6 +51,153 @@ pub fn parse(body: &str) -> Result<(Vec<Server>, Skipped)> {
         "subscription returned no supported servers (expected a share-link list, Xray or \
          sing-box JSON, or Clash YAML)"
     )
+}
+
+/// What a config body carried besides its servers, and which oxidom did not
+/// apply.
+///
+/// The parser takes outbounds and nothing else. A provider that ships routing
+/// alongside its nodes — advertising blocked, one country direct, the rest
+/// through the proxy — has all of that dropped, and until now the import said
+/// only how many servers it found. Silence there reads as "there was nothing
+/// else in it", which is how the same subscription behaves differently in
+/// oxidom and in another client with nothing to connect the two.
+///
+/// This counts what was recognised and left. It does **not** apply any of it:
+/// deciding whether a provider may choose the routing, or where rule and geo
+/// data is fetched from, is a separate question with a security answer
+/// attached.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotTaken {
+    /// Routing rules the body carried: `route.rules` in sing-box, `rules` in
+    /// Clash, `routing.rules` in a full Xray config.
+    pub rules: usize,
+    /// Named rule sets: `route.rule_set` in sing-box, `rule-providers` in
+    /// Clash. Counted apart from `rules` because they are a different kind of
+    /// thing — a set is usually a *pointer* to rules held somewhere else.
+    pub rule_sets: usize,
+    /// The body named where to fetch rule or geo data from: a `geox-url`
+    /// block, a `rule_set` entry of `type: "remote"`, a `rule-providers` entry
+    /// of `type: http`.
+    ///
+    /// Kept as its own fact because it is the one with a security answer:
+    /// whoever chooses the geo lists chooses which traffic leaves the tunnel,
+    /// and that is a larger power than choosing which servers exist.
+    pub own_source: bool,
+}
+
+impl NotTaken {
+    pub fn is_empty(&self) -> bool {
+        self.rules == 0 && self.rule_sets == 0 && !self.own_source
+    }
+
+    /// What was left, in the one wording the log line and the interface both
+    /// use. Empty when there is nothing to say — never "0 rules", which reads
+    /// as an import that went wrong rather than as a plain subscription.
+    ///
+    /// It says **not applied** rather than naming a count and leaving the
+    /// reader to guess. A number on its own would read as something that
+    /// worked.
+    pub fn summary(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.rules > 0 {
+            let plural = if self.rules == 1 { "" } else { "s" };
+            parts.push(format!("{} routing rule{plural}", self.rules));
+        }
+        if self.rule_sets > 0 {
+            let plural = if self.rule_sets == 1 { "" } else { "s" };
+            parts.push(format!("{} rule set{plural}", self.rule_sets));
+        }
+        let carried = match parts.as_slice() {
+            [] => "its own source for rule or geo data".to_string(),
+            [one] => one.clone(),
+            [one, two] => format!("{one} and {two}"),
+            _ => parts.join(", "),
+        };
+        let source = if self.own_source && !parts.is_empty() {
+            ", and its own source for that data"
+        } else {
+            ""
+        };
+        Some(format!(
+            "carried {carried}{source}, none of which oxidom applied"
+        ))
+    }
+}
+
+/// Read what a subscription body carried besides its servers.
+///
+/// Separate from [`parse`] rather than another value out of it, because the
+/// two answer different questions and only one of them can fail: a body this
+/// cannot read at all carries nothing worth reporting, so every path here ends
+/// in a count rather than an error. It also means the rules are a pure
+/// function over the bytes, which is the only way to hold them to a corpus.
+pub fn not_taken(body: &str) -> NotTaken {
+    let text = decode_body(body);
+    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+        return not_taken_from(&value);
+    }
+    if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text)
+        && let Ok(value) = serde_json::to_value(value)
+    {
+        return not_taken_from(&value);
+    }
+    // A share-link list carries no routing at all, and neither does anything
+    // this cannot read. Nothing to say is said as nothing.
+    NotTaken::default()
+}
+
+fn not_taken_from(value: &Value) -> NotTaken {
+    // An Xray subscription may be a bare array of configs.
+    if let Some(configs) = value.as_array() {
+        return configs
+            .iter()
+            .map(not_taken_from)
+            .fold(NotTaken::default(), |mut total, one| {
+                total.rules += one.rules;
+                total.rule_sets += one.rule_sets;
+                total.own_source |= one.own_source;
+                total
+            });
+    }
+    let count = |pointer: &str| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    let entries = |pointer: &str| -> &[Value] {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+    };
+
+    // `rule-providers` is a mapping in Clash, not a list.
+    let providers = value.get("rule-providers").and_then(Value::as_object);
+    let rule_sets = count("/route/rule_set") + providers.map_or(0, |map| map.len());
+
+    let remote_set = entries("/route/rule_set")
+        .iter()
+        .any(|entry| entry.get("type").and_then(Value::as_str) == Some("remote"));
+    let remote_provider = providers.is_some_and(|map| {
+        map.values()
+            .any(|entry| entry.get("type").and_then(Value::as_str) == Some("http"))
+    });
+    let own_source = value.get("geox-url").is_some() || remote_set || remote_provider;
+
+    NotTaken {
+        // Clash `rules` is a list of strings; sing-box and Xray hold objects.
+        // All three are counted the same way, because the count is what is
+        // being reported and not the shape.
+        rules: count("/route/rules") + count("/rules") + count("/routing/rules"),
+        rule_sets,
+        own_source,
+    }
 }
 
 fn decode_body(body: &str) -> String {
@@ -979,7 +1127,136 @@ fn string_vec(value: Option<&Value>) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    /// A sing-box body of the shape a panel actually serves: nodes, a rule
+    /// list, and named sets — one of which is a pointer to somewhere else.
+    /// The servers come through and nothing else does, which is correct; the
+    /// count is what makes it say so.
+    #[test]
+    fn a_sing_box_body_reports_the_routing_it_arrived_with() {
+        let body = r#"{
+            "outbounds": [
+                {"type": "vless", "tag": "de", "server": "203.0.113.9", "server_port": 443,
+                 "uuid": "6f8c3d2e-1a4b-4c7d-9e0f-5a6b7c8d9e0f"}
+            ],
+            "route": {
+                "rules": [
+                    {"rule_set": "ads", "outbound": "block"},
+                    {"domain_suffix": [".example.invalid"], "outbound": "direct"}
+                ],
+                "rule_set": [
+                    {"tag": "ads", "type": "remote", "format": "binary",
+                     "url": "https://example.invalid/ads.srs"},
+                    {"tag": "local", "type": "local", "format": "binary",
+                     "path": "local.srs"}
+                ]
+            }
+        }"#;
+        let carried = not_taken(body);
+        assert_eq!(carried.rules, 2);
+        assert_eq!(carried.rule_sets, 2);
+        assert!(
+            carried.own_source,
+            "a rule set of type remote names a host to fetch from"
+        );
+        assert!(!carried.is_empty());
+
+        let (servers, _skipped) = parse(body).expect("the servers still parse");
+        assert_eq!(servers.len(), 1, "no rule may arrive as a server");
+        assert_eq!(servers[0].address, "203.0.113.9");
+    }
+
+    /// The same for Clash, where `rule-providers` is a mapping rather than a
+    /// list and the rules are bare strings.
+    #[test]
+    fn a_clash_body_reports_the_routing_it_arrived_with() {
+        let body = "proxies:\n\
+             \x20 - name: de\n\
+             \x20   type: vless\n\
+             \x20   server: 203.0.113.9\n\
+             \x20   port: 443\n\
+             \x20   uuid: 6f8c3d2e-1a4b-4c7d-9e0f-5a6b7c8d9e0f\n\
+             rules:\n\
+             \x20 - 'RULE-SET,ads,REJECT'\n\
+             \x20 - 'GEOIP,LAN,DIRECT'\n\
+             \x20 - 'MATCH,de'\n\
+             rule-providers:\n\
+             \x20 ads:\n\
+             \x20   type: http\n\
+             \x20   behavior: domain\n\
+             \x20   url: 'https://example.invalid/ads.yaml'\n\
+             geox-url:\n\
+             \x20 geoip: 'https://example.invalid/geoip.dat'\n";
+        let carried = not_taken(body);
+        assert_eq!(carried.rules, 3);
+        assert_eq!(carried.rule_sets, 1);
+        assert!(
+            carried.own_source,
+            "geox-url names where geo data comes from"
+        );
+
+        let (servers, _skipped) = parse(body).expect("the servers still parse");
+        assert_eq!(servers.len(), 1, "no rule may arrive as a server");
+    }
+
+    /// A body that carried nothing but servers must say nothing. "0 rules"
+    /// reads as a defect in the import rather than as a plain subscription.
+    #[test]
+    fn a_body_that_carried_only_servers_says_nothing() {
+        let sing_box = r#"{"outbounds": [
+            {"type": "vless", "tag": "de", "server": "203.0.113.9", "server_port": 443,
+             "uuid": "6f8c3d2e-1a4b-4c7d-9e0f-5a6b7c8d9e0f"}
+        ]}"#;
+        assert_eq!(not_taken(sing_box), NotTaken::default());
+        assert!(not_taken(sing_box).is_empty());
+
+        // A share-link list carries no routing at all, and neither does a body
+        // nothing can read.
+        assert!(
+            not_taken("vless://6f8c3d2e-1a4b-4c7d-9e0f-5a6b7c8d9e0f@203.0.113.9:443#de").is_empty()
+        );
+        assert!(not_taken("<html>not supported</html>").is_empty());
+        assert!(not_taken("").is_empty());
+    }
+
+    /// Local sets point at nothing outside the body, so they are counted but
+    /// they are not a source anybody chose on the user's behalf. The two facts
+    /// are reported apart because only one of them has a security answer.
+    #[test]
+    fn a_set_that_names_no_host_is_counted_but_is_not_a_source() {
+        let body = r#"{
+            "outbounds": [{"type": "vless", "tag": "de", "server": "203.0.113.9",
+                           "server_port": 443,
+                           "uuid": "6f8c3d2e-1a4b-4c7d-9e0f-5a6b7c8d9e0f"}],
+            "route": {"rule_set": [{"tag": "local", "type": "local", "path": "local.srs"}]}
+        }"#;
+        let carried = not_taken(body);
+        assert_eq!(carried.rule_sets, 1);
+        assert!(!carried.own_source);
+        assert!(!carried.is_empty(), "a set is still something not taken");
+    }
+
+    /// A full Xray config drops its rules the same way — `parse` reads
+    /// `routing` only for the balancer tag — so the same silence applied
+    /// there, and the same count ends it.
+    #[test]
+    fn an_xray_config_reports_the_routing_block_it_arrived_with() {
+        let body = r#"[{
+            "remarks": "Imported",
+            "outbounds": [{"protocol": "vless", "tag": "proxy", "settings": {"vnext": [
+                {"address": "203.0.113.9", "port": 443,
+                 "users": [{"id": "6f8c3d2e-1a4b-4c7d-9e0f-5a6b7c8d9e0f"}]}]}}],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
+                {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"}
+            ]}
+        }]"#;
+        let carried = not_taken(body);
+        assert_eq!(carried.rules, 2);
+        assert_eq!(carried.rule_sets, 0);
+        assert!(!carried.own_source);
+    }
+
+    use super::{NotTaken, not_taken, parse};
     use crate::model::{OutboundSpec, PortRange, Protocol};
 
     /// The reported case: a panel lists more servers than this build can read,

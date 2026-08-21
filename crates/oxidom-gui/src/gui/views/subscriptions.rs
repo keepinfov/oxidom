@@ -10,7 +10,7 @@ use oxidom_core::link;
 use oxidom_core::model::{Subscription, UserInfo};
 use oxidom_core::subscription;
 
-use super::super::group::{format_bytes, skipped_note, subscription_description};
+use super::super::group::{format_bytes, not_taken_note, skipped_note, subscription_description};
 use super::{dialog_content, icon_button, set_transient_parent, set_validation, validation_label};
 
 /// Callbacks the subscriptions view invokes.
@@ -709,6 +709,20 @@ fn show_subscription_details(
             .subtitle_lines(4)
             .build();
         details.add(&skipped);
+    }
+    // Not the same row and not the same word. "Skipped" is about servers this
+    // build could not read; this is about routing it read perfectly well and
+    // deliberately left, which is a different answer to a different question.
+    if let Some(note) = not_taken_note(&subscription) {
+        let carried = adw::ActionRow::builder()
+            .title("Routing")
+            .subtitle(format!(
+                "{note} Where traffic goes is decided by this app's own settings, \
+                 not by the subscription."
+            ))
+            .subtitle_lines(4)
+            .build();
+        details.add(&carried);
     }
 
     // The User-Agent belongs next to the subscription and not only in Settings,

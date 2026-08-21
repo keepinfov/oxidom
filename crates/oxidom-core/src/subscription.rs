@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use crate::link::{Skipped, b64_decode};
 use crate::model::{Server, Subscription, UserInfo};
 use crate::subscription_format;
+use crate::subscription_format::NotTaken;
 
 /// Fallback User-Agent when neither the subscription nor config specify one.
 /// Panels commonly gate the response on a recognized client string.
@@ -55,6 +56,10 @@ pub struct FetchResult {
     /// what its own clients understand, so this is routinely non-empty and
     /// routinely the answer to "where did half my servers go".
     pub skipped: Skipped,
+    /// The routing the response carried and oxidom did not apply. Distinct
+    /// from `skipped`, which is about servers this build could not read: this
+    /// is about entries it read perfectly well and deliberately left.
+    pub not_taken: NotTaken,
 }
 
 /// Fetch and parse a subscription.
@@ -129,6 +134,16 @@ pub fn fetch(
     let body = resp.into_string().context("reading subscription body")?;
     let (servers, skipped) = subscription_format::parse(&body)
         .with_context(|| format!("parsing subscription response for User-Agent \"{ua}\""))?;
+    let not_taken = subscription_format::not_taken(&body);
+    if !not_taken.is_empty() {
+        // At info, beside the count of servers, because this is part of what
+        // the import did rather than a diagnostic about it. The URL is never
+        // named: it is a credential.
+        log::info!(
+            "this subscription {}",
+            not_taken.summary().unwrap_or_default()
+        );
+    }
 
     Ok(FetchResult {
         servers,
@@ -136,6 +151,7 @@ pub fn fetch(
         title,
         update_interval,
         skipped,
+        not_taken,
     })
 }
 
@@ -192,6 +208,7 @@ pub fn refresh(sub: &mut Subscription, user_agent: &str, hwid: Option<&str>) -> 
     preserve_server_identity(&sub.servers, &mut res.servers);
     sub.servers = res.servers;
     sub.skipped = res.skipped;
+    sub.not_taken = res.not_taken;
     sub.userinfo = res.userinfo;
     if let Some(t) = res.title {
         sub.name = t;

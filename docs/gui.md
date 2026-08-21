@@ -198,6 +198,24 @@ than ignored.
 
 Locally pasted share links live in a built-in subscription called **My servers**.
 
+Opening a subscription shows two rows only when they have something to report,
+because a row reading "none" on every healthy subscription is furniture:
+
+- **Skipped** — share links in the response this build cannot read. A panel
+  lists what its own clients understand, so this is routinely non-empty and is
+  usually the answer to "the app on my phone shows twenty of these".
+- **Routing** — rules the subscription carried and oxidom **did not apply**.
+  Providers ship routing alongside their nodes: advertising blocked, one country
+  direct, the rest through the proxy. oxidom reads the servers and nothing else,
+  so this row says how many rules and rule sets arrived, whether the body named
+  its own source for rule or geo data, and that none of it was used. Where
+  traffic goes is decided by this application's settings, not by your provider.
+  That is deliberate — whoever chooses the routing chooses which of your traffic
+  goes around the tunnel.
+
+The two are different answers to different questions: Skipped is what could not
+be read, Routing is what was read and left.
+
 ### A certificate you have to decide about
 
 Xray 26 removed the setting that skipped certificate verification, so a server
