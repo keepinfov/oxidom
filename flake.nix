@@ -30,17 +30,20 @@
         # by crane's own lock.
         craneLib = crane.mkLib pkgs;
 
-        # `cleanCargoSource` keeps only cargo's inputs, so the data/ assets the
-        # packages install (icons, desktop entry, metainfo, D-Bus policy) would
-        # be dropped and the postInstall steps below would have nothing to copy.
-        # Start from the default source filter — which strips VCS, editor and
-        # generated files — then keep cargo sources plus everything under data/.
-        src = lib.cleanSourceWith {
-          src = ./.;
-          filter = path: type:
-            lib.cleanSourceFilter path type
-            && (craneLib.filterCargoSources path type
-              || lib.hasPrefix "${toString ./.}/data" (toString path));
+        # Cargo sources plus the three directories the crates actually read:
+        # `data/` and the flag PNGs are `include_bytes!`/`include_str!` inputs as
+        # well as `postInstall` inputs, and the fixtures are needed because this
+        # flake runs `cargo test` inside the CLI derivation. A filter that keeps
+        # only cargo sources drops all three, and the failure lands as an
+        # unresolved `include_str!` rather than as a missing file.
+        src = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            (craneLib.fileset.commonCargoSources ./.)
+            ./data
+            ./crates/oxidom-gui/data
+            ./crates/oxidom-core/src/subscription_format/fixtures
+          ];
         };
 
         cliCommon = {
