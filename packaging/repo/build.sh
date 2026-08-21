@@ -83,6 +83,15 @@ find "$work/pkgs" -type f -printf '  found %f\n' | sort
 
 rm -rf "$out"; mkdir -p "$out"
 gpg --armor --export "$key" > "$out/KEY.gpg"
+# The fingerprint, published beside the key it belongs to. `install.sh` pins this
+# value in its own source so it can refuse a key that does not match; without it
+# published, nobody reading the script can tell whether the pin is the right one.
+fingerprint=$(gpg --with-colons --fingerprint "$key" | awk -F: '/^fpr:/ { print $10; exit }')
+printf '%s\n' "$fingerprint" > "$out/KEY.fingerprint"
+echo "  key fingerprint $fingerprint"
+# Served from the same host as the key, so fetching the installer and fetching
+# the key are one act of trust rather than two.
+install -m 0755 "$(dirname "$0")/../install.sh" "$out/install.sh"
 
 echo "== apt =="
 # pool/ holds the files; dists/ describes them. `apt-ftparchive packages` writes
@@ -183,6 +192,14 @@ cat > "$out/index.html" <<HTML
 <p>A signed apt and rpm repository, so upgrades arrive with the rest of the
 system. Source and releases:
 <a href="https://github.com/$repo">github.com/$repo</a>.</p>
+
+<h2>One line, if you would rather not read four</h2>
+<pre>curl -fsSL $pages_url/install.sh | sh</pre>
+<p>It detects apt or dnf, runs exactly the commands below, and checks the key it
+downloads against the fingerprint it was published with — refusing to install if
+they disagree. Read it first: <a href="$pages_url/install.sh">install.sh</a>.
+The key's fingerprint is
+<code>$fingerprint</code>.</p>
 
 <h2>Debian, Ubuntu</h2>
 <pre>curl -fsSL $pages_url/KEY.gpg | sudo gpg --dearmor -o /usr/share/keyrings/oxidom.gpg

@@ -2838,6 +2838,12 @@ impl Service {
         // hand-written fragment setting on the next Apply click.
         if raw.get("core").is_none() {
             config.core = engine.registry.config.core.clone();
+        } else if raw.pointer("/core/pool_probe_url").is_none() {
+            // And the same one key deeper. A client that knows `[core]` but not
+            // this key sends the section without it, and serde reads that
+            // absence as `None` — which would clear a pool health-check address
+            // the user had set, on the next Apply from an older window.
+            config.core.pool_probe_url = engine.registry.config.core.pool_probe_url.clone();
         }
         if raw.get("tun2socks_binary").is_none() || self.shared.system_bus {
             if self.shared.system_bus
@@ -3277,14 +3283,61 @@ fn confirmation_failure(
     let ConnectionTarget::Pool { members, .. } = target else {
         return "active server did not pass its latency check".to_string();
     };
-    let seen = match rotating {
-        Some(live) => format!("{live} of {} nodes were in rotation", members.len()),
-        None => format!("none of its {} nodes answered", members.len()),
+    // A count on its own names the symptom and not the cause, and under
+    // roundRobin it is actively misleading: every node stays eligible, so the
+    // message reads "3 of 3 nodes were in rotation" while nothing works. The
+    // balancer puts a node in rotation only once the observatory's ping has
+    // come back through it, so the core's own failed pings outrank the count —
+    // and they point at the one thing a user can change.
+    let failed = observatory_failures(logs);
+    let seen = if failed > 0 {
+        format!(
+            "its health check could not be reached through {failed} of {} nodes — the address is \
+             [core] pool_probe_url",
+            members.len()
+        )
+    } else {
+        match rotating {
+            Some(live) => format!("{live} of {} nodes were in rotation", members.len()),
+            None => format!("none of its {} nodes answered", members.len()),
+        }
     };
     format!(
         "the pool carried no traffic within {}s — {seen}",
         POOL_CONFIRM_WINDOW.as_secs()
     )
+}
+
+/// Where the burst observatory names itself in the core's own log.
+const OBSERVATORY_SOURCE: &str = "app/observatory/burst";
+
+/// How many distinct pool members the core failed to reach its health-check
+/// destination through.
+///
+/// Deliberately not folded into `probe::classify_complaint`, which is shared
+/// with the single-server probe path and answers with a `ProbeDetail` — a
+/// verdict on one server. An observatory failure is a verdict on the
+/// destination, and teaching that function about it would make a single-server
+/// check report a pool's wording.
+///
+/// The line is the core's, and reads
+/// `WARN xray/app/observatory/burst  error ping <url> with <tag>: ...`.
+fn observatory_failures(logs: &[String]) -> usize {
+    let mut tags: HashSet<&str> = HashSet::new();
+    for line in logs {
+        if !line.contains(OBSERVATORY_SOURCE) || !line.contains("error ping") {
+            continue;
+        }
+        // The tag sits between " with " and the colon that opens the Go error.
+        // Anything else on the line is the destination, which is already known.
+        if let Some(tail) = line.split(" with ").nth(1)
+            && let Some(tag) = tail.split(':').next()
+            && !tag.trim().is_empty()
+        {
+            tags.insert(tag.trim());
+        }
+    }
+    tags.len()
 }
 
 /// Whether the core's own output says it could not build the outbound at all —
@@ -3359,6 +3412,55 @@ mod tests {
         assert_eq!(
             confirmation_failure(&target, true, &[], None),
             "the pool carried no traffic within 20s — none of its 3 nodes answered"
+        );
+    }
+
+    /// A count on its own names the symptom and not the cause — and under
+    /// roundRobin every node stays eligible, so it reads "3 of 3 nodes were in
+    /// rotation" while nothing works. The balancer puts a node in rotation only
+    /// once the observatory has reached its destination through it, so a failed
+    /// ping is the actual answer and names the setting that changes it.
+    ///
+    /// The lines are the core's own, as they arrive in the log book.
+    #[test]
+    fn a_pool_whose_health_check_never_succeeded_says_so_instead_of_counting_rotation() {
+        let target = pool_target(&["one", "two", "three"]);
+        let logs = vec![
+            "19:02:20  WARN   xray/app/observatory/burst  error ping \
+             https://probe.example/generate_204 with s-01: Head \
+             \"https://probe.example/generate_204\": context deadline exceeded"
+                .to_string(),
+            // The same member failing twice is one member, not two.
+            "19:02:25  WARN   xray/app/observatory/burst  error ping \
+             https://probe.example/generate_204 with s-01: Head \
+             \"https://probe.example/generate_204\": context deadline exceeded"
+                .to_string(),
+            "19:02:26  WARN   xray/app/observatory/burst  error ping \
+             https://probe.example/generate_204 with s-02: Head \
+             \"https://probe.example/generate_204\": context deadline exceeded"
+                .to_string(),
+        ];
+
+        assert_eq!(
+            confirmation_failure(&target, true, &logs, Some(3)),
+            "the pool carried no traffic within 20s — its health check could not be reached \
+             through 2 of 3 nodes — the address is [core] pool_probe_url",
+            "the rotation count outranked the core's own failed pings"
+        );
+    }
+
+    /// A pool that failed for some other reason keeps the wording it had, and
+    /// nothing oxidom writes itself may be read as the core complaining.
+    #[test]
+    fn a_log_without_an_observatory_complaint_still_reports_the_rotation() {
+        let target = pool_target(&["one", "two"]);
+        let logs = vec![
+            "19:02:20  INFO   oxidom  the pool carried no traffic within 20s".to_string(),
+            "19:02:21  INFO   xray  from tcp:127.0.0.1:42204 accepted tcp:example:443".to_string(),
+        ];
+        assert_eq!(
+            confirmation_failure(&target, true, &logs, Some(2)),
+            "the pool carried no traffic within 20s — 2 of 2 nodes were in rotation"
         );
     }
 
