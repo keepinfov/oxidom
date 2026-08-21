@@ -254,6 +254,31 @@ query_strategy = "use_ipv4"
 nothing more: oxidom currently routes everything except private addresses through
 the proxy, which leaves no other class of "direct" name to point it at.
 
+### `pool_probe_url`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `pool_probe_url` | string | unset | Where a pool's balancer sends its health check. Empty means the built-in address. |
+
+A pool's balancer puts a node into rotation only once it has reached this address
+*through* that node. Where the built-in one is blocked, throttled, or simply slow
+through your exits, every pool reports that nothing is in rotation and carries no
+traffic — so this is the setting to change when a pool of servers that pass their
+own latency checks still carries nothing.
+
+```toml
+[core]
+pool_probe_url = "https://your-reachable-host.example/generate_204"
+```
+
+It must be an `http` or `https` address with a host and no credentials, and it is
+refused when saved otherwise. It is deliberately not the same setting as
+`latency_test_url`: that one is only editable while the latency check method is
+HTTP, and the balancer needs an HTTP target whatever method the checks use.
+
+Anything a subscription supplies for this is discarded. A destination chosen by
+somebody else is a URL your core would fetch on a timer, through your own exits.
+
 ### In the GUI
 
 Settings → **Core behaviour** edits the machine's `[core]`; the profile editor

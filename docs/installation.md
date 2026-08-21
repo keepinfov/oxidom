@@ -67,6 +67,31 @@ sudo dnf install oxidom-gui
 On a server, install `oxidom` instead — the daemon and CLI, with no GTK
 dependency at all.
 
+**Or one line.** It detects apt or dnf and runs exactly the commands above,
+printing each one before it does:
+
+```sh
+curl -fsSL https://keepinfov.github.io/oxidom/install.sh | sh
+curl -fsSL https://keepinfov.github.io/oxidom/install.sh | sh -s -- --server
+```
+
+Before trusting it, read it: it is
+[`packaging/install.sh`](../packaging/install.sh) in this repository, served from
+the same host as the key it verifies. It checks the downloaded key against the
+fingerprint pinned in its own source —
+
+```
+05BC 9AA4 B90F F65A CE7F  AE1C 74FE 48BE 84CA 2CCF
+```
+
+— and refuses to install if they disagree, rather than importing whatever
+arrives. The same value is published as
+[`KEY.fingerprint`](https://keepinfov.github.io/oxidom/KEY.fingerprint) beside
+the key, so the pin can be checked against the repository as well as against
+this page. It does **not** enable the system daemon: which daemon runs decides
+where the database lives, and that is not a decision an installer gets to make
+quietly.
+
 The repository is signed, and the packages in it are the same ones attached to
 the release. Only full releases appear; release candidates do not, because a
 repository is what a package manager upgrades to without being asked.
@@ -123,8 +148,8 @@ of all **Ubuntu 24.04 LTS** and **Debian 12**, whose libadwaita is 1.5 and 1.2
 against a floor of 1.7.
 
 ```sh
-chmod +x oxidom-0.1.0-x86_64.AppImage
-./oxidom-0.1.0-x86_64.AppImage
+chmod +x oxidom-*-x86_64.AppImage
+./oxidom-*-x86_64.AppImage
 ```
 
 About 45 MB. It carries its own GTK, libadwaita, icon theme **and glibc**, so

@@ -14,7 +14,87 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Added
+- **A pool's health check is no longer one hard-coded address.** A pool's balancer puts a node into
+  rotation only once it has reached a ping destination *through* that node. That destination was a
+  constant with no setting behind it, so wherever it was blocked, throttled or simply slow through
+  an exit, every pool on the machine reported that nothing was in rotation and carried no traffic —
+  with a count of nodes as the only clue, and nothing saying a health check was the reason.
+
+  **`[core] pool_probe_url`** now sets it, in `config.toml` for the machine and in a profile for one
+  tunnel: two pools through two countries need not share a reachable destination. It appears in
+  **Settings › Core behaviour › Pools** and in the profile editor's matching section. Unset means
+  the built-in address, so a file written before this generates exactly what it generated before.
+
+  It is deliberately not the existing latency check URL, which is only editable while the check
+  method is HTTP — reusing it would drive every pool through an address the interface would not
+  always let you change.
+
+  Whatever a subscription supplies for this is still discarded, unconditionally. A destination
+  chosen by somebody else is a URL your core would fetch on a timer, through your own exits.
+
+- **A one-line installer.** `curl -fsSL https://keepinfov.github.io/oxidom/install.sh | sh` detects
+  apt or dnf and runs exactly the commands the documentation lists, printing each before it runs.
+  It checks the repository key it downloads against a fingerprint pinned in its own source and
+  refuses to install if they disagree — a fetch that does not check the key is trust-on-first-use
+  dressed up as verification. The fingerprint is now published beside the key so the pin can be
+  checked against the repository too. The script is in the repository, so it can be read before it
+  is trusted, and it deliberately does not enable the system daemon.
+
+### Changed
+- **A Debian or Ubuntu user can install oxidom from the README.** `## Install` was the third
+  heading, opened with eight lines of Nix, gave Arch two lines of prose, and for everything else
+  named three build prerequisites and no commands at all — while a signed apt and rpm repository
+  had been documented in `docs/installation.md` all along. Someone on Ubuntu read the top of the
+  file and concluded they had to build from source.
+
+  The apt and dnf lines now sit above the feature list, with the AppImage for distributions too
+  old for the packages and one line saying an Xray core is required and not bundled. `## Install`
+  runs deb and rpm first, Arch next, Nix last, and `## Try it` leads with the installed binaries
+  rather than `nix run`. The README also claimed oxidom was on the AUR, which
+  `docs/installation.md` says it is not; that is corrected.
+
 ### Fixed
+- **A pool that carried no traffic says whether its health check ever succeeded.** The message gave
+  a count and no cause, and under round-robin rotation the count actively misled: every node stays
+  eligible, so it read "3 of 3 nodes were in rotation" while nothing worked. Where the core's own
+  log shows the health check failing, that is now what is reported, and it names the setting that
+  changes the address.
+
+- **A problem report no longer names the provider.** Server aliases survived a report in full,
+  inside every access line the core writes: `[socks-in >> s-nl-soda-vpn]`. That tag is `s-` plus
+  the server's alias, and the alias is derived from the server's name and its country — so it named
+  the provider and usually the exit country, which is the one thing the bug form asks a reporter
+  not to include. No rule reached it: as a token it has no dot, so the host rule never saw it.
+
+  The report is now built with the server list the daemon already holds, so aliases, display names
+  and server addresses are taken out by name rather than by shape. The `s-` namespace stays,
+  because it names nobody and the line is about a pool member. A tag naming a server the report
+  does not know still survives: taking it out would mean redacting on the strength of a
+  two-character prefix.
+
+- **A problem report says which redaction is which.** Every removal carried the same word, so two
+  different hosts read identically and one host appearing twice could not be told from two:
+
+      error ping https://[redacted] with ...: Head "https://[redacted] context deadline exceeded
+
+  Both of those were the same URL, and nothing said so. Marks are now numbered per report —
+  `[host 1]`, `[host 2]`, `[address 1]`, `[node 1]` — so the same value carries the same number
+  wherever it appears, and a failure followed through a log cannot be read as a sequence of events
+  that never happened. A server's alias, name and address share one number, because they are one
+  server. Credentials are deliberately not numbered.
+
+- **A problem report states what it kept, and why.** The footer said what had been removed, in four
+  categories, and named none of the marks — `[machine]` and `[user]` appeared in reports and were
+  documented nowhere. It said nothing about what was kept on purpose, so a reader seeing
+  `127.0.0.1:1080` and `geoip.dat` intact beside a redaction could not tell a decision from a miss.
+
+  It now names every mark a report can contain and what each stood for, says that loopback, the
+  unspecified address, ports and oxidom's own names are kept deliberately, and says that the rules
+  read shapes rather than meanings and are best-effort. The report ends by asking the reporter to
+  read it through; that is only actionable if they know what the rules were meant to catch. The
+  wording lives in one table now, so the footer and the marks cannot drift apart.
+
 - **The context menu covers the whole card.** Right-clicking an expanded card opened the menu
   only in its top 64 pixels; below that nothing happened. The menu is where favouriting,
   re-checking and the alias dialog live while a card is open — the card's own check button sits
@@ -28,6 +108,7 @@ surface, packaging, or the CLI belongs here.
   Selectable text keeps its own menu: the metadata labels are selectable so an address or a
   failure reason can be copied out, and a card menu that took the press first would have removed
   the only way to do it.
+
 
 ## [0.2.0] - 2026-08-21
 
