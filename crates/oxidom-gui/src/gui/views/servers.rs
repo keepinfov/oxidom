@@ -2530,11 +2530,17 @@ impl ServersView {
     ///
     /// The passed states are the authority rather than the set this view keeps,
     /// which is why the set is rebuilt from them here too.
+    ///
+    /// The set holds the checks a stop would actually reach, not every check in
+    /// flight. Both controls are drawn from it, so a spinner turning on a check
+    /// that cannot be called off shows no stop — the same rule that already
+    /// keeps the stop away from a daemon too old to know the verb, applied to
+    /// the check rather than to the daemon.
     fn sync_probing(&self, latency_states: &HashMap<String, LatencyState>) {
         let mut checking = self.checking.borrow_mut();
         checking.clear();
         for (id, state) in latency_states {
-            if *state == LatencyState::Checking {
+            if matches!(state, LatencyState::Checking { stoppable: true }) {
                 checking.insert(id.clone());
             }
         }
@@ -2660,7 +2666,10 @@ impl ServersView {
         if let Some(card) = self.cards.borrow().get(server_id) {
             card.set_latency_state(state);
         }
-        self.track_checking(server_id, state == LatencyState::Checking);
+        self.track_checking(
+            server_id,
+            matches!(state, LatencyState::Checking { stoppable: true }),
+        );
         // `Checking` says nothing about where the card belongs in a latency
         // sort, so it leaves the previous key alone rather than clearing it.
         match sort_value(state) {
@@ -2669,7 +2678,7 @@ impl ServersView {
                     .borrow_mut()
                     .insert(server_id.to_string(), value);
             }
-            None if state != LatencyState::Checking => {
+            None if !matches!(state, LatencyState::Checking { .. }) => {
                 self.latencies.borrow_mut().remove(server_id);
             }
             None => {}
@@ -3573,7 +3582,7 @@ fn sort_value(state: LatencyState) -> Option<Option<u32>> {
         // absence of a reading, exactly like a server nobody has measured.
         LatencyState::Unmeasured
         | LatencyState::Superseded
-        | LatencyState::Checking
+        | LatencyState::Checking { .. }
         | LatencyState::NotRun(_) => None,
     }
 }

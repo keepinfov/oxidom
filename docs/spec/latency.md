@@ -172,6 +172,30 @@ from "this daemon is too old to ask": called with an empty list, a current daemo
 an older one answers `UnknownMethod`, which is how `Client::supports_probe_cancel` decides whether
 to offer a stop control at all.
 
+**A stop is offered only where a cancel reaches (binding).** The two preceding paragraphs are
+what a client has to draw from, not merely obey: a check that is already measuring, and a check for
+the server carrying the tunnel, are both beyond a cancel, so a control offering to stop either is a
+control that will be pressed and do nothing. The reading of `ProbeState` therefore keeps `running`
+and `queued` apart — folding them into "the daemon holds this id" answers whether a number is
+pending, which is a different question — and a card whose check cannot be stopped keeps its spinner
+and offers no stop. This is the same rule already stated for a daemon too old to know the verb,
+applied to the check rather than to the daemon. Before any snapshot has mentioned an id there is
+nothing to read the phase from, and the control switches on the press rather than waiting a poll;
+the route is known from the first frame, so the connected server's check never offers a stop at all.
+
+**A stop says what it stopped.** The count above is answered so a client can use it, and a client
+that discards it leaves the user watching spinners to work out whether the press landed — about ten
+seconds, on a sweep. It is reported as news and never as an error, and zero is its own sentence
+rather than a number, because "there was nothing left to stop" is a different fact from a stop that
+dropped nothing. The activity indicator is refreshed at the press, not at whichever later poll
+happens to shrink.
+
+**A check that was stopped is distinguishable from one that failed.** A cancelled reading, a
+machine with no network and a machine with no core are three conditions and must not share one
+appearance: the first is the user's own doing and the other two are not, and telling them apart is
+the whole of what a card is asked right after a stop. The stopped one is ruled off rather than
+coloured as a fault.
+
 **A cancel only ever drops `Direct` jobs (binding).** A `Proxied` job is the confirmation deciding
 whether a live tunnel stays up; it is keyed by profile rather than by the server a user is looking
 at, and `spawn_active_probe_loop` re-enqueues it every thirty seconds regardless. Calling one off

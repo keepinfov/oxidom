@@ -23,11 +23,12 @@ use oxidom_core::{paths, sysproxy};
 use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
-    CardAction, Effect, PolledSnapshot, PoolAction, ProbeWait, SessionRowState, SnapshotState,
-    SwitcherItem, about_comments, active_latency_for, card_action, geo_download_prompt,
-    history_rows, human_bytes, latency_states, missing_core_message, other_profiles_message,
-    pool_action, pool_short_label, press_stops, reduce, selected_status, session_for, session_rows,
-    switcher_items, switcher_visible,
+    CardAction, Effect, PolledSnapshot, PoolAction, ProbePhase, ProbeWait, SessionRowState,
+    SnapshotState, SwitcherItem, about_comments, active_latency_for, card_action,
+    check_can_be_stopped, geo_download_prompt, history_rows, human_bytes, latency_states,
+    missing_core_message, other_profiles_message, pool_action, pool_short_label, press_stops,
+    reduce, selected_status, session_for, session_rows, stop_report, switcher_items,
+    switcher_visible,
 };
 use super::server_card::{self, LatencyState};
 use super::sidebar::{Page, Sidebar};
@@ -2634,16 +2635,26 @@ impl Controller {
     /// Mark a card as checking and ask the daemon for a probe. Results come
     /// back through the poll snapshot; the daemon caps concurrency.
     fn probe_one(self: &Rc<Self>, server_id: String, notify_failure: bool) {
+        let stoppable;
         {
             let mut state = self.state.borrow_mut();
             // A press while this card is checking means stop, not "ignore me".
             // Answering the same gesture with silence, twice over — the daemon
             // drops the duplicate too — is what made the control feel dead.
-            if state.ui.checking.contains_key(&server_id) {
+            if let Some(wait) = state.ui.checking.get(&server_id).copied() {
+                let reaches = check_can_be_stopped(wait.phase, state.ui.is_proxied(&server_id));
                 drop(state);
-                self.cancel_probes(vec![server_id]);
+                // A press while this card is checking means stop only where a
+                // stop lands. Where it does not, the button is not showing one,
+                // and asking the daemon to drop a job it cannot drop would
+                // report back that nothing was stopped — for a press that was
+                // never a stop.
+                if reaches {
+                    self.cancel_probes(vec![server_id]);
+                }
                 return;
             }
+            stoppable = check_can_be_stopped(ProbePhase::Unknown, state.ui.is_proxied(&server_id));
             state
                 .ui
                 .checking
@@ -2653,15 +2664,19 @@ impl Controller {
             }
         }
         self.servers
-            .set_latency_state(&server_id, LatencyState::Checking);
+            .set_latency_state(&server_id, LatencyState::Checking { stoppable });
         self.refresh_activity_status();
         self.request_probes(vec![server_id]);
     }
 
     fn enqueue_probes(self: &Rc<Self>, ids: Vec<String>) {
-        if press_stops(&ids, &self.state.borrow().ui.checking) {
-            self.cancel_probes(ids);
-            return;
+        {
+            let state = self.state.borrow();
+            if press_stops(&ids, &state.ui.checking, &state.ui.sessions) {
+                drop(state);
+                self.cancel_probes(ids);
+                return;
+            }
         }
         let new_ids: Vec<String> = {
             let mut state = self.state.borrow_mut();
@@ -2681,15 +2696,20 @@ impl Controller {
             return;
         }
         for id in &new_ids {
-            self.servers.set_latency_state(id, LatencyState::Checking);
+            let stoppable = {
+                let state = self.state.borrow();
+                check_can_be_stopped(ProbePhase::Unknown, state.ui.is_proxied(id))
+            };
+            self.servers
+                .set_latency_state(id, LatencyState::Checking { stoppable });
         }
         self.refresh_activity_status();
         self.request_probes(new_ids);
     }
 
-    /// Ask the daemon to call off checks.
+    /// Ask the daemon to call off checks, and say what was called off.
     ///
-    /// Nothing is repainted here, and that is deliberate rather than lazy. The
+    /// No card is repainted here, and that is deliberate rather than lazy. The
     /// daemon leaves a `Cancelled` reading for every id it drops, so those ids
     /// leave `running ∪ queued` and the reducer retires their spinners on the
     /// next poll through the path it already uses for a finished check. Anything
@@ -2697,20 +2717,55 @@ impl Controller {
     /// card retires when its own reading lands. Deciding here which of the two a
     /// card is would be a second copy of a rule the reducer already owns, and
     /// the copy would be the one that is wrong.
+    ///
+    /// The count is not thrown away, though, and that was the defect. Stopping
+    /// a sweep of several hundred servers takes about ten seconds to show, so
+    /// with nothing said the natural reading of the press was that it was
+    /// missed. `CancelProbes` answers with how many it dropped precisely so a
+    /// client can tell a real stop from "there was nothing left to stop"
+    /// (`docs/spec/latency.md`), and the activity indicator is refreshed at the
+    /// press rather than at whichever later poll happens to shrink.
     fn cancel_probes(self: &Rc<Self>, ids: Vec<String>) {
         if ids.is_empty() {
             return;
         }
         let client = self.state.borrow().client.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            // Fire and forget, with the failure in the log rather than a toast:
-            // the checks carry on, every card still says so, and interrupting
-            // the user to report that stopping failed is worse than letting the
-            // spinners speak for themselves.
-            if let Err(error) = client.cancel_probes(&ids) {
-                log::warn!("could not call off the latency checks: {error:#}");
-            }
+            let _ = sender.send(
+                client
+                    .cancel_probes(&ids)
+                    .map_err(|error| format!("{error:#}")),
+            );
         });
+        // The same 40 ms poll `request_probes` uses to bring a worker's answer
+        // back to the main thread.
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(40), move || {
+            let answer = match receiver.try_recv() {
+                Ok(answer) => answer,
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    log::warn!("the request to call off the latency checks did not complete");
+                    return glib::ControlFlow::Break;
+                }
+            };
+            if let Some(controller) = weak.upgrade() {
+                match answer {
+                    // A stop is not a failure, so this is a plain message and
+                    // never `show_error`: reporting it as one would tell the
+                    // user their own decision went wrong.
+                    Ok(dropped) => controller.show_message(&stop_report(dropped)),
+                    // The failure goes in the log rather than a toast: the
+                    // checks carry on, every card still says so, and
+                    // interrupting to report that stopping failed is worse than
+                    // letting the spinners speak for themselves.
+                    Err(error) => log::warn!("could not call off the latency checks: {error}"),
+                }
+            }
+            glib::ControlFlow::Break
+        });
+        self.refresh_activity_status();
     }
 
     /// Ask the daemon to probe `ids` on a worker thread, and put the cards
@@ -5064,6 +5119,7 @@ fn install_css() {
            rotating its whole node, background included. */
         .latency-badge { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; font-weight: 500; background: alpha(@window_fg_color, 0.07); }
         .latency-badge.latency-offline { font-size: 1.05em; padding: 1px 8px; font-weight: 700; }
+        .latency-badge.latency-stopped { font-size: 1.05em; padding: 1px 8px; font-weight: 700; }
         .latency-spinner { color: @accent_color; }
         .latency-reachable { color: @accent_color; background: alpha(@accent_color, 0.12); }
         /* Measured through the tunnel: a fact about the connection in use, not
@@ -5074,6 +5130,9 @@ fn install_css() {
         .latency-badge.latency-stale { opacity: 0.55; }
         .latency-error { color: @error_color; background: alpha(@error_color, 0.13); }
         .latency-offline { color: @warning_color; background: alpha(@warning_color, 0.13); }
+        /* A check the user stopped: ruled off in the window's own foreground
+           rather than coloured, because nothing failed. */
+        .latency-stopped { color: alpha(@window_fg_color, 0.55); background: alpha(@window_fg_color, 0.08); }
         .status-badge { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; font-weight: 600; }
         .status-badge.status-neutral { color: alpha(@window_fg_color, 0.68); background: alpha(@window_fg_color, 0.07); }
         .status-badge.status-working { color: @accent_color; background: alpha(@accent_color, 0.13); }

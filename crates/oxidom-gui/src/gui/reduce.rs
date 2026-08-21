@@ -130,6 +130,28 @@ pub(super) struct SnapshotState {
     pub state_epoch: u64,
 }
 
+/// Where a check the daemon holds actually is.
+///
+/// The daemon reports `running` and `queued` separately, and the difference is
+/// the whole of whether a stop can land: `CancelProbes` drops queued jobs and
+/// nothing else, because the at most eight running probes each own a thread
+/// that releases its own slot (`docs/spec/latency.md`). The reducer used to
+/// fold both sets into one and could not tell them apart afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbePhase {
+    /// Asked for, and no snapshot has mentioned it yet. The daemon's answer is
+    /// up to one poll away, and `docs/spec/gui.md` binds that a latency control
+    /// switches on the press rather than on the acknowledgement — a control
+    /// that waits for it reads as one that missed the press. So an unknown
+    /// phase is treated as stoppable, and corrected by the first snapshot that
+    /// holds the id.
+    Unknown,
+    /// Waiting for a slot. A cancel drops it.
+    Queued,
+    /// Measuring. A cancel does not reach it; it ends when it ends.
+    Running,
+}
+
 /// One card's wait for a probe result.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ProbeWait {
@@ -146,6 +168,10 @@ pub(super) struct ProbeWait {
     /// *kept* so the next tick does not read the id as new and raise the
     /// spinner again. It is dropped once the daemon lets the id go.
     pub given_up: bool,
+    /// Queued or running, as of the last snapshot that mentioned this id.
+    ///
+    /// [`ProbePhase::Unknown`] until a snapshot mentions the id.
+    pub phase: ProbePhase,
 }
 
 impl ProbeWait {
@@ -154,6 +180,7 @@ impl ProbeWait {
             since,
             acked: false,
             given_up: false,
+            phase: ProbePhase::Unknown,
         }
     }
 
@@ -225,12 +252,18 @@ impl SnapshotState {
     /// How `id`'s badge should look right now. The one place that decides it,
     /// so a card rebuilt from scratch, a card updated by the poll and a card
     /// swept for age cannot disagree about what the same reading means.
+    /// Whether a check for this server would go through the tunnel.
+    pub fn is_proxied(&self, id: &str) -> bool {
+        probe_is_proxied(&self.sessions, id)
+    }
+
     pub fn card_state(&self, id: &str, now_unix_ms: u64) -> LatencyState {
         let is_active = self.is_active(id);
         latency_state(
             self.shown_reading(id),
-            self.is_checking(id),
+            self.running_wait(id),
             is_active,
+            self.is_proxied(id),
             now_unix_ms,
         )
     }
@@ -282,7 +315,13 @@ impl SnapshotState {
     /// longer a check in progress, and drawing it as one is the thing the
     /// deadline exists to stop.
     pub(super) fn is_checking(&self, id: &str) -> bool {
-        self.checking.get(id).is_some_and(ProbeWait::is_running)
+        self.running_wait(id).is_some()
+    }
+
+    /// The live wait for this id, if the card is drawing a check in progress.
+    /// Carries the phase, which is what decides whether a stop is offered.
+    pub(super) fn running_wait(&self, id: &str) -> Option<ProbeWait> {
+        self.checking.get(id).copied().filter(ProbeWait::is_running)
     }
 
     /// Drop the pin without waiting for the daemon to contradict it. Only for
@@ -414,12 +453,13 @@ pub(super) fn reduce(
 
     // An id the daemon holds — running it, or merely queueing it behind
     // `MAX_CONCURRENT_PROBES` — is a probe that has not produced a number yet.
-    let held: HashSet<&String> = snapshot
-        .probe
-        .running
-        .iter()
-        .chain(snapshot.probe.queued.iter())
-        .collect();
+    //
+    // The two sets are kept apart as well as joined. Whether a number is
+    // pending is the same question for both; whether a stop would reach the
+    // check is not, and folding them was why the interface could not tell.
+    let running: HashSet<&String> = snapshot.probe.running.iter().collect();
+    let queued: HashSet<&String> = snapshot.probe.queued.iter().collect();
+    let held: HashSet<&String> = running.union(&queued).copied().collect();
 
     for (id, reading) in &snapshot.probe.readings {
         if state.readings.get(id) != Some(reading) {
@@ -500,8 +540,30 @@ pub(super) fn reduce(
             .retain(|profile, _| snapshot.probe.proxied.contains_key(profile));
     }
     for id in &held {
+        // Queued unless the daemon says it is running: those are the only two
+        // sets `held` is built from.
+        let phase = if running.contains(id) {
+            ProbePhase::Running
+        } else {
+            ProbePhase::Queued
+        };
+        let stoppable = check_can_be_stopped(phase, state.is_proxied(id));
         match state.checking.get_mut(*id) {
-            Some(wait) => wait.acked = true,
+            Some(wait) => {
+                wait.acked = true;
+                // A queued check that starts measuring loses its stop, and the
+                // card has to be told: the affordance is drawn from the state,
+                // not recomputed on a timer.
+                if wait.phase != phase {
+                    wait.phase = phase;
+                    if wait.is_running() {
+                        effects.push(Effect::Latency(
+                            (*id).clone(),
+                            LatencyState::Checking { stoppable },
+                        ));
+                    }
+                }
+            }
             None => {
                 state.checking.insert(
                     (*id).clone(),
@@ -509,9 +571,13 @@ pub(super) fn reduce(
                         since: now,
                         acked: true,
                         given_up: false,
+                        phase,
                     },
                 );
-                effects.push(Effect::Latency((*id).clone(), LatencyState::Checking));
+                effects.push(Effect::Latency(
+                    (*id).clone(),
+                    LatencyState::Checking { stoppable },
+                ));
             }
         }
     }
@@ -1257,7 +1323,8 @@ fn latency_parts(
     reading: Option<&LatencyReading>,
     now_unix_ms: u64,
 ) -> (Option<String>, Option<SessionDetail>) {
-    let LatencyState::Tunnel { ms, age, .. } = latency_state(reading, false, true, now_unix_ms)
+    let LatencyState::Tunnel { ms, age, .. } =
+        latency_state(reading, None, true, false, now_unix_ms)
     else {
         return (None, None);
     };
@@ -1899,15 +1966,67 @@ pub(super) fn other_profiles_message(
     }
 }
 
+/// What a press of stop actually stopped.
+///
+/// `CancelProbes` answers with the number it dropped, and the number is the
+/// point: stopping a sweep of several hundred servers takes about ten seconds
+/// to show on the cards, so with nothing said the press reads as missed. Zero
+/// is its own sentence rather than "0 checks" — it means the queue was already
+/// empty, which is a different thing from a stop that landed.
+pub(super) fn stop_report(dropped: usize) -> String {
+    match dropped {
+        0 => "There was nothing left to stop".to_string(),
+        1 => "Stopped 1 check".to_string(),
+        many => format!("Stopped {many} checks"),
+    }
+}
+
+/// Whether a check in this phase, on this route, can be called off.
+///
+/// `docs/spec/latency.md` binds both halves. Cancelling stops the queue, not
+/// the measurement: the running probes each own a thread and release their own
+/// slot, so a running check ends when it ends. And a cancel only ever drops
+/// `Direct` jobs, so the check for the server currently carrying the tunnel —
+/// which the daemon enqueues as `Proxied` — is not cancellable even while it is
+/// still queued.
+/// A check that is measuring cannot be stopped; one that is queued, or has not
+/// been placed yet, can. The route is the second half and is known from the
+/// first frame, so the connected server's card never offers a stop at all.
+pub(super) fn check_can_be_stopped(phase: ProbePhase, proxied: bool) -> bool {
+    phase != ProbePhase::Running && !proxied
+}
+
+/// Whether a check for this server goes through the tunnel rather than straight
+/// out, which is what the daemon's `probe_target` decides from the same fact: a
+/// server carried by a connected session is probed `Proxied`.
+pub(super) fn probe_is_proxied(sessions: &[SessionInfo], server_id: &str) -> bool {
+    sessions.iter().any(|session| {
+        session.state == "connected" && session.server_id.as_deref() == Some(server_id)
+    })
+}
+
 /// Whether pressing a latency control means stop rather than start.
 ///
-/// True when *any* of the ids is mid-check, because that is exactly when the
-/// button is showing a stop icon. The tempting rule — "stop if there is nothing
-/// new to start" — reads the press backwards halfway through a sweep: cards
-/// retire one at a time, so once a few have finished, a press on a button
-/// showing a stop would start fresh checks on the finished ones.
-pub(super) fn press_stops(ids: &[String], checking: &HashMap<String, ProbeWait>) -> bool {
-    ids.iter().any(|id| checking.contains_key(id))
+/// True when any of the ids is mid-check **and that check can be stopped**. The
+/// tempting rule — "stop if there is nothing new to start" — reads the press
+/// backwards halfway through a sweep: cards retire one at a time, so once a few
+/// have finished, a press on a button showing a stop would start fresh checks on
+/// the finished ones.
+///
+/// Reading it from the whole `checking` set was the older mistake, and a
+/// different one: it offered a stop for checks a cancel does not reach, so the
+/// press did nothing at all and the button stayed a stop button that had been
+/// pressed.
+pub(super) fn press_stops(
+    ids: &[String],
+    checking: &HashMap<String, ProbeWait>,
+    sessions: &[SessionInfo],
+) -> bool {
+    ids.iter().any(|id| {
+        checking
+            .get(id)
+            .is_some_and(|wait| check_can_be_stopped(wait.phase, probe_is_proxied(sessions, id)))
+    })
 }
 
 /// Which toast a reading earns, if any.
@@ -1962,12 +2081,15 @@ pub(super) fn probe_toast(
 /// card claims to show.
 pub(super) fn latency_state(
     reading: Option<&LatencyReading>,
-    is_checking: bool,
+    checking: Option<ProbeWait>,
     is_active: bool,
+    proxied: bool,
     now_unix_ms: u64,
 ) -> LatencyState {
-    if is_checking {
-        return LatencyState::Checking;
+    if let Some(wait) = checking {
+        return LatencyState::Checking {
+            stoppable: check_can_be_stopped(wait.phase, proxied),
+        };
     }
     let Some(reading) = reading else {
         return LatencyState::Unmeasured;
@@ -3752,7 +3874,11 @@ mod tests {
             Instant::now(),
             true,
         );
-        assert_eq!(latency(&effects, "a"), Some(LatencyState::Checking));
+        assert_eq!(
+            latency(&effects, "a"),
+            Some(LatencyState::Checking { stoppable: false }),
+            "the daemon says it is running, and a running check cannot be stopped"
+        );
         assert!(state.checking.contains_key("a"));
     }
 
@@ -3792,7 +3918,11 @@ mod tests {
             now,
             true,
         );
-        assert_eq!(latency(&effects, "a"), Some(LatencyState::Checking));
+        assert_eq!(
+            latency(&effects, "a"),
+            Some(LatencyState::Checking { stoppable: true }),
+            "a queued check is the one a stop reaches"
+        );
         assert!(state.checking.contains_key("a"));
     }
 
@@ -3894,7 +4024,7 @@ mod tests {
             let effects = fold(&mut state, &held, later, true);
             assert_ne!(
                 latency(&effects, "a"),
-                Some(LatencyState::Checking),
+                Some(LatencyState::Checking { stoppable: false }),
                 "tick {tick} raised the spinner again"
             );
             assert!(!state.is_checking("a"), "tick {tick} restarted the wait");
@@ -4073,6 +4203,135 @@ mod tests {
         );
     }
 
+    /// The whole of #125 in one assertion set: `CancelProbes` drops queued
+    /// direct jobs and nothing else, so the two sets the daemon reports
+    /// separately decide whether a stop is offered at all. Folding them into
+    /// one is what made every spinning card show a stop, including the ones a
+    /// press could never reach.
+    #[test]
+    fn a_stop_is_offered_only_where_a_cancel_reaches() {
+        let mut state = state();
+        let mut waiting = probe(&["running"], &[]);
+        waiting.queued = vec!["queued".to_string()];
+
+        let effects = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), waiting),
+            Instant::now(),
+            true,
+        );
+
+        assert_eq!(
+            latency(&effects, "queued"),
+            Some(LatencyState::Checking { stoppable: true }),
+            "a queued check is exactly what a cancel drops"
+        );
+        assert_eq!(
+            latency(&effects, "running"),
+            Some(LatencyState::Checking { stoppable: false }),
+            "a running probe owns a thread that releases its own slot"
+        );
+        assert!(
+            state.is_checking("queued") && state.is_checking("running"),
+            "both are still checks in progress; only the stop differs"
+        );
+    }
+
+    /// The second case the fold hid. A probe for the server carrying the tunnel
+    /// is enqueued `Proxied`, and a cancel only ever drops `Direct` jobs — so
+    /// that check is not cancellable even while it is still queued, and its
+    /// card was offering a stop that could never land.
+    #[test]
+    fn the_connected_servers_check_offers_no_stop_even_while_it_waits() {
+        let mut state = state();
+        let mut waiting = probe(&[], &[]);
+        waiting.queued = vec!["carrying".to_string(), "ordinary".to_string()];
+        let status = StatusInfo {
+            sessions: vec![session("default", "connected", "carrying")],
+            ..StatusInfo::default()
+        };
+
+        let effects = fold(&mut state, &snapshot(status, waiting), Instant::now(), true);
+
+        assert_eq!(
+            latency(&effects, "carrying"),
+            Some(LatencyState::Checking { stoppable: false }),
+            "queued, but proxied, so the cancel does not name it"
+        );
+        assert_eq!(
+            latency(&effects, "ordinary"),
+            Some(LatencyState::Checking { stoppable: true }),
+            "the same queue, a direct job, and a stop that lands"
+        );
+    }
+
+    /// A queued check that gets a slot loses its stop, and the card has to be
+    /// told: the affordance is drawn from the pushed state, so a phase change
+    /// that pushed nothing would leave a stop button on a check that had
+    /// started measuring.
+    #[test]
+    fn a_check_that_starts_measuring_withdraws_its_stop() {
+        let mut state = state();
+        let now = Instant::now();
+        let mut waiting = probe(&[], &[]);
+        waiting.queued = vec!["a".to_string()];
+        fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), waiting),
+            now,
+            true,
+        );
+
+        let effects = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probe(&["a"], &[])),
+            now,
+            true,
+        );
+
+        assert_eq!(
+            latency(&effects, "a"),
+            Some(LatencyState::Checking { stoppable: false }),
+            "the check moved from the queue into a slot"
+        );
+    }
+
+    /// Before any snapshot mentions the id there is nothing to read the phase
+    /// from, and `docs/spec/gui.md` binds that a latency control switches on the
+    /// press rather than on the acknowledgement. So a fresh wait offers a stop
+    /// — except where the route already rules one out, which is known from the
+    /// first frame.
+    #[test]
+    fn a_check_nobody_has_acknowledged_yet_still_offers_a_stop() {
+        let now = Instant::now();
+        let mut checking = HashMap::new();
+        checking.insert("fresh".to_string(), ProbeWait::new(now));
+
+        assert!(
+            press_stops(&["fresh".to_string()], &checking, &[]),
+            "the press must not wait a poll for the daemon to answer"
+        );
+        assert!(
+            !press_stops(
+                &["fresh".to_string()],
+                &checking,
+                &[session("default", "connected", "fresh")]
+            ),
+            "the tunnel's own server is probed through the tunnel, which a cancel never drops"
+        );
+    }
+
+    /// The count `CancelProbes` answers with is the difference between "that
+    /// press did something" and "there was nothing left to stop" — a sweep
+    /// takes about ten seconds to settle, so with nothing said the press reads
+    /// as missed.
+    #[test]
+    fn stopping_says_how_many_checks_it_dropped() {
+        assert_eq!(stop_report(0), "There was nothing left to stop");
+        assert_eq!(stop_report(1), "Stopped 1 check");
+        assert_eq!(stop_report(240), "Stopped 240 checks");
+    }
+
     /// The case a naive rule gets backwards. Cards retire one at a time, so for
     /// most of a sweep's life the set is partly checked and partly done — and
     /// throughout that, the button says stop and must mean it.
@@ -4088,15 +4347,15 @@ mod tests {
         ];
 
         assert!(
-            press_stops(&swept, &checking),
+            press_stops(&swept, &checking, &[]),
             "two of the three have finished, but the sweep has not"
         );
         assert!(
-            !press_stops(&swept, &HashMap::new()),
+            !press_stops(&swept, &HashMap::new(), &[]),
             "with nothing checking, the same press starts a sweep"
         );
         assert!(
-            !press_stops(&[], &checking),
+            !press_stops(&[], &checking, &[]),
             "an empty block offers nothing to stop"
         );
     }
@@ -4984,7 +5243,10 @@ mod tests {
             Instant::now(),
             true,
         );
-        assert_eq!(state.card_state("a", NOW_MS), LatencyState::Checking);
+        assert_eq!(
+            state.card_state("a", NOW_MS),
+            LatencyState::Checking { stoppable: false }
+        );
         assert_eq!(state.card_failure("a", NOW_MS), None);
     }
 

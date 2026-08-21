@@ -139,12 +139,20 @@ waiting. On a collapsed card the action row is hidden, so the right-click menu
 carries the same item under the same name. A sweep of a large subscription can
 run for minutes, and stopping it takes about ten seconds: the handful of checks
 already measuring finish, because each is a separate Xray core mid-request, and
-only the queue behind them is dropped.
+only the queue behind them is dropped. Stopping says how many checks it dropped,
+and says something different when there was nothing left to stop.
 
-A card whose check was stopped says so rather than showing the number from last
-time as though it had just been refreshed. Closing the window does not stop
-anything — the daemon owns the work, and it is still there when the window
-comes back.
+**The stop appears only on a check it can reach.** The checks already measuring
+are the ones a stop does not reach, and neither is the check for the server
+carrying the tunnel, which is made through the tunnel. Those cards keep their
+spinner and show no stop, because a button that says it will stop something and
+then cannot is worse than no button at all.
+
+A card whose check was stopped says so — a dash in the window's own grey, told
+apart from the ⊘ of a server that could not be reached or a machine with no core,
+and it does not show the number from last time as though it had just been
+refreshed. Closing the window does not stop anything — the daemon owns the work,
+and it is still there when the window comes back.
 
 The stop appears only where the daemon knows how to stop. A session daemon still
 running from an older version does not, and installing a new one does not restart

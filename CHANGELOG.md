@@ -14,6 +14,25 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- **A stop is offered where it lands, and says what it stopped.** Pressing stop on a
+  subscription's latency sweep produced no visible sign that anything had stopped. Whether the
+  press landed could only be worked out by watching spinners disappear over the following seconds.
+  The daemon answers a cancel with how many checks it dropped, and that number was being thrown
+  away. It is now said — and "there was nothing left to stop" is said differently from a stop that
+  dropped something. The sidebar's activity indicator settles at the press rather than at the next
+  poll.
+
+  A card being checked also offered a stop whether or not the check could be stopped. Cancelling
+  drops the queue and nothing else: the checks already measuring each own a thread and run to their
+  end, and the check for the server currently carrying the tunnel is made through the tunnel, which
+  a cancel never drops. For those, the press did nothing at all and the button stayed a stop button
+  that had been pressed. A check that cannot be stopped now keeps its spinner and offers no stop.
+
+  A check that *was* stopped no longer looks like a server that could not be reached or a machine
+  with no Xray core — three conditions that drew the same mark in the same colour, one of them the
+  user's own doing.
+
 ## [0.2.0] - 2026-08-21
 
 ### Added
