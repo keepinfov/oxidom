@@ -2611,27 +2611,34 @@ impl Controller {
     /// a third party's address bar and history, and it would submit before the
     /// reporter had read what they were submitting.
     fn start_problem_report(self: &Rc<Self>, lines: Vec<String>) {
-        let context = {
+        let (context, mut redactor) = {
             let state = self.state.borrow();
+            let servers: Vec<_> = state
+                .subscriptions
+                .iter()
+                .flat_map(|subscription| subscription.servers.iter())
+                .cloned()
+                .collect();
             let transport = state.ui.connected_id.as_ref().and_then(|id| {
-                state
-                    .subscriptions
+                servers
                     .iter()
-                    .flat_map(|subscription| subscription.servers.iter())
                     .find(|server| &server.id == id)
                     .map(|server| server.transport_label.clone())
             });
-            redact::ReportContext {
-                transport,
-                user_agent: self.settings.applied().subscription_user_agent,
-            }
+            (
+                redact::ReportContext {
+                    transport,
+                    user_agent: self.settings.applied().subscription_user_agent,
+                },
+                // The server list was already being walked here for the
+                // transport label, and every alias in it is a name the report
+                // must not carry: an alias is derived from the server's name
+                // and country, so it names the provider and the exit country in
+                // every access line.
+                redact::Redactor::here().for_servers(&servers),
+            )
         };
-        let text = redact::report(
-            &self.versions(),
-            &context,
-            &lines,
-            &redact::Redactor::here(),
-        );
+        let text = redact::report(&self.versions(), &context, &lines, &mut redactor);
         self.window.clipboard().set_text(&text);
         self.save_problem_report(text);
     }

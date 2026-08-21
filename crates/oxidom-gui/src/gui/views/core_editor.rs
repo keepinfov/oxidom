@@ -25,8 +25,9 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use oxidom_core::core_options::{
-    CoreOptions, DestOverride, DnsOptions, DomainStrategy, FragmentOptions, LogLevel, MuxOptions,
-    Noise, QueryStrategy, ResolvedCore, ResolvedMux, SniffingOptions, XudpMode,
+    CoreOptions, DEFAULT_POOL_PROBE, DestOverride, DnsOptions, DomainStrategy, FragmentOptions,
+    LogLevel, MuxOptions, Noise, QueryStrategy, ResolvedCore, ResolvedMux, SniffingOptions,
+    XudpMode,
 };
 
 /// The one listener an editor reports edits to, once someone asks for it.
@@ -154,7 +155,9 @@ struct CoreWidgets {
     length: adw::EntryRow,
     interval: adw::EntryRow,
     noise_row: adw::ActionRow,
+    pool: adw::ExpanderRow,
     dns: adw::ExpanderRow,
+    pool_probe: adw::EntryRow,
     dns_server: adw::EntryRow,
     dns_direct: adw::EntryRow,
     query_strategy: adw::ComboRow,
@@ -268,6 +271,17 @@ impl CoreEditor {
         fragment.add_row(&noise_row);
         group.add(&fragment);
 
+        // Not in the DNS section and not beside the latency URL in Settings:
+        // this is what the core itself fetches through every pool member on a
+        // timer, and it decides whether a pool carries traffic at all.
+        let pool = section("Pools", profile);
+        let pool_probe = entry(
+            "Health-check URL",
+            "The balancer pings this through every member and puts a node in rotation only once              it answers. Empty means the built-in address.",
+        );
+        pool.add_row(&pool_probe);
+        group.add(&pool);
+
         let dns = section("DNS", profile);
         let dns_server = entry(
             "Resolver",
@@ -301,6 +315,8 @@ impl CoreEditor {
             length,
             interval,
             noise_row,
+            pool,
+            pool_probe,
             dns,
             dns_server,
             dns_direct,
@@ -374,6 +390,11 @@ impl CoreEditor {
                 FragmentOptions::default()
             },
             noises: self.noises.borrow().clone(),
+            pool_probe_url: if widgets.pool.enables_expansion() {
+                entry_value(&widgets.pool_probe)
+            } else {
+                None
+            },
             dns: if widgets.dns.enables_expansion() {
                 DnsOptions {
                     server: entry_value(&widgets.dns_server),
@@ -502,6 +523,14 @@ impl CoreEditor {
         *self.noises.borrow_mut() = noises;
 
         widgets
+            .pool
+            .set_enable_expansion(!profile || values.pool_probe_url.is_some());
+        widgets.pool_probe.set_text(&pick(
+            values.pool_probe_url.as_deref(),
+            Some(resolved.pool_probe.as_str()),
+        ));
+
+        widgets
             .dns
             .set_enable_expansion(!profile || !values.dns.is_unset());
         let inherited_dns = resolved.dns.clone();
@@ -589,6 +618,7 @@ impl CoreEditor {
             &widgets.interval,
             &widgets.dns_server,
             &widgets.dns_direct,
+            &widgets.pool_probe,
         ] {
             row.connect_changed({
                 let notify = notify.clone();
@@ -844,6 +874,9 @@ fn inherited_text(level: CoreLevel, resolved: &ResolvedCore) -> InheritedText {
 /// resolver it mirrors.
 fn built_in_options() -> CoreOptions {
     CoreOptions {
+        // The built-in address is what an empty field means, so it is never
+        // written into `config.toml` as though the user had chosen it.
+        pool_probe_url: None,
         log_level: Some(LogLevel::default()),
         domain_strategy: Some(DomainStrategy::default()),
         sniffing: SniffingOptions {
@@ -897,6 +930,12 @@ fn drop_built_ins(mut options: CoreOptions) -> CoreOptions {
     clear(&mut options.mux.enabled, built_in.mux.enabled);
     clear(&mut options.fragment.enabled, built_in.fragment.enabled);
     clear(&mut options.dns.query_strategy, built_in.dns.query_strategy);
+    // The field is pre-filled with whatever is in force, so leaving it alone at
+    // the machine level would write the built-in address into `config.toml` as
+    // though it had been chosen — and then a later release could not move it.
+    if options.pool_probe_url.as_deref() == Some(DEFAULT_POOL_PROBE) {
+        options.pool_probe_url = None;
+    }
     options
 }
 

@@ -89,6 +89,7 @@ noises = []
 [core.mux]                    # enabled | concurrency | xudp_concurrency | xudp_proxy_udp_443
 [core.fragment]               # enabled | packets | length | interval
 [core.dns]                    # server | direct_server | query_strategy
+pool_probe_url = ""           # where a pool's balancer sends its health check; empty: built-in
 ```
 
 A profile file carries the same `[core]` table plus `description`, `[select]`, `[proxy]`,

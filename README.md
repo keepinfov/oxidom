@@ -15,6 +15,53 @@ interfaces, and per-app routing. The GUI runs fully unprivileged.
   <img alt="The server browser with one node connected" src="docs/screenshots/servers-connected-dark.png">
 </picture>
 
+## Install it
+
+**Debian, Ubuntu, Mint:**
+
+```sh
+curl -fsSL https://keepinfov.github.io/oxidom/KEY.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/oxidom.gpg
+echo "deb [signed-by=/usr/share/keyrings/oxidom.gpg] https://keepinfov.github.io/oxidom/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/oxidom.list
+sudo apt update && sudo apt install oxidom-gui
+```
+
+**Fedora, RHEL:**
+
+```sh
+sudo curl -fsSL https://keepinfov.github.io/oxidom/oxidom.repo -o /etc/yum.repos.d/oxidom.repo
+sudo dnf install oxidom-gui
+```
+
+Both are the signed repository, so upgrades arrive with the rest of the system.
+On a server, install `oxidom` instead — the daemon and CLI, with no GTK
+dependency.
+
+**Or one line**, which detects apt or dnf and runs exactly the commands above:
+
+```sh
+curl -fsSL https://keepinfov.github.io/oxidom/install.sh | sh
+```
+
+It checks the key it downloads against the fingerprint it was published with —
+`05BC 9AA4 B90F F65A CE7F AE1C 74FE 48BE 84CA 2CCF` — and refuses to install if
+they disagree. [Read it first](packaging/install.sh); it prints every command
+before running it.
+
+**Too old for the packages** — Ubuntu 24.04 LTS, Debian 12, whose libadwaita is
+1.5 and 1.2 against a floor of 1.7 — take the **AppImage** from the [releases
+page](https://github.com/keepinfov/oxidom/releases): `chmod +x` and run it. It
+carries its own GTK, libadwaita, glibc *and* an Xray core.
+
+**An Xray core is required and is not bundled** (except in the AppImage). No
+distribution packages one, so no package here can depend on it: run
+`oxidom status` and it names the exact download for this machine. Settings ›
+Xray core will fetch it for you.
+
+Everything else — NixOS, Nix, Arch, from source, the tested distro matrix — is in
+**[docs/installation.md](docs/installation.md)**.
+
 ## Features
 
 - **Subscriptions**: base64 share-link lists, provider-selected Xray JSON,
@@ -39,7 +86,16 @@ interfaces, and per-app routing. The GUI runs fully unprivileged.
 - Crash-safe: an orphaned xray child, a stuck GNOME system proxy, or leftover
   routes and devices left by a killed instance are repaired on the next start.
 
-## Install
+## Other ways to install
+
+**`.deb` / `.rpm` on their own:** from the [releases
+page](https://github.com/keepinfov/oxidom/releases), if you would rather not add
+a repository. Installing does not enable the system daemon; `oxidom status` says
+what that decides.
+
+**Arch:** oxidom is **not on the AUR**. Build it from the `PKGBUILD` in this
+repository — `cd packaging/aur && makepkg -si` — then
+`systemctl enable --now oxidom.service` if you want the system daemon.
 
 **NixOS (flake):**
 
@@ -53,16 +109,24 @@ services.oxidom.enable = true;          # system daemon at boot
 services.oxidom.tun.enable = true;      # allow TUN interfaces
 ```
 
-**Arch (AUR):** `packaging/aur/PKGBUILD` (`oxidom-git`), then
-`systemctl enable --now oxidom.service`.
-
-**Anything else:** a Rust toolchain (1.85+), GTK4 and libadwaita development
+**From source:** a Rust toolchain (1.85+), GTK4 and libadwaita development
 packages, and an `xray` binary.
 
 Full instructions, the tested distro matrix, and the from-source asset list are in
 **[docs/installation.md](docs/installation.md)**.
 
 ## Try it
+
+Once installed:
+
+```sh
+oxidom-gui                           # the interface
+oxidom status                        # what is running, and what is missing
+oxidom connect ch-trojan
+oxidom ip --egress
+```
+
+Without installing anything, if you have Nix:
 
 ```sh
 nix run github:keepinfov/oxidom      # the GUI
@@ -74,12 +138,6 @@ or, in a clone:
 nix develop -c cargo run -p oxidom-gui       # graphical client
 nix develop -c cargo run -p oxidom -- daemon # headless daemon
 nix build                                    # both wrapped binaries
-```
-
-```sh
-oxidom connect ch-trojan
-oxidom status
-oxidom ip --egress
 ```
 
 ## Documentation

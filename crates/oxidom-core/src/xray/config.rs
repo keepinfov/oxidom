@@ -7,17 +7,13 @@ use serde_json::{Value, json};
 use crate::core_options::{ResolvedCore, ResolvedDialer, ResolvedDns, ResolvedMux};
 use crate::model::{Hysteria2Settings, OutboundSpec, Server, StreamSettings};
 
-// The pool generator has no Config parameter, and an observatory needs one
-// stable HTTP target regardless of the user's direct/active probe method.
-const POOL_PROBE_DESTINATION: &str = "https://connectivitycheck.gstatic.com/generate_204";
-
 /// Namespace every balancer-selectable outbound tag shares.
 ///
 /// Xray resolves a balancer `selector` by prefix-matching outbound tags, and
 /// `scaffold` always appends `direct` and `block`. Keeping the selectable
 /// outbounds under one prefix oxidom owns is what stops a selector from
 /// resolving to either of those.
-const SELECTABLE_TAG_PREFIX: &str = "s-";
+pub(crate) const SELECTABLE_TAG_PREFIX: &str = "s-";
 
 /// Balancer tag oxidom's own catch-all routing rule dispatches to.
 const BALANCER_TAG: &str = "pool";
@@ -79,7 +75,7 @@ pub fn generate(
                 config["burstObservatory"] = json!({
                     "subjectSelector": [SELECTABLE_TAG_PREFIX],
                     "pingConfig": {
-                        "destination": POOL_PROBE_DESTINATION,
+                        "destination": core.pool_probe,
                         "interval": "5m",
                         "timeout": "3s",
                         "sampling": 3
@@ -186,7 +182,7 @@ pub fn generate_pool(
     config["burstObservatory"] = json!({
         "subjectSelector": [SELECTABLE_TAG_PREFIX],
         "pingConfig": {
-            "destination": POOL_PROBE_DESTINATION,
+            "destination": core.pool_probe,
             "interval": probe_interval,
             "timeout": "3s",
             "sampling": 3
@@ -802,9 +798,30 @@ mod tests {
         );
         assert_eq!(
             config["burstObservatory"]["pingConfig"]["destination"],
-            super::POOL_PROBE_DESTINATION
+            crate::core_options::DEFAULT_POOL_PROBE,
+            "the provider's beacon survived, or the built-in destination moved"
         );
         assert_eq!(config["burstObservatory"]["subjectSelector"], json!(["s-"]));
+
+        // The overwrite is unconditional; only what it writes is now settable.
+        // A configured destination must replace the provider's just as the
+        // built-in one does — this is the half that would silently regress if
+        // somebody made the overwrite conditional on the value being a default.
+        let options = CoreOptions {
+            pool_probe_url: Some("https://reachable.example/generate_204".to_string()),
+            ..CoreOptions::default()
+        };
+        let configured = generate(
+            &server,
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &CoreOptions::resolve(&options, &CoreOptions::default()),
+        );
+        assert_eq!(
+            configured["burstObservatory"]["pingConfig"]["destination"],
+            "https://reachable.example/generate_204"
+        );
         // An unrecognised strategy falls back to a safe default rather than
         // reaching the core as written.
         assert_eq!(
@@ -1778,6 +1795,7 @@ mod tests {
         // `noises[].type`, `sockopt.domainStrategy`, a zero-minimum range, and
         // whether `geosite:private` resolves at all.
         let everything = CoreOptions {
+            pool_probe_url: None,
             log_level: Some(LogLevel::Debug),
             domain_strategy: Some(DomainStrategy::IpOnDemand),
             sniffing: SniffingOptions {

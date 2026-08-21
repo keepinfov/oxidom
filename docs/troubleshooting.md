@@ -141,6 +141,7 @@ works, so these messages are the account of *why* it was torn down:
 | `the local SOCKS inbound never came up — the core is not carrying traffic` | The core started but never bound its inbound. Check the Logs page. |
 | `active server did not pass its latency check` | The core is up; the server did not answer through it. |
 | `the pool carried no traffic within 20s — 2 of 8 nodes were in rotation` | The pool's members are mostly unreachable. |
+| `the pool carried no traffic within 20s — its health check could not be reached through 8 of 8 nodes — the address is [core] pool_probe_url` | The members may be fine. The balancer only puts a node in rotation once it has reached the health-check address through it, and that address answered through none of them. Point `[core] pool_probe_url` at something reachable from where you are — see [configuration.md](configuration.md#pool_probe_url). |
 | `Xray exited unexpectedly` | The core died. The reason is in the log buffer. |
 
 Things that look like a broken tunnel but are not:
