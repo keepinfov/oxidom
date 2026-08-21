@@ -14,7 +14,32 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Added
+- **A pool's health check is no longer one hard-coded address.** A pool's balancer puts a node into
+  rotation only once it has reached a ping destination *through* that node. That destination was a
+  constant with no setting behind it, so wherever it was blocked, throttled or simply slow through
+  an exit, every pool on the machine reported that nothing was in rotation and carried no traffic —
+  with a count of nodes as the only clue, and nothing saying a health check was the reason.
+
+  **`[core] pool_probe_url`** now sets it, in `config.toml` for the machine and in a profile for one
+  tunnel: two pools through two countries need not share a reachable destination. It appears in
+  **Settings › Core behaviour › Pools** and in the profile editor's matching section. Unset means
+  the built-in address, so a file written before this generates exactly what it generated before.
+
+  It is deliberately not the existing latency check URL, which is only editable while the check
+  method is HTTP — reusing it would drive every pool through an address the interface would not
+  always let you change.
+
+  Whatever a subscription supplies for this is still discarded, unconditionally. A destination
+  chosen by somebody else is a URL your core would fetch on a timer, through your own exits.
+
 ### Fixed
+- **A pool that carried no traffic says whether its health check ever succeeded.** The message gave
+  a count and no cause, and under round-robin rotation the count actively misled: every node stays
+  eligible, so it read "3 of 3 nodes were in rotation" while nothing worked. Where the core's own
+  log shows the health check failing, that is now what is reported, and it names the setting that
+  changes the address.
+
 - **A problem report no longer names the provider.** Server aliases survived a report in full,
   inside every access line the core writes: `[socks-in >> s-nl-soda-vpn]`. That tag is `s-` plus
   the server's alias, and the alias is derived from the server's name and its country — so it named

@@ -16,6 +16,17 @@
 //! existed, byte for byte. `xray/config.rs` has a golden test that fails if that
 //! ever stops being true.
 
+/// Where a pool's balancer sends its health check, unless something says
+/// otherwise.
+///
+/// The observatory pings this through every member and puts a node in rotation
+/// only once the ping has come back, so a destination that cannot be reached
+/// through an exit is a pool that carries nothing — with "0 of N nodes were in
+/// rotation" as the only symptom. It used to be a constant in the generator
+/// with no way to change it, which made every pool on a machine dependent on
+/// one address being reachable from wherever the user is.
+pub const DEFAULT_POOL_PROBE: &str = "https://connectivitycheck.gstatic.com/generate_204";
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +51,15 @@ pub struct CoreOptions {
     pub noises: Option<Vec<Noise>>,
     #[serde(skip_serializing_if = "DnsOptions::is_unset")]
     pub dns: DnsOptions,
+    /// Where a pool's burst observatory sends its health check.
+    ///
+    /// A `[core]` option rather than a top-level key because the observatory is
+    /// core configuration, and because two pools through two countries do not
+    /// necessarily share a reachable destination. Deliberately not the settings'
+    /// `latency_test_url`: that one is only editable while the probe method is
+    /// HTTP, so reusing it would drive every pool through a URL the interface
+    /// would not always let the user change.
+    pub pool_probe_url: Option<String>,
 }
 
 /// An untouched section is left out of the file entirely.
@@ -296,6 +316,9 @@ pub struct ResolvedCore {
     /// `CoreOptions` a `routing` field — a probe routed by the user's rules
     /// stops measuring the server it claims to.
     pub routing: Option<serde_json::Value>,
+    /// Where a pool's burst observatory pings. [`DEFAULT_POOL_PROBE`] unless a
+    /// level set one.
+    pub pool_probe: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,6 +449,19 @@ impl CoreOptions {
             });
 
         ResolvedCore {
+            // Profile over machine over built-in, like every other field here.
+            // A value that got past `validate` — an older file, or one edited by
+            // hand — falls back rather than disabling the observatory: a pool
+            // with no health check puts nothing in rotation at all, which is a
+            // worse answer to a bad URL than ignoring it.
+            pool_probe: profile
+                .pool_probe_url
+                .as_deref()
+                .or(global.pool_probe_url.as_deref())
+                .map(str::trim)
+                .filter(|url| usable_pool_probe(url))
+                .unwrap_or(DEFAULT_POOL_PROBE)
+                .to_string(),
             log_level: profile.log_level.or(global.log_level).unwrap_or_default(),
             domain_strategy: profile
                 .domain_strategy
@@ -495,6 +531,15 @@ impl CoreOptions {
         {
             bail!("[{section}] dns server cannot be blank");
         }
+        if let Some(url) = &self.pool_probe_url
+            && !url.trim().is_empty()
+            && !usable_pool_probe(url.trim())
+        {
+            bail!(
+                "[{section}] pool_probe_url must be an http or https address with a host and no \
+                 credentials — the core fetches it through every pool member on a timer"
+            );
+        }
         if let Some(direct) = &self.dns.direct_server {
             if direct.trim().is_empty() {
                 bail!("[{section}] dns direct_server cannot be blank");
@@ -508,6 +553,20 @@ impl CoreOptions {
         }
         Ok(())
     }
+}
+
+/// Whether a string is something the core can be told to ping.
+///
+/// http or https, a host, and no credentials — the last because the address is
+/// written into the generated config, which is on disk and in a problem report.
+fn usable_pool_probe(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed.host().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
 }
 
 fn check_concurrency(value: i16, section: &str, field: &str) -> Result<()> {
@@ -811,5 +870,82 @@ query_strategy = "use_nothing""#
         assert_eq!(Origin::of(Some(&1), None), Origin::Global);
         assert_eq!(Origin::of(Some(&1), Some(&2)), Origin::Profile);
         assert_eq!(Origin::of(None, Some(&2)), Origin::Profile);
+    }
+
+    /// Two pools through two countries do not necessarily share a reachable
+    /// destination, so a profile overrides the machine, like every other field.
+    #[test]
+    fn a_profile_chooses_its_own_pool_health_check() {
+        let machine = CoreOptions {
+            pool_probe_url: Some("https://machine.example/generate_204".to_string()),
+            ..CoreOptions::default()
+        };
+        let profile = CoreOptions {
+            pool_probe_url: Some("https://profile.example/generate_204".to_string()),
+            ..CoreOptions::default()
+        };
+
+        assert_eq!(
+            CoreOptions::resolve(&machine, &CoreOptions::default()).pool_probe,
+            "https://machine.example/generate_204"
+        );
+        assert_eq!(
+            CoreOptions::resolve(&machine, &profile).pool_probe,
+            "https://profile.example/generate_204"
+        );
+        assert_eq!(
+            CoreOptions::resolve(&CoreOptions::default(), &CoreOptions::default()).pool_probe,
+            DEFAULT_POOL_PROBE,
+            "unset must reproduce what the generator emitted before this was settable"
+        );
+    }
+
+    /// A pool with no working health check puts nothing in rotation and carries
+    /// nothing, so an unusable value is worse than no value: it falls back
+    /// rather than reaching the core as written.
+    #[test]
+    fn an_unusable_pool_health_check_falls_back_instead_of_breaking_every_pool() {
+        for bad in [
+            "ftp://files.example/thing",
+            "not a url at all",
+            "https://user:secret@host.example/generate_204",
+            "",
+            "   ",
+        ] {
+            let options = CoreOptions {
+                pool_probe_url: Some(bad.to_string()),
+                ..CoreOptions::default()
+            };
+            assert_eq!(
+                CoreOptions::resolve(&options, &CoreOptions::default()).pool_probe,
+                DEFAULT_POOL_PROBE,
+                "{bad:?} reached the core"
+            );
+        }
+    }
+
+    /// And it is refused when it is written, so the answer is a sentence rather
+    /// than a setting that silently did nothing.
+    #[test]
+    fn a_pool_health_check_that_names_no_host_is_refused_where_it_is_written() {
+        let mut options = CoreOptions {
+            pool_probe_url: Some("ftp://files.example/thing".to_string()),
+            ..CoreOptions::default()
+        };
+        let error = options.validate("core").expect_err("ftp is not fetchable");
+        assert!(
+            error.to_string().contains("pool_probe_url"),
+            "the message does not name the field: {error}"
+        );
+
+        options.pool_probe_url = Some("https://user:secret@host.example/x".to_string());
+        assert!(
+            options.validate("core").is_err(),
+            "credentials would be written into the generated config"
+        );
+
+        // Empty is how a level says "not this one", not a mistake.
+        options.pool_probe_url = Some(String::new());
+        assert!(options.validate("core").is_ok());
     }
 }

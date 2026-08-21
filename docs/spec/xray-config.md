@@ -25,6 +25,36 @@ A **pool** session emits the same scaffold plus one outbound per member tagged `
 `burstObservatory` with `subjectSelector: ["s-"]`, and an `api` block with `RoutingService`
 reachable through a `dokodemo-door` inbound tagged `api-in` on the session's own address.
 
+**The observatory's destination is `[core] pool_probe_url` (binding).** The balancer puts a node
+in rotation only once the burst observatory has reached that address *through* that node, so an
+address that cannot be reached from where the user is means every pool on the machine carries
+nothing — with a rotation count as the only symptom. It was a constant, which made that outcome
+unfixable; it is now a `[core]` key, resolved profile over machine over built-in like every other,
+because two pools through two countries need not share a reachable destination. Deliberately not
+the settings' `latency_test_url`: that one is only editable while the probe method is HTTP, so
+reusing it would drive every pool through an address the interface would not always let the user
+change.
+
+**A provider's `pingConfig` is still discarded whole, unconditionally.** Only its *presence* is
+read, to decide whether the imported profile wanted an observatory at all. The destination the
+generator writes is always oxidom's — built-in or configured — because a destination chosen by
+somebody else is a URL the core fetches on a timer through the user's own exits, i.e. a beacon.
+Making the overwrite conditional on the value being a default would put that back.
+
+**An unusable configured destination falls back to the built-in.** It is refused where it is
+written, so the normal answer is a sentence at `SetSettings` or `SaveProfile`; a value that got
+past that — an older file, or one edited by hand — is ignored rather than emitted, because a pool
+with no working health check puts nothing in rotation and carries nothing, which is a worse answer
+to a bad URL than disregarding it.
+
+**A pool that carried no traffic says whether its health check ever succeeded.** The count on its
+own names the symptom rather than the cause, and under `roundRobin` it actively misleads: every
+node stays eligible, so the message reads "3 of 3 nodes were in rotation" while nothing works.
+Where the core's own log carries failed observatory pings, they outrank the count and the message
+names the setting that changes the address. This is read from the core's log rather than folded
+into `probe::classify_complaint`, which is shared with the single-server probe path and answers
+with a verdict on one server.
+
 **An observatory is not by itself a failover — the strategy decides.** Measured on Xray 26.3.27
 with one reachable and one unreachable outbound, twelve requests each:
 

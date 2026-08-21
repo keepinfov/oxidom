@@ -180,7 +180,7 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
     application id, bus names, `geoip.dat` — are not hostnames however much they look like one,
     and neither is a dotted identifier from a library below oxidom (`Client.Timeout`, `io.EOF`),
     which is told apart by case since DNS is written in lower case. The hosts oxidom itself
-    reaches for — the release downloads, the pool observatory's probe destination, the default
+    reaches for — the release downloads, the pool observatory's default probe destination, the default
     latency target — are kept with or without a scheme in front of them.
     Both directions are pinned by one corpus: shapes that must not survive, and lines that must
     survive byte for byte.
