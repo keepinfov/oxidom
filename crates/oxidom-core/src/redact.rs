@@ -35,6 +35,23 @@
 //! - **oxidom's own dotted names stay** — the application id, bus names, and
 //!   file names like `geoip.dat`, none of which are hostnames however much they
 //!   look like one.
+//! - **A dotted identifier stays.** `Client.Timeout`, `io.EOF`,
+//!   `net.ErrClosed`: the libraries below oxidom write errors this way, and
+//!   `[host] exceeded while awaiting headers` sends a reader after a network
+//!   problem that is not there. Case is what tells the two apart — DNS is
+//!   written in lower case.
+//! - **The hosts oxidom itself reaches for stay**, whether or not a scheme
+//!   stands in front of them: a geo-data fetch and a reachability check that
+//!   failed are both reports people file, and neither is readable once the
+//!   name is gone.
+//!
+//! ## What the shapes are read from
+//!
+//! The lines are the ones the log actually holds, not invented ones. Xray's
+//! access log writes `network:host:port` on both sides of `accepted` on every
+//! line it emits, so the network comes off before the address is looked at;
+//! its observatory writes a Go error with a quoted URL in the middle of a
+//! sentence, so the punctuation after a URL is put back where it stood.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -88,7 +105,20 @@ const OXIDOM_HOSTS: &[&str] = &[
     "api.github.com",
     "raw.githubusercontent.com",
     "objects.githubusercontent.com",
+    // The two reachability targets oxidom ships as defaults: the pool
+    // observatory's `POOL_PROBE_DESTINATION`, which no setting can change, and
+    // the default `latency_test_url`. A user who points the second somewhere
+    // else no longer matches this list, and their host is taken out as any
+    // other is.
+    "connectivitycheck.gstatic.com",
+    "www.gstatic.com",
 ];
+
+/// Networks Xray writes in front of an address in its access log:
+/// `from tcp:127.0.0.1:42204 accepted tcp:relay.example.net:443`. With the
+/// network still attached the token parses as neither an address nor a host,
+/// so the commonest line in the log needs the prefix taken off first.
+const NETWORK_PREFIXES: &[&str] = &["tcp", "udp"];
 
 /// Last labels that make a dotted token a file rather than a host. Without this
 /// `geoip.dat` reads as a hostname and the one line explaining a routing
@@ -245,17 +275,40 @@ fn scheme_token(core: &str) -> Option<String> {
     {
         return None;
     }
+    // The punctuation a sentence puts after a URL is the sentence's. It cannot
+    // come off with the token's other edges, because `:` separates a port and
+    // `.` separates a label inside a URL; only a token already known to carry a
+    // scheme can tell those two uses apart.
+    let body = split + 3;
+    let end = body + core[body..].trim_end_matches(is_url_tail).len();
+    let (url, tail) = core.split_at(end);
+    Some(format!("{}{tail}", scheme_url(scheme, &url[body..])))
+}
+
+/// Punctuation that ends a phrase around a URL rather than belonging to it.
+///
+/// `]` and `}` are not here: a URL carries an IPv6 address in brackets, and
+/// trimming the closing one would leave `https://[::1` to be read as a host.
+fn is_url_tail(c: char) -> bool {
+    matches!(
+        c,
+        '"' | '\'' | '`' | ',' | ';' | ':' | '.' | '!' | '?' | ')' | '>'
+    )
+}
+
+/// A URL whose scheme is already split off and whose trailing punctuation is
+/// already set aside.
+fn scheme_url(scheme: &str, after: &str) -> String {
     let lower = scheme.to_ascii_lowercase();
     if SHARE_SCHEMES.contains(&lower.as_str()) {
         // Not "[address]" plus "[uuid]" plus "[password]": the whole token is
         // one credential, and reporting its parts separately would describe how
         // it was built.
-        return Some("[share link]".to_string());
+        return "[share link]".to_string();
     }
     if lower != "http" && lower != "https" {
-        return Some(format!("{scheme}://[redacted]"));
+        return format!("{scheme}://[redacted]");
     }
-    let after = &core[split + 3..];
     let host_end = after.find(['/', '?', '#']).unwrap_or(after.len());
     let authority = &after[..host_end];
     // Anything before an `@` is userinfo, which is a credential wherever it
@@ -267,9 +320,9 @@ fn scheme_token(core: &str) -> Option<String> {
         } else {
             ""
         };
-        return Some(format!("{lower}://{authority}{tail}"));
+        return format!("{lower}://{authority}{tail}");
     }
-    Some(format!("{lower}://[redacted]"))
+    format!("{lower}://[redacted]")
 }
 
 /// Apply `f` to each piece of `core` between `separators`, putting the
@@ -294,6 +347,12 @@ fn split_keep(core: &str, separators: &[char], f: fn(&str) -> String) -> String 
 fn classify(core: &str) -> String {
     if core.is_empty() {
         return String::new();
+    }
+    // The network comes off first, before the `@` rule and before either
+    // parser: `tcp:203.0.113.9:443` is an address with four characters in
+    // front of it, and every rule below reads it as a word it does not know.
+    if let Some(marked) = network_token(core) {
+        return marked;
     }
     // `ann@desk-01`, `someone@example.com`, `uuid@203.0.113.9:443`: whatever
     // stands in front of an `@` is an account and whatever stands behind it is
@@ -330,6 +389,19 @@ fn classify(core: &str) -> String {
         return marked;
     }
     core.to_string()
+}
+
+/// `tcp:HOST:PORT` — Xray's access-log shape — with the network kept and what
+/// follows it put back through the same rules.
+///
+/// The network is worth keeping: which protocol a connection was refused on is
+/// diagnosis, and it names nobody.
+fn network_token(core: &str) -> Option<String> {
+    let (network, rest) = core.split_once(':')?;
+    if rest.is_empty() || !NETWORK_PREFIXES.contains(&network.to_ascii_lowercase().as_str()) {
+        return None;
+    }
+    Some(format!("{network}:{}", classify(rest)))
 }
 
 /// `[v6]:port`, `v4:port`, or a bare address of either family.
@@ -395,6 +467,12 @@ fn host(core: &str) -> Option<String> {
     {
         return None;
     }
+    // A host oxidom itself reaches for is kept whether or not a scheme stood in
+    // front of it. Consulting this list only where one did meant the same name
+    // was kept in a URL and taken out on its own line.
+    if OXIDOM_HOSTS.contains(&lower.as_str()) {
+        return None;
+    }
     let labels: Vec<&str> = head.split('.').collect();
     if labels.len() < 2 {
         return None;
@@ -415,6 +493,19 @@ fn host(core: &str) -> Option<String> {
         return None;
     }
     if FILE_SUFFIXES.contains(&last.to_ascii_lowercase().as_str()) {
+        return None;
+    }
+    // A dotted identifier is not a host: `Client.Timeout`, `io.EOF`,
+    // `net.ErrClosed`, and every bus name outside the prefix list above. Case
+    // is what separates them from a name that was resolved — DNS is written in
+    // lower case and an exported Go identifier is not. A token that is upper
+    // case throughout stays in the rule, because a host shouted in capitals is
+    // still a host.
+    let shouted = head
+        .chars()
+        .filter(char::is_ascii_alphabetic)
+        .all(|c| c.is_ascii_uppercase());
+    if !shouted && last.chars().any(|c| c.is_ascii_uppercase()) {
         return None;
     }
     Some(format!("[host]{port}"))
@@ -657,6 +748,19 @@ mod tests {
                 "saw 203.0.113.9, then gave up",
                 "saw [address], then gave up",
             ),
+            (
+                "from tcp:203.0.113.9:42204 accepted tcp:relay.example.com:443",
+                "from tcp:[address]:42204 accepted tcp:[host]:443",
+            ),
+            (
+                "relaying udp:198.51.100.7:53 to the tunnel",
+                "relaying udp:[address]:53 to the tunnel",
+            ),
+            (
+                "accepted tcp:[2001:db8::1]:443 from the pool",
+                "accepted tcp:[address]:443 from the pool",
+            ),
+            ("RELAY.EXAMPLE.COM answered", "[host] answered"),
         ] {
             assert_eq!(r.line(line), expected, "input: {line}");
         }
@@ -683,6 +787,10 @@ mod tests {
             "socks_port=1080 http_port=8118",
             "app/proxyman/outbound refused the config",
             "writing /home/[user]/.local/share/oxidom/oxidom.log",
+            "from tcp:127.0.0.1:42204 accepted tcp:www.gstatic.com:443 [socks-in >> s-01]",
+            "context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+            "the stream ended with io.EOF",
+            "github.com answered in 200 ms",
         ] {
             assert_eq!(r.line(line), line, "input: {line}");
         }
@@ -729,6 +837,14 @@ mod tests {
                 "19:02:18  INFO   oxidom/oxidom::daemon  desk-01 claimed dev.keepinfov.oxidom on the bus",
                 "19:02:18  INFO   oxidom/oxidom::daemon  [machine] claimed dev.keepinfov.oxidom on the bus",
             ),
+            (
+                "19:02:19  INFO   xray  from tcp:127.0.0.1:42204 accepted tcp:relay.example.com:443 [socks-in >> s-01]",
+                "19:02:19  INFO   xray  from tcp:127.0.0.1:42204 accepted tcp:[host]:443 [socks-in >> s-01]",
+            ),
+            (
+                "19:02:20  WARN   xray/app/observatory/burst  error ping https://connectivitycheck.gstatic.com/generate_204 with s-01: Head \"https://connectivitycheck.gstatic.com/generate_204\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+                "19:02:20  WARN   xray/app/observatory/burst  error ping https://connectivitycheck.gstatic.com/[redacted] with s-01: Head \"https://connectivitycheck.gstatic.com/[redacted]\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+            ),
         ] {
             assert_eq!(r.line(line), expected, "input: {line}");
         }
@@ -748,6 +864,90 @@ mod tests {
         assert_eq!(
             r.line("HEAD https://raw.githubusercontent.com"),
             "HEAD https://raw.githubusercontent.com"
+        );
+    }
+
+    /// The punctuation a sentence puts after a URL belongs to the sentence. It
+    /// cannot be trimmed with the token's other edges, because `:` separates a
+    /// port and `.` separates a label inside a URL, so only a token already
+    /// known to be one can tell the two uses apart.
+    #[test]
+    fn punctuation_after_a_url_belongs_to_the_line_and_stays() {
+        let r = plain();
+        assert_eq!(
+            r.line("Head \"https://subs.example.net/token\": timed out"),
+            "Head \"https://[redacted]\": timed out"
+        );
+        assert_eq!(
+            r.line("fetched https://subs.example.net/list."),
+            "fetched https://[redacted]."
+        );
+    }
+
+    /// Xray's access log writes `network:host:port` on both sides of
+    /// `accepted`, on every line it emits. Neither half of the pair parses as
+    /// an address or as a host while the network is still attached, so without
+    /// this the commonest line in the log the report is written from carries a
+    /// server address out whole.
+    #[test]
+    fn a_network_in_front_of_an_address_does_not_carry_it_past_the_rules() {
+        let r = plain();
+        assert_eq!(r.line("tcp:203.0.113.9:443"), "tcp:[address]:443");
+        assert_eq!(r.line("udp:relay.example.com:53"), "udp:[host]:53");
+        assert_eq!(r.line("TCP:203.0.113.9:443"), "TCP:[address]:443");
+        assert_eq!(
+            r.line("dest=tcp:203.0.113.9:443"),
+            "dest=tcp:[address]:443",
+            "a value under a key goes through the same rules"
+        );
+        assert_eq!(
+            r.line("tcp:127.0.0.1:1080"),
+            "tcp:127.0.0.1:1080",
+            "loopback is kept with a network in front of it as it is without"
+        );
+    }
+
+    /// A dotted name whose last label is not written the way DNS is written is
+    /// an identifier, not a host. `[host] exceeded while awaiting headers`
+    /// sends a reader looking for a network problem that is not there.
+    #[test]
+    fn a_dotted_identifier_is_not_a_host() {
+        let r = plain();
+        for line in [
+            "Client.Timeout exceeded while awaiting headers",
+            "the stream ended with io.EOF",
+            "closed with net.ErrClosed",
+            "com.example.Some.Error was raised",
+        ] {
+            assert_eq!(r.line(line), line, "input: {line}");
+        }
+        assert_eq!(
+            r.line("RELAY.EXAMPLE.COM answered"),
+            "[host] answered",
+            "a host shouted in capitals is still a host"
+        );
+    }
+
+    /// `OXIDOM_HOSTS` was consulted only where a scheme stood in front of the
+    /// host, so the same name was kept in a URL and taken out on its own. The
+    /// pool's probe destination is oxidom's own constant and belongs there:
+    /// without it an observatory failure names nothing anyone can act on.
+    #[test]
+    fn a_host_oxidom_reaches_for_itself_is_kept_with_or_without_a_scheme() {
+        let r = plain();
+        assert_eq!(r.line("github.com answered"), "github.com answered");
+        assert_eq!(
+            r.line("ping connectivitycheck.gstatic.com timed out"),
+            "ping connectivitycheck.gstatic.com timed out"
+        );
+        assert_eq!(
+            r.line("probing www.gstatic.com:443"),
+            "probing www.gstatic.com:443"
+        );
+        assert_eq!(
+            r.line("resolving relay.example.com"),
+            "resolving [host]",
+            "a name that is not oxidom's own is still taken out"
         );
     }
 
