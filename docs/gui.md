@@ -313,12 +313,23 @@ the core, how it was installed, the distribution and desktop — plus what the
 connection is made of and the subscription User-Agent, and then the lines.
 
 Everything identifying is taken out of those lines and **marked where it stood**:
-`[address]`, `[host]`, `[uuid]`, `[share link]`, `[redacted]`, `[machine]`,
-`[user]`. A bracket is a redaction, not an absence, so nothing quietly disappears.
+`[host 1]`, `[address 1]`, `[private address 1]`, `[uuid 1]`, `[node 1]`,
+`[share link]`, `[redacted]`, `[machine]`, `[user]`. A bracket is a redaction, not
+an absence, so nothing quietly disappears.
+
+**The numbers matter.** They are counted per report, so the same host carries the
+same number wherever it appears and two different hosts never read alike —
+otherwise a failure followed through a log can be read as a sequence of events
+that never happened. `[node N]` is a server: its alias names your provider and
+usually its exit country, and it appears in every access line the core writes.
+
 What is deliberately kept is what a report is written for: loopback addresses and
 port numbers, which name nobody; a private address marked as private, because
 which side of the tunnel it was on is often the bug; and oxidom's own names, so a
-line about `geoip.dat` still says `geoip.dat`.
+line about `geoip.dat` still says `geoip.dat`. The report says all of this at the
+end of itself, including that the rules read shapes rather than meanings and are
+best-effort — which is why reading it through before sending it is asked for and
+not a formality.
 
 The report goes on the clipboard and a save dialog opens. **No browser opens and
 nothing is sent anywhere** — read it through, then paste it into the bug form

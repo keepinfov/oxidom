@@ -158,10 +158,35 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
     report from the same rules, and a rule that lived in a widget could not be tested against a
     corpus. It has no regular-expression engine: addresses are recognised by `std`'s own
     parsers, the rest by hand, the way `link` parses links.
-  - **Every removal is marked in place.** `[address]`, `[host]`, `[uuid]`, `[share link]`,
-    `[redacted]`, `[machine]`, `[user]`. A line that never named an address and a line whose
-    address was taken out must not read the same, or a reader cannot tell a redaction from an
-    absence — and the report says so in its own words at the end.
+  - **Every removal is marked in place, and the marks are numbered.** `[host N]`,
+    `[address N]`, `[private address N]`, `[uuid N]`, `[node N]`, `[share link]`, `[redacted]`,
+    `[machine]`, `[user]`. A line that never named an address and a line whose address was taken
+    out must not read the same, or a reader cannot tell a redaction from an absence. Nor may two
+    different hosts read alike: numbering is per kind and per report, so the same value carries the
+    same number wherever it appears and one host appearing twice can be told from two. Without it a
+    redacted report can be read as a different sequence of events from the one that happened.
+    Credentials are not numbered — whether the same password recurs is not something a reader needs
+    and is the one class where the correlation is itself sensitive.
+  - **An outbound tag names the provider, and is taken out by name (binding).** A tag is `s-`
+    plus a server's alias, and `alias::suggest` derives that alias from the server's name and its
+    country, so it names the provider and usually the exit country — in every access line and
+    every observatory line. It has no dot, so the host rule's two-label guard rejects it, and no
+    shape separates it from an ordinary word. The report is therefore built with the daemon's
+    server list: `Redactor::for_servers` takes aliases, display names and addresses as literals.
+    The `s-` namespace is kept and only the handle replaced, because the prefix names nobody and
+    the line is about a pool member. A tag whose handle is not a known server survives, and the
+    corpus asserts that — redacting it anyway would mean redacting on the strength of a
+    two-character prefix. A server's alias, display name and address share one number: they are
+    one server. The CLI builds the same list from the same D-Bus call, which is what keeps the two
+    reports identical.
+  - **The footer states the rules, not only that there were some (binding).** It names every mark
+    the report can contain, says what is kept and why — loopback, the unspecified address, ports,
+    and oxidom's own names — and says the rules are shape-based and best-effort. The report ends by
+    telling the reporter to read it through, and that instruction is only actionable if they know
+    what the rules were meant to catch: a reader who sees `127.0.0.1:1080` and `geoip.dat` intact
+    beside a redaction cannot otherwise tell a decision from a miss. The wording lives in one
+    table, read both by the code that emits the marks and by the footer, and a test asserts the
+    footer names every entry.
   - **Over-redaction is a failure too.** A report reading `[host] [address] [redacted]` on every
     line is as useless as one that leaks. Loopback, the unspecified address and ports stay,
     because they name nobody and are usually the point; a private address is marked
@@ -170,7 +195,7 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
     application id, bus names, `geoip.dat` — are not hostnames however much they look like one,
     and neither is a dotted identifier from a library below oxidom (`Client.Timeout`, `io.EOF`),
     which is told apart by case since DNS is written in lower case. The hosts oxidom itself
-    reaches for — the release downloads, the pool observatory's probe destination, the default
+    reaches for — the release downloads, the pool observatory's default probe destination, the default
     latency target — are kept with or without a scheme in front of them.
     Both directions are pinned by one corpus: shapes that must not survive, and lines that must
     survive byte for byte.
