@@ -25,9 +25,9 @@
         # produced packages whose name disagreed with the binary inside them.
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-        # Spliced against this flake's nixpkgs, so the builds, the dev shell and
-        # CI all compile with the same toolchain rather than a second one pinned
-        # by crane's own lock.
+        # Spliced against this flake's nixpkgs, so crane builds with the same
+        # toolchain the dev shell takes from `pkgs` rather than a second one
+        # pinned by crane's own lock.
         craneLib = crane.mkLib pkgs;
 
         # Cargo sources plus the three directories the crates actually read:
@@ -52,16 +52,21 @@
           nativeBuildInputs = with pkgs; [pkg-config makeWrapper];
         };
 
-        cliDeps = craneLib.buildDepsOnly (cliCommon
-          // {
-            # Deps for the two crates the CLI builds and tests; oxidom-gui's gtk
-            # stack stays out of the headless package.
-            cargoExtraArgs = "--locked -p oxidom -p oxidom-core";
-          });
+        # One dependency build for both packages. oxidom-gui's graph is a
+        # superset of the CLI's, so building the workspace once and giving both
+        # derivations the same artifacts compiles serde, ureq, rustls and the gtk
+        # bindings once rather than twice. The gtk inputs are build-time only:
+        # the CLI binary links none of them, so its closure does not grow.
+        workspaceDeps = craneLib.buildDepsOnly {
+          inherit src version;
+          pname = "oxidom-workspace";
+          nativeBuildInputs = with pkgs; [pkg-config];
+          buildInputs = with pkgs; [gtk4 libadwaita glib];
+        };
 
         oxidom-cli = craneLib.buildPackage (cliCommon
           // {
-            cargoArtifacts = cliDeps;
+            cargoArtifacts = workspaceDeps;
             cargoBuildExtraArgs = "-p oxidom";
             cargoTestExtraArgs = "-p oxidom -p oxidom-core";
             # Without wrapGAppsHook4 there is no gappsWrapperArgs, so point the daemon at
@@ -96,14 +101,9 @@
           buildInputs = with pkgs; [gtk4 libadwaita glib adwaita-icon-theme];
         };
 
-        guiDeps = craneLib.buildDepsOnly (guiCommon
-          // {
-            cargoExtraArgs = "--locked -p oxidom-gui";
-          });
-
         oxidom-gui = craneLib.buildPackage (guiCommon
           // {
-            cargoArtifacts = guiDeps;
+            cargoArtifacts = workspaceDeps;
             cargoBuildExtraArgs = "-p oxidom-gui";
             # Named for the same reason the CLI derivation names its own: without
             # it the build compiles the whole workspace, so oxidom and oxidom-core
