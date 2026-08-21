@@ -263,8 +263,12 @@ surface, packaging, or the CLI belongs here.
 
   The width is now pushed at three moments — when the surface is created, on the first turn
   of the main loop after the window is mapped, and on every later resize — into a setter that
-  does nothing unless the count actually changes. No single one of them has to be right, which
-  is the difference: being wrong early is recoverable instead of permanent.
+  does nothing unless the count actually changes. No single one of them has to be right.
+
+  The first count also applies immediately instead of waiting for an idle turn. Deferring it
+  put the opening frame on screen at the starting value of one and repacked afterwards, so a
+  single column flashed on every launch. That was there all along, hidden behind the larger
+  defect while the count never changed at all.
 
 
 - **A tunnel whose core died now holds its traffic instead of releasing it.** When the Xray
