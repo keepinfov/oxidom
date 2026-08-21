@@ -139,9 +139,18 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
     because they name nobody and are usually the point; a private address is marked
     `[private address]` rather than `[address]`, since which side of the tunnel it was on is the
     difference between a routing bug and a server bug; oxidom's own dotted names — the
-    application id, bus names, `geoip.dat` — are not hostnames however much they look like one.
+    application id, bus names, `geoip.dat` — are not hostnames however much they look like one,
+    and neither is a dotted identifier from a library below oxidom (`Client.Timeout`, `io.EOF`),
+    which is told apart by case since DNS is written in lower case. The hosts oxidom itself
+    reaches for — the release downloads, the pool observatory's probe destination, the default
+    latency target — are kept with or without a scheme in front of them.
     Both directions are pinned by one corpus: shapes that must not survive, and lines that must
     survive byte for byte.
+  - **The corpus is built from lines the log holds (binding).** Xray's access log writes
+    `network:host:port` on both sides of `accepted` on every line, and a rule that reads the
+    address without taking the network off first passes it through whole; its observatory writes
+    a quoted URL inside a sentence, and punctuation after a URL belongs to the sentence. A shape
+    the log emits constantly and the corpus does not carry is where the next leak is.
   - **No browser is opened.** The report goes on the clipboard and is offered a file. A
     prefilled issue URL would carry the log through a third party's address bar and would submit
     it before the reporter had read it, which is the opposite of what the redaction is for.
