@@ -1084,6 +1084,27 @@ fn build(
 /// was actually clicked still gets the same click it always did. Only text
 /// widgets are dropped — anything else keeps its focus, or keyboard navigation
 /// would be unusable.
+/// Whether a paste on this page means "import this".
+///
+/// It means that where servers arrive and where subscriptions are managed, and
+/// nowhere else: a subscription URL pasted on Settings, Profiles or Logs
+/// answers a question nobody asked.
+fn paste_imports_on(page: Page) -> bool {
+    matches!(page, Page::Servers | Page::Subscriptions)
+}
+
+/// The focused widget, when what has focus is somewhere text is typed.
+///
+/// `GtkEditable` covers the whole family in one test — `GtkText`, the entries
+/// that delegate to it, and libadwaita's `AdwEntryRow`, `AdwSpinRow` and
+/// `GtkSearchEntry`, all of which report their inner `GtkText` as the focus.
+/// Testing against `gtk::Entry` instead would match none of the entry rows in
+/// this application.
+fn text_focus(window: &adw::ApplicationWindow) -> Option<gtk::Widget> {
+    let focused = gtk::prelude::GtkWindowExt::focus(window)?;
+    (focused.is::<gtk::Editable>() || focused.is::<gtk::TextView>()).then_some(focused)
+}
+
 fn drop_focus_on_outside_click(window: &adw::ApplicationWindow) {
     let click = gtk::GestureClick::new();
     click.set_button(0);
@@ -1094,14 +1115,9 @@ fn drop_focus_on_outside_click(window: &adw::ApplicationWindow) {
             let Some(window) = window.upgrade() else {
                 return;
             };
-            let Some(focused) = gtk::prelude::GtkWindowExt::focus(&window) else {
+            let Some(focused) = text_focus(&window) else {
                 return;
             };
-            // `GtkEditable` covers the whole family in one test — GtkText, the
-            // entries that delegate to it, and libadwaita's `AdwEntryRow`.
-            if !focused.is::<gtk::Editable>() && !focused.is::<gtk::TextView>() {
-                return;
-            }
             // A click on the entry itself arrives as its inner `GtkText`, and a
             // click on the frame around it as the `GtkEntry` that owns it —
             // hence both directions of the ancestry test.
@@ -1284,15 +1300,35 @@ impl Controller {
         dialog.present(Some(&self.window));
     }
 
-    /// Ctrl+V anywhere but a text field: take whatever is on the clipboard and
-    /// open the dialog it belongs to, filled in.
+    /// Ctrl+V on Servers or Subscriptions, with nothing being typed into: take
+    /// whatever is on the clipboard and open the dialog it belongs to, filled
+    /// in.
     ///
     /// A subscription link is copied from a browser or a chat and then pasted;
     /// the app asking the user to first find the right dialog, and paste there,
-    /// is the step being removed. An entry with focus keeps its own Ctrl+V —
-    /// GTK gives the focused widget the key first, and this action never sees
-    /// it.
+    /// is the step being removed.
+    ///
+    /// A focused entry does **not** keep its own Ctrl+V by itself, which this
+    /// comment used to claim. `set_accels_for_action` installs the shortcut on
+    /// the application, and a `GtkApplicationWindow` dispatches those in the
+    /// capture phase — root to target — so the action consumes the key before
+    /// the focused `GtkText` ever sees it. Returning early is therefore not
+    /// enough: the key would be swallowed and the field would still not paste.
+    /// The press is handed to the widget instead.
+    ///
+    /// The page test is the second half. On Settings, Profiles or Logs a pasted
+    /// subscription URL answers a question nobody asked, and the answer was a
+    /// dialog opening over the page being read.
     fn import_from_clipboard(self: &Rc<Self>) {
+        if let Some(focused) = text_focus(&self.window) {
+            // Both `GtkText` and `GtkTextView` install this action; it is what
+            // their own Ctrl+V binding activates.
+            let _ = gtk::prelude::WidgetExt::activate_action(&focused, "clipboard.paste", None);
+            return;
+        }
+        if !paste_imports_on(self.current_page()) {
+            return;
+        }
         let weak = Rc::downgrade(self);
         with_clipboard(&self.window, move |pasted| {
             let Some(controller) = weak.upgrade() else {
@@ -1642,6 +1678,16 @@ impl Controller {
 
     fn is_servers_page(&self) -> bool {
         self.stack.visible_child_name().as_deref() == Some(Page::Servers.stack_name())
+    }
+
+    /// Which page is showing, read back from the sidebar selection that drives
+    /// it. `navigate_to` moves that selection rather than the stack, so the
+    /// selection is the one place both routes agree on.
+    fn current_page(&self) -> Page {
+        self.sidebar_list
+            .selected_row()
+            .map(|row| Page::from_index(row.index()))
+            .unwrap_or(Page::Servers)
     }
 
     fn handle_search_changed(&self, entry: &gtk::SearchEntry) {
@@ -5107,6 +5153,8 @@ fn install_css() {
 
 #[cfg(test)]
 mod tests {
+    use super::{Page, paste_imports_on};
+
     /// The first frame used to lay out from whatever width happened to be
     /// reported at realize, and a value that was not yet final stuck for the
     /// session. Zero is the one reported width that means "nobody has been
@@ -5286,5 +5334,17 @@ mod tests {
                 selection: None,
             }
         );
+    }
+
+    /// A subscription URL is pasted where servers and subscriptions are; on the
+    /// other three pages the same press used to open a dialog over what was
+    /// being read, or answer "Nothing on the clipboard to import".
+    #[test]
+    fn a_paste_imports_only_where_importing_is_what_it_means() {
+        assert!(paste_imports_on(Page::Servers));
+        assert!(paste_imports_on(Page::Subscriptions));
+        assert!(!paste_imports_on(Page::Profiles));
+        assert!(!paste_imports_on(Page::Settings));
+        assert!(!paste_imports_on(Page::Logs));
     }
 }
