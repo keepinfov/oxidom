@@ -14,6 +14,41 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- **A problem report no longer names the provider.** Server aliases survived a report in full,
+  inside every access line the core writes: `[socks-in >> s-nl-soda-vpn]`. That tag is `s-` plus
+  the server's alias, and the alias is derived from the server's name and its country — so it named
+  the provider and usually the exit country, which is the one thing the bug form asks a reporter
+  not to include. No rule reached it: as a token it has no dot, so the host rule never saw it.
+
+  The report is now built with the server list the daemon already holds, so aliases, display names
+  and server addresses are taken out by name rather than by shape. The `s-` namespace stays,
+  because it names nobody and the line is about a pool member. A tag naming a server the report
+  does not know still survives: taking it out would mean redacting on the strength of a
+  two-character prefix.
+
+- **A problem report says which redaction is which.** Every removal carried the same word, so two
+  different hosts read identically and one host appearing twice could not be told from two:
+
+      error ping https://[redacted] with ...: Head "https://[redacted] context deadline exceeded
+
+  Both of those were the same URL, and nothing said so. Marks are now numbered per report —
+  `[host 1]`, `[host 2]`, `[address 1]`, `[node 1]` — so the same value carries the same number
+  wherever it appears, and a failure followed through a log cannot be read as a sequence of events
+  that never happened. A server's alias, name and address share one number, because they are one
+  server. Credentials are deliberately not numbered.
+
+- **A problem report states what it kept, and why.** The footer said what had been removed, in four
+  categories, and named none of the marks — `[machine]` and `[user]` appeared in reports and were
+  documented nowhere. It said nothing about what was kept on purpose, so a reader seeing
+  `127.0.0.1:1080` and `geoip.dat` intact beside a redaction could not tell a decision from a miss.
+
+  It now names every mark a report can contain and what each stood for, says that loopback, the
+  unspecified address, ports and oxidom's own names are kept deliberately, and says that the rules
+  read shapes rather than meanings and are best-effort. The report ends by asking the reporter to
+  read it through; that is only actionable if they know what the rules were meant to catch. The
+  wording lives in one table now, so the footer and the marks cannot drift apart.
+
 ## [0.2.0] - 2026-08-21
 
 ### Added
