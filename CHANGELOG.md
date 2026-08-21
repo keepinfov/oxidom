@@ -14,6 +14,19 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Changed
+- **A Debian or Ubuntu user can install oxidom from the README.** `## Install` was the third
+  heading, opened with eight lines of Nix, gave Arch two lines of prose, and for everything else
+  named three build prerequisites and no commands at all — while a signed apt and rpm repository
+  had been documented in `docs/installation.md` all along. Someone on Ubuntu read the top of the
+  file and concluded they had to build from source.
+
+  The apt and dnf lines now sit above the feature list, with the AppImage for distributions too
+  old for the packages and one line saying an Xray core is required and not bundled. `## Install`
+  runs deb and rpm first, Arch next, Nix last, and `## Try it` leads with the installed binaries
+  rather than `nix run`. The README also claimed oxidom was on the AUR, which
+  `docs/installation.md` says it is not; that is corrected.
+
 ### Added
 - **A pool's health check is no longer one hard-coded address.** A pool's balancer puts a node into
   rotation only once it has reached a ping destination *through* that node. That destination was a
@@ -32,6 +45,14 @@ surface, packaging, or the CLI belongs here.
 
   Whatever a subscription supplies for this is still discarded, unconditionally. A destination
   chosen by somebody else is a URL your core would fetch on a timer, through your own exits.
+
+- **A one-line installer.** `curl -fsSL https://keepinfov.github.io/oxidom/install.sh | sh` detects
+  apt or dnf and runs exactly the commands the documentation lists, printing each before it runs.
+  It checks the repository key it downloads against a fingerprint pinned in its own source and
+  refuses to install if they disagree — a fetch that does not check the key is trust-on-first-use
+  dressed up as verification. The fingerprint is now published beside the key so the pin can be
+  checked against the repository too. The script is in the repository, so it can be read before it
+  is trusted, and it deliberately does not enable the system daemon.
 
 ### Fixed
 - **A pool that carried no traffic says whether its health check ever succeeded.** The message gave
