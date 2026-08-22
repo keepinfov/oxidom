@@ -41,6 +41,14 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   - **A region that is not drawn takes no clicks.** Opacity alone does not stop a widget being
     targeted, so the detail region becomes targetable when the fade finishes and stops being
     targetable when the card collapses.
+  - **The context menu covers the whole card.** The gesture is carried by the box holding the
+    header and the detail region, not by the header, which is a button of fixed height and the
+    detail region's sibling — a menu carried by the header reaches only the top of an open card
+    while holding actions that exist nowhere else at that moment. The popover points at the press.
+  - **Selectable text keeps its own menu.** The gesture bubbles rather than captures, so a
+    metadata label that is selectable answers a right-click with the text menu and the card menu
+    covers everything else. Those labels are selectable so an address or a failure reason can be
+    copied out; a card menu taking the press first would remove the only way to do it.
 - **Groups:** a chip row above the grid — `All`, one chip per saved group, `+`. A group narrows
   **the one list**, and is never a second block of cards: rendering it as its own block
   shows the same server two or three times and leaves no way to tell which card is real, and
