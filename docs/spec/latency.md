@@ -110,6 +110,15 @@ for this check beside the reason from the one before it.
   other source: the card opens the log page narrowed to the server's **address**, because that is
   what the prober and the core write. A name is the user's word for a server and appears in no log
   line. The narrowing is the log page's own search entry, so it is visible and can be widened.
+- **The block's two actions are icons on the reason's own line.** Two labelled buttons on a row of
+  their own made this the tallest thing on an expanded card once the recent checks stopped being
+  it. Every icon here carries a tooltip *and* an accessible label, which is the whole of what keeps
+  an icon from being a guess — and the report's icon is a warning rather than a send, because
+  nothing leaves the machine and an arrow would promise a transmission that does not happen.
+- **It sits under the record, not over it.** The count of failures and the reason for the newest
+  one are both about checks, and either side of the chart they read as two blocks that happen to
+  share a subject. Together they read as one statement: this many of the last ten failed, and the
+  last of them was tried this way, this recently.
 
 ## What the recent checks say (binding)
 

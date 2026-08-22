@@ -122,13 +122,16 @@ Hysteria2 is QUIC over UDP and has no TCP port to open.
 tooltip to work with, and "the server did not answer" covers a refused handshake,
 a wrong TLS parameter and a dead network alike. Opening a card whose last check
 produced no number shows the reason the daemon gave, how the check was made — the
-method really used, and whether it went through the tunnel — and how long ago.
-Beside it, **Show in logs** opens the log page narrowed to that server's address,
-which is what the core and the prober write into their lines. A check you stopped
+method really used, and whether it went through the tunnel — and how long ago. It
+sits under the recent checks rather than above them, so everything the card says
+about checks is in one place. On the reason's own line are two icons: 👁 **Show in
+logs** opens the log page narrowed to that server's address, which is what the
+core and the prober write into their lines, and ⚠ **Report a problem** builds the
+redacted report from it. Both name themselves when pointed at. A check you stopped
 is reported as stopped, not as a fault; a check still running shows nothing,
 because the only reason it could show is about the measurement being replaced.
 
-**Recent checks** below it draws the last ten as a chart, oldest at the left. One
+**Recent checks** above it draws the last ten as a chart, oldest at the left. One
 number says whether a server answered once; it cannot say whether it answers
 reliably, and that is usually the question — which is a question about spread and
 outliers, and those are easier to see than to read.
@@ -326,8 +329,8 @@ collected, the missing count is stated in place rather than passed over.
 **Report a problem** — the send icon in the toolbar — turns the lines you have
 **selected** into a report you can paste into a public issue. Select nothing and
 it takes everything visible, filters included. An expanded server card whose last
-check failed offers the same thing beside **Show in logs**: it narrows the page to
-that server first, then builds the report from what is left.
+check failed offers the same thing as the ⚠ icon beside 👁 **Show in logs**: it
+narrows the page to that server first, then builds the report from what is left.
 
 The report carries the version block the About dialog shows — oxidom, the daemon,
 the core, how it was installed, the distribution and desktop — plus what the

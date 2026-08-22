@@ -833,33 +833,41 @@ impl ServerCard {
         // The rest of what happened is in the log, mixed with every other
         // source on the machine. This is the only way to it that arrives
         // already narrowed to the server being asked about.
-        // `flat` alone, without `server-action`: that class squares a button
-        // down to an icon's footprint, and this one carries words.
-        let failure_logs = gtk::Button::builder()
-            .label("Show in logs")
-            .halign(gtk::Align::Start)
-            .css_classes(["flat"])
-            .build();
+        //
+        // Icons rather than words, on the reason's own line rather than a row
+        // of their own: two labelled buttons under two lines of text made this
+        // the tallest thing on an expanded card once the recent checks stopped
+        // being it. `icon_button` gives each one a tooltip *and* an accessible
+        // label, which is what keeps an icon from being a guess.
+        let failure_logs = icon_button("view-reveal-symbolic", "Show in logs");
+        failure_logs.add_css_class("server-action");
         failure_logs.connect_clicked(move |_| on_show_logs());
         // The step after reading the log, in the place somebody reaches it
         // from. What it produces has every address, host name, account id and
         // credential taken out and marked, so it can be pasted into a public
         // issue without being read line by line first.
-        let failure_report = gtk::Button::builder()
-            .label("Report a problem")
-            .halign(gtk::Align::Start)
-            .css_classes(["flat"])
-            .build();
+        //
+        // A warning rather than a send: nothing leaves the machine here, the
+        // report goes to the clipboard and to a file the user picks, and an
+        // arrow would promise a transmission that does not happen.
+        let failure_report = icon_button("dialog-warning-symbolic", "Report a problem");
+        failure_report.add_css_class("server-action");
         failure_report.connect_clicked(move |_| on_report());
-        let failure_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let failure_actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        // Pinned to the top of the row: the reason beside them wraps, and
+        // buttons that drifted to the middle of a three-line reason would read
+        // as belonging to the line they happened to land on.
+        failure_actions.set_valign(gtk::Align::Start);
         failure_actions.append(&failure_logs);
         failure_actions.append(&failure_report);
+        let failure_head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        failure_head.append(&failure_reason);
+        failure_head.append(&failure_actions);
         let failure = gtk::Box::new(gtk::Orientation::Vertical, 4);
         failure.set_visible(false);
         failure.set_css_classes(&["server-failure"]);
-        failure.append(&failure_reason);
+        failure.append(&failure_head);
         failure.append(&failure_attempt);
-        failure.append(&failure_actions);
 
         // The record behind the badge. One number cannot tell a steady server
         // from one that is fast half the time, and choosing between servers is
@@ -915,8 +923,13 @@ impl ServerCard {
         metadata.append(&full_name);
         metadata.append(&meta);
         metadata.append(&alias);
-        metadata.append(&failure);
+        // The record first, the newest failure under it. Both are about checks
+        // and they used to sit either side of the chart, which put the count of
+        // failures at the bottom of one block and the reason for the newest at
+        // the top of another. Together they read as one statement: three of ten
+        // failed this way, and the last of them was tried like this, just now.
         metadata.append(&history);
+        metadata.append(&failure);
         let metadata_scroller = gtk::ScrolledWindow::builder()
             .child(&metadata)
             .hscrollbar_policy(gtk::PolicyType::Never)
