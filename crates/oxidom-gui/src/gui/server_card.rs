@@ -10,7 +10,9 @@ use oxidom_core::config::LatencyMethod;
 use oxidom_core::ipc::ProbeDetail;
 use oxidom_core::model::Server;
 
-use super::reduce::{CHART_GAP, ChartMark, ChartSlot, FailureReport, HistoryChart, chart_columns};
+use super::reduce::{
+    CHART_GAP, ChartMark, ChartSlot, FailureReport, HistoryChart, chart_columns, history_legend,
+};
 use super::views::{
     dialog_content, icon_button, set_transient_parent, set_validation, validation_label,
 };
@@ -499,7 +501,7 @@ pub struct ServerCard {
     failure_attempt: gtk::Label,
     history: gtk::Box,
     history_chart: ProbeChart,
-    history_caption: gtk::Label,
+    history_summary: gtk::Label,
     history_failures: gtk::Label,
     expanded: Rc<Cell<bool>>,
     /// What the badge is currently showing. The age sweep re-pushes a state for
@@ -862,23 +864,33 @@ impl ServerCard {
         // The record behind the badge. One number cannot tell a steady server
         // from one that is fast half the time, and choosing between servers is
         // what the page is for. Spread, outliers and failures are shape, so
-        // they are drawn; the numbers at the ends, the direction and the
-        // reasons are words, so they are written under the drawing.
+        // they are drawn; the numbers behind the heights ride on the heading,
+        // and only the failures are worth a line of their own.
         let history_title = gtk::Label::builder()
             .xalign(0.0)
+            .hexpand(true)
             .label("Recent checks")
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["server-meta", "server-history-title"])
             .build();
-        let history_chart = ProbeChart::new();
-        let history_caption = gtk::Label::builder()
-            .xalign(0.0)
-            .hexpand(true)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(1)
+        // Selectable, because a range is a number somebody copies into an
+        // issue. Right-aligned against the title so the two read as one line
+        // rather than as a heading with an afterthought.
+        let history_summary = gtk::Label::builder()
+            .xalign(1.0)
             .selectable(true)
             .css_classes(["dim-label", "server-meta"])
             .build();
+        let history_heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        history_heading.append(&history_title);
+        history_heading.append(&history_summary);
+        // Which way the chart runs, and how much of it is kept: the one part of
+        // the block that is identical on every card of every server forever. It
+        // spent two lines of card as a caption, which is rent a legend does not
+        // earn. The numbers and the reasons stay on the card, because those
+        // describe the server rather than the drawing.
+        history_heading.set_tooltip_text(Some(&history_legend()));
+        let history_chart = ProbeChart::new();
         // The block above states the newest failure in full; this owes the
         // older ones, and it is a label rather than a tooltip because a check
         // that failed is the case the whole block exists for.
@@ -895,9 +907,8 @@ impl ServerCard {
         let history = gtk::Box::new(gtk::Orientation::Vertical, 4);
         history.set_visible(false);
         history.set_css_classes(&["server-history"]);
-        history.append(&history_title);
+        history.append(&history_heading);
         history.append(&history_chart);
-        history.append(&history_caption);
         history.append(&history_failures);
 
         let metadata = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -1029,7 +1040,7 @@ impl ServerCard {
             failure_attempt,
             history,
             history_chart,
-            history_caption,
+            history_summary,
             history_failures,
             expanded,
             last_latency: Rc::new(Cell::new(latency_state)),
@@ -1180,7 +1191,7 @@ impl ServerCard {
             return true;
         };
         self.history_chart.set_slots(&chart.slots);
-        self.history_caption.set_label(&chart.caption);
+        self.history_summary.set_label(&chart.summary);
         match chart.failures.as_deref() {
             Some(failures) => {
                 self.history_failures.set_label(failures);
