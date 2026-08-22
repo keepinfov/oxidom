@@ -153,16 +153,21 @@ honest — a chart says things a list cannot, and it can also imply things a lis
   the card. The list this replaced stopped at ten and said nothing about it, so it read as
   unbounded.
 - **Time runs left to right**, which is the opposite of the newest-first order the daemon answers
-  in and of the failure block above. The caption says which, because both directions are ordinary
-  and the picture cannot show that it chose one.
+  in and of the failure block above. `gui::reduce::history_legend` says which, because both
+  directions are ordinary and the picture cannot show that it chose one.
 - **The heights are shares of the tallest reading on that chart alone.** Two servers' charts are
   therefore *not* comparable with each other, and a steady 5 ms server and a steady 500 ms one draw
-  the same picture. This is why the caption states the actual range and is not optional.
-- **The words are not a tooltip.** The range, the direction, the bound and the reasons for the
-  failures are labels on the card. A chart whose content is reachable only by pointing at it says
-  nothing to a screen reader and nothing to anyone who does not think to hover — and the failures
-  are the case the block exists for. The per-column tooltip is an addition to that, never the
-  carrier of it.
+  the same picture. This is why the range is stated and is not optional.
+- **A reading is a label; a legend is a tooltip.** The range, how many checks are behind it, and
+  the reasons for the failures describe the *server*: they are labels on the card, because a chart
+  whose content is reachable only by pointing at it says nothing to a screen reader and nothing to
+  anyone who does not think to hover — and the failures are the case the block exists for. The
+  direction and the bound describe the *drawing*, are identical on every card of every server, and
+  are the heading's tooltip. They were a caption once and cost two lines of every open card, on a
+  block whose whole reason for replacing a list was height.
+- **The range rides on the heading.** It sits beside "Recent checks" rather than under the chart,
+  so the numbers the heights cannot state cost no line of their own. Its shortness is a
+  requirement, not a style: a summary long enough to wrap has given back what the chart saved.
 - **The reasons are grouped, not listed.** Six timeouts in a row spend one line, not six, and the
   commonest reason leads because that is the one describing the server.
 - **The geometry is a pure function.** `gui::reduce::chart_columns` turns the marks and a

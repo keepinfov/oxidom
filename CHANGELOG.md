@@ -53,10 +53,13 @@ surface, packaging, or the CLI belongs here.
   never made — and every one of the ten slots the daemon keeps is drawn whether or not a check has
   filled it, which is where the bound became visible.
 
-  The words the picture cannot carry are on the card, not in a tooltip: the real range, how many
-  checks produced a number, which end is the oldest, and — in red under it — why the checks that
-  produced no number produced none, grouped so six timeouts spend one line rather than six.
-  Pointing at a column still gives that one check in full.
+  The heights are relative, so the real numbers sit on the block's own heading, to the right of
+  **Recent checks** — the range and how many checks are behind it — where they cost no line of
+  card. Under the chart, in red, is why the checks that produced no number produced none, grouped
+  so six timeouts spend one line rather than six. Which end is the oldest and how many checks are
+  kept is the heading's tooltip: it is the same sentence on every card of every server, and a
+  legend that spends two lines of every open card is not worth them on a block that replaced a
+  list for being too tall. Pointing at a column still gives that one check in full.
 
 - **A Debian or Ubuntu user can install oxidom from the README.** `## Install` was the third
   heading, opened with eight lines of Nix, gave Arch two lines of prose, and for everything else

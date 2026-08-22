@@ -142,10 +142,12 @@ at any column says what that check measured, how, and when.
 
 Because the heights are shares of that one server's slowest reading, two servers'
 charts do not compare with each other — a steady 5 ms server and a steady 500 ms
-one draw the same picture. The line under the chart is where the real numbers are:
-the range, how many checks produced one, and which end is which. Under that, in
-red, is why the ones that produced no number produced none, with the commonest
-reason first; the newest failure is already stated in full above the chart.
+one draw the same picture. The real numbers are on the block's own heading, to the
+right of **Recent checks**: the range and how many checks are behind it. Under the
+chart, in red, is why the ones that produced no number produced none, with the
+commonest reason first; the newest failure is already stated in full above the
+chart. Pointing at the heading says which end is the oldest and how many checks
+are kept.
 
 Checks you called off before they ran leave no column, so stopping a sweep does not
 push a server's real record off the chart. A daemon from an older version kept no

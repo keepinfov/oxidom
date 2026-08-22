@@ -2348,11 +2348,13 @@ pub(super) struct HistoryChart {
     /// Oldest at the left, newest at the right, always [`HISTORY_SLOTS`] long.
     ///
     /// Left-to-right because that is which way time runs in every chart; the
-    /// list it replaced ran newest-first, which is which way a log reads. The
-    /// caption says which of the two this is, since both are ordinary.
+    /// list it replaced ran newest-first, which is which way a log reads.
+    /// [`history_legend`] says which of the two this is, since both are
+    /// ordinary.
     pub slots: Vec<ChartSlot>,
-    /// The range, the count, and the two facts the picture cannot state.
-    pub caption: String,
+    /// The numbers the relative heights cannot state, short enough to sit on
+    /// the block's own heading rather than spend a line of card under it.
+    pub summary: String,
     /// The failed checks in words, or `None` when every check produced a
     /// number. The block above the chart already states the newest failure in
     /// full, so this owes the older ones.
@@ -2378,7 +2380,7 @@ pub(super) fn history_chart(history: &ProbeHistory, now_unix_ms: u64) -> Option<
     }
     // The tallest reading sets the scale, which is what makes a chart of one
     // server comparable with itself over time rather than with the card above
-    // it. The caption carries the absolute numbers precisely because the
+    // it. The heading carries the absolute numbers precisely because the
     // heights are relative.
     let tallest = newest_first
         .iter()
@@ -2407,49 +2409,60 @@ pub(super) fn history_chart(history: &ProbeHistory, now_unix_ms: u64) -> Option<
         });
     }
     Some(HistoryChart {
-        caption: chart_caption(&newest_first),
+        summary: chart_summary(&newest_first),
         failures: chart_failures(&newest_first),
         slots,
     })
 }
 
-/// What the chart cannot draw: the numbers at each end, which way time runs,
-/// and how many slots there are.
+/// What the chart itself cannot state: the real numbers behind the heights.
 ///
-/// The count is of the checks that produced a number, not of the checks. A
-/// range stated "across 10 checks" when three of the ten failed reads as ten
-/// measurements, and the three that measured nothing are the ones the reader
-/// most needs kept out of the average they are about to do in their head.
-fn chart_caption(readings: &[&LatencyReading]) -> String {
+/// The columns are shares of the tallest reading on this one chart, so a steady
+/// 5 ms server and a steady 500 ms one draw the same picture. Without these the
+/// block would say how a server behaves and never what it costs.
+///
+/// Short on purpose. It rides on the block's heading, beside "Recent checks",
+/// because it earns its place only if it spends no line of its own — the block
+/// this replaced was already the tallest thing on the card.
+///
+/// The count is of the checks that produced a number, not of the checks. A range
+/// stated over ten when three of the ten failed reads as ten measurements, and
+/// those three are the ones a reader most needs kept out of the average they are
+/// about to do in their head.
+fn chart_summary(readings: &[&LatencyReading]) -> String {
     let mut measured: Vec<u32> = readings
         .iter()
         .filter_map(|reading| reading.value)
         .collect();
     measured.sort_unstable();
     let total = readings.len();
-    let reading = match (measured.first(), measured.last()) {
+    let (Some(low), Some(high)) = (measured.first(), measured.last()) else {
         // Not an error and not an empty chart: the columns are all failures,
-        // which is a record and a strong one. "No data" over a chart full of
-        // marks would read as the chart being broken rather than the server
-        // being it. How many, and why, is the failure line's business.
-        (None, _) | (_, None) => "No check produced a number".to_string(),
-        (Some(low), Some(high)) => {
-            let range = if low == high {
-                format!("{low} ms")
-            } else {
-                format!("{low}–{high} ms")
-            };
-            match (measured.len(), measured.len() == total) {
-                (1, true) => format!("{range} from the one check that ran"),
-                (1, false) => format!("{range} from the one check that produced a number"),
-                (many, true) => format!("{range} across {many} checks"),
-                (many, false) => {
-                    format!("{range} from the {many} checks that produced a number")
-                }
-            }
-        }
+        // which is a record and a strong one. How many, and why, is the failure
+        // line's business, and it is directly underneath.
+        return "no numbers".to_string();
     };
-    format!("{reading} · oldest at the left, and the last {HISTORY_SLOTS} are kept")
+    let range = if low == high {
+        format!("{low} ms")
+    } else {
+        format!("{low}–{high} ms")
+    };
+    match (measured.len(), measured.len() == total) {
+        (1, true) => format!("{range} · 1 check"),
+        (many, true) => format!("{range} · {many} checks"),
+        (many, false) => format!("{range} · {many} of {total}"),
+    }
+}
+
+/// Which way the chart runs and how much of it is kept.
+///
+/// A tooltip on the block's heading rather than a line under the chart. It is
+/// the one part of the block that is the same on every card of every server
+/// forever — a legend, not a reading — and a legend that costs two lines of card
+/// on every open card is paying rent it does not earn. The numbers and the
+/// reasons stay on the card as labels, because those describe the server.
+pub(super) fn history_legend() -> String {
+    format!("Oldest at the left; the last {HISTORY_SLOTS} checks are kept.")
 }
 
 /// The checks that produced no number, in the daemon's own wording.
@@ -5804,10 +5817,10 @@ mod tests {
     }
 
     /// The heights are relative, so the numbers behind them have to be written
-    /// down — and so does which end is which, since a chart that ran the other
-    /// way would look exactly the same.
+    /// down somewhere. They ride on the block's heading, which costs no line of
+    /// card — the caption that used to carry them spent two.
     #[test]
-    fn the_caption_states_the_range_the_count_and_which_way_time_runs() {
+    fn the_heading_states_the_range_and_how_many_checks_are_behind_it() {
         let history = ProbeHistory {
             readings: vec![
                 measured_at(41, LatencyMethod::HttpGet, NOW_MS),
@@ -5816,29 +5829,24 @@ mod tests {
             ],
         };
         let chart = history_chart(&history, NOW_MS).expect("three readings draw a chart");
-        assert_eq!(
-            chart.caption,
-            "38–870 ms across 3 checks · oldest at the left, and the last 10 are kept"
-        );
+        assert_eq!(chart.summary, "38–870 ms · 3 checks");
     }
 
     /// One reading is not a range, and calling it one would be the chart
     /// claiming a spread it has no basis for.
     #[test]
-    fn the_caption_of_a_single_check_does_not_claim_a_range() {
+    fn the_heading_of_a_single_check_does_not_claim_a_range() {
         let history = ProbeHistory {
             readings: vec![measured_at(41, LatencyMethod::HttpGet, NOW_MS)],
         };
         let chart = history_chart(&history, NOW_MS).expect("one reading draws a chart");
-        assert_eq!(
-            chart.caption,
-            "41 ms from the one check that ran · oldest at the left, and the last 10 are kept"
-        );
+        assert_eq!(chart.summary, "41 ms · 1 check");
     }
 
     /// A chart whose every column is a failure is a record, and a strong one.
-    /// "No data" over a chart full of marks would read as the chart being
-    /// broken rather than the server being it.
+    /// A blank heading over a chart full of marks would read as the chart being
+    /// broken rather than the server being it. How many and why is the failure
+    /// line's business, directly underneath.
     #[test]
     fn a_chart_that_measured_nothing_says_so_rather_than_reading_as_broken() {
         let history = ProbeHistory {
@@ -5860,10 +5868,7 @@ mod tests {
             ],
         };
         let chart = history_chart(&history, NOW_MS).expect("failures are a record");
-        assert_eq!(
-            chart.caption,
-            "No check produced a number · oldest at the left, and the last 10 are kept"
-        );
+        assert_eq!(chart.summary, "no numbers");
     }
 
     /// A range stated "across 10 checks" when three of the ten measured nothing
@@ -5872,7 +5877,7 @@ mod tests {
     /// do in their head. The count is of the numbers; the failure line accounts
     /// for the rest.
     #[test]
-    fn the_caption_counts_the_checks_that_produced_a_number_and_not_the_rest() {
+    fn the_heading_counts_the_checks_that_produced_a_number_and_not_the_rest() {
         let history = ProbeHistory {
             readings: vec![
                 failed_at(
@@ -5887,14 +5892,25 @@ mod tests {
             ],
         };
         let chart = history_chart(&history, NOW_MS).expect("three readings draw a chart");
-        assert_eq!(
-            chart.caption,
-            "38–41 ms from the 2 checks that produced a number · oldest at the left, and the \
-             last 10 are kept"
-        );
+        assert_eq!(chart.summary, "38–41 ms · 2 of 3");
         assert_eq!(
             chart.failures.as_deref(),
             Some("1 of 3 failed: the server did not answer")
+        );
+    }
+
+    /// Which way the chart runs and how much of it is kept is the one part of
+    /// the block that never changes, on any card, for any server. It is a
+    /// legend, so it lives in the heading's tooltip rather than spending two
+    /// lines of every open card — but it still has to name both facts, since a
+    /// chart drawn the other way round would look exactly the same.
+    #[test]
+    fn the_legend_names_the_direction_and_the_bound() {
+        let legend = history_legend();
+        assert!(legend.contains("Oldest at the left"), "{legend}");
+        assert!(
+            legend.contains(&HISTORY_SLOTS.to_string()),
+            "the bound is the daemon's, not a number written twice: {legend}"
         );
     }
 
