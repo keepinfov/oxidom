@@ -22,8 +22,7 @@ impl Page {
         }
     }
 
-    /// Row position in the navigation list; inverse of the mapping in
-    /// `connect_row_selected`.
+    /// Row position in the navigation list.
     pub fn index(self) -> i32 {
         match self {
             Self::Servers => 0,
@@ -31,6 +30,22 @@ impl Page {
             Self::Subscriptions => 2,
             Self::Settings => 3,
             Self::Logs => 4,
+        }
+    }
+
+    /// The page a row position names; the inverse of [`Page::index`].
+    ///
+    /// This used to be written out a second time inside `connect_row_selected`,
+    /// where nothing compared the two tables. Anything reading the selection
+    /// back — which is how the window answers "which page is showing" — went
+    /// through that copy.
+    pub fn from_index(index: i32) -> Self {
+        match index {
+            1 => Self::Profiles,
+            2 => Self::Subscriptions,
+            3 => Self::Settings,
+            4 => Self::Logs,
+            _ => Self::Servers,
         }
     }
 }
@@ -110,14 +125,7 @@ impl Sidebar {
         list.select_row(list.row_at_index(0).as_ref());
         list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
-            let page = match row.index() {
-                1 => Page::Profiles,
-                2 => Page::Subscriptions,
-                3 => Page::Settings,
-                4 => Page::Logs,
-                _ => Page::Servers,
-            };
-            on_page(page);
+            on_page(Page::from_index(row.index()));
         });
 
         let status_icon = gtk::Image::builder()
@@ -181,5 +189,37 @@ impl Sidebar {
             status_action,
             status_action_icon,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two tables used to be written out separately, in two files, with
+    /// nothing comparing them. A page that navigated to row 3 and read row 3
+    /// back as a different page would have been a silent disagreement.
+    #[test]
+    fn a_row_position_and_the_page_it_names_are_inverses() {
+        for page in [
+            Page::Servers,
+            Page::Profiles,
+            Page::Subscriptions,
+            Page::Settings,
+            Page::Logs,
+        ] {
+            assert_eq!(
+                Page::from_index(page.index()),
+                page,
+                "{page:?} did not survive the round trip through its row index"
+            );
+        }
+    }
+
+    /// A list with no selection reports -1, and the sidebar opens on Servers.
+    #[test]
+    fn a_row_position_that_names_no_page_reads_as_the_first_one() {
+        assert_eq!(Page::from_index(-1), Page::Servers);
+        assert_eq!(Page::from_index(9), Page::Servers);
     }
 }
