@@ -42,6 +42,18 @@ surface, packaging, or the CLI belongs here.
   is trusted, and it deliberately does not enable the system daemon.
 
 ### Changed
+- **The expanded card puts the record above the reason, and its two actions on one line.** A card
+  whose last check produced no number carried the reason, how the check was made, and two
+  word-labelled buttons — **Show in logs** and **Report a problem** — on a row of their own, above
+  the recent checks. Once the checks stopped being the tallest thing on the card, that block was.
+
+  The reason now sits *under* the recent checks, so everything the card says about checks is in one
+  place and reads as one statement: this many of the last ten failed, and the last of them was
+  tried this way, this recently. The two buttons are icons on the reason's own line — 👁 for the
+  logs, ⚠ for the report — each naming itself when pointed at and to a screen reader. The report's
+  icon is a warning rather than a send: nothing leaves the machine, and an arrow would promise a
+  transmission that does not happen.
+
 - **The record behind the badge is a chart.** The expanded card ended in ten rows of
   `41 ms · HTTP GET · 3 minutes ago`, which made it the tallest block on the card and decided the
   card's expanded height — while saying nothing about the list stopping at ten, so it read as
