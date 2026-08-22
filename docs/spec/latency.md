@@ -116,25 +116,63 @@ for this check beside the reason from the one before it.
 One number is the weakest possible basis for choosing between servers: a server that is fast half
 the time and one that is steady are indistinguishable through their newest reading alone. The
 daemon therefore keeps the last `ipc::PROBE_HISTORY_LIMIT` readings per server, and the expanded
-card draws them with the method and the age of each.
+card **draws** them as a chart with the numbers, the direction and the failures written underneath.
 
 - **The history is fetched, never polled.** `ProbeHistory` is asked for one server at a time, when
   a card opens and when something about that server changes, the way `RuntimeInfo` is asked for
   when Settings opens. Folding it into `ProbeState` would multiply a twice-a-second payload for
-  every server by ten to feed a list only the one open card can show.
+  every server by ten to feed a block only the one open card can show.
 - **It records checks that ran.** A check called off before it got a slot measured nothing about
   the server, so it leaves a `readings` entry — the card still owes an answer for having no
   number — and no history entry. Recording those would let one press of Stop on a large sweep push
   every server's real record out of a ten-deep list, erasing the history by way of filling it.
 - **A check that ran and failed keeps its place.** A server that times out every other attempt is
-  exactly what the list exists to expose, and dropping those rows would make it look steady. The
-  reason is `ProbeFailure::message_with` again, not a second wording.
+  exactly what the block exists to expose, and dropping those readings would make it look steady.
+  The reason is `ProbeFailure::message_with` again, not a second wording.
 - **It is direct measurements only**, like `readings`. A `Proxied` reading describes a tunnel, and
   belongs to the profile carrying it rather than to the server.
 - **Histories are pruned with their server**, for the same reason readings are.
 - **The age is worded by one function.** `gui::reduce::when_text` writes "just now", "3 minutes
-  ago" and "at an unrecorded time" for both the reason above the list and every row in it, because
-  the two sit on the same card and two spellings there read as two different facts.
+  ago" and "at an unrecorded time" for both the reason above the chart and every column of it,
+  because the two sit on the same card and two spellings there read as two different facts.
+
+### The shape of the block (binding)
+
+Spread, outliers and failures are shape rather than text, and a list of ten lines is not how a
+comparison between servers is made. The block is a chart, and these are the rules that keep it
+honest — a chart says things a list cannot, and it can also imply things a list never could.
+
+- **Three marks, not two.** A check that ran and failed, and a slot no check has filled, are drawn
+  differently. A gap would be both at once, and would report a server that fails every other
+  attempt as one nobody has got round to testing — the distinction the whole block exists for.
+- **A failure is drawn full height and striped.** It is not a measurement, so no height would be
+  the honest drawing and a gap the result. Full height cannot be mistaken for a gap, and the
+  stripes are what keep it from being read as a very slow reading by someone who cannot separate
+  the two colours. The mark carries the difference; the colour only reinforces it.
+- **Every slot the daemon keeps is drawn**, filled or not, so `PROBE_HISTORY_LIMIT` is visible on
+  the card. The list this replaced stopped at ten and said nothing about it, so it read as
+  unbounded.
+- **Time runs left to right**, which is the opposite of the newest-first order the daemon answers
+  in and of the failure block above. The caption says which, because both directions are ordinary
+  and the picture cannot show that it chose one.
+- **The heights are shares of the tallest reading on that chart alone.** Two servers' charts are
+  therefore *not* comparable with each other, and a steady 5 ms server and a steady 500 ms one draw
+  the same picture. This is why the caption states the actual range and is not optional.
+- **The words are not a tooltip.** The range, the direction, the bound and the reasons for the
+  failures are labels on the card. A chart whose content is reachable only by pointing at it says
+  nothing to a screen reader and nothing to anyone who does not think to hover — and the failures
+  are the case the block exists for. The per-column tooltip is an addition to that, never the
+  carrier of it.
+- **The reasons are grouped, not listed.** Six timeouts in a row spend one line, not six, and the
+  commonest reason leads because that is the one describing the server.
+- **The geometry is a pure function.** `gui::reduce::chart_columns` turns the marks and a
+  rectangle into integer columns, and `history_chart` turns a `ProbeHistory` into marks and
+  sentences. Neither touches a widget, because no test here may construct one, and the column
+  arithmetic is the part that fails invisibly: a width rounded down ten times leaves a strip on
+  the right that reads as the chart being clipped.
+- **The palette stays in CSS.** Every column is a child widget carrying a style class rather than
+  a rectangle drawn from an `RGBA` held in Rust, because nothing else in this application picks its
+  own colours and a chart that did would be the one thing on the card that ignored the theme.
 
 ## The D-Bus surface (binding)
 

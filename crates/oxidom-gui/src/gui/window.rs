@@ -25,7 +25,7 @@ use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbePhase, ProbeWait, SessionRowState,
     SnapshotState, SwitcherItem, about_comments, active_latency_for, card_action,
-    check_can_be_stopped, geo_download_prompt, history_rows, human_bytes, latency_states,
+    check_can_be_stopped, geo_download_prompt, history_chart, human_bytes, latency_states,
     missing_core_message, other_profiles_message, pool_action, pool_short_label, press_stops,
     reduce, selected_status, session_for, session_rows, stop_report, switcher_items,
     switcher_visible,
@@ -2555,8 +2555,8 @@ impl Controller {
                     // which is the failure this whole panel exists to prevent.
                     if controller.state.borrow().selected_id.as_deref() == Some(server_id.as_str())
                     {
-                        let rows = history_rows(&history, ipc::now_unix_ms());
-                        controller.servers.set_history(&server_id, &rows);
+                        let chart = history_chart(&history, ipc::now_unix_ms());
+                        controller.servers.set_history(&server_id, chart.as_ref());
                     }
                 }
                 // Nothing is said to the user. A daemon too old to keep a
@@ -5169,6 +5169,31 @@ fn install_css() {
         .server-history { border-left: 2px solid alpha(@window_fg_color, 0.25); padding-left: 8px; }
         .server-failure-reason,
         .server-history-title { font-weight: 500; }
+        /* The chart itself paints nothing: every column is a child widget, so
+           the palette stays in CSS where the rest of the application's colours
+           are. A measured check is the accent the reachable badge already uses,
+           which is what ties the picture to the number above it. */
+        .probe-chart-slot { border-radius: 1px; }
+        .probe-chart-ran { background-color: @accent_color; }
+        /* Striped rather than solid, and full height. A failure is not a
+           measurement, so no height would be the honest drawing and a gap the
+           result — indistinguishable from a check that was never made. Full
+           height cannot be mistaken for a gap, and the stripes are what keep it
+           from being read as a very slow reading by anyone who cannot separate
+           the two colours. */
+        .probe-chart-failed {
+            background-color: alpha(@error_color, 0.16);
+            background-image: repeating-linear-gradient(
+                to bottom,
+                @error_color 0px,
+                @error_color 2px,
+                transparent 2px,
+                transparent 5px);
+        }
+        /* A slot no check has filled: a rule on the floor, so the ten slots the
+           daemon keeps are visible as ten whether or not ten checks have run. */
+        .probe-chart-empty { background-color: alpha(@window_fg_color, 0.22); }
+        .server-history-failures { color: @error_color; }
 
         .server-flag { min-width: 28px; min-height: 28px; border-radius: 4px; }
         .server-globe { min-width: 28px; min-height: 28px; }

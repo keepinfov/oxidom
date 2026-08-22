@@ -42,6 +42,22 @@ surface, packaging, or the CLI belongs here.
   is trusted, and it deliberately does not enable the system daemon.
 
 ### Changed
+- **The record behind the badge is a chart.** The expanded card ended in ten rows of
+  `41 ms · HTTP GET · 3 minutes ago`, which made it the tallest block on the card and decided the
+  card's expanded height — while saying nothing about the list stopping at ten, so it read as
+  unbounded. It is now one chart with three lines under it: a bar per check, oldest at the left,
+  as tall a share of the block as its number is of that server's slowest reading.
+
+  A check that ran and failed is a striped red column at full height, and a slot no check has
+  filled is a thin rule on the floor, so a failure can no longer be confused with a check that was
+  never made — and every one of the ten slots the daemon keeps is drawn whether or not a check has
+  filled it, which is where the bound became visible.
+
+  The words the picture cannot carry are on the card, not in a tooltip: the real range, how many
+  checks produced a number, which end is the oldest, and — in red under it — why the checks that
+  produced no number produced none, grouped so six timeouts spend one line rather than six.
+  Pointing at a column still gives that one check in full.
+
 - **A Debian or Ubuntu user can install oxidom from the README.** `## Install` was the third
   heading, opened with eight lines of Nix, gave Arch two lines of prose, and for everything else
   named three build prerequisites and no commands at all — while a signed apt and rpm repository
