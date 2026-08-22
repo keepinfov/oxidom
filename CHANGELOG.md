@@ -14,6 +14,8 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-22
+
 ### Added
 - **A pool's health check is no longer one hard-coded address.** A pool's balancer puts a node into
   rotation only once it has reached a ping destination *through* that node. That destination was a

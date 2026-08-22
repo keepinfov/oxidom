@@ -43,6 +43,38 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.3.0" date="2026-08-22">
+      <description>
+        <p>
+          This release is about the interface telling the truth about what it
+          did. The expanded server card draws the record behind its number as a
+          chart instead of ten lines of text: a column per check, oldest at the
+          left, with a failed check marked apart from a slot no check has filled
+          and the range stated beside the heading. Its right-click menu covers
+          the whole card rather than only the strip at the top, and the reason a
+          check produced no number sits under the chart with its two actions as
+          icons.
+        </p>
+        <p>
+          A problem report no longer names the provider. Server names, aliases
+          and the tags built from them are taken out along with addresses, host
+          names and credentials; each distinct value carries its own numbered
+          mark, so one host can be followed through a report without being
+          readable; and the footer names every mark the report can contain and
+          says what was kept on purpose.
+        </p>
+        <p>
+          A pool's health check is a setting rather than one hard-coded address,
+          for the machine or for one profile, and a pool that carried no traffic
+          says whether that check ever succeeded instead of only counting nodes.
+          Stopping a latency sweep says how many checks it stopped, and a stop is
+          offered only where one lands. A paste lands in the field it was aimed
+          at. Connecting a group of servers names the session it runs in. Debian,
+          Ubuntu and Fedora users can install oxidom with one command from the
+          README.
+        </p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-08-21">
       <description>
         <p>
