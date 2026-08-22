@@ -109,6 +109,21 @@ surface, packaging, or the CLI belongs here.
   failure reason can be copied out, and a card menu that took the press first would have removed
   the only way to do it.
 
+- **A paste lands where it was aimed.** Pasting a filesystem path into **Settings › Advanced ›
+  Xray binary** did not paste. The application took the clipboard, read it as a subscription or a
+  server list, failed, and answered "Nothing on the clipboard to import" — sending the reader off
+  after a subscription problem while they were editing a binary path. Every one of the roughly
+  thirty entry rows behaved the same way, as did the search entry.
+
+  Ctrl+V is registered as an application accelerator, and a window dispatches those from the root
+  down, so the action consumed the key before the focused field ever saw it. The comment in the
+  source said the opposite and had been believed. Ctrl+V in a text field now pastes into that
+  field.
+
+  It also no longer imports on every page. Importing is what a paste means on **Servers** and
+  **Subscriptions**; on Profiles, Settings and Logs the key now does nothing rather than opening a
+  dialog over what was being read.
+
 
 ## [0.2.0] - 2026-08-21
 
@@ -369,6 +384,21 @@ surface, packaging, or the CLI belongs here.
   word matches the CLI, which only ever said remove.
 
 ### Fixed
+- **A paste lands where it was aimed.** Pasting a filesystem path into **Settings › Advanced ›
+  Xray binary** did not paste. The application took the clipboard, read it as a subscription or a
+  server list, failed, and answered "Nothing on the clipboard to import" — sending the reader off
+  after a subscription problem while they were editing a binary path. Every one of the roughly
+  thirty entry rows behaved the same way, as did the search entry.
+
+  Ctrl+V is registered as an application accelerator, and a window dispatches those from the root
+  down, so the action consumed the key before the focused field ever saw it. The comment in the
+  source said the opposite and had been believed. Ctrl+V in a text field now pastes into that
+  field.
+
+  It also no longer imports on every page. Importing is what a paste means on **Servers** and
+  **Subscriptions**; on Profiles, Settings and Logs the key now does nothing rather than opening a
+  dialog over what was being read.
+
 - **The server grid opens at the width it has.** Every launch laid the cards out in a single
   column down the left of a wide window, and the only way to discover the application could
   do better was to resize it for some unrelated reason. The column arithmetic was right all
