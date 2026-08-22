@@ -14,19 +14,6 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
-### Changed
-- **A Debian or Ubuntu user can install oxidom from the README.** `## Install` was the third
-  heading, opened with eight lines of Nix, gave Arch two lines of prose, and for everything else
-  named three build prerequisites and no commands at all — while a signed apt and rpm repository
-  had been documented in `docs/installation.md` all along. Someone on Ubuntu read the top of the
-  file and concluded they had to build from source.
-
-  The apt and dnf lines now sit above the feature list, with the AppImage for distributions too
-  old for the packages and one line saying an Xray core is required and not bundled. `## Install`
-  runs deb and rpm first, Arch next, Nix last, and `## Try it` leads with the installed binaries
-  rather than `nix run`. The README also claimed oxidom was on the AUR, which
-  `docs/installation.md` says it is not; that is corrected.
-
 ### Added
 - **A pool's health check is no longer one hard-coded address.** A pool's balancer puts a node into
   rotation only once it has reached a ping destination *through* that node. That destination was a
@@ -53,6 +40,19 @@ surface, packaging, or the CLI belongs here.
   dressed up as verification. The fingerprint is now published beside the key so the pin can be
   checked against the repository too. The script is in the repository, so it can be read before it
   is trusted, and it deliberately does not enable the system daemon.
+
+### Changed
+- **A Debian or Ubuntu user can install oxidom from the README.** `## Install` was the third
+  heading, opened with eight lines of Nix, gave Arch two lines of prose, and for everything else
+  named three build prerequisites and no commands at all — while a signed apt and rpm repository
+  had been documented in `docs/installation.md` all along. Someone on Ubuntu read the top of the
+  file and concluded they had to build from source.
+
+  The apt and dnf lines now sit above the feature list, with the AppImage for distributions too
+  old for the packages and one line saying an Xray core is required and not bundled. `## Install`
+  runs deb and rpm first, Arch next, Nix last, and `## Try it` leads with the installed binaries
+  rather than `nix run`. The README also claimed oxidom was on the AUR, which
+  `docs/installation.md` says it is not; that is corrected.
 
 ### Fixed
 - **A pool that carried no traffic says whether its health check ever succeeded.** The message gave
@@ -94,6 +94,21 @@ surface, packaging, or the CLI belongs here.
   read shapes rather than meanings and are best-effort. The report ends by asking the reporter to
   read it through; that is only actionable if they know what the rules were meant to catch. The
   wording lives in one table now, so the footer and the marks cannot drift apart.
+
+- **The context menu covers the whole card.** Right-clicking an expanded card opened the menu
+  only in its top 64 pixels; below that nothing happened. The menu is where favouriting,
+  re-checking and the alias dialog live while a card is open — the card's own check button sits
+  in the region a collapsed card hides, which is why the menu borrows it — so for most of the
+  card a user was looking at, those actions were unreachable.
+
+  The gesture was carried by the header, a button of fixed height sitting beside the detail
+  region rather than around it, so a press below the header was never on its path. It is now
+  carried by the box that holds both, and the popover points at where the click happened.
+
+  Selectable text keeps its own menu: the metadata labels are selectable so an address or a
+  failure reason can be copied out, and a card menu that took the press first would have removed
+  the only way to do it.
+
 
 ## [0.2.0] - 2026-08-21
 
