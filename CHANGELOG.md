@@ -124,6 +124,23 @@ surface, packaging, or the CLI belongs here.
   **Subscriptions**; on Profiles, Settings and Logs the key now does nothing rather than opening a
   dialog over what was being read.
 
+- **The Connect bar says which session it runs in.** Connecting a group while a profile was
+  selected in the header raised the pool in the `default` session. That is the design and not a
+  defect — no profile file is read, written or confirmed — but four things on screen implied
+  otherwise: the header kept the profile visibly selected, the Connect tooltip said "without saving
+  anything" and named no session, the header went on reporting that profile as idle afterwards, and
+  a banner announced "1 more profile is running". The connection a user had just started read as
+  having happened somewhere else.
+
+  The difference is not cosmetic. Which session runs decides which ports are opened, which
+  interface is configured and which routing applies — `default.toml`'s, not the shown profile's.
+
+  The bar now names the session it will use, and says on its face, not only in a tooltip, when the
+  profile shown above it is not the one used. A `default` session carrying a group is reported as a
+  group rather than counted as another profile.
+
+  Raising a pool in a *named* session is a separate change and is not this one.
+
 - **A stop is offered where it lands, and says what it stopped.** Pressing stop on a
   subscription's latency sweep produced no visible sign that anything had stopped. Whether the
   press landed could only be worked out by watching spinners disappear over the following seconds.

@@ -72,6 +72,14 @@ profile, asks nothing, and needs none selected — "connect me to one of these" 
 what the page is for, and it used to cost a profile write plus a dialog about
 profiles, or a trip to another page when none was selected.
 
+**It runs in the `default` session**, whatever profile the header is showing,
+and the bar says so. Writing no profile is not the same as touching none:
+`default.toml`'s ports, its interface, its `[core]` and its routing block are the
+ones that apply. Where the header names something else, the bar says that too —
+that profile is not the one used, and it goes on reporting its own status,
+because that status is still true. A card click on the same page is the other
+way round: it does honour the selected profile, and offers to repoint it.
+
 Pressing it again stops the session running that selection. Which session that
 is, is decided by the servers rather than by the name, so a saved group and the
 same servers picked by hand are the same run.

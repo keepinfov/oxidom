@@ -1977,6 +1977,9 @@ impl Controller {
         // reachable somewhere.
         self.profile_switcher
             .set_tooltip_text(Some(&format!("Profile: {selected_profile}")));
+        // The group Connect bar sits under this chip and does not use what it
+        // names, so it has to be told what is being shown in order to say so.
+        self.servers.set_selected_profile(&selected_profile);
 
         // The poll calls this twice a second. Rebuilding the popover's rows
         // while the user has it open destroys the row they are reaching for,
@@ -2398,6 +2401,12 @@ impl Controller {
     /// so this is the pool counterpart of connecting a single server, and like
     /// that one it modifies no profile file. Saving a selection is a separate,
     /// deliberate act: **Save as a profile** on the same bar.
+    ///
+    /// "Writing nothing" is not "touching nothing", and the difference is what
+    /// the bar now says out loud. `default.toml`'s ports, its interface, its
+    /// `[core]` and its routing block are the ones that apply, whatever profile
+    /// the header happens to be showing — and which session runs decides which
+    /// ports are opened and which routing holds.
     fn connect_pool(self: &Rc<Self>, query: PoolQuery, members: Vec<String>) {
         let action = {
             let state = self.state.borrow();
