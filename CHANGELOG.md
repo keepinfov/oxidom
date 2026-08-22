@@ -95,6 +95,20 @@ surface, packaging, or the CLI belongs here.
   read it through; that is only actionable if they know what the rules were meant to catch. The
   wording lives in one table now, so the footer and the marks cannot drift apart.
 
+- **The context menu covers the whole card.** Right-clicking an expanded card opened the menu
+  only in its top 64 pixels; below that nothing happened. The menu is where favouriting,
+  re-checking and the alias dialog live while a card is open — the card's own check button sits
+  in the region a collapsed card hides, which is why the menu borrows it — so for most of the
+  card a user was looking at, those actions were unreachable.
+
+  The gesture was carried by the header, a button of fixed height sitting beside the detail
+  region rather than around it, so a press below the header was never on its path. It is now
+  carried by the box that holds both, and the popover points at where the click happened.
+
+  Selectable text keeps its own menu: the metadata labels are selectable so an address or a
+  failure reason can be copied out, and a card menu that took the press first would have removed
+  the only way to do it.
+
 - **A paste lands where it was aimed.** Pasting a filesystem path into **Settings › Advanced ›
   Xray binary** did not paste. The application took the clipboard, read it as a subscription or a
   server list, failed, and answered "Nothing on the clipboard to import" — sending the reader off
