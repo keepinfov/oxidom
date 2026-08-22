@@ -12,7 +12,7 @@ use oxidom_core::pool::PoolQuery;
 use super::super::group::subscription_description;
 use super::super::prefs::{FAVOURITES_ID, GroupKind, GuiPrefs, ServerGroup};
 use super::super::reduce::{
-    FailureReport, FilterOption, GROUP_CONNECT_SESSION, HistoryRow, ServerProfiles,
+    FailureReport, FilterOption, GROUP_CONNECT_SESSION, HistoryChart, ServerProfiles,
     available_countries, available_protocols, available_subscriptions, connect_bar_session_note,
     connect_button_tooltip, connect_choices, describe_rule, excludable_servers, filtered_ids,
     filters_to_query, group_member_ids, groups_holding, moved_in_order, ordered_subscriptions,
@@ -2685,10 +2685,11 @@ impl ServersView {
     ///
     /// A lookup and a re-measure for the same reasons as
     /// [`Self::set_failure_report`]: only the expanded card carries a history,
-    /// and the list growing a row is a content change under a fixed height.
-    pub fn set_history(&self, server_id: &str, rows: &[HistoryRow]) {
+    /// and the failure line under the chart appearing is a content change under
+    /// a fixed height.
+    pub fn set_history(&self, server_id: &str, chart: Option<&HistoryChart>) {
         let changed = match self.cards.borrow().get(server_id) {
-            Some(card) => card.set_history(rows) && card.is_expanded(),
+            Some(card) => card.set_history(chart) && card.is_expanded(),
             None => false,
         };
         if changed {

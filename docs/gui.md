@@ -128,14 +128,28 @@ which is what the core and the prober write into their lines. A check you stoppe
 is reported as stopped, not as a fault; a check still running shows nothing,
 because the only reason it could show is about the measurement being replaced.
 
-**Recent checks** below it lists the last ten, newest first, with the method each
-was taken by and how long ago. One number says whether a server answered once; it
-cannot say whether it answers reliably, and that is usually the question. Checks
-that ran and failed keep their place in the list — a server that times out every
-other attempt is exactly what the list is for. Checks you called off before they
-ran leave no row, so stopping a sweep does not push a server's real record out of
-the list. A daemon from an older version kept no history and the list simply does
-not appear.
+**Recent checks** below it draws the last ten as a chart, oldest at the left. One
+number says whether a server answered once; it cannot say whether it answers
+reliably, and that is usually the question — which is a question about spread and
+outliers, and those are easier to see than to read.
+
+A check that produced a number is a solid bar, as tall a share of the chart as its
+number is of the slowest reading on it. A check that ran and failed is a striped
+red column at full height, so it cannot be mistaken either for a gap or for a very
+slow reading. A slot no check has filled is a thin rule on the floor: all ten slots
+are always drawn, so you can see how much of the record is actually there. Pointing
+at any column says what that check measured, how, and when.
+
+Because the heights are shares of that one server's slowest reading, two servers'
+charts do not compare with each other — a steady 5 ms server and a steady 500 ms
+one draw the same picture. The line under the chart is where the real numbers are:
+the range, how many checks produced one, and which end is which. Under that, in
+red, is why the ones that produced no number produced none, with the commonest
+reason first; the newest failure is already stated in full above the chart.
+
+Checks you called off before they ran leave no column, so stopping a sweep does not
+push a server's real record off the chart. A daemon from an older version kept no
+history and the block simply does not appear.
 
 Two controls start a check. The card's own ⟳ **Re-check latency** sits in the
 expanded card and in its right-click menu; the subscription header's ⚡ **Check

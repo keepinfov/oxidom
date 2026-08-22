@@ -10,7 +10,7 @@ use oxidom_core::config::LatencyMethod;
 use oxidom_core::ipc::ProbeDetail;
 use oxidom_core::model::Server;
 
-use super::reduce::{FailureReport, HistoryRow};
+use super::reduce::{CHART_GAP, ChartMark, ChartSlot, FailureReport, HistoryChart, chart_columns};
 use super::views::{
     dialog_content, icon_button, set_transient_parent, set_validation, validation_label,
 };
@@ -81,6 +81,131 @@ mod card_frame {
                 self.obj().snapshot_child(child, snapshot);
             }
         }
+    }
+}
+
+/// How tall the recent-checks chart is drawn.
+///
+/// Fixed, and small: the block it replaced was ten rows plus a title and was
+/// the tallest thing on the card, which is what decided the card's expanded
+/// height. Thirty pixels is enough for a bar to have a readable share of it and
+/// little enough that the chart is never what the card is mostly made of.
+const PROBE_CHART_HEIGHT: i32 = 30;
+
+/// The narrowest a column may be drawn before the chart stops being one.
+const PROBE_CHART_MIN_COLUMN: i32 = 3;
+
+mod probe_chart {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct ProbeChart {
+        /// One child per slot, in the order they are drawn, with the mark that
+        /// decides each one's height. Widgets rather than a `snapshot` of
+        /// rectangles because every colour in this application is reachable
+        /// only through CSS: nothing hands RGBA to Rust, and a chart that
+        /// carried its own palette would be the one thing on the card that did
+        /// not follow the theme.
+        pub(super) columns: RefCell<Vec<(gtk::Widget, ChartMark)>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for ProbeChart {
+        const NAME: &'static str = "OxidomProbeChart";
+        type Type = super::ProbeChart;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for ProbeChart {
+        fn dispose(&self) {
+            for (child, _) in self.columns.borrow_mut().drain(..) {
+                child.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for ProbeChart {
+        fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
+            if orientation == gtk::Orientation::Vertical {
+                return (PROBE_CHART_HEIGHT, PROBE_CHART_HEIGHT, -1, -1);
+            }
+            // The children are drawn at whatever the layout gives them and are
+            // measured at nothing, so the minimum is the chart's own: enough
+            // for every slot to be a column rather than a line.
+            let count = i32::try_from(self.columns.borrow().len()).unwrap_or(0);
+            let width = if count > 0 {
+                count * PROBE_CHART_MIN_COLUMN + (count - 1) * CHART_GAP
+            } else {
+                0
+            };
+            (width, width, -1, -1)
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            let columns = self.columns.borrow();
+            let marks: Vec<ChartMark> = columns.iter().map(|(_, mark)| *mark).collect();
+            for ((child, _), column) in columns.iter().zip(chart_columns(&marks, width, height)) {
+                child.size_allocate(
+                    &gtk::Allocation::new(column.x, column.y, column.width, column.height),
+                    baseline,
+                );
+            }
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            for (child, _) in self.columns.borrow().iter() {
+                self.obj().snapshot_child(child, snapshot);
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    /// The record behind the badge, drawn.
+    pub struct ProbeChart(ObjectSubclass<probe_chart::ProbeChart>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl ProbeChart {
+    fn new() -> Self {
+        let chart: Self = glib::Object::new();
+        chart.set_hexpand(true);
+        chart.set_css_classes(&["probe-chart"]);
+        chart
+    }
+
+    /// Draw these slots and no others.
+    ///
+    /// Rebuilt rather than reused column by column: the chart is at most
+    /// `HISTORY_SLOTS` wide and changes only when a check finishes on the one
+    /// card that is open.
+    fn set_slots(&self, slots: &[ChartSlot]) {
+        let imp = self.imp();
+        for (child, _) in imp.columns.borrow_mut().drain(..) {
+            child.unparent();
+        }
+        let mut columns = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            column.set_css_classes(&[
+                "probe-chart-slot",
+                match slot.mark {
+                    ChartMark::Ran { .. } => "probe-chart-ran",
+                    ChartMark::Failed => "probe-chart-failed",
+                    ChartMark::Empty => "probe-chart-empty",
+                },
+            ]);
+            // The words are on the card either way — the caption and the
+            // failure line under the chart say what it is made of. This is the
+            // one check behind the one column, for a pointer that is already
+            // on it.
+            column.set_tooltip_text(slot.detail.as_deref());
+            column.set_parent(self);
+            columns.push((column.upcast::<gtk::Widget>(), slot.mark));
+        }
+        imp.columns.replace(columns);
+        self.queue_resize();
     }
 }
 
@@ -373,7 +498,9 @@ pub struct ServerCard {
     failure_reason: gtk::Label,
     failure_attempt: gtk::Label,
     history: gtk::Box,
-    history_list: gtk::Box,
+    history_chart: ProbeChart,
+    history_caption: gtk::Label,
+    history_failures: gtk::Label,
     expanded: Rc<Cell<bool>>,
     /// What the badge is currently showing. The age sweep re-pushes a state for
     /// every card every 15 s, so without this the whole grid would re-fade on
@@ -402,7 +529,7 @@ pub struct ServerCard {
     /// re-measure used to be gated on `is_expanded()` alone, so opening a card
     /// re-measured it whether or not anything had changed.
     failure_shown: Rc<RefCell<Option<FailureReport>>>,
-    history_shown: Rc<RefCell<Vec<HistoryRow>>>,
+    history_shown: Rc<RefCell<Option<HistoryChart>>>,
 }
 
 impl ServerCard {
@@ -734,20 +861,44 @@ impl ServerCard {
 
         // The record behind the badge. One number cannot tell a steady server
         // from one that is fast half the time, and choosing between servers is
-        // what the page is for. Rebuilt rather than reused row by row: the list
-        // is at most `PROBE_HISTORY_LIMIT` long and changes only when a check
-        // finishes on the one card that is open.
+        // what the page is for. Spread, outliers and failures are shape, so
+        // they are drawn; the numbers at the ends, the direction and the
+        // reasons are words, so they are written under the drawing.
         let history_title = gtk::Label::builder()
             .xalign(0.0)
             .label("Recent checks")
             .css_classes(["server-meta", "server-history-title"])
             .build();
-        let history_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let history_chart = ProbeChart::new();
+        let history_caption = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(1)
+            .selectable(true)
+            .css_classes(["dim-label", "server-meta"])
+            .build();
+        // The block above states the newest failure in full; this owes the
+        // older ones, and it is a label rather than a tooltip because a check
+        // that failed is the case the whole block exists for.
+        let history_failures = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(1)
+            .selectable(true)
+            .visible(false)
+            .css_classes(["server-meta", "server-history-failures"])
+            .build();
         let history = gtk::Box::new(gtk::Orientation::Vertical, 4);
         history.set_visible(false);
         history.set_css_classes(&["server-history"]);
         history.append(&history_title);
-        history.append(&history_list);
+        history.append(&history_chart);
+        history.append(&history_caption);
+        history.append(&history_failures);
 
         let metadata = gtk::Box::new(gtk::Orientation::Vertical, 6);
         metadata.append(&full_name);
@@ -877,7 +1028,9 @@ impl ServerCard {
             failure_reason,
             failure_attempt,
             history,
-            history_list,
+            history_chart,
+            history_caption,
+            history_failures,
             expanded,
             last_latency: Rc::new(Cell::new(latency_state)),
             last_connection: Rc::new(Cell::new(CardConnectionState::Disconnected)),
@@ -888,7 +1041,7 @@ impl ServerCard {
             height_animating: Rc::new(Cell::new(false)),
             height_target: Rc::new(Cell::new(COMPACT_CARD_HEIGHT)),
             failure_shown: Rc::new(RefCell::new(None)),
-            history_shown: Rc::new(RefCell::new(Vec::new())),
+            history_shown: Rc::new(RefCell::new(None)),
         };
         card.apply_latency(latency_state);
         card.set_connection_state(connection_state);
@@ -1015,45 +1168,28 @@ impl ServerCard {
     ///
     /// Returns whether what is drawn changed, for the same reason as
     /// [`Self::set_failure_report`] — and with more force here, since the poll
-    /// that feeds this list runs twice a second and rebuilding the rows would
-    /// otherwise re-measure the card on every tick.
-    pub fn set_history(&self, rows: &[HistoryRow]) -> bool {
-        if self.history_shown.borrow().as_slice() == rows {
+    /// that feeds this block runs twice a second and rebuilding the columns
+    /// would otherwise re-measure the card on every tick.
+    pub fn set_history(&self, chart: Option<&HistoryChart>) -> bool {
+        if self.history_shown.borrow().as_ref() == chart {
             return false;
         }
-        self.history_shown.replace(rows.to_vec());
-        while let Some(child) = self.history_list.first_child() {
-            self.history_list.remove(&child);
-        }
-        if rows.is_empty() {
+        self.history_shown.replace(chart.cloned());
+        let Some(chart) = chart else {
             self.history.set_visible(false);
             return true;
-        }
-        for row in rows {
-            // Fixed width on the number so the column lines up: "8 ms" and
-            // "1204 ms" in the same list otherwise leave the methods ragged,
-            // and the point of the list is comparing down it.
-            let value = gtk::Label::builder()
-                .xalign(0.0)
-                .label(&row.value)
-                .width_chars(8)
-                .selectable(true)
-                .css_classes(["server-meta"])
-                .build();
-            let taken = gtk::Label::builder()
-                .xalign(0.0)
-                .hexpand(true)
-                .label(&row.taken)
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .max_width_chars(1)
-                .selectable(true)
-                .css_classes(["dim-label", "server-meta"])
-                .build();
-            let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            line.append(&value);
-            line.append(&taken);
-            self.history_list.append(&line);
+        };
+        self.history_chart.set_slots(&chart.slots);
+        self.history_caption.set_label(&chart.caption);
+        match chart.failures.as_deref() {
+            Some(failures) => {
+                self.history_failures.set_label(failures);
+                self.history_failures.set_visible(true);
+            }
+            None => {
+                self.history_failures.set_visible(false);
+                self.history_failures.set_label("");
+            }
         }
         self.history.set_visible(true);
         true

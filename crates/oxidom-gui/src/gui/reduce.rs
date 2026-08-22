@@ -13,8 +13,9 @@ use std::time::Instant;
 
 use oxidom_core::client::DaemonSource;
 use oxidom_core::ipc::{
-    LatencyReading, PROBE_STATE_VERSION, ProbeDetail, ProbeFailure, ProbeHistory, ProbeRoute,
-    ProbeState, ProfileEntry, RuntimeInfo, SelectionInfo, SessionInfo, StatusInfo,
+    LatencyReading, PROBE_HISTORY_LIMIT, PROBE_STATE_VERSION, ProbeDetail, ProbeFailure,
+    ProbeHistory, ProbeRoute, ProbeState, ProfileEntry, RuntimeInfo, SelectionInfo, SessionInfo,
+    StatusInfo,
 };
 use oxidom_core::logbook::LogSlice;
 use oxidom_core::model::{OutboundSpec, Subscription};
@@ -2270,56 +2271,302 @@ fn when_text(reading: &LatencyReading, now_unix_ms: u64) -> String {
     }
 }
 
-/// One past check, as the expanded card states it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct HistoryRow {
-    /// `"41 ms"`, or an em dash when the check produced no number. Never blank:
-    /// a row with nothing in this column reads as a rendering fault rather than
-    /// as a check that failed.
-    pub value: String,
-    /// How it was taken, when, and — where there is no number — why:
-    /// `"HTTP · 3 minutes ago"`, or `"HTTP · 3 minutes ago · the server did not
-    /// answer"`. The reason stays a fragment here, unlike the one standing on
-    /// its own above, because it is the tail of a line.
-    pub taken: String,
+/// One past check in a single line: what it measured, how it was taken, when,
+/// and — where there is no number — why.
+///
+/// This is what a column of the chart says when it is pointed at. The list this
+/// replaced spent a row of the card on every one of these; the chart spends a
+/// column, and the words arrive on demand.
+fn check_line(reading: &LatencyReading, now_unix_ms: u64) -> String {
+    // "No number" rather than the em dash the list used. A dash is legible in a
+    // column of them, next to the numbers it lines up with; alone in a tooltip
+    // it reads as a rendering fault.
+    let mut line = match reading.value {
+        Some(ms) => format!("{ms} ms"),
+        None => "No number".to_string(),
+    };
+    line.push_str(" · ");
+    line.push_str(method_text(reading.method));
+    line.push_str(" · ");
+    line.push_str(&when_text(reading, now_unix_ms));
+    // `failure.is_some()` exactly when `value.is_none()`, so a reading with
+    // neither comes from a daemon that broke the contract. The line still says
+    // there was no number; it just cannot say why.
+    if let (None, Some(failure)) = (reading.value, reading.failure) {
+        line.push_str(" · ");
+        line.push_str(failure.message_with(reading.detail));
+    }
+    line
 }
 
-/// The recent checks, newest first, as rows.
+/// How many slots the chart draws, filled or not.
+///
+/// The daemon keeps [`PROBE_HISTORY_LIMIT`] readings and the chart draws that
+/// many columns whatever it was given, so a server checked twice shows two
+/// columns and eight empty slots rather than two columns filling the width. The
+/// list this replaced said nothing about stopping at ten and read as unbounded;
+/// the empty slots are where the bound became visible.
+pub(super) const HISTORY_SLOTS: usize = PROBE_HISTORY_LIMIT;
+
+/// What one slot of the chart draws.
+///
+/// Three cases and not two: a check that ran and failed is not a check that was
+/// never made, and a chart that drew both as a gap would report a server that
+/// fails every other attempt as one nobody has got round to testing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum ChartMark {
+    /// A check that produced a number. `fill` is that number's share of the
+    /// tallest reading on the chart, `0.0..=1.0`.
+    Ran { fill: f64 },
+    /// A check that ran and produced no number.
+    Failed,
+    /// A slot no check has filled.
+    Empty,
+}
+
+/// One column: what it draws, and the whole of the check behind it in words.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ChartSlot {
+    pub mark: ChartMark,
+    /// [`check_line`], or `None` for a slot no check filled — there is nothing
+    /// to say about a check that was never made, and a tooltip saying so would
+    /// be eight tooltips on a card with two readings.
+    pub detail: Option<String>,
+}
+
+/// The record behind the badge, as the expanded card draws it.
+///
+/// The picture carries the shape — spread, outliers, failures — and the two
+/// lines under it carry everything the picture cannot: the actual numbers at
+/// each end, which way time runs, how many slots there are, and why the checks
+/// that produced no number produced none. They are labels rather than tooltips
+/// because a chart whose content is only reachable by pointing at it is a chart
+/// a screen reader is told nothing about, and because the failures are the case
+/// the whole block exists for.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct HistoryChart {
+    /// Oldest at the left, newest at the right, always [`HISTORY_SLOTS`] long.
+    ///
+    /// Left-to-right because that is which way time runs in every chart; the
+    /// list it replaced ran newest-first, which is which way a log reads. The
+    /// caption says which of the two this is, since both are ordinary.
+    pub slots: Vec<ChartSlot>,
+    /// The range, the count, and the two facts the picture cannot state.
+    pub caption: String,
+    /// The failed checks in words, or `None` when every check produced a
+    /// number. The block above the chart already states the newest failure in
+    /// full, so this owes the older ones.
+    pub failures: Option<String>,
+}
+
+/// The record behind the badge, or `None` when there is no record.
 ///
 /// A single sample is the weakest possible basis for choosing between servers:
 /// one that is fast half the time and one that is steady look identical through
-/// their newest number alone. These rows are what tells them apart.
+/// their newest number alone. This is what tells them apart, and it is a picture
+/// because spread, outliers and failures are shape rather than text.
 ///
-/// Every row is a check that *ran*. The daemon records no history for a check
-/// it called off, so nothing here needs to distinguish "measured badly" from
-/// "never measured" — the failures shown are the server's or this machine's.
-pub(super) fn history_rows(history: &ProbeHistory, now_unix_ms: u64) -> Vec<HistoryRow> {
-    history
-        .readings
+/// Every reading here is a check that *ran*. The daemon records no history for a
+/// check it called off, which is what lets an empty slot mean "no check has
+/// filled this" without qualification.
+pub(super) fn history_chart(history: &ProbeHistory, now_unix_ms: u64) -> Option<HistoryChart> {
+    // Newest first is how the daemon keeps them, and it is also the end that
+    // survives a daemon that ignored the limit.
+    let newest_first: Vec<&LatencyReading> = history.readings.iter().take(HISTORY_SLOTS).collect();
+    if newest_first.is_empty() {
+        return None;
+    }
+    // The tallest reading sets the scale, which is what makes a chart of one
+    // server comparable with itself over time rather than with the card above
+    // it. The caption carries the absolute numbers precisely because the
+    // heights are relative.
+    let tallest = newest_first
         .iter()
-        .map(|reading| {
-            let mut taken = format!(
-                "{} · {}",
-                method_text(reading.method),
-                when_text(reading, now_unix_ms)
-            );
-            // `failure.is_some()` exactly when `value.is_none()`, so a reading
-            // with neither comes from a daemon that broke the contract. The row
-            // still owes the column something, and a dash with no reason is the
-            // honest form of "it did not say".
-            if let (None, Some(failure)) = (reading.value, reading.failure) {
-                taken.push_str(" · ");
-                taken.push_str(failure.message_with(reading.detail));
-            }
-            HistoryRow {
-                value: match reading.value {
-                    Some(ms) => format!("{ms} ms"),
-                    None => "—".to_string(),
+        .filter_map(|reading| reading.value)
+        .max()
+        .unwrap_or(0);
+    let mut slots = vec![
+        ChartSlot {
+            mark: ChartMark::Empty,
+            detail: None,
+        };
+        HISTORY_SLOTS.saturating_sub(newest_first.len())
+    ];
+    for reading in newest_first.iter().rev() {
+        slots.push(ChartSlot {
+            mark: match reading.value {
+                // A machine that answered in 0 ms and one whose tallest reading
+                // is 0 are both real; neither may divide by it.
+                Some(ms) if tallest > 0 => ChartMark::Ran {
+                    fill: f64::from(ms) / f64::from(tallest),
                 },
-                taken,
+                Some(_) => ChartMark::Ran { fill: 1.0 },
+                None => ChartMark::Failed,
+            },
+            detail: Some(check_line(reading, now_unix_ms)),
+        });
+    }
+    Some(HistoryChart {
+        caption: chart_caption(&newest_first),
+        failures: chart_failures(&newest_first),
+        slots,
+    })
+}
+
+/// What the chart cannot draw: the numbers at each end, which way time runs,
+/// and how many slots there are.
+///
+/// The count is of the checks that produced a number, not of the checks. A
+/// range stated "across 10 checks" when three of the ten failed reads as ten
+/// measurements, and the three that measured nothing are the ones the reader
+/// most needs kept out of the average they are about to do in their head.
+fn chart_caption(readings: &[&LatencyReading]) -> String {
+    let mut measured: Vec<u32> = readings
+        .iter()
+        .filter_map(|reading| reading.value)
+        .collect();
+    measured.sort_unstable();
+    let total = readings.len();
+    let reading = match (measured.first(), measured.last()) {
+        // Not an error and not an empty chart: the columns are all failures,
+        // which is a record and a strong one. "No data" over a chart full of
+        // marks would read as the chart being broken rather than the server
+        // being it. How many, and why, is the failure line's business.
+        (None, _) | (_, None) => "No check produced a number".to_string(),
+        (Some(low), Some(high)) => {
+            let range = if low == high {
+                format!("{low} ms")
+            } else {
+                format!("{low}–{high} ms")
+            };
+            match (measured.len(), measured.len() == total) {
+                (1, true) => format!("{range} from the one check that ran"),
+                (1, false) => format!("{range} from the one check that produced a number"),
+                (many, true) => format!("{range} across {many} checks"),
+                (many, false) => {
+                    format!("{range} from the {many} checks that produced a number")
+                }
             }
+        }
+    };
+    format!("{reading} · oldest at the left, and the last {HISTORY_SLOTS} are kept")
+}
+
+/// The checks that produced no number, in the daemon's own wording.
+///
+/// Grouped rather than listed: a server that timed out six times running would
+/// otherwise spend six lines saying one thing, which is the shape this whole
+/// change is getting rid of. The commonest reason leads, because that is the
+/// one that describes the server.
+fn chart_failures(readings: &[&LatencyReading]) -> Option<String> {
+    let mut reasons: Vec<(&str, usize)> = Vec::new();
+    for reading in readings.iter().rev() {
+        let (None, Some(failure)) = (reading.value, reading.failure) else {
+            continue;
+        };
+        let message = failure.message_with(reading.detail);
+        match reasons.iter_mut().find(|(seen, _)| *seen == message) {
+            Some((_, count)) => *count += 1,
+            None => reasons.push((message, 1)),
+        }
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    let failed: usize = reasons.iter().map(|(_, count)| count).sum();
+    // Stable, so reasons of equal weight stay in the order they first appear,
+    // which is oldest first — the same direction the chart runs.
+    reasons.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    // One reason needs no tally: the sentence already opens with the number,
+    // and "3 of 10 failed: the server did not answer (3)" says it twice.
+    let single = reasons.len() == 1;
+    let listed: Vec<String> = reasons
+        .iter()
+        .map(|(message, count)| match count {
+            _ if single => (*message).to_string(),
+            1 => (*message).to_string(),
+            many => format!("{message} ({many})"),
         })
-        .collect()
+        .collect();
+    Some(format!(
+        "{failed} of {} failed: {}",
+        readings.len(),
+        listed.join(" · ")
+    ))
+}
+
+/// The gap between two columns, in pixels.
+pub(super) const CHART_GAP: i32 = 2;
+
+/// How tall an empty slot, and the shortest possible reading, are drawn.
+///
+/// A reading of 1 ms beside one of 900 would otherwise be allocated no height
+/// at all, and a column of zero pixels is a column that is not there — the gap
+/// this chart exists to avoid drawing.
+pub(super) const CHART_FLOOR: i32 = 2;
+
+/// Where one column is drawn, in widget coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChartColumn {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// The whole geometry of the chart, as integers.
+///
+/// Pure, and here rather than in the widget, because no test may construct a
+/// widget and the column arithmetic is the part that can be wrong in a way
+/// nobody notices: a rounded-down column width leaves a ragged strip on the
+/// right that reads as the chart being clipped.
+///
+/// The remainder is spread over the leading columns rather than dropped, so the
+/// columns and gaps together fill `width` exactly.
+pub(super) fn chart_columns(marks: &[ChartMark], width: i32, height: i32) -> Vec<ChartColumn> {
+    let count = i32::try_from(marks.len()).unwrap_or(i32::MAX);
+    if count <= 0 || width <= 0 || height <= 0 {
+        return Vec::new();
+    }
+    // Narrow enough and the gaps go before the columns do. A chart of ten
+    // touching bars still says what it has to say; a chart of ten gaps does not.
+    let gap = if width >= count * 2 + CHART_GAP * (count - 1) {
+        CHART_GAP
+    } else {
+        0
+    };
+    let span = (width - gap * (count - 1)).max(count);
+    let base = span / count;
+    let mut spare = span % count;
+    let mut x = 0;
+    let mut columns = Vec::with_capacity(marks.len());
+    for mark in marks {
+        let mut column_width = base;
+        if spare > 0 {
+            column_width += 1;
+            spare -= 1;
+        }
+        let column_height = match mark {
+            // A failure is drawn full height. It is not a measurement of
+            // anything, so no height is the honest one; full height is the one
+            // that cannot be mistaken for a gap, and the striping is what keeps
+            // it from being read as a very slow reading.
+            ChartMark::Failed => height,
+            ChartMark::Empty => CHART_FLOOR.min(height),
+            ChartMark::Ran { fill } => {
+                let scaled = (fill.clamp(0.0, 1.0) * f64::from(height)).round();
+                (scaled as i32).clamp(CHART_FLOOR.min(height), height)
+            }
+        };
+        columns.push(ChartColumn {
+            x,
+            y: height - column_height,
+            width: column_width,
+            height: column_height,
+        });
+        x += column_width + gap;
+    }
+    columns
 }
 
 /// What the confirmation says before anything is fetched.
@@ -5464,32 +5711,77 @@ mod tests {
         reading
     }
 
-    /// The point of the panel: two servers whose newest number is the same can
-    /// have completely different records behind it, and the rows are what say
-    /// so. Newest first, because that is the order the daemon keeps and the
-    /// order the number above the list belongs to.
+    /// The point of the block: two servers whose newest number is the same can
+    /// have completely different records behind it. Time runs left to right,
+    /// which is the opposite of the list this replaced and the same as every
+    /// other chart — and the heights are shares of the tallest reading, which
+    /// is what makes an outlier look like one.
     #[test]
-    fn the_history_reads_newest_first_with_the_method_and_the_age_of_each_check() {
+    fn the_chart_runs_oldest_to_newest_and_scales_to_its_tallest_reading() {
         let history = ProbeHistory {
             readings: vec![
                 measured_at(41, LatencyMethod::HttpGet, NOW_MS),
                 measured_at(870, LatencyMethod::Tcp, NOW_MS - 3 * 60_000),
             ],
         };
-        let rows = history_rows(&history, NOW_MS);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].value, "41 ms");
-        assert_eq!(rows[0].taken, "HTTP GET · just now");
-        assert_eq!(rows[1].value, "870 ms");
-        assert_eq!(rows[1].taken, "TCP handshake · 3 minutes ago");
+        let chart = history_chart(&history, NOW_MS).expect("two readings draw a chart");
+        let drawn: Vec<ChartMark> = chart
+            .slots
+            .iter()
+            .filter(|slot| slot.mark != ChartMark::Empty)
+            .map(|slot| slot.mark)
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![
+                ChartMark::Ran { fill: 1.0 },
+                ChartMark::Ran { fill: 41.0 / 870.0 },
+            ],
+            "the older, slower check is on the left and sets the scale"
+        );
+        let detail: Vec<&str> = chart
+            .slots
+            .iter()
+            .filter_map(|slot| slot.detail.as_deref())
+            .collect();
+        assert_eq!(
+            detail,
+            vec![
+                "870 ms · TCP handshake · 3 minutes ago",
+                "41 ms · HTTP GET · just now"
+            ],
+            "each column carries the whole of its own check"
+        );
     }
 
-    /// A check that ran and failed is part of the record — a server that times
-    /// out every other attempt is exactly what this panel exists to expose, and
-    /// dropping those rows would make it look steady. The reason is the
-    /// daemon's own wording, the same words the block above the list uses.
+    /// Nothing on the old list said it stopped at ten, so it read as unbounded.
+    /// The chart draws the slots the daemon keeps whether or not checks have
+    /// filled them, which is where the bound became visible.
     #[test]
-    fn a_failed_check_keeps_its_place_in_the_history_and_says_why() {
+    fn a_short_history_still_draws_every_slot_the_daemon_keeps() {
+        let history = ProbeHistory {
+            readings: vec![measured_at(41, LatencyMethod::HttpGet, NOW_MS)],
+        };
+        let chart = history_chart(&history, NOW_MS).expect("one reading draws a chart");
+        assert_eq!(chart.slots.len(), HISTORY_SLOTS);
+        assert!(
+            chart.slots[..HISTORY_SLOTS - 1]
+                .iter()
+                .all(|slot| slot.mark == ChartMark::Empty && slot.detail.is_none()),
+            "an unfilled slot draws nothing and says nothing"
+        );
+        assert_eq!(
+            chart.slots[HISTORY_SLOTS - 1].mark,
+            ChartMark::Ran { fill: 1.0 }
+        );
+    }
+
+    /// The distinction the whole shape had to answer for: a gap in a chart is
+    /// indistinguishable from a check that was never made, so a check that ran
+    /// and failed is not drawn as a gap. It gets a mark of its own, and the
+    /// geometry gives it the full height an empty slot never gets.
+    #[test]
+    fn a_failed_check_is_not_drawn_as_a_check_that_never_ran() {
         let history = ProbeHistory {
             readings: vec![failed_at(
                 ProbeFailure::Timeout,
@@ -5499,32 +5791,265 @@ mod tests {
                 NOW_MS - 60_000,
             )],
         };
-        let rows = history_rows(&history, NOW_MS);
-        assert_eq!(rows[0].value, "—", "a failed check still fills its column");
+        let chart = history_chart(&history, NOW_MS).expect("a failed check is still a record");
+        assert_eq!(chart.slots[HISTORY_SLOTS - 1].mark, ChartMark::Failed);
+        assert_eq!(chart.slots[0].mark, ChartMark::Empty);
+        let marks = [ChartMark::Failed, ChartMark::Empty];
+        let columns = chart_columns(&marks, 40, 30);
+        assert_eq!(columns[0].height, 30, "a failure fills the height");
         assert_eq!(
-            rows[0].taken,
-            "HTTP GET · 1 minute ago · the check ran out of time"
+            columns[1].height, CHART_FLOOR,
+            "an empty slot rules the floor"
         );
+    }
+
+    /// The heights are relative, so the numbers behind them have to be written
+    /// down — and so does which end is which, since a chart that ran the other
+    /// way would look exactly the same.
+    #[test]
+    fn the_caption_states_the_range_the_count_and_which_way_time_runs() {
+        let history = ProbeHistory {
+            readings: vec![
+                measured_at(41, LatencyMethod::HttpGet, NOW_MS),
+                measured_at(870, LatencyMethod::Tcp, NOW_MS - 60_000),
+                measured_at(38, LatencyMethod::Tcp, NOW_MS - 2 * 60_000),
+            ],
+        };
+        let chart = history_chart(&history, NOW_MS).expect("three readings draw a chart");
+        assert_eq!(
+            chart.caption,
+            "38–870 ms across 3 checks · oldest at the left, and the last 10 are kept"
+        );
+    }
+
+    /// One reading is not a range, and calling it one would be the chart
+    /// claiming a spread it has no basis for.
+    #[test]
+    fn the_caption_of_a_single_check_does_not_claim_a_range() {
+        let history = ProbeHistory {
+            readings: vec![measured_at(41, LatencyMethod::HttpGet, NOW_MS)],
+        };
+        let chart = history_chart(&history, NOW_MS).expect("one reading draws a chart");
+        assert_eq!(
+            chart.caption,
+            "41 ms from the one check that ran · oldest at the left, and the last 10 are kept"
+        );
+    }
+
+    /// A chart whose every column is a failure is a record, and a strong one.
+    /// "No data" over a chart full of marks would read as the chart being
+    /// broken rather than the server being it.
+    #[test]
+    fn a_chart_that_measured_nothing_says_so_rather_than_reading_as_broken() {
+        let history = ProbeHistory {
+            readings: vec![
+                failed_at(
+                    ProbeFailure::Unreachable,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS,
+                ),
+                failed_at(
+                    ProbeFailure::Unreachable,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS - 60_000,
+                ),
+            ],
+        };
+        let chart = history_chart(&history, NOW_MS).expect("failures are a record");
+        assert_eq!(
+            chart.caption,
+            "No check produced a number · oldest at the left, and the last 10 are kept"
+        );
+    }
+
+    /// A range stated "across 10 checks" when three of the ten measured nothing
+    /// reads as ten measurements — and the three that measured nothing are
+    /// exactly the ones a reader must keep out of the average they are about to
+    /// do in their head. The count is of the numbers; the failure line accounts
+    /// for the rest.
+    #[test]
+    fn the_caption_counts_the_checks_that_produced_a_number_and_not_the_rest() {
+        let history = ProbeHistory {
+            readings: vec![
+                failed_at(
+                    ProbeFailure::Unreachable,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS,
+                ),
+                measured_at(41, LatencyMethod::Tcp, NOW_MS - 60_000),
+                measured_at(38, LatencyMethod::Tcp, NOW_MS - 2 * 60_000),
+            ],
+        };
+        let chart = history_chart(&history, NOW_MS).expect("three readings draw a chart");
+        assert_eq!(
+            chart.caption,
+            "38–41 ms from the 2 checks that produced a number · oldest at the left, and the \
+             last 10 are kept"
+        );
+        assert_eq!(
+            chart.failures.as_deref(),
+            Some("1 of 3 failed: the server did not answer")
+        );
+    }
+
+    /// One reason needs no tally beside it: the sentence already opens with the
+    /// number, and "9 of 9 failed: the server did not answer (9)" says it twice.
+    #[test]
+    fn one_reason_for_every_failure_is_not_also_counted_beside_itself() {
+        let readings = (0..3)
+            .map(|minutes| {
+                failed_at(
+                    ProbeFailure::Unreachable,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS - minutes * 60_000,
+                )
+            })
+            .collect();
+        let chart =
+            history_chart(&ProbeHistory { readings }, NOW_MS).expect("failures are a record");
+        assert_eq!(
+            chart.failures.as_deref(),
+            Some("3 of 3 failed: the server did not answer")
+        );
+    }
+
+    /// The reason a check produced no number has to stay reachable, and the
+    /// block above only states the newest one. Grouped rather than listed:
+    /// six timeouts in a row spending six lines is the shape this change
+    /// exists to get rid of.
+    #[test]
+    fn the_failures_are_written_out_with_the_commonest_reason_first() {
+        let history = ProbeHistory {
+            readings: vec![
+                failed_at(
+                    ProbeFailure::Unreachable,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS,
+                ),
+                failed_at(
+                    ProbeFailure::Timeout,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::HttpGet,
+                    NOW_MS - 60_000,
+                ),
+                measured_at(41, LatencyMethod::HttpGet, NOW_MS - 2 * 60_000),
+                failed_at(
+                    ProbeFailure::Timeout,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::HttpGet,
+                    NOW_MS - 3 * 60_000,
+                ),
+            ],
+        };
+        let chart = history_chart(&history, NOW_MS).expect("four readings draw a chart");
+        assert_eq!(
+            chart.failures.as_deref(),
+            Some("3 of 4 failed: the check ran out of time (2) · the server did not answer")
+        );
+    }
+
+    /// A server that answered every time owes no explanation, and a line
+    /// saying "0 failed" would be one more thing to read on a card that has
+    /// just been made shorter.
+    #[test]
+    fn a_record_with_no_failures_in_it_writes_no_failure_line() {
+        let history = ProbeHistory {
+            readings: vec![measured_at(41, LatencyMethod::HttpGet, NOW_MS)],
+        };
+        let chart = history_chart(&history, NOW_MS).expect("one reading draws a chart");
+        assert_eq!(chart.failures, None);
     }
 
     /// A daemon too old to keep a history answers an empty one, and a server
     /// nobody has checked answers the same. Neither is an error and neither
-    /// draws a row; the card falls back to the single reading it already has.
+    /// draws a chart; the card falls back to the single reading it already has.
     #[test]
-    fn a_daemon_with_no_history_to_give_draws_no_rows() {
-        assert!(history_rows(&ProbeHistory::default(), NOW_MS).is_empty());
+    fn a_daemon_with_no_history_to_give_draws_no_chart() {
+        assert!(history_chart(&ProbeHistory::default(), NOW_MS).is_none());
     }
 
     /// A reading that cannot be dated says so rather than reading as fresh,
-    /// which is the same promise the reason above the list makes — and it is
+    /// which is the same promise the reason above the chart makes — and it is
     /// one function making it, so the two cannot drift apart.
     #[test]
-    fn an_undated_reading_in_the_history_is_not_passed_off_as_recent() {
+    fn an_undated_reading_in_the_chart_is_not_passed_off_as_recent() {
         let history = ProbeHistory {
             readings: vec![measured_at(41, LatencyMethod::HttpGet, 0)],
         };
-        let rows = history_rows(&history, NOW_MS);
-        assert_eq!(rows[0].taken, "HTTP GET · at an unrecorded time");
+        let chart = history_chart(&history, NOW_MS).expect("one reading draws a chart");
+        assert_eq!(
+            chart.slots[HISTORY_SLOTS - 1].detail.as_deref(),
+            Some("41 ms · HTTP GET · at an unrecorded time")
+        );
+    }
+
+    /// A column width rounded down ten times leaves a strip on the right that
+    /// reads as the chart being clipped. The remainder is spread over the
+    /// leading columns instead, so the columns and their gaps land exactly on
+    /// the width they were given.
+    #[test]
+    fn the_columns_and_their_gaps_fill_the_whole_width() {
+        let marks = vec![ChartMark::Ran { fill: 0.5 }; HISTORY_SLOTS];
+        for width in [48, 97, 123, 300, 301] {
+            let columns = chart_columns(&marks, width, 30);
+            assert_eq!(columns.len(), HISTORY_SLOTS, "width {width}");
+            let last = columns.last().expect("a column per slot");
+            assert_eq!(last.x + last.width, width, "width {width} leaves a strip");
+            for pair in columns.windows(2) {
+                assert_eq!(
+                    pair[1].x - (pair[0].x + pair[0].width),
+                    CHART_GAP,
+                    "width {width} draws an uneven gap"
+                );
+            }
+        }
+    }
+
+    /// A 1 ms reading beside a 900 ms one would otherwise be allocated no
+    /// height at all, and a column of zero pixels is the gap this chart exists
+    /// to avoid drawing.
+    #[test]
+    fn a_measured_check_is_never_allocated_no_height_at_all() {
+        let columns = chart_columns(&[ChartMark::Ran { fill: 1.0 / 900.0 }], 20, 30);
+        assert_eq!(columns[0].height, CHART_FLOOR);
+        assert_eq!(columns[0].y, 30 - CHART_FLOOR, "columns stand on the floor");
+    }
+
+    /// Narrow enough and something has to give. Ten touching bars still say
+    /// what they have to say; ten gaps do not.
+    #[test]
+    fn a_chart_too_narrow_for_gaps_drops_the_gaps_before_the_columns() {
+        let marks = vec![ChartMark::Failed; HISTORY_SLOTS];
+        let columns = chart_columns(&marks, 12, 30);
+        assert_eq!(columns.len(), HISTORY_SLOTS);
+        assert!(
+            columns.iter().all(|column| column.width >= 1),
+            "every slot is still drawn"
+        );
+        let last = columns.last().expect("a column per slot");
+        assert_eq!(last.x + last.width, 12);
+    }
+
+    /// A card measured before it has been given a width asks for the geometry
+    /// of a chart with no room in it. It gets nothing to draw rather than a
+    /// panic or a row of inverted rectangles.
+    #[test]
+    fn a_chart_with_no_room_in_it_draws_nothing() {
+        assert!(chart_columns(&[ChartMark::Failed], 0, 30).is_empty());
+        assert!(chart_columns(&[ChartMark::Failed], 40, 0).is_empty());
+        assert!(chart_columns(&[], 40, 30).is_empty());
     }
 
     /// Every sentence in this dialog used to assume one source: it named
