@@ -179,7 +179,15 @@ pub enum LatencyState {
     /// the other way round. Showing it is the same lie as passing a
     /// pre-connect direct ping off as the tunnel's latency.
     Superseded,
-    Checking,
+    /// A check is in flight for this server.
+    ///
+    /// `stoppable` says whether pressing stop would actually call it off.
+    /// `CancelProbes` drops queued direct jobs and nothing else, so a check that
+    /// is already measuring, or one for the server carrying the tunnel, runs to
+    /// its end whatever is pressed. The card keeps its spinner either way and
+    /// offers the stop only where it lands, which is the same rule
+    /// `docs/spec/gui.md` already applies to a daemon too old to know the verb.
+    Checking { stoppable: bool },
     /// Measured straight at the server: a fact about that server.
     Reachable {
         ms: u32,
@@ -270,6 +278,23 @@ pub const UNREACHABLE_TEXT: &str = "Server is unreachable or did not respond";
 
 /// Likewise for this machine having no network at all.
 pub const NO_NETWORK_TEXT: &str = "No network connection";
+
+/// The glyph and colour for a check that produced no number, and why the
+/// stopped case is not the others.
+///
+/// A cancel, a machine with no network and a machine with no core all drew `⊘`
+/// in the offline colour. Three conditions with one appearance, and the one the
+/// user caused was indistinguishable from the two they did not — after a press
+/// of stop, that is the whole question the card is being asked.
+///
+/// A stopped check is ruled off rather than coloured as a fault, which is what
+/// `docs/spec/latency.md` binds: the user stopped it, so nothing failed.
+fn not_run_badge(detail: Option<ProbeDetail>) -> (&'static str, &'static str) {
+    match detail {
+        Some(ProbeDetail::Cancelled) => ("–", "latency-stopped"),
+        _ => ("⊘", "latency-offline"),
+    }
+}
 
 /// What the check button offers, given whether a check is already running.
 ///
@@ -905,8 +930,8 @@ impl ServerCard {
         // The spinner and the number share one slot, so fading across that
         // boundary reads as the pill blinking out and back rather than as a
         // check starting. Only number-to-number is worth a crossfade.
-        if state == LatencyState::Checking
-            || previous == LatencyState::Checking
+        if matches!(state, LatencyState::Checking { .. })
+            || matches!(previous, LatencyState::Checking { .. })
             || self.latency.text().is_empty()
             || !adw::is_animations_enabled(&self.latency_display)
         {
@@ -1042,6 +1067,7 @@ impl ServerCard {
             "latency-stale",
             "latency-error",
             "latency-offline",
+            "latency-stopped",
         ] {
             self.latency.remove_css_class(class);
         }
@@ -1068,7 +1094,7 @@ impl ServerCard {
             LatencyState::Superseded => {
                 self.show_label("—", "Measured in a different context — needs a fresh check");
             }
-            LatencyState::Checking => {
+            LatencyState::Checking { .. } => {
                 self.latency_display.set_visible_child_name("spinner");
                 self.latency_spinner.set_spinning(true);
                 self.latency_spinner_pill
@@ -1093,13 +1119,14 @@ impl ServerCard {
             // someone to look at a core that is present and working is worse
             // than saying nothing.
             LatencyState::NotRun(detail) => {
+                let (glyph, class) = not_run_badge(detail);
                 let tooltip = match detail {
                     Some(detail) => format!("Not measured: {}", detail.message()),
                     None => "The check could not run on this machine — see Settings › Xray core"
                         .to_string(),
                 };
-                self.show_label("⊘", &tooltip);
-                self.latency.add_css_class("latency-offline");
+                self.show_label(glyph, &tooltip);
+                self.latency.add_css_class(class);
             }
         }
     }
@@ -1737,8 +1764,8 @@ pub(crate) fn flag_widget(country: Option<&str>, flag_size: i32, globe_size: i32
 mod tests {
     use super::{
         ALIAS_ERROR, COMPACT_CARD_HEIGHT, CardConnectionState, ClickPlan, HeightRefresh,
-        LatencyAge, LatencyMethod, LatencyState, alias_validation, click_plan_for_press,
-        height_refresh,
+        LatencyAge, LatencyMethod, LatencyState, ProbeDetail, alias_validation,
+        click_plan_for_press, height_refresh, not_run_badge,
     };
 
     /// A re-measure that arrives while the card is opening must aim the
@@ -1884,6 +1911,24 @@ mod tests {
                 age: LatencyAge::Fresh,
                 method: LatencyMethod::Icmp
             }
+        );
+    }
+
+    /// Three conditions used to draw one glyph in one colour, and the one the
+    /// user caused looked exactly like the two they did not — which is the
+    /// question a card is being asked right after a press of stop.
+    #[test]
+    fn a_stopped_check_does_not_look_like_a_machine_with_no_network() {
+        assert_eq!(not_run_badge(Some(ProbeDetail::Cancelled)).0, "–");
+        assert_ne!(
+            not_run_badge(Some(ProbeDetail::Cancelled)),
+            not_run_badge(None),
+            "a check the user stopped reads the same as a core that could not run one"
+        );
+        assert_eq!(
+            not_run_badge(Some(ProbeDetail::NoCore)),
+            not_run_badge(None),
+            "everything that is not a stop keeps the appearance it had"
         );
     }
 }
