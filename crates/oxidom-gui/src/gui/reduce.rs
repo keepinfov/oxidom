@@ -1822,7 +1822,15 @@ pub(super) fn connect_bar_session_note(selected_profile: &str) -> Option<String>
 /// same session, and a session started from one is stopped by the other.
 pub(super) fn pool_action(state: &SnapshotState, members: &[String]) -> PoolAction {
     let running = state.sessions.iter().find(|session| {
-        session.selection.kind == "pool" && same_members(&session.selection, members)
+        session.selection.kind == "pool"
+            && same_members(&session.selection, members)
+            // The daemon keeps a stopped or failed session inspectable with
+            // its selection intact; that entry is not this selection running,
+            // and Stop on it would tear down a corpse instead of connecting.
+            // A session holding traffic still owns routes, so stopping it
+            // must stay reachable.
+            && (matches!(session.state.as_str(), "connected" | "connecting")
+                || session.holding_traffic)
     });
     match running {
         Some(session) => PoolAction::Stop(session.profile.clone()),
@@ -3283,6 +3291,47 @@ mod tests {
             "hamburg".to_string(),
         ];
         assert_eq!(pool_action(&state, &wider), PoolAction::ConnectSelection);
+    }
+
+    /// The daemon keeps a stopped or failed session inspectable, selection
+    /// intact — so matching on kind and members alone made the always-labelled
+    /// Connect resolve to Stop, and a retry press tore the dead session down
+    /// instead of connecting. A session that still holds traffic is different:
+    /// it owns routes, and stopping it must stay reachable.
+    #[test]
+    fn connect_on_a_group_whose_session_died_connects_rather_than_stops() {
+        let members = vec!["berlin".to_string(), "munich".to_string()];
+        let mut state = state();
+
+        let mut dead = session("default", "error", "berlin");
+        dead.selection = SelectionInfo {
+            kind: "pool".to_string(),
+            members: vec![
+                PoolMember {
+                    server_id: "berlin".to_string(),
+                    ..PoolMember::default()
+                },
+                PoolMember {
+                    server_id: "munich".to_string(),
+                    ..PoolMember::default()
+                },
+            ],
+            ..SelectionInfo::default()
+        };
+        state.sessions = vec![dead];
+        assert_eq!(
+            pool_action(&state, &members),
+            PoolAction::ConnectSelection,
+            "a dead session is not this selection running"
+        );
+
+        // Holding traffic means the routes are still installed; the press
+        // stops that deliberately rather than raising a second core under it.
+        state.sessions[0].holding_traffic = true;
+        assert_eq!(
+            pool_action(&state, &members),
+            PoolAction::Stop("default".to_string())
+        );
     }
 
     #[test]
