@@ -34,6 +34,8 @@ surface, packaging, or the CLI belongs here.
   interface already up, restarts only a tun2socks that did not survive the outage, and adds nothing.
 - A vmess link whose `aid` does not fit is rejected instead of silently truncated to a
   different AlterID.
+- A toast shows its message as written: an error naming a URL with a bare ampersand no longer
+  comes up blank, and a server name written as markup no longer renders as markup.
 
 ## [0.3.0] - 2026-08-22
 
