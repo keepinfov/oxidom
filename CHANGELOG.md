@@ -14,6 +14,10 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- A toast shows its message as written: an error naming a URL with a bare ampersand no longer
+  comes up blank, and a server name written as markup no longer renders as markup.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added
