@@ -30,7 +30,9 @@ pub fn subscription_description(subscription: &Subscription) -> String {
         parts.push(skipped);
     }
     if parts.is_empty() {
-        format!("{} servers", subscription.servers.len())
+        let count = subscription.servers.len();
+        let plural = if count == 1 { "" } else { "s" };
+        format!("{count} server{plural}")
     } else {
         parts.join(" · ")
     }
@@ -90,7 +92,7 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use oxidom_core::link::Skipped;
-    use oxidom_core::model::Subscription;
+    use oxidom_core::model::{OutboundSpec, Protocol, Server, Subscription};
     use oxidom_core::subscription_format::NotTaken;
 
     use super::{not_taken_note, skipped_note, subscription_description};
@@ -173,6 +175,52 @@ mod tests {
                 schemes: vec!["tuic".into()],
             }))
             .contains("1 link skipped: tuic")
+        );
+    }
+
+    fn subscription_with_servers(count: usize) -> Subscription {
+        let mut subscription = subscription(Skipped::default());
+        subscription.servers = (0..count)
+            .map(|index| Server {
+                id: format!("server-{index}"),
+                name: format!("Server {index}"),
+                protocol: Protocol::Vless,
+                address: format!("{index}.example.invalid"),
+                port: 443,
+                transport_label: "vless".to_string(),
+                country: None,
+                spec: OutboundSpec::Socks {
+                    username: None,
+                    password: None,
+                },
+                link: None,
+                alias: None,
+                latency_ms: None,
+            })
+            .collect();
+        subscription
+    }
+
+    /// The fallback subtitle counts like its neighbours do: `skipped_note`
+    /// says "1 link", so a subscription holding one server says "1 server",
+    /// not "1 servers".
+    #[test]
+    fn a_lone_server_is_counted_in_the_singular() {
+        assert_eq!(
+            subscription_description(&subscription_with_servers(1)),
+            "1 server"
+        );
+    }
+
+    #[test]
+    fn several_servers_keep_the_plural_count() {
+        assert_eq!(
+            subscription_description(&subscription_with_servers(2)),
+            "2 servers"
+        );
+        assert_eq!(
+            subscription_description(&subscription_with_servers(0)),
+            "0 servers"
         );
     }
 }
