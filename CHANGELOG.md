@@ -14,6 +14,10 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
+  so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added
