@@ -17,6 +17,8 @@ surface, packaging, or the CLI belongs here.
 ### Fixed
 - An HTTP-camouflaged TCP outbound now sends the path and Host its link carried; both were parsed
   and then dropped, so a server keyed on the disguise rejected the handshake.
+- Adding or removing servers no longer silently drops a running pool's queued health check; the
+  pool's latency updates on schedule instead of going stale for another sweep.
 
 ### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
