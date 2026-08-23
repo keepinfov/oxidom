@@ -14,6 +14,10 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- The red line under the latency chart no longer repeats the newest failure's reason, which the
+  block directly beneath already states in full; the count still covers every check.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added
