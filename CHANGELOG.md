@@ -14,6 +14,10 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- A vmess link whose `aid` does not fit is rejected instead of silently truncated to a
+  different AlterID.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added
