@@ -15,6 +15,18 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- An HTTP-camouflaged TCP outbound now sends the path and Host its link carried; both were parsed
+  and then dropped, so a server keyed on the disguise rejected the handshake.
+- Adding or removing servers no longer silently drops a running pool's queued health check; the
+  pool's latency updates on schedule instead of going stale for another sweep.
+- Connect on a group whose previous session failed now connects on the first press instead of
+  first tearing down the dead session; a session still holding traffic is stopped as before.
+- The "more profiles are running" banner no longer counts sessions whose connect failed; a
+  session still holding traffic is named as holding rather than running.
+- A connect whose core never started — a busy port, a missing binary — now records the failure it
+  is instead of leaving the card's spinner to retire onto a stale measurement.
+- Stopping a core whose process had already been reaped no longer sends a signal to its old pid,
+  which could by then belong to an unrelated process.
 - `oxidom status <PROFILE>`, `oxidom tun` and `oxidom run` exit 3 ("no active connection") for a
   profile that is not up, as `env` and `ip` already did, instead of exit 1.
 
@@ -44,6 +56,9 @@ surface, packaging, or the CLI belongs here.
   different AlterID.
 - A toast shows its message as written: an error naming a URL with a bare ampersand no longer
   comes up blank, and a server name written as markup no longer renders as markup.
+- A SOCKS or HTTP proxy link carrying only a username (or only a password) now authenticates: the
+  generated outbound sends the credential with the missing half empty, where it previously sent no
+  credential at all.
 
 ## [0.3.0] - 2026-08-22
 
