@@ -21,6 +21,8 @@ surface, packaging, or the CLI belongs here.
   pool's latency updates on schedule instead of going stale for another sweep.
 - Connect on a group whose previous session failed now connects on the first press instead of
   first tearing down the dead session; a session still holding traffic is stopped as before.
+- The "more profiles are running" banner no longer counts sessions whose connect failed; a
+  session still holding traffic is named as holding rather than running.
 
 ### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
