@@ -14,6 +14,11 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- A SOCKS or HTTP proxy link carrying only a username (or only a password) now authenticates: the
+  generated outbound sends the credential with the missing half empty, where it previously sent no
+  credential at all.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added

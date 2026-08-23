@@ -20,6 +20,11 @@ when nothing is set.
 Generate the protocol-specific `outbounds[0]` from `OutboundSpec` (streamSettings for
 tcp/ws/grpc/xhttp; tlsSettings/realitySettings/xtls as needed).
 
+A socks or http outbound emits its `users` entry when the link carried **either** half of the
+credential, with the missing half as an empty string — Xray accepts an empty `pass`. Requiring
+both halves made a `socks5://user@host` link dial unauthenticated, with nothing anywhere saying
+so.
+
 A **pool** session emits the same scaffold plus one outbound per member tagged `s-<alias|id>`, a
 `routing.balancers` entry `{ tag: "pool", selector: ["s-"], strategy: { type: <strategy> } }`, a
 `burstObservatory` with `subjectSelector: ["s-"]`, and an `api` block with `RoutingService`
