@@ -43,6 +43,28 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.3.1" date="2026-08-23">
+      <description>
+        <p>
+          A fixes-only release. The most important one closes a window in which
+          traffic could leave outside the tunnel: while the application was
+          automatically reconnecting a tunnel whose core had died, it briefly
+          removed the routes that were holding traffic back. Reconnection now
+          keeps those routes installed until the new connection stands.
+        </p>
+        <p>
+          Beyond that: a failed connection attempt no longer cancels an ongoing
+          automatic reconnect or leaves a stale latency reading on the card;
+          proxy passwords with special characters, half-filled proxy
+          credentials, IPv6 share links, HTTP-camouflaged servers and Clash
+          imports that use HTTP camouflage all work as their sources intended;
+          and several small interface wrongs — a Connect button that first
+          disconnected a dead group, a banner counting dead sessions, a chart
+          line repeating the failure stated under it, blank toasts — say the
+          right thing now.
+        </p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-08-22">
       <description>
         <p>
