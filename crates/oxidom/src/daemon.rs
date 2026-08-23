@@ -2362,8 +2362,6 @@ impl Service {
         let default_profile = profile::load_or_default("default").map_err(failed)?;
         default_profile.validate("default").map_err(failed)?;
         let default_routing = default_profile.routing_block().map_err(failed)?;
-        self.shared.clear_override("default");
-        let generation = self.shared.next_connect_generation("default");
         {
             let mut engine = oxidom_core::sync::lock(&self.shared.engine);
             let socks_port = engine.registry.config.socks_port;
@@ -2405,6 +2403,12 @@ impl Service {
             }
         }
 
+        // Claimed only now that every fallible preparation is behind us, the
+        // same order as `connect_pool` and `up_profile`: burning the generation
+        // or the override on an attempt that then fails to start would cancel a
+        // pending automatic reconnect and leave the session in Error for good.
+        self.shared.clear_override("default");
+        let generation = self.shared.next_connect_generation("default");
         let result = self.shared.start_connection(
             "default",
             &server_id,
@@ -3685,6 +3689,45 @@ mod tests {
         assert_eq!(
             oxidom_core::sync::lock(&service.shared.engine).status(),
             Status::Disconnected
+        );
+        Ok(())
+    }
+
+    /// The inverse of the cancellation above: an explicit connect owns the
+    /// visible state only once it actually starts something. One that fails
+    /// during preparation must not burn the generation a pending automatic
+    /// reconnect is waiting on, or clear its override — either loss strands
+    /// the session in Error, holding traffic, with no retry left alive.
+    #[test]
+    fn a_failed_connect_leaves_a_pending_reconnect_intact() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failed-connect-reconnect")?;
+        let service = for_test();
+        let generation = service.shared.next_connect_generation("default");
+        let selection = SessionSelection::Server("dead-server".to_string());
+        oxidom_core::sync::lock(&service.shared.override_status).insert(
+            "default".to_string(),
+            ErrorOverride {
+                status: Status::Error(RECONNECTING_MESSAGE.to_string()),
+                selection: selection.clone(),
+            },
+        );
+
+        assert!(service.connect("no-such-server".to_string()).is_err());
+
+        assert!(
+            service.shared.generation_is_current("default", generation),
+            "a connect that started nothing must not invalidate the reconnect's generation"
+        );
+        assert!(
+            matches!(
+                oxidom_core::sync::lock(&service.shared.override_status).get("default"),
+                Some(ErrorOverride {
+                    status: Status::Error(message),
+                    selection: held,
+                }) if message == RECONNECTING_MESSAGE && held == &selection
+            ),
+            "the reconnecting override survives a connect that started nothing"
         );
         Ok(())
     }
