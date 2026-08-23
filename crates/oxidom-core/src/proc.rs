@@ -135,7 +135,10 @@ mod tests {
         // status, exactly the state `is_alive` leaves behind.
         child.wait().expect("reaping the child");
 
-        assert_eq!(super::stop_child(&mut child), super::StopOutcome::AlreadyReaped);
+        assert_eq!(
+            super::stop_child(&mut child),
+            super::StopOutcome::AlreadyReaped
+        );
     }
 
     #[test]
