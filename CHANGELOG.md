@@ -29,6 +29,8 @@ surface, packaging, or the CLI belongs here.
   which could by then belong to an unrelated process.
 - `oxidom status <PROFILE>`, `oxidom tun` and `oxidom run` exit 3 ("no active connection") for a
   profile that is not up, as `env` and `ip` already did, instead of exit 1.
+- A share link emitted for an IPv6 server keeps the address in brackets; it used to name a
+  truncated host, and re-importing it produced a server aimed at the wrong place.
 
 ### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
