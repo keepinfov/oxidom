@@ -14,6 +14,10 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- A subscription whose subtitle falls back to a bare count no longer says "1 servers" for a
+  single server.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added
