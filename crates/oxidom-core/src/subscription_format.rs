@@ -802,9 +802,20 @@ fn canonical_share_link(server: &Server) -> Option<String> {
 
 fn endpoint_url(scheme: &str, address: &str, port: u16) -> Option<Url> {
     let mut url = Url::parse(&format!("{scheme}://placeholder@localhost:1")).ok()?;
-    url.set_host(Some(address)).ok()?;
+    url.set_host(Some(&bracketed(address))).ok()?;
     url.set_port(Some(port)).ok()?;
     Some(url)
+}
+
+/// A bare IPv6 address handed to `Url::set_host` is truncated at its first
+/// colon — `2001:db8::1` becomes host `2001` — so every emitter brackets it,
+/// and `normalize_host` strips the brackets again on parse.
+fn bracketed(address: &str) -> String {
+    if address.contains(':') && !address.starts_with('[') {
+        format!("[{address}]")
+    } else {
+        address.to_string()
+    }
 }
 
 fn authenticated_url(
@@ -1067,7 +1078,7 @@ const SHARE_LINK_VALUE: &AsciiSet = &NON_ALPHANUMERIC
 fn hysteria2_share_link(server: &Server, auth: &str, s: &Hysteria2Settings) -> String {
     let encode = |value: &str| utf8_percent_encode(value, SHARE_LINK_VALUE).to_string();
 
-    let mut authority = format!("{}:{}", server.address, server.port);
+    let mut authority = format!("{}:{}", bracketed(&server.address), server.port);
     for range in &s.port_hop {
         authority.push(',');
         authority.push_str(&range.to_xray());
@@ -1531,6 +1542,43 @@ proxies:
 
     /// The emitter and the parser must agree: the generated link becomes the
     /// server's stable id, so a mismatch renames every server on each refresh.
+    #[test]
+    fn an_ipv6_server_emits_a_bracketed_link_that_parses_back() {
+        let yaml = r#"
+proxies:
+  - name: "SIX"
+    type: vless
+    server: "2001:db8::1"
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+    tls: true
+  - name: "HY6"
+    type: hysteria2
+    server: "2001:db8::2"
+    port: 443
+    password: "pw"
+"#;
+        let imported = parse(yaml).unwrap().0;
+
+        let vless = imported[0]
+            .link
+            .as_deref()
+            .expect("vless links are emitable");
+        assert!(vless.contains("@[2001:db8::1]:443"), "{vless}");
+        let reparsed = crate::link::parse_link(vless).expect("emitted link must parse");
+        assert_eq!(reparsed.address, "2001:db8::1");
+        assert_eq!(reparsed.port, 443);
+
+        let hysteria = imported[1]
+            .link
+            .as_deref()
+            .expect("hysteria2 links are emitable");
+        assert!(hysteria.contains("@[2001:db8::2]:443"), "{hysteria}");
+        let reparsed = crate::link::parse_link(hysteria).expect("emitted link must parse");
+        assert_eq!(reparsed.address, "2001:db8::2");
+        assert_eq!(reparsed.port, 443);
+    }
+
     #[test]
     fn clash_network_http_imports_as_tcp_camouflage_and_h2_reads_its_host_list() {
         let yaml = r#"

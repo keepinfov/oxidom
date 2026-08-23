@@ -224,12 +224,15 @@ impl ProbeQueue {
     /// alone on purpose: each of those has a thread that will `finish` it, and
     /// removing the entry early would hand out a slot that is still occupied.
     fn retain_alive(&mut self, servers: &HashSet<String>, profiles: &HashSet<String>) {
-        self.queued.retain(|job| {
-            servers.contains(&job.server_id)
-                && match &job.target {
-                    ProbeTarget::Direct(_) => true,
-                    ProbeTarget::Proxied(profile) => profiles.contains(profile),
-                }
+        self.queued.retain(|job| match &job.target {
+            ProbeTarget::Direct(_) => servers.contains(&job.server_id),
+            // A pool's job is labelled `pool:<profile>` — a name no server
+            // list will ever contain — so it lives and dies with its profile.
+            ProbeTarget::Proxied(profile) => {
+                profiles.contains(profile)
+                    && (job.server_id == format!("pool:{profile}")
+                        || servers.contains(&job.server_id))
+            }
         });
     }
 }
@@ -1300,6 +1303,23 @@ impl Shared {
                 Ok(None)
             }
             Some(Err(error)) => {
+                // The GUI watched this id run; leaving without a reading
+                // would retire its spinner onto a stale number presented as
+                // this check's result — the silent departure from `running`
+                // that docs/spec/latency.md forbids. Nothing was measured:
+                // the core never started. (The superseded arm above is
+                // different: the operation that superseded this one claimed
+                // the same label with `start_now`, so the id is still running
+                // under the newer job and a failure written here would race
+                // its genuine reading.)
+                oxidom_core::sync::lock(&self.proxied).insert(
+                    profile.to_string(),
+                    LatencyReading::failed(
+                        ProbeFailure::Unknown,
+                        ProbeRoute::Proxied,
+                        LatencyMethod::default(),
+                    ),
+                );
                 oxidom_core::sync::lock(&self.probes).finish(probe_job.token);
                 oxidom_core::sync::lock(&self.engine)
                     .sessions
@@ -2722,7 +2742,7 @@ impl Service {
         let session = self
             .shared
             .session_info(&profile)
-            .ok_or_else(|| failed(format!("profile {profile:?} is not up")))?;
+            .ok_or_else(|| failed(oxidom_core::ipc::profile_not_up_message(&profile)))?;
         json(&session)
     }
 
@@ -5085,6 +5105,79 @@ mod tests {
         queue.retain_alive(&HashSet::from(["kept".to_string()]), &HashSet::new());
         let (_, queued) = queue.snapshot();
         assert_eq!(queued, vec!["kept".to_string()]);
+    }
+
+    /// docs/spec/latency.md: no id leaves `running` (or the queue) without a
+    /// reading — "a silent early return, by any route". A connect whose core
+    /// never started claimed the slot with `start_now`, so the GUI watched the
+    /// id run; releasing it with nothing written retired the spinner onto a
+    /// stale number presented as this check's result.
+    #[test]
+    fn a_connect_that_never_started_leaves_a_reading_behind() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failed-start-reading")?;
+        let service = for_test();
+        let server_id = {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.config.xray_binary = "/nonexistent-oxidom-xray".to_string();
+            engine.import_links("trojan://pw@one.example.invalid:443#One")?;
+            engine.prepare_session(
+                "default",
+                std::net::Ipv4Addr::new(127, 72, 14, 9),
+                12980,
+                12981,
+            )?;
+            engine
+                .all_servers()
+                .next()
+                .context("the imported server")?
+                .id
+                .clone()
+        };
+        let generation = service.shared.next_connect_generation("default");
+
+        let result = service.shared.start_connection(
+            "default",
+            &server_id,
+            generation,
+            ConnectionOrigin::Explicit,
+        );
+        assert!(result.is_err(), "the core binary does not exist");
+
+        let (running, queued) = oxidom_core::sync::lock(&service.shared.probes).snapshot();
+        assert!(
+            running.is_empty() && queued.is_empty(),
+            "the slot was released"
+        );
+        let proxied = oxidom_core::sync::lock(&service.shared.proxied);
+        let reading = proxied
+            .get("default")
+            .context("the departure left a reading, not a silence")?;
+        assert!(reading.value.is_none(), "nothing was measured");
+        Ok(())
+    }
+
+    /// A pool's liveness probe is queued under the synthetic label
+    /// `pool:<profile>`, which no server list will ever contain — the job
+    /// lives and dies with its profile, not with a server id.
+    #[test]
+    fn a_prune_spares_the_queued_probe_of_a_living_pool() {
+        let mut queue = ProbeQueue::default();
+        queue.enqueue(
+            ProbeTarget::Proxied("spread".to_string()),
+            "pool:spread".to_string(),
+        );
+
+        queue.retain_alive(&HashSet::new(), &HashSet::from(["spread".to_string()]));
+        let (_, queued) = queue.snapshot();
+        assert_eq!(queued, vec!["pool:spread".to_string()]);
+
+        queue.retain_alive(&HashSet::new(), &HashSet::new());
+        let (_, queued) = queue.snapshot();
+        assert!(
+            queued.is_empty(),
+            "the pool's profile went away, so the job goes too"
+        );
     }
 
     /// A running probe owns a slot until its thread reports back; forgetting it

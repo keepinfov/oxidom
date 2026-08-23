@@ -10,11 +10,31 @@ use crate::logbook::{self, LogSource};
 /// How long a managed child gets to exit on SIGTERM before SIGKILL.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
+/// What `stop_child` actually did, so the reap guard is a fact a test can
+/// state rather than an absence it cannot observe.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StopOutcome {
+    /// The child had already been waited for; its pid may belong to somebody
+    /// else by now, and no signal was sent.
+    AlreadyReaped,
+    /// SIGTERM (and, past the grace, SIGKILL) went to a child this handle
+    /// still owned.
+    Stopped,
+}
+
 /// Stop a child gracefully when possible, then ensure it has been reaped.
 ///
 /// `Child::kill` alone is an unconditional SIGKILL, which needlessly severs
 /// in-flight traffic during an ordinary disconnect.
-pub(crate) fn stop_child(child: &mut Child) {
+pub(crate) fn stop_child(child: &mut Child) -> StopOutcome {
+    // `is_alive` reaps an exited child through `try_wait`, and std caches the
+    // status — so a handle that answers `Ok(Some(_))` here names a pid that
+    // may already be somebody else's (pids recycle; `kill_stale_xray` guards
+    // the same hazard). Signalling it would terminate an unrelated process,
+    // which is why std's own `Child::kill` refuses a reaped child.
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return StopOutcome::AlreadyReaped;
+    }
     let signalled = i32::try_from(child.id()).is_ok_and(|pid| {
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
@@ -26,7 +46,7 @@ pub(crate) fn stop_child(child: &mut Child) {
         let deadline = Instant::now() + STOP_GRACE;
         while Instant::now() < deadline {
             match child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => return StopOutcome::Stopped,
                 Ok(None) => thread::sleep(Duration::from_millis(25)),
                 Err(_) => break,
             }
@@ -34,6 +54,7 @@ pub(crate) fn stop_child(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+    StopOutcome::Stopped
 }
 
 /// Stop a recovered child for which no `Child` handle survived the crash.
@@ -102,6 +123,24 @@ pub fn cmdline(pid: u32) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    /// The supervisor's poll reaps an exited core through `try_wait`; a later
+    /// disconnect must not signal that pid again — it can already belong to an
+    /// unrelated process.
+    #[test]
+    fn a_reaped_child_is_not_signalled_again() {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawning /bin/true");
+        // Deterministic reap: `wait` blocks until the exit and caches the
+        // status, exactly the state `is_alive` leaves behind.
+        child.wait().expect("reaping the child");
+
+        assert_eq!(
+            super::stop_child(&mut child),
+            super::StopOutcome::AlreadyReaped
+        );
+    }
+
     #[test]
     fn cmdline_identifies_this_test_process_and_missing_processes() {
         let arguments = super::cmdline(std::process::id()).expect("this test process must exist");

@@ -21,6 +21,20 @@ surface, packaging, or the CLI belongs here.
 ### Fixed
 - An HTTP-camouflaged TCP outbound now sends the path and Host its link carried; both were parsed
   and then dropped, so a server keyed on the disguise rejected the handshake.
+- Adding or removing servers no longer silently drops a running pool's queued health check; the
+  pool's latency updates on schedule instead of going stale for another sweep.
+- Connect on a group whose previous session failed now connects on the first press instead of
+  first tearing down the dead session; a session still holding traffic is stopped as before.
+- The "more profiles are running" banner no longer counts sessions whose connect failed; a
+  session still holding traffic is named as holding rather than running.
+- A connect whose core never started — a busy port, a missing binary — now records the failure it
+  is instead of leaving the card's spinner to retire onto a stale measurement.
+- Stopping a core whose process had already been reaped no longer sends a signal to its old pid,
+  which could by then belong to an unrelated process.
+- `oxidom status <PROFILE>`, `oxidom tun` and `oxidom run` exit 3 ("no active connection") for a
+  profile that is not up, as `env` and `ip` already did, instead of exit 1.
+- A share link emitted for an IPv6 server keeps the address in brackets; it used to name a
+  truncated host, and re-importing it produced a server aimed at the wrong place.
 
 ### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
