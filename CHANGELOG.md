@@ -32,6 +32,8 @@ surface, packaging, or the CLI belongs here.
   on the ordinary default route with the machine's own address. The reconnect now leaves a holding
   session's interface in place, as `docs/spec/interfaces.md` always said it should: it finds the
   interface already up, restarts only a tun2socks that did not survive the outage, and adds nothing.
+- A vmess link whose `aid` does not fit is rejected instead of silently truncated to a
+  different AlterID.
 
 ## [0.3.0] - 2026-08-22
 
