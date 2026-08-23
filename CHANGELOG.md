@@ -25,6 +25,8 @@ surface, packaging, or the CLI belongs here.
   session still holding traffic is named as holding rather than running.
 - A connect whose core never started — a busy port, a missing binary — now records the failure it
   is instead of leaving the card's spinner to retire onto a stale measurement.
+- Stopping a core whose process had already been reaped no longer sends a signal to its old pid,
+  which could by then belong to an unrelated process.
 
 ### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
