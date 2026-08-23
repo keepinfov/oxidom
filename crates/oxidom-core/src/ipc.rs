@@ -93,6 +93,14 @@ impl StatusInfo {
     }
 }
 
+/// The daemon's reply when a session-scoped request names a profile that is
+/// not up. One shape on both sides of the wire: the daemon words the refusal
+/// with it, and the CLI recognises it to exit 3 ("no active connection",
+/// docs/spec/cli.md) rather than 1.
+pub fn profile_not_up_message(profile: &str) -> String {
+    format!("profile {profile:?} is not up")
+}
+
 /// One running profile as exposed by the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
