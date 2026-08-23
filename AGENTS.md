@@ -57,6 +57,7 @@ files. None may loosen them.
 | `nix/` | The NixOS module. |
 | `packaging/systemd/` | The systemd units and the sysusers file, shared by every package. |
 | `packaging/aur/` | The Arch package: `PKGBUILD`, `.SRCINFO`. |
+| `scripts/` | Developer tooling: `headless-bench.sh` raises an isolated Xvfb + session-bus sandbox for exercising the GUI without a display or the user's live daemon. |
 | `docs/`, `docs/spec/` | User manual; binding implementation contract. |
 
 Parsing, Xray control and routing belong in `oxidom-core`. The GUI must not
