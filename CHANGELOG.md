@@ -15,6 +15,10 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- A Clash proxy with `network: http` imports as TCP with HTTP header camouflage fed from
+  `http-opts`, not as an HTTP/2 outbound with its options dropped; `h2-opts.host` lists are read.
+
+### Fixed
 - An HTTP-camouflaged TCP outbound now sends the path and Host its link carried; both were parsed
   and then dropped, so a server keyed on the disguise rejected the handshake.
 - Adding or removing servers no longer silently drops a running pool's queued health check; the
