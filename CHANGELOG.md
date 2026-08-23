@@ -15,6 +15,10 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- An HTTP-camouflaged TCP outbound now sends the path and Host its link carried; both were parsed
+  and then dropped, so a server keyed on the disguise rejected the handshake.
+
+### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
   so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
 - A subscription fetch that fails while the window opens no longer erases the saved subscription
