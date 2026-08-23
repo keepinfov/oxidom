@@ -15,6 +15,13 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
+  so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
+- A subscription whose subtitle falls back to a bare count no longer says "1 servers" for a
+  single server.
+- A connect that fails before anything starts — an unknown server id, an interface that will not
+  configure — no longer cancels an automatic reconnect already underway. The retry keeps running
+  instead of the session sitting in Error, holding traffic, until someone intervenes by hand.
 - The red line under the latency chart no longer repeats the newest failure's reason, which the
   block directly beneath already states in full; the count still covers every check.
 
