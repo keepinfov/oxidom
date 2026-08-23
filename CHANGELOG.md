@@ -15,6 +15,10 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- `oxidom status <PROFILE>`, `oxidom tun` and `oxidom run` exit 3 ("no active connection") for a
+  profile that is not up, as `env` and `ip` already did, instead of exit 1.
+
+### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
   so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
 - A subscription fetch that fails while the window opens no longer erases the saved subscription
