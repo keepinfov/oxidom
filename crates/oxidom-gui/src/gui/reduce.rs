@@ -4710,7 +4710,10 @@ mod tests {
     #[test]
     fn the_banner_does_not_call_a_dead_session_running() {
         let dead = session("work", "error", "a");
-        assert_eq!(other_profiles_message(&[dead.clone()], "default"), None);
+        assert_eq!(
+            other_profiles_message(std::slice::from_ref(&dead), "default"),
+            None
+        );
 
         let mut holding = session("work", "error", "a");
         holding.holding_traffic = true;
