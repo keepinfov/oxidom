@@ -14,6 +14,16 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- **An automatic reconnect no longer drops the held routes while it retries.** When a core died
+  under the default `on_core_exit = "hold"`, the session kept its routes and fwmark rule so the
+  tunnel's traffic was dropped rather than released — but the daemon's own reconnect then tore that
+  interface down before starting the new core, removing the routes and the rule for the whole retry
+  (with backoff, up to half a minute at a time). During that window traffic aimed at the tunnel left
+  on the ordinary default route with the machine's own address. The reconnect now leaves a holding
+  session's interface in place, as `docs/spec/interfaces.md` always said it should: it finds the
+  interface already up, restarts only a tun2socks that did not survive the outage, and adds nothing.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added
