@@ -15,6 +15,10 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- Adding or removing servers no longer silently drops a running pool's queued health check; the
+  pool's latency updates on schedule instead of going stale for another sweep.
+
+### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
   so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
 - A subscription whose subtitle falls back to a bare count no longer says "1 servers" for a
