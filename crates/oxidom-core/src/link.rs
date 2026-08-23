@@ -460,7 +460,9 @@ fn parse_socks(link: &str) -> Option<Server> {
     let host = host_of(&url)?;
     let port = url.port()?;
     let username = opt(url.username());
-    let password = url.password().map(|p| p.to_string());
+    let password = url
+        .password()
+        .map(|p| percent_decode_str(p).decode_utf8_lossy().into_owned());
     let name = {
         let f = decode_fragment(&url);
         if f.is_empty() { host.clone() } else { f }
@@ -476,7 +478,9 @@ fn parse_http(link: &str) -> Option<Server> {
         .port()
         .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
     let username = opt(url.username());
-    let password = url.password().map(|p| p.to_string());
+    let password = url
+        .password()
+        .map(|p| percent_decode_str(p).decode_utf8_lossy().into_owned());
     let name = {
         let f = decode_fragment(&url);
         if f.is_empty() { host.clone() } else { f }
@@ -689,6 +693,29 @@ mod tests {
                 password: None
             }
         ));
+    }
+
+    #[test]
+    fn socks_and_http_passwords_survive_percent_encoding() {
+        // A password is percent-escaped in the userinfo like the username is;
+        // taking it verbatim used to hand xray `p%40ss` for `p@ss`.
+        let socks = parse_link("socks5://user:p%40ss@example.com:1080#S").unwrap();
+        match &socks.spec {
+            OutboundSpec::Socks { username, password } => {
+                assert_eq!(username.as_deref(), Some("user"));
+                assert_eq!(password.as_deref(), Some("p@ss"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let http = parse_link("http://user:p%23ss@example.com:8080#H").unwrap();
+        match &http.spec {
+            OutboundSpec::Http { username, password } => {
+                assert_eq!(username.as_deref(), Some("user"));
+                assert_eq!(password.as_deref(), Some("p#ss"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
