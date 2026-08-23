@@ -591,7 +591,18 @@ fn stream_settings(s: &StreamSettings) -> Value {
             }));
         }
         "tcp" if s.header_type.as_deref() == Some("http") => {
-            v["tcpSettings"] = json!({ "header": { "type": "http" } });
+            // The camouflage is the request: a path and Host were parsed for
+            // exactly this arm, and a server keyed on them rejects a bare
+            // `GET /`. Both are lists in Xray's request object.
+            let request = trim_obj(json!({
+                "path": s.path.as_ref().map(|p| json!([p])),
+                "headers": s.host.as_ref().map(|h| json!({ "Host": [h] })),
+            }));
+            let mut header = json!({ "type": "http" });
+            if request.as_object().is_some_and(|o| !o.is_empty()) {
+                header["request"] = request;
+            }
+            v["tcpSettings"] = json!({ "header": header });
         }
         _ => {}
     }
@@ -657,6 +668,55 @@ mod tests {
         Hysteria2Obfs, Hysteria2Settings, OutboundSpec, PortRange, Protocol, Server, StreamSettings,
     };
     use crate::xray::routing;
+
+    /// A `type=tcp&headerType=http` link parses its camouflage path and Host,
+    /// and the generated `tcpSettings` must carry them: a server keyed on the
+    /// request it disguises as rejects a bare `GET /` with no Host.
+    #[test]
+    fn tcp_http_camouflage_carries_its_path_and_host() {
+        let server = crate::link::parse_link(
+            "vless://00000000-0000-0000-0000-000000000000@203.0.113.1:80\
+             ?type=tcp&headerType=http&path=/live&host=cdn.example.invalid#n",
+        )
+        .unwrap();
+        let config = generate(
+            &server,
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
+        let expected = json!({
+            "header": {
+                "type": "http",
+                "request": {
+                    "path": ["/live"],
+                    "headers": { "Host": ["cdn.example.invalid"] }
+                }
+            }
+        });
+        assert_eq!(
+            config["outbounds"][0]["streamSettings"]["tcpSettings"],
+            expected
+        );
+
+        // A bare headerType=http with nothing to carry keeps the minimal shape.
+        let plain = crate::link::parse_link(
+            "vless://00000000-0000-0000-0000-000000000000@203.0.113.1:80?type=tcp&headerType=http#n",
+        )
+        .unwrap();
+        let config = generate(
+            &plain,
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
+        assert_eq!(
+            config["outbounds"][0]["streamSettings"]["tcpSettings"],
+            json!({ "header": { "type": "http" } })
+        );
+    }
 
     #[test]
     fn balanced_profile_keeps_local_inbounds_and_safe_routing() {
