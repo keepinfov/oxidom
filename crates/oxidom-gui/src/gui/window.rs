@@ -4360,6 +4360,10 @@ impl Controller {
     /// which button had been pressed.
     fn show_error(self: &Rc<Self>, title: &str, detail: &str) {
         let toast = adw::Toast::new(&summarize_error(title, detail));
+        // A toast title is Pango markup by default, and this one carries
+        // daemon- and server-derived text: a bare `&` in an error naming a URL
+        // blanks the toast, and a name written as markup renders as markup.
+        toast.set_use_markup(false);
         toast.set_priority(adw::ToastPriority::High);
         toast.set_timeout(8);
         let action = ipc::error_action(detail);
@@ -4912,7 +4916,10 @@ impl Controller {
     /// user should notice. Never a failure carrying an error string — that is
     /// [`Self::show_error`], which keeps the untruncated text reachable.
     fn show_message(&self, message: &str) {
-        self.toasts.add_toast(adw::Toast::new(message));
+        let toast = adw::Toast::new(message);
+        // Same reason as `show_error`: the text is shown, never parsed.
+        toast.set_use_markup(false);
+        self.toasts.add_toast(toast);
     }
 }
 

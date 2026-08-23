@@ -240,7 +240,12 @@ fn parse_vmess(link: &str) -> Option<Server> {
     // a config xray refuses to load, with nothing on screen to explain it.
     let port = u16::try_from(num("port")?).ok()?;
     let uuid = s("id")?;
-    let alter_id = num("aid").unwrap_or(0) as u32;
+    // The same wrap as the port above: `as u32` would turn an oversized
+    // AlterID into a different one and the handshake would fail unexplained.
+    let alter_id = match num("aid") {
+        Some(aid) => u32::try_from(aid).ok()?,
+        None => 0,
+    };
     let security = s("scy").unwrap_or_else(|| "auto".to_string());
     let net = s("net").unwrap_or_else(|| "tcp".to_string());
     let tls = s("tls").unwrap_or_default();
@@ -455,7 +460,9 @@ fn parse_socks(link: &str) -> Option<Server> {
     let host = host_of(&url)?;
     let port = url.port()?;
     let username = opt(url.username());
-    let password = url.password().map(|p| p.to_string());
+    let password = url
+        .password()
+        .map(|p| percent_decode_str(p).decode_utf8_lossy().into_owned());
     let name = {
         let f = decode_fragment(&url);
         if f.is_empty() { host.clone() } else { f }
@@ -471,7 +478,9 @@ fn parse_http(link: &str) -> Option<Server> {
         .port()
         .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
     let username = opt(url.username());
-    let password = url.password().map(|p| p.to_string());
+    let password = url
+        .password()
+        .map(|p| percent_decode_str(p).decode_utf8_lossy().into_owned());
     let name = {
         let f = decode_fragment(&url);
         if f.is_empty() { host.clone() } else { f }
@@ -684,6 +693,29 @@ mod tests {
                 password: None
             }
         ));
+    }
+
+    #[test]
+    fn socks_and_http_passwords_survive_percent_encoding() {
+        // A password is percent-escaped in the userinfo like the username is;
+        // taking it verbatim used to hand xray `p%40ss` for `p@ss`.
+        let socks = parse_link("socks5://user:p%40ss@example.com:1080#S").unwrap();
+        match &socks.spec {
+            OutboundSpec::Socks { username, password } => {
+                assert_eq!(username.as_deref(), Some("user"));
+                assert_eq!(password.as_deref(), Some("p@ss"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let http = parse_link("http://user:p%23ss@example.com:8080#H").unwrap();
+        match &http.spec {
+            OutboundSpec::Http { username, password } => {
+                assert_eq!(username.as_deref(), Some("user"));
+                assert_eq!(password.as_deref(), Some("p#ss"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -924,6 +956,16 @@ mod tests {
     fn vmess_rejects_a_port_that_does_not_fit() {
         // `as u16` used to wrap 65536 to 0 and hand xray a config it refuses.
         let link = vmess_link(r#"{"add":"example.com","port":"65536","id":"uuid","ps":"Wrapped"}"#);
+        assert!(parse_link(&link).is_none());
+    }
+
+    #[test]
+    fn vmess_rejects_an_alter_id_that_does_not_fit() {
+        // `as u32` used to wrap 4294967296 to 0, silently changing the
+        // AlterID the handshake is made with.
+        let link = vmess_link(
+            r#"{"add":"example.com","port":"443","id":"uuid","aid":"4294967296","ps":"Wide"}"#,
+        );
         assert!(parse_link(&link).is_none());
     }
 
