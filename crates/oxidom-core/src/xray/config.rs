@@ -556,8 +556,14 @@ fn hysteria2_stream(auth: &str, s: &Hysteria2Settings, port: u16) -> Value {
 
 fn socks_http_server(addr: &str, port: u16, user: &Option<String>, pass: &Option<String>) -> Value {
     let mut server = json!({ "address": addr, "port": port });
-    if let (Some(u), Some(p)) = (user, pass) {
-        server["users"] = json!([ { "user": u, "pass": p } ]);
+    // Half a credential still authenticates: a `socks5://user@host` link has no
+    // password, and Xray accepts a `users` entry with an empty half. Requiring
+    // both halves made such an outbound dial with no `users` at all.
+    if user.is_some() || pass.is_some() {
+        server["users"] = json!([ {
+            "user": user.as_deref().unwrap_or(""),
+            "pass": pass.as_deref().unwrap_or("")
+        } ]);
     }
     server
 }
@@ -925,6 +931,33 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&generated).unwrap(),
             serde_json::to_vec(&legacy).unwrap()
+        );
+    }
+
+    /// A `socks5://user@host` link carries only half a credential. Xray accepts
+    /// a `users` entry whose other half is an empty string, so the entry is
+    /// emitted whenever either half is present; requiring both made the
+    /// outbound dial unauthenticated with nothing saying so.
+    #[test]
+    fn half_a_credential_still_reaches_the_outbound() {
+        let server = crate::link::parse_link("socks5://user@example.com:1080#S").unwrap();
+        let config = generate(
+            &server,
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
+        let expected = json!({
+            "servers": [{
+                "address": "example.com",
+                "port": 1080,
+                "users": [{ "user": "user", "pass": "" }]
+            }]
+        });
+        assert_eq!(
+            serde_json::to_vec(&config["outbounds"][0]["settings"]).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
         );
     }
 

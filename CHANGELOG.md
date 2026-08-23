@@ -40,6 +40,9 @@ surface, packaging, or the CLI belongs here.
   different AlterID.
 - A toast shows its message as written: an error naming a URL with a bare ampersand no longer
   comes up blank, and a server name written as markup no longer renders as markup.
+- A SOCKS or HTTP proxy link carrying only a username (or only a password) now authenticates: the
+  generated outbound sends the credential with the missing half empty, where it previously sent no
+  credential at all.
 
 ## [0.3.0] - 2026-08-22
 
