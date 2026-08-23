@@ -15,6 +15,10 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- Stopping a core whose process had already been reaped no longer sends a signal to its old pid,
+  which could by then belong to an unrelated process.
+
+### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
   so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
 - A subscription whose subtitle falls back to a bare count no longer says "1 servers" for a
