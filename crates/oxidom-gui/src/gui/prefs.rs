@@ -145,7 +145,12 @@ pub struct GuiPrefs {
 }
 
 impl GuiPrefs {
-    pub fn load(subscriptions: &[Subscription]) -> GuiPrefs {
+    /// `fetched` is `Some` only when the subscription list was actually read
+    /// from the daemon. Pruning against a list that failed to arrive — an
+    /// empty default where the D-Bus call errored — would persist away the
+    /// saved order and collapse state for good; an empty list that *was* read
+    /// is a legitimate prune.
+    pub fn load(fetched: Option<&[Subscription]>) -> GuiPrefs {
         let Ok(path) = paths::gui_prefs_file() else {
             return GuiPrefs::default();
         };
@@ -160,21 +165,23 @@ impl GuiPrefs {
             },
             Err(_) => GuiPrefs::default(),
         };
-        let current: HashSet<&str> = subscriptions
-            .iter()
-            .map(|subscription| subscription.id.as_str())
-            .collect();
-        let before = prefs.collapsed_subscriptions.len() + prefs.subscription_order.len();
-        prefs
-            .collapsed_subscriptions
-            .retain(|subscription_id| current.contains(subscription_id.as_str()));
-        prefs
-            .subscription_order
-            .retain(|subscription_id| current.contains(subscription_id.as_str()));
-        if prefs.collapsed_subscriptions.len() + prefs.subscription_order.len() != before
-            && let Err(error) = prefs.save()
-        {
-            log::warn!("could not discard stale gui prefs: {error:#}");
+        if let Some(subscriptions) = fetched {
+            let current: HashSet<&str> = subscriptions
+                .iter()
+                .map(|subscription| subscription.id.as_str())
+                .collect();
+            let before = prefs.collapsed_subscriptions.len() + prefs.subscription_order.len();
+            prefs
+                .collapsed_subscriptions
+                .retain(|subscription_id| current.contains(subscription_id.as_str()));
+            prefs
+                .subscription_order
+                .retain(|subscription_id| current.contains(subscription_id.as_str()));
+            if prefs.collapsed_subscriptions.len() + prefs.subscription_order.len() != before
+                && let Err(error) = prefs.save()
+            {
+                log::warn!("could not discard stale gui prefs: {error:#}");
+            }
         }
         // Not written back: an install that has never starred anything should
         // not acquire a prefs file just for showing the chip.
@@ -195,6 +202,83 @@ impl GuiPrefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RAII root for the prefs file, so the tests never touch a real
+    /// `gui_prefs.toml`. The lock is process-global; taking it is not optional.
+    struct PrefsRoot(std::path::PathBuf);
+    impl PrefsRoot {
+        fn install(name: &str) -> PrefsRoot {
+            let path =
+                std::env::temp_dir().join(format!("oxidom-prefs-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("test root");
+            oxidom_core::paths::set_test_root(Some(path.clone()));
+            PrefsRoot(path)
+        }
+    }
+    impl Drop for PrefsRoot {
+        fn drop(&mut self) {
+            oxidom_core::paths::set_test_root(None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn saved_prefs() -> GuiPrefs {
+        let prefs = GuiPrefs {
+            collapsed_subscriptions: ["sub-a".to_string()].into_iter().collect(),
+            subscription_order: vec!["sub-a".to_string(), "sub-b".to_string()],
+            ..GuiPrefs::default()
+        };
+        prefs.save().expect("saving the fixture");
+        prefs
+    }
+
+    fn subscription(id: &str) -> Subscription {
+        let mut subscription = Subscription::new(format!("https://example.invalid/{id}"), None);
+        subscription.id = id.to_string();
+        subscription
+    }
+
+    /// The list is `None` exactly when the D-Bus fetch failed — a daemon
+    /// restarting under the GUI's startup. Pruning against that would persist
+    /// away the hand-arranged order for good.
+    #[test]
+    fn a_failed_fetch_does_not_erase_the_saved_order() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = PrefsRoot::install("failed-fetch");
+        saved_prefs();
+
+        let loaded = GuiPrefs::load(None);
+        assert_eq!(loaded.subscription_order, ["sub-a", "sub-b"]);
+        assert!(loaded.collapsed_subscriptions.contains("sub-a"));
+
+        let reloaded = GuiPrefs::load(Some(&[subscription("sub-a"), subscription("sub-b")]));
+        assert_eq!(
+            reloaded.subscription_order,
+            ["sub-a", "sub-b"],
+            "nothing was written back while the list was unknown"
+        );
+    }
+
+    /// An id that really is gone still leaves the order, and the pruned file
+    /// is written back — a successful read is what makes the prune true.
+    #[test]
+    fn a_read_list_still_prunes_what_it_no_longer_contains() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = PrefsRoot::install("read-prune");
+        saved_prefs();
+
+        let loaded = GuiPrefs::load(Some(&[subscription("sub-b")]));
+        assert_eq!(loaded.subscription_order, ["sub-b"]);
+        assert!(loaded.collapsed_subscriptions.is_empty());
+
+        let reloaded = GuiPrefs::load(None);
+        assert_eq!(
+            reloaded.subscription_order,
+            ["sub-b"],
+            "the prune was persisted by the read that justified it"
+        );
+    }
 
     /// The combo's positions are a contract between two files; a round trip
     /// through them is what keeps the row from showing one thing and applying

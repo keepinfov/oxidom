@@ -17,6 +17,10 @@ surface, packaging, or the CLI belongs here.
 ### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
   so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
+- A subscription fetch that fails while the window opens no longer erases the saved subscription
+  order and collapse state; pruning happens only against a list that was actually read.
+
+### Fixed
 - A subscription whose subtitle falls back to a bare count no longer says "1 servers" for a
   single server.
 - A connect that fails before anything starts — an unknown server id, an interface that will not

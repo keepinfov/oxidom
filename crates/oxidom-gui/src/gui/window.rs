@@ -599,7 +599,11 @@ fn build(
             client.source()
         );
     }
-    let subscriptions_snapshot = client.subscriptions().unwrap_or_default();
+    // `ok()` rather than a default: GuiPrefs::load must know whether the list
+    // was read or the call failed, or a daemon restarting right now would let
+    // the prune erase the saved subscription order.
+    let fetched_subscriptions = client.subscriptions().ok();
+    let subscriptions_snapshot = fetched_subscriptions.clone().unwrap_or_default();
     let profiles_snapshot = client.list_profiles().unwrap_or_default();
     let initial_status = client.status().unwrap_or_default();
     let initial_config = client.settings().unwrap_or_default();
@@ -619,7 +623,7 @@ fn build(
     // install.
     let probe_cancel_supported = client.supports_probe_cancel();
     let selected_id = initial_status.active_id.clone();
-    let servers = ServersView::new(&subscriptions_snapshot);
+    let servers = ServersView::new(fetched_subscriptions.as_deref());
     let state = Rc::new(RefCell::new(AppState {
         client,
         subscriptions: subscriptions_snapshot,
