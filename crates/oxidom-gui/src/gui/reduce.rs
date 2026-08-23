@@ -2017,18 +2017,22 @@ pub(super) fn other_profiles_message(
     sessions: &[SessionInfo],
     selected_profile: &str,
 ) -> Option<String> {
-    let count = sessions
+    // A session whose connect failed is neither out of sight nor running —
+    // the daemon keeps it inspectable, and `oxidom status` reports nothing —
+    // so it draws no banner. One that is holding traffic still owns routes
+    // and is named for what it is.
+    let others: Vec<&SessionInfo> = sessions
         .iter()
-        .filter(|session| session.profile != selected_profile)
-        .count();
+        .filter(|session| {
+            session.profile != selected_profile
+                && (matches!(session.state.as_str(), "connected" | "connecting")
+                    || session.holding_traffic)
+        })
+        .collect();
     // A group Connect raises its pool in `default`, which is not a profile the
     // user named and not something out of sight — the bar that started it is on
     // screen. Reported as "1 more profile is running", it read as the
     // connection having happened somewhere else entirely.
-    let others: Vec<&SessionInfo> = sessions
-        .iter()
-        .filter(|session| session.profile != selected_profile)
-        .collect();
     if !others.is_empty()
         && others.iter().all(|session| {
             session.profile == GROUP_CONNECT_SESSION && session.selection.kind == "pool"
@@ -2038,10 +2042,28 @@ pub(super) fn other_profiles_message(
             "A group is running in the {GROUP_CONNECT_SESSION} session"
         ));
     }
-    match count {
+    let holding = others
+        .iter()
+        .filter(|session| session.holding_traffic)
+        .count();
+    let running = others.len() - holding;
+    let running_part = match running {
         0 => None,
         1 => Some("1 more profile is running".to_string()),
         count => Some(format!("{count} more profiles are running")),
+    };
+    let holding_part = match holding {
+        0 => None,
+        1 => Some("1 profile is holding traffic".to_string()),
+        count => Some(format!("{count} profiles are holding traffic")),
+    };
+    match (running_part, holding_part) {
+        (None, None) => None,
+        (Some(running), None) => Some(running),
+        (None, Some(holding)) => Some(holding),
+        // One sentence, second half without its subject repeated:
+        // "1 more profile is running, 1 holding traffic".
+        (Some(running), Some(_)) => Some(format!("{running}, {holding} holding traffic")),
     }
 }
 
@@ -4147,7 +4169,8 @@ mod tests {
         );
         assert_eq!(
             other_profiles_message(&status.sessions, "home").as_deref(),
-            Some("2 more profiles are running")
+            Some("1 more profile is running"),
+            "the errored session is not running and draws no banner"
         );
     }
 
@@ -4676,6 +4699,36 @@ mod tests {
         assert_eq!(
             other_profiles_message(&[pool, session("home", "connected", "b")], "work").as_deref(),
             Some("2 more profiles are running")
+        );
+    }
+
+    /// The banner exists to name what is out of sight and running. A session
+    /// whose connect failed is neither — `oxidom status` reports nothing
+    /// running, and the banner contradicted it until someone brought the dead
+    /// session down by hand. A session holding traffic is different: its
+    /// routes are still installed, and it is named for what it is.
+    #[test]
+    fn the_banner_does_not_call_a_dead_session_running() {
+        let dead = session("work", "error", "a");
+        assert_eq!(
+            other_profiles_message(std::slice::from_ref(&dead), "default"),
+            None
+        );
+
+        let mut holding = session("work", "error", "a");
+        holding.holding_traffic = true;
+        assert_eq!(
+            other_profiles_message(&[holding.clone()], "default").as_deref(),
+            Some("1 profile is holding traffic")
+        );
+
+        assert_eq!(
+            other_profiles_message(
+                &[dead, holding, session("home", "connected", "b")],
+                "default"
+            )
+            .as_deref(),
+            Some("1 more profile is running, 1 holding traffic")
         );
     }
 

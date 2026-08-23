@@ -619,17 +619,62 @@ fn server_from_clash(proxy: &Value) -> Option<Server> {
     Some(finish_server(&name, protocol, address, port, spec))
 }
 
+/// A Clash option that is a string in one dialect and a one-or-more list in
+/// another; either way the first entry is the one the outbound carries.
+fn first_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => items.first().and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
 fn stream_from_clash(proxy: &Value) -> StreamSettings {
     let reality = proxy.get("reality-opts").unwrap_or(&Value::Null);
-    let network = string(proxy, "network").unwrap_or_else(|| "tcp".to_string());
+    let requested = string(proxy, "network").unwrap_or_else(|| "tcp".to_string());
     let tls = bool_value(proxy.get("tls")).unwrap_or(false);
-    let network_options = match network.as_str() {
+    // Clash's `network: http` is not a transport: it is TCP with HTTP header
+    // camouflage, and its options live in `http-opts`, where both `path` and
+    // the header values are lists. `h2` is the real HTTP/2 transport, with its
+    // host list under `h2-opts.host` rather than in a headers map.
+    let (network, header_type) = match requested.as_str() {
+        "http" => ("tcp".to_string(), Some("http".to_string())),
+        _ => (requested.clone(), None),
+    };
+    let network_options = match requested.as_str() {
         "ws" => proxy.get("ws-opts"),
         "grpc" => proxy.get("grpc-opts"),
-        "h2" | "http" => proxy.get("h2-opts"),
+        "h2" => proxy.get("h2-opts"),
+        "http" => proxy.get("http-opts"),
         _ => None,
     }
     .unwrap_or(&Value::Null);
+    let (path, host) = match requested.as_str() {
+        "http" => (
+            network_options.get("path").and_then(first_string),
+            network_options
+                .pointer("/headers/Host")
+                .and_then(first_string),
+        ),
+        "h2" => (
+            string(network_options, "path"),
+            network_options
+                .get("host")
+                .and_then(first_string)
+                .or_else(|| {
+                    network_options
+                        .pointer("/headers/Host")
+                        .and_then(first_string)
+                }),
+        ),
+        _ => (
+            string(network_options, "path"),
+            network_options
+                .pointer("/headers/Host")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
+    };
     StreamSettings {
         network,
         security: if !reality.is_null() {
@@ -651,13 +696,10 @@ fn stream_from_clash(proxy: &Value) -> StreamSettings {
         public_key: string(reality, "public-key"),
         short_id: string(reality, "short-id"),
         spider_x: None,
-        path: string(network_options, "path"),
-        host: network_options
-            .pointer("/headers/Host")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        path,
+        host,
         service_name: string(network_options, "grpc-service-name"),
-        header_type: None,
+        header_type,
         flow: string(proxy, "flow"),
     }
 }
@@ -760,9 +802,20 @@ fn canonical_share_link(server: &Server) -> Option<String> {
 
 fn endpoint_url(scheme: &str, address: &str, port: u16) -> Option<Url> {
     let mut url = Url::parse(&format!("{scheme}://placeholder@localhost:1")).ok()?;
-    url.set_host(Some(address)).ok()?;
+    url.set_host(Some(&bracketed(address))).ok()?;
     url.set_port(Some(port)).ok()?;
     Some(url)
+}
+
+/// A bare IPv6 address handed to `Url::set_host` is truncated at its first
+/// colon — `2001:db8::1` becomes host `2001` — so every emitter brackets it,
+/// and `normalize_host` strips the brackets again on parse.
+fn bracketed(address: &str) -> String {
+    if address.contains(':') && !address.starts_with('[') {
+        format!("[{address}]")
+    } else {
+        address.to_string()
+    }
 }
 
 fn authenticated_url(
@@ -1025,7 +1078,7 @@ const SHARE_LINK_VALUE: &AsciiSet = &NON_ALPHANUMERIC
 fn hysteria2_share_link(server: &Server, auth: &str, s: &Hysteria2Settings) -> String {
     let encode = |value: &str| utf8_percent_encode(value, SHARE_LINK_VALUE).to_string();
 
-    let mut authority = format!("{}:{}", server.address, server.port);
+    let mut authority = format!("{}:{}", bracketed(&server.address), server.port);
     for range in &s.port_hop {
         authority.push(',');
         authority.push_str(&range.to_xray());
@@ -1489,6 +1542,100 @@ proxies:
 
     /// The emitter and the parser must agree: the generated link becomes the
     /// server's stable id, so a mismatch renames every server on each refresh.
+    #[test]
+    fn an_ipv6_server_emits_a_bracketed_link_that_parses_back() {
+        let yaml = r#"
+proxies:
+  - name: "SIX"
+    type: vless
+    server: "2001:db8::1"
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+    tls: true
+  - name: "HY6"
+    type: hysteria2
+    server: "2001:db8::2"
+    port: 443
+    password: "pw"
+"#;
+        let imported = parse(yaml).unwrap().0;
+
+        let vless = imported[0]
+            .link
+            .as_deref()
+            .expect("vless links are emitable");
+        assert!(vless.contains("@[2001:db8::1]:443"), "{vless}");
+        let reparsed = crate::link::parse_link(vless).expect("emitted link must parse");
+        assert_eq!(reparsed.address, "2001:db8::1");
+        assert_eq!(reparsed.port, 443);
+
+        let hysteria = imported[1]
+            .link
+            .as_deref()
+            .expect("hysteria2 links are emitable");
+        assert!(hysteria.contains("@[2001:db8::2]:443"), "{hysteria}");
+        let reparsed = crate::link::parse_link(hysteria).expect("emitted link must parse");
+        assert_eq!(reparsed.address, "2001:db8::2");
+        assert_eq!(reparsed.port, 443);
+    }
+
+    #[test]
+    fn clash_network_http_imports_as_tcp_camouflage_and_h2_reads_its_host_list() {
+        let yaml = r#"
+proxies:
+  - name: "CAMO"
+    type: vmess
+    server: c.example
+    port: 80
+    uuid: 00000000-0000-0000-0000-000000000000
+    alterId: 0
+    cipher: auto
+    network: http
+    http-opts:
+      path: ["/live"]
+      headers:
+        Host: ["cdn.example"]
+  - name: "REALH2"
+    type: vmess
+    server: h.example
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+    alterId: 0
+    cipher: auto
+    tls: true
+    network: h2
+    h2-opts:
+      host: ["h2.example"]
+      path: /h2
+"#;
+        let imported = parse(yaml).unwrap().0;
+
+        let camo = stream_of(&imported[0]);
+        assert_eq!(
+            camo.network, "tcp",
+            "Clash http is camouflage, not a transport"
+        );
+        assert_eq!(camo.header_type.as_deref(), Some("http"));
+        assert_eq!(camo.path.as_deref(), Some("/live"));
+        assert_eq!(camo.host.as_deref(), Some("cdn.example"));
+
+        let h2 = stream_of(&imported[1]);
+        assert_eq!(h2.network, "h2");
+        assert_eq!(h2.path.as_deref(), Some("/h2"));
+        assert_eq!(
+            h2.host.as_deref(),
+            Some("h2.example"),
+            "h2-opts.host is a list"
+        );
+    }
+
+    fn stream_of(server: &crate::model::Server) -> &crate::model::StreamSettings {
+        match &server.spec {
+            crate::model::OutboundSpec::Vmess { stream, .. } => stream,
+            other => panic!("expected vmess: {other:?}"),
+        }
+    }
+
     #[test]
     fn hysteria2_share_link_round_trips() {
         let yaml = r#"
