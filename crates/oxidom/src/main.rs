@@ -324,7 +324,7 @@ fn tun(profile: &str, down: bool) -> CliResult {
         }
         return Ok(());
     }
-    let session = client.session_status(profile).map_err(Failure::error)?;
+    let session = session_status_for(&client, profile)?;
     let interface = session.interface.ok_or_else(|| {
         Failure::message(format!(
             "profile {profile:?} has no interface; set [interface] enable = true and bring it up"
@@ -346,7 +346,7 @@ fn run(profile: &str, args: &[String], command: Option<&str>) -> CliResult {
     let argv = oxidom_core::run::command_argv(args, command).map_err(Failure::error)?;
     let client = existing_client()?;
     let configured = client.profile(profile).map_err(Failure::error)?;
-    let session = client.session_status(profile).map_err(Failure::error)?;
+    let session = session_status_for(&client, profile)?;
     oxidom_core::run::validate_interface(
         profile,
         session.interface.as_ref(),
@@ -827,8 +827,25 @@ impl Drop for TemporaryProfile {
 }
 
 fn connected_session(client: &DaemonClient, profile: &str) -> CliResult<SessionInfo> {
-    let session = client.session_status(profile).map_err(Failure::error)?;
+    let session = session_status_for(client, profile)?;
     require_connected(session)
+}
+
+/// A profile that exists but is not up is a state, not a fault: the binding
+/// exit-code table maps it to 3, and `env`/`ip` already answer it that way
+/// through the session list. Any other daemon error stays a command error.
+fn session_status_for(client: &DaemonClient, profile: &str) -> CliResult<SessionInfo> {
+    client
+        .session_status(profile)
+        .map_err(|error| not_up_failure(profile, &error))
+}
+
+fn not_up_failure(profile: &str, error: &anyhow::Error) -> Failure {
+    if format!("{error:#}").contains(&oxidom_core::ipc::profile_not_up_message(profile)) {
+        Failure::not_connected()
+    } else {
+        Failure::error(error)
+    }
 }
 
 fn connected_listed_session(client: &DaemonClient, profile: &str) -> CliResult<SessionInfo> {
@@ -1053,6 +1070,22 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn the_not_up_reply_exits_3_like_env_and_ip() {
+        let not_up = anyhow::anyhow!(
+            "org.freedesktop.DBus.Error.Failed: {}",
+            oxidom_core::ipc::profile_not_up_message("work")
+        );
+        assert_eq!(
+            exit_code_for(not_up_failure("work", &not_up).kind),
+            3,
+            "a down tunnel is a state, not a command error"
+        );
+
+        let other = anyhow::anyhow!("something else broke");
+        assert_eq!(exit_code_for(not_up_failure("work", &other).kind), 1);
+    }
 
     #[test]
     fn failures_map_to_the_stable_exit_codes() {

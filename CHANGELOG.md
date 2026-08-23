@@ -27,6 +27,8 @@ surface, packaging, or the CLI belongs here.
   is instead of leaving the card's spinner to retire onto a stale measurement.
 - Stopping a core whose process had already been reaped no longer sends a signal to its old pid,
   which could by then belong to an unrelated process.
+- `oxidom status <PROFILE>`, `oxidom tun` and `oxidom run` exit 3 ("no active connection") for a
+  profile that is not up, as `env` and `ip` already did, instead of exit 1.
 
 ### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,

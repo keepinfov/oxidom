@@ -2742,7 +2742,7 @@ impl Service {
         let session = self
             .shared
             .session_info(&profile)
-            .ok_or_else(|| failed(format!("profile {profile:?} is not up")))?;
+            .ok_or_else(|| failed(oxidom_core::ipc::profile_not_up_message(&profile)))?;
         json(&session)
     }
 
