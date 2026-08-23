@@ -1822,7 +1822,15 @@ pub(super) fn connect_bar_session_note(selected_profile: &str) -> Option<String>
 /// same session, and a session started from one is stopped by the other.
 pub(super) fn pool_action(state: &SnapshotState, members: &[String]) -> PoolAction {
     let running = state.sessions.iter().find(|session| {
-        session.selection.kind == "pool" && same_members(&session.selection, members)
+        session.selection.kind == "pool"
+            && same_members(&session.selection, members)
+            // The daemon keeps a stopped or failed session inspectable with
+            // its selection intact; that entry is not this selection running,
+            // and Stop on it would tear down a corpse instead of connecting.
+            // A session holding traffic still owns routes, so stopping it
+            // must stay reachable.
+            && (matches!(session.state.as_str(), "connected" | "connecting")
+                || session.holding_traffic)
     });
     match running {
         Some(session) => PoolAction::Stop(session.profile.clone()),
@@ -2009,18 +2017,22 @@ pub(super) fn other_profiles_message(
     sessions: &[SessionInfo],
     selected_profile: &str,
 ) -> Option<String> {
-    let count = sessions
+    // A session whose connect failed is neither out of sight nor running —
+    // the daemon keeps it inspectable, and `oxidom status` reports nothing —
+    // so it draws no banner. One that is holding traffic still owns routes
+    // and is named for what it is.
+    let others: Vec<&SessionInfo> = sessions
         .iter()
-        .filter(|session| session.profile != selected_profile)
-        .count();
+        .filter(|session| {
+            session.profile != selected_profile
+                && (matches!(session.state.as_str(), "connected" | "connecting")
+                    || session.holding_traffic)
+        })
+        .collect();
     // A group Connect raises its pool in `default`, which is not a profile the
     // user named and not something out of sight — the bar that started it is on
     // screen. Reported as "1 more profile is running", it read as the
     // connection having happened somewhere else entirely.
-    let others: Vec<&SessionInfo> = sessions
-        .iter()
-        .filter(|session| session.profile != selected_profile)
-        .collect();
     if !others.is_empty()
         && others.iter().all(|session| {
             session.profile == GROUP_CONNECT_SESSION && session.selection.kind == "pool"
@@ -2030,10 +2042,28 @@ pub(super) fn other_profiles_message(
             "A group is running in the {GROUP_CONNECT_SESSION} session"
         ));
     }
-    match count {
+    let holding = others
+        .iter()
+        .filter(|session| session.holding_traffic)
+        .count();
+    let running = others.len() - holding;
+    let running_part = match running {
         0 => None,
         1 => Some("1 more profile is running".to_string()),
         count => Some(format!("{count} more profiles are running")),
+    };
+    let holding_part = match holding {
+        0 => None,
+        1 => Some("1 profile is holding traffic".to_string()),
+        count => Some(format!("{count} profiles are holding traffic")),
+    };
+    match (running_part, holding_part) {
+        (None, None) => None,
+        (Some(running), None) => Some(running),
+        (None, Some(holding)) => Some(holding),
+        // One sentence, second half without its subject repeated:
+        // "1 more profile is running, 1 holding traffic".
+        (Some(running), Some(_)) => Some(format!("{running}, {holding} holding traffic")),
     }
 }
 
@@ -3310,6 +3340,47 @@ mod tests {
         assert_eq!(pool_action(&state, &wider), PoolAction::ConnectSelection);
     }
 
+    /// The daemon keeps a stopped or failed session inspectable, selection
+    /// intact — so matching on kind and members alone made the always-labelled
+    /// Connect resolve to Stop, and a retry press tore the dead session down
+    /// instead of connecting. A session that still holds traffic is different:
+    /// it owns routes, and stopping it must stay reachable.
+    #[test]
+    fn connect_on_a_group_whose_session_died_connects_rather_than_stops() {
+        let members = vec!["berlin".to_string(), "munich".to_string()];
+        let mut state = state();
+
+        let mut dead = session("default", "error", "berlin");
+        dead.selection = SelectionInfo {
+            kind: "pool".to_string(),
+            members: vec![
+                PoolMember {
+                    server_id: "berlin".to_string(),
+                    ..PoolMember::default()
+                },
+                PoolMember {
+                    server_id: "munich".to_string(),
+                    ..PoolMember::default()
+                },
+            ],
+            ..SelectionInfo::default()
+        };
+        state.sessions = vec![dead];
+        assert_eq!(
+            pool_action(&state, &members),
+            PoolAction::ConnectSelection,
+            "a dead session is not this selection running"
+        );
+
+        // Holding traffic means the routes are still installed; the press
+        // stops that deliberately rather than raising a second core under it.
+        state.sessions[0].holding_traffic = true;
+        assert_eq!(
+            pool_action(&state, &members),
+            PoolAction::Stop("default".to_string())
+        );
+    }
+
     #[test]
     fn moving_an_entry_clamps_at_both_ends() {
         let visible = vec!["a".to_string(), "b".to_string(), "c".to_string()];
@@ -4098,7 +4169,8 @@ mod tests {
         );
         assert_eq!(
             other_profiles_message(&status.sessions, "home").as_deref(),
-            Some("2 more profiles are running")
+            Some("1 more profile is running"),
+            "the errored session is not running and draws no banner"
         );
     }
 
@@ -4627,6 +4699,36 @@ mod tests {
         assert_eq!(
             other_profiles_message(&[pool, session("home", "connected", "b")], "work").as_deref(),
             Some("2 more profiles are running")
+        );
+    }
+
+    /// The banner exists to name what is out of sight and running. A session
+    /// whose connect failed is neither — `oxidom status` reports nothing
+    /// running, and the banner contradicted it until someone brought the dead
+    /// session down by hand. A session holding traffic is different: its
+    /// routes are still installed, and it is named for what it is.
+    #[test]
+    fn the_banner_does_not_call_a_dead_session_running() {
+        let dead = session("work", "error", "a");
+        assert_eq!(
+            other_profiles_message(std::slice::from_ref(&dead), "default"),
+            None
+        );
+
+        let mut holding = session("work", "error", "a");
+        holding.holding_traffic = true;
+        assert_eq!(
+            other_profiles_message(&[holding.clone()], "default").as_deref(),
+            Some("1 profile is holding traffic")
+        );
+
+        assert_eq!(
+            other_profiles_message(
+                &[dead, holding, session("home", "connected", "b")],
+                "default"
+            )
+            .as_deref(),
+            Some("1 more profile is running, 1 holding traffic")
         );
     }
 

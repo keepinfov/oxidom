@@ -15,12 +15,24 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- An HTTP-camouflaged TCP outbound now sends the path and Host its link carried; both were parsed
+  and then dropped, so a server keyed on the disguise rejected the handshake.
+- Adding or removing servers no longer silently drops a running pool's queued health check; the
+  pool's latency updates on schedule instead of going stale for another sweep.
+- Connect on a group whose previous session failed now connects on the first press instead of
+  first tearing down the dead session; a session still holding traffic is stopped as before.
+- The "more profiles are running" banner no longer counts sessions whose connect failed; a
+  session still holding traffic is named as holding rather than running.
 - A connect whose core never started — a busy port, a missing binary — now records the failure it
   is instead of leaving the card's spinner to retire onto a stale measurement.
 
 ### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
   so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
+- A subscription fetch that fails while the window opens no longer erases the saved subscription
+  order and collapse state; pruning happens only against a list that was actually read.
+
+### Fixed
 - A subscription whose subtitle falls back to a bare count no longer says "1 servers" for a
   single server.
 - A connect that fails before anything starts — an unknown server id, an interface that will not
@@ -36,6 +48,13 @@ surface, packaging, or the CLI belongs here.
   on the ordinary default route with the machine's own address. The reconnect now leaves a holding
   session's interface in place, as `docs/spec/interfaces.md` always said it should: it finds the
   interface already up, restarts only a tun2socks that did not survive the outage, and adds nothing.
+- A vmess link whose `aid` does not fit is rejected instead of silently truncated to a
+  different AlterID.
+- A toast shows its message as written: an error naming a URL with a bare ampersand no longer
+  comes up blank, and a server name written as markup no longer renders as markup.
+- A SOCKS or HTTP proxy link carrying only a username (or only a password) now authenticates: the
+  generated outbound sends the credential with the missing half empty, where it previously sent no
+  credential at all.
 
 ## [0.3.0] - 2026-08-22
 

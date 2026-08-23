@@ -224,12 +224,15 @@ impl ProbeQueue {
     /// alone on purpose: each of those has a thread that will `finish` it, and
     /// removing the entry early would hand out a slot that is still occupied.
     fn retain_alive(&mut self, servers: &HashSet<String>, profiles: &HashSet<String>) {
-        self.queued.retain(|job| {
-            servers.contains(&job.server_id)
-                && match &job.target {
-                    ProbeTarget::Direct(_) => true,
-                    ProbeTarget::Proxied(profile) => profiles.contains(profile),
-                }
+        self.queued.retain(|job| match &job.target {
+            ProbeTarget::Direct(_) => servers.contains(&job.server_id),
+            // A pool's job is labelled `pool:<profile>` — a name no server
+            // list will ever contain — so it lives and dies with its profile.
+            ProbeTarget::Proxied(profile) => {
+                profiles.contains(profile)
+                    && (job.server_id == format!("pool:{profile}")
+                        || servers.contains(&job.server_id))
+            }
         });
     }
 }
@@ -5152,6 +5155,29 @@ mod tests {
             .context("the departure left a reading, not a silence")?;
         assert!(reading.value.is_none(), "nothing was measured");
         Ok(())
+    }
+
+    /// A pool's liveness probe is queued under the synthetic label
+    /// `pool:<profile>`, which no server list will ever contain — the job
+    /// lives and dies with its profile, not with a server id.
+    #[test]
+    fn a_prune_spares_the_queued_probe_of_a_living_pool() {
+        let mut queue = ProbeQueue::default();
+        queue.enqueue(
+            ProbeTarget::Proxied("spread".to_string()),
+            "pool:spread".to_string(),
+        );
+
+        queue.retain_alive(&HashSet::new(), &HashSet::from(["spread".to_string()]));
+        let (_, queued) = queue.snapshot();
+        assert_eq!(queued, vec!["pool:spread".to_string()]);
+
+        queue.retain_alive(&HashSet::new(), &HashSet::new());
+        let (_, queued) = queue.snapshot();
+        assert!(
+            queued.is_empty(),
+            "the pool's profile went away, so the job goes too"
+        );
     }
 
     /// A running probe owns a slot until its thread reports back; forgetting it
