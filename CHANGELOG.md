@@ -21,8 +21,32 @@ surface, packaging, or the CLI belongs here.
 ### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
   so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
+- A subscription fetch that fails while the window opens no longer erases the saved subscription
+  order and collapse state; pruning happens only against a list that was actually read.
+
+### Fixed
 - A subscription whose subtitle falls back to a bare count no longer says "1 servers" for a
   single server.
+- A connect that fails before anything starts — an unknown server id, an interface that will not
+  configure — no longer cancels an automatic reconnect already underway. The retry keeps running
+  instead of the session sitting in Error, holding traffic, until someone intervenes by hand.
+- The red line under the latency chart no longer repeats the newest failure's reason, which the
+  block directly beneath already states in full; the count still covers every check.
+- **An automatic reconnect no longer drops the held routes while it retries.** When a core died
+  under the default `on_core_exit = "hold"`, the session kept its routes and fwmark rule so the
+  tunnel's traffic was dropped rather than released — but the daemon's own reconnect then tore that
+  interface down before starting the new core, removing the routes and the rule for the whole retry
+  (with backoff, up to half a minute at a time). During that window traffic aimed at the tunnel left
+  on the ordinary default route with the machine's own address. The reconnect now leaves a holding
+  session's interface in place, as `docs/spec/interfaces.md` always said it should: it finds the
+  interface already up, restarts only a tun2socks that did not survive the outage, and adds nothing.
+- A vmess link whose `aid` does not fit is rejected instead of silently truncated to a
+  different AlterID.
+- A toast shows its message as written: an error naming a URL with a bare ampersand no longer
+  comes up blank, and a server name written as markup no longer renders as markup.
+- A SOCKS or HTTP proxy link carrying only a username (or only a password) now authenticates: the
+  generated outbound sends the credential with the missing half empty, where it previously sent no
+  credential at all.
 
 ## [0.3.0] - 2026-08-22
 
