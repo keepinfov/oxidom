@@ -343,7 +343,10 @@ pub struct ServersView {
 }
 
 impl ServersView {
-    pub fn new(subscriptions: &[Subscription]) -> Self {
+    /// `subscriptions` is `Some` only when the startup fetch succeeded; the
+    /// distinction matters to [`GuiPrefs::load`], which must not prune saved
+    /// state against a list that never arrived.
+    pub fn new(subscriptions: Option<&[Subscription]>) -> Self {
         let content = gtk::Box::new(gtk::Orientation::Vertical, 20);
         content.set_hexpand(true);
         content.set_margin_top(16);
@@ -504,7 +507,7 @@ impl ServersView {
             on_browse_subscriptions: Rc::new(RefCell::new(None)),
             cards: Rc::new(RefCell::new(HashMap::new())),
             blocks: Rc::new(RefCell::new(Vec::new())),
-            subscriptions: Rc::new(RefCell::new(subscriptions.to_vec())),
+            subscriptions: Rc::new(RefCell::new(subscriptions.unwrap_or_default().to_vec())),
             search_texts: Rc::new(RefCell::new(HashMap::new())),
             query: Rc::new(RefCell::new(String::new())),
             filter_countries: Rc::new(RefCell::new(Vec::new())),
