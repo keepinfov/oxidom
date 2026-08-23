@@ -15,6 +15,10 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- A share link emitted for an IPv6 server keeps the address in brackets; it used to name a
+  truncated host, and re-importing it produced a server aimed at the wrong place.
+
+### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
   so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
 - A subscription fetch that fails while the window opens no longer erases the saved subscription
