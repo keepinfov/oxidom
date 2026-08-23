@@ -128,9 +128,15 @@ mod tests {
     /// unrelated process.
     #[test]
     fn a_reaped_child_is_not_signalled_again() {
-        let mut child = std::process::Command::new("/bin/true")
+        let test_binary = std::env::current_exe().expect("locating this test binary");
+        let mut child = std::process::Command::new(test_binary)
+            // The test harness exits after printing help, without recursively
+            // running tests. Unlike /bin/true, it exists inside a Nix sandbox.
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawning /bin/true");
+            .expect("spawning this test binary");
         // Deterministic reap: `wait` blocks until the exit and caches the
         // status, exactly the state `is_alive` leaves behind.
         child.wait().expect("reaping the child");
