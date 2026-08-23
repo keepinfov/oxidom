@@ -15,6 +15,10 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- A connect whose core never started — a busy port, a missing binary — now records the failure it
+  is instead of leaving the card's spinner to retire onto a stale measurement.
+
+### Fixed
 - A percent-encoded password in a `socks://` or `http://` link is now decoded like the username,
   so a password containing `@`, `#` or other reserved characters reaches the proxy as written.
 - A subscription whose subtitle falls back to a bare count no longer says "1 servers" for a
