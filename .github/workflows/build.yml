@@ -44,9 +44,27 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v27
+      # nix-quick-install rather than cachix/install-nix-action: cache-nix-action
+      # saves and restores /nix/store as one archive, which needs the store to be
+      # owned by the runner user — the multi-user daemon install is not.
+      - uses: nixbuild/nix-quick-install-action@v30
         with:
-          extra_nix_config: experimental-features = nix-command flakes
+          nix_conf: |
+            experimental-features = nix-command flakes
+            keep-env-derivations = true
+            keep-outputs = true
+      # The dependency graph has its own derivation whose inputs are the cargo
+      # manifests and the lock file, so its store path is stable across most
+      # commits — the precondition a cache needed, per the issue that asked for
+      # one. GitHub's Actions cache backs this, so there is no secret involved
+      # and a fork's pull request restores the same entries; a run that cannot
+      # reach the cache builds from scratch, slower but not broken.
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 6G
       # Not `nix build` as well: `checks.{cli,gui}` are the very derivations
       # `packages.{oxidom-cli,oxidom-gui}` name, so building both realised each
       # one twice for one answer. AGENTS.md has said "run one, not both" since
