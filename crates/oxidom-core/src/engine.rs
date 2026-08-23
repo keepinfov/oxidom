@@ -1537,12 +1537,20 @@ impl Engine {
         let server = self
             .find_server(server_id)
             .ok_or_else(|| anyhow!("server not found"))?;
-        if self
-            .sessions
-            .get(profile)
-            .and_then(|session| session.interface.as_ref())
-            .is_some_and(|interface| interface.up || interface.tun2socks.child_pid().is_some())
-        {
+        // A session holding its traffic across a core death keeps its
+        // interface: `docs/spec/interfaces.md` binds that a reconnect under a
+        // held interface adds nothing — `start_interface` finds it already up
+        // and restarts only a dead tun2socks. Tearing it down here would
+        // remove the routes and the fwmark rule for the whole retry window,
+        // releasing marked traffic onto the ordinary default route — exactly
+        // what the hold exists to prevent. The user paths re-plan through
+        // `configure_interface` first, which stops the interface itself.
+        if self.sessions.get(profile).is_some_and(|session| {
+            !session.holding_traffic
+                && session.interface.as_ref().is_some_and(|interface| {
+                    interface.up || interface.tun2socks.child_pid().is_some()
+                })
+        }) {
             self.stop_interface(profile)?;
         }
         self.sessions
@@ -1569,12 +1577,14 @@ impl Engine {
                     .with_context(|| format!("pool member {id} is no longer in the daemon store"))
             })
             .collect::<Result<Vec<_>>>()?;
-        if self
-            .sessions
-            .get(profile)
-            .and_then(|session| session.interface.as_ref())
-            .is_some_and(|interface| interface.up || interface.tun2socks.child_pid().is_some())
-        {
+        // Same guard as `connect_session`: a reconnect under a held interface
+        // must leave it in place for `start_interface` to find already up.
+        if self.sessions.get(profile).is_some_and(|session| {
+            !session.holding_traffic
+                && session.interface.as_ref().is_some_and(|interface| {
+                    interface.up || interface.tun2socks.child_pid().is_some()
+                })
+        }) {
             self.stop_interface(profile)?;
         }
         self.sessions
@@ -2006,7 +2016,7 @@ mod tests {
 
     use anyhow::{Context, Result, anyhow};
 
-    use super::{Engine, Interface, LOCAL_ID, Session, Sessions};
+    use super::{Engine, Interface, LOCAL_ID, PoolSession, Session, Sessions};
     use crate::bind;
     use crate::link::parse_link;
     use crate::model::{Server, Subscription};
@@ -2386,6 +2396,154 @@ mod tests {
             "the routes and the rule are still installed, so the tunnel drops traffic \
              rather than releasing it"
         );
+        Ok(())
+    }
+
+    /// A fake core for the reconnect-under-hold tests: an executable that
+    /// stays alive until the session reaps it, so `Session::connect` succeeds
+    /// without a real Xray or any network.
+    fn fake_core_binary(root: &std::path::Path) -> Result<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join("fake-xray");
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        Ok(path.display().to_string())
+    }
+
+    /// The state a live interface is in, hand-built because planning one
+    /// through `configure_interface` refuses without CAP_NET_ADMIN: `up`,
+    /// with its plan recorded. Mirrors the interface in
+    /// [`a_held_session_keeps_the_interface_its_core_died_under`].
+    fn held_interface(profile: &str) -> Interface {
+        Interface {
+            profile: profile.to_string(),
+            device: format!("oxi-{profile}"),
+            address: Ipv4Addr::new(198, 18, 9, 7),
+            mtu: 1500,
+            table: 0x6f21,
+            mark: 0x6f21,
+            routes: RouteMode::Manual,
+            created: true,
+            tun2socks: Tun2socks::new(profile.to_string(), String::new()),
+            nft_binary: String::new(),
+            cgroup: None,
+            nft_active: false,
+            plan: RoutePlan {
+                private: Vec::new(),
+                system: Vec::new(),
+                rule: RuleSpec {
+                    mark: 0x6f21,
+                    table: 0x6f21,
+                    priority: 0x6f21,
+                },
+            },
+            up: true,
+            fresh: false,
+        }
+    }
+
+    /// `docs/spec/interfaces.md` binds this: "A reconnect under a held
+    /// interface adds nothing: `start_interface` finds it already up and
+    /// returns." The supervisor's automatic reconnect reaches
+    /// `connect_session` directly — no `configure_interface` re-plans on that
+    /// path — so the teardown that clears a stale interface for an ordinary
+    /// connect must not run for a session that is holding traffic: it would
+    /// remove the routes and the fwmark rule for the whole retry window,
+    /// releasing marked traffic onto the ordinary default route.
+    #[test]
+    fn a_reconnect_under_a_held_interface_does_not_tear_it_down() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("reconnect-under-hold")?;
+        let mut engine = Engine::load();
+        engine.registry.config.xray_binary = fake_core_binary(&root.path)?;
+        engine.import_links("trojan://one@one.example:443#One")?;
+        let server_id = engine
+            .all_servers()
+            .next()
+            .context("the imported server")?
+            .id
+            .clone();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 14, 2), 12180, 12181)?;
+        engine.configure_hold_traffic("work", None);
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(held_interface("work"));
+        assert!(engine.note_core_exit("work"), "the default is to hold");
+
+        engine.connect_session("work", &server_id)?;
+
+        let session = engine.sessions.get("work").context("session")?;
+        assert!(
+            !session.holding_traffic,
+            "a core is carrying traffic again, so the hold is over"
+        );
+        let interface = session
+            .interface
+            .as_ref()
+            .context("the reconnect kept the interface attached")?;
+        assert!(
+            interface.up,
+            "the routes and the rule survived the reconnect instead of being \
+             removed while the retry ran"
+        );
+        engine.stop_session("work");
+        Ok(())
+    }
+
+    /// The pool arm of the reconnect goes through `connect_pool_session`,
+    /// which carries the same teardown as `connect_session` and therefore the
+    /// same obligation to a session that is holding traffic.
+    #[test]
+    fn a_pool_reconnect_under_a_held_interface_does_not_tear_it_down() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("pool-reconnect-under-hold")?;
+        let mut engine = Engine::load();
+        engine.registry.config.xray_binary = fake_core_binary(&root.path)?;
+        engine
+            .import_links("trojan://one@one.example:443#One\ntrojan://two@two.example:443#Two")?;
+        let member_ids: Vec<String> = engine
+            .all_servers()
+            .map(|server| server.id.clone())
+            .collect();
+        assert_eq!(member_ids.len(), 2, "both invented servers imported");
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 14, 3), 12280, 12281)?;
+        engine.configure_hold_traffic("work", None);
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(held_interface("work"));
+        assert!(engine.note_core_exit("work"), "the default is to hold");
+
+        engine.connect_pool_session(
+            "work",
+            &member_ids,
+            &PoolSession {
+                name: "pool",
+                strategy: "random",
+                expected: member_ids.len(),
+                probe_interval: "10s",
+                api_port: 12282,
+            },
+        )?;
+
+        let session = engine.sessions.get("work").context("session")?;
+        assert!(
+            !session.holding_traffic,
+            "a core is carrying traffic again, so the hold is over"
+        );
+        let interface = session
+            .interface
+            .as_ref()
+            .context("the reconnect kept the interface attached")?;
+        assert!(
+            interface.up,
+            "the routes and the rule survived the reconnect instead of being \
+             removed while the retry ran"
+        );
+        engine.stop_session("work");
         Ok(())
     }
 
