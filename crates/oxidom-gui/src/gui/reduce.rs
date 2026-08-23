@@ -2471,9 +2471,31 @@ pub(super) fn history_legend() -> String {
 /// otherwise spend six lines saying one thing, which is the shape this whole
 /// change is getting rid of. The commonest reason leads, because that is the
 /// one that describes the server.
+///
+/// The count is over every check, but when the newest check is a failure its
+/// reason is left out of the listing: the failure block states that one in
+/// full, one line away, and naming it here too said the same thing twice.
+/// When the newest is the only failure, the count stands alone.
 fn chart_failures(readings: &[&LatencyReading]) -> Option<String> {
+    let failed = readings
+        .iter()
+        .filter(|reading| reading.value.is_none())
+        .count();
+    if failed == 0 {
+        return None;
+    }
+    // Newest first, so the first reading is the one the failure block already
+    // states in full.
+    let newest_failed = readings
+        .first()
+        .is_some_and(|reading| reading.value.is_none());
+    let owed = if newest_failed {
+        &readings[1..]
+    } else {
+        readings
+    };
     let mut reasons: Vec<(&str, usize)> = Vec::new();
-    for reading in readings.iter().rev() {
+    for reading in owed.iter().rev() {
         let (None, Some(failure)) = (reading.value, reading.failure) else {
             continue;
         };
@@ -2484,15 +2506,18 @@ fn chart_failures(readings: &[&LatencyReading]) -> Option<String> {
         }
     }
     if reasons.is_empty() {
-        return None;
+        return Some(format!("{failed} of {} failed", readings.len()));
     }
-    let failed: usize = reasons.iter().map(|(_, count)| count).sum();
     // Stable, so reasons of equal weight stay in the order they first appear,
     // which is oldest first — the same direction the chart runs.
     reasons.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-    // One reason needs no tally: the sentence already opens with the number,
-    // and "3 of 10 failed: the server did not answer (3)" says it twice.
-    let single = reasons.len() == 1;
+    // One reason accounting for every failure needs no tally: the sentence
+    // already opens with the number, and "3 of 10 failed: the server did not
+    // answer (3)" says it twice. A lone reason that covers fewer checks than
+    // the count — the newest failure being the block's to state — keeps its
+    // tally, or the listing would claim the failures it does not name.
+    let accounted: usize = reasons.iter().map(|(_, count)| count).sum();
+    let single = reasons.len() == 1 && accounted == failed;
     let listed: Vec<String> = reasons
         .iter()
         .map(|(message, count)| match count {
@@ -5895,7 +5920,8 @@ mod tests {
         assert_eq!(chart.summary, "38–41 ms · 2 of 3");
         assert_eq!(
             chart.failures.as_deref(),
-            Some("1 of 3 failed: the server did not answer")
+            Some("1 of 3 failed"),
+            "the one failure is the newest, whose reason the block states"
         );
     }
 
@@ -5916,24 +5942,25 @@ mod tests {
 
     /// One reason needs no tally beside it: the sentence already opens with the
     /// number, and "9 of 9 failed: the server did not answer (9)" says it twice.
+    /// The newest check measured, so the listing accounts for every failure the
+    /// count names — the case where the tally really would say it twice.
     #[test]
     fn one_reason_for_every_failure_is_not_also_counted_beside_itself() {
-        let readings = (0..3)
-            .map(|minutes| {
-                failed_at(
-                    ProbeFailure::Unreachable,
-                    None,
-                    ProbeRoute::Direct,
-                    LatencyMethod::Tcp,
-                    NOW_MS - minutes * 60_000,
-                )
-            })
-            .collect();
+        let mut readings = vec![measured_at(41, LatencyMethod::Tcp, NOW_MS)];
+        readings.extend((1..4).map(|minutes| {
+            failed_at(
+                ProbeFailure::Unreachable,
+                None,
+                ProbeRoute::Direct,
+                LatencyMethod::Tcp,
+                NOW_MS - minutes * 60_000,
+            )
+        }));
         let chart =
             history_chart(&ProbeHistory { readings }, NOW_MS).expect("failures are a record");
         assert_eq!(
             chart.failures.as_deref(),
-            Some("3 of 3 failed: the server did not answer")
+            Some("3 of 4 failed: the server did not answer")
         );
     }
 
@@ -5945,21 +5972,21 @@ mod tests {
     fn the_failures_are_written_out_with_the_commonest_reason_first() {
         let history = ProbeHistory {
             readings: vec![
+                measured_at(41, LatencyMethod::HttpGet, NOW_MS),
                 failed_at(
                     ProbeFailure::Unreachable,
                     None,
                     ProbeRoute::Direct,
                     LatencyMethod::Tcp,
-                    NOW_MS,
+                    NOW_MS - 60_000,
                 ),
                 failed_at(
                     ProbeFailure::Timeout,
                     None,
                     ProbeRoute::Direct,
                     LatencyMethod::HttpGet,
-                    NOW_MS - 60_000,
+                    NOW_MS - 2 * 60_000,
                 ),
-                measured_at(41, LatencyMethod::HttpGet, NOW_MS - 2 * 60_000),
                 failed_at(
                     ProbeFailure::Timeout,
                     None,
@@ -5974,6 +6001,94 @@ mod tests {
             chart.failures.as_deref(),
             Some("3 of 4 failed: the check ran out of time (2) · the server did not answer")
         );
+    }
+
+    /// The failure block sits directly under the chart and states the newest
+    /// failure in full, so the line owes the reasons for the older ones only —
+    /// naming the newest in both places said the same thing twice, one line
+    /// apart. The count stays over every check, because the block does not
+    /// count.
+    #[test]
+    fn the_newest_failures_reason_is_left_to_the_block_that_states_it() {
+        let history = ProbeHistory {
+            readings: vec![
+                failed_at(
+                    ProbeFailure::Unreachable,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS,
+                ),
+                failed_at(
+                    ProbeFailure::Timeout,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS - 60_000,
+                ),
+                measured_at(41, LatencyMethod::Tcp, NOW_MS - 2 * 60_000),
+            ],
+        };
+        let chart = history_chart(&history, NOW_MS).expect("three readings draw a chart");
+        assert_eq!(
+            chart.failures.as_deref(),
+            Some("2 of 3 failed: the check ran out of time"),
+            "the count covers every check; the reasons cover only the older ones"
+        );
+
+        // A lone listed reason that covers fewer checks than the count keeps
+        // its tally, or the listing would claim the failure it does not name.
+        let all_failed = ProbeHistory {
+            readings: vec![
+                failed_at(
+                    ProbeFailure::Unreachable,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS,
+                ),
+                failed_at(
+                    ProbeFailure::Timeout,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS - 60_000,
+                ),
+                failed_at(
+                    ProbeFailure::Timeout,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS - 2 * 60_000,
+                ),
+            ],
+        };
+        let chart = history_chart(&all_failed, NOW_MS).expect("failures are a record");
+        assert_eq!(
+            chart.failures.as_deref(),
+            Some("3 of 3 failed: the check ran out of time (2)")
+        );
+    }
+
+    /// When the newest check is the only failure, the block has said all there
+    /// is to say, and the line carries the count alone rather than repeating
+    /// the reason from one line up.
+    #[test]
+    fn a_lone_newest_failure_leaves_the_line_a_count_with_no_reason() {
+        let history = ProbeHistory {
+            readings: vec![
+                failed_at(
+                    ProbeFailure::Unreachable,
+                    None,
+                    ProbeRoute::Direct,
+                    LatencyMethod::Tcp,
+                    NOW_MS,
+                ),
+                measured_at(41, LatencyMethod::Tcp, NOW_MS - 60_000),
+            ],
+        };
+        let chart = history_chart(&history, NOW_MS).expect("two readings draw a chart");
+        assert_eq!(chart.failures.as_deref(), Some("1 of 2 failed"));
     }
 
     /// A server that answered every time owes no explanation, and a line

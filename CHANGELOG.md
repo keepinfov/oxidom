@@ -22,6 +22,8 @@ surface, packaging, or the CLI belongs here.
 - A connect that fails before anything starts — an unknown server id, an interface that will not
   configure — no longer cancels an automatic reconnect already underway. The retry keeps running
   instead of the session sitting in Error, holding traffic, until someone intervenes by hand.
+- The red line under the latency chart no longer repeats the newest failure's reason, which the
+  block directly beneath already states in full; the count still covers every check.
 
 ## [0.3.0] - 2026-08-22
 
