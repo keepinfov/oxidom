@@ -418,6 +418,18 @@ impl LogsView {
 
         if batch.reset {
             self.redraw();
+            // The replacement must not swallow the gap either book reported:
+            // spec says lines the daemon could not hand over are announced in
+            // place, and a reset round used to return before doing so.
+            if batch.skipped > 0 {
+                self.updating_scroll.set(true);
+                self.insert_notice(&gap_notice(batch.skipped));
+                if self.following.get() {
+                    self.scroll_to_mark();
+                }
+                self.release_scroll_guard();
+                self.refresh_controls();
+            }
             return;
         }
 

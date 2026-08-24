@@ -17,6 +17,9 @@ surface, packaging, or the CLI belongs here.
 ## [0.3.1] - 2026-08-23
 
 ### Fixed
+- Against a daemon too old to keep a log cursor, the log view no longer erases the GUI's own
+  lines within half a second of their appearing, and a gap either log reported is announced
+  after the view is replaced rather than dropped with it.
 - **An automatic reconnect no longer drops the held routes while it retries.** When a core died
   under the default `on_core_exit = "hold"`, the session kept its routes and fwmark rule so the
   tunnel's traffic was dropped rather than released — but the daemon's own reconnect then tore that

@@ -92,6 +92,12 @@ impl LogFeed {
             reset = true;
             self.holding.clear();
             self.remote_cursor = 0;
+            // The reset replaces the view, and the caller reads this process's
+            // own book *before* absorbing — so the local cursor has to stay
+            // rewound for the next round to re-send the lines the GUI itself
+            // wrote. Without the re-feed they survive one round of a legacy
+            // daemon and are gone from the view for good.
+            self.local_cursor = 0;
         } else if self.remote_book != Some(remote.book_id) {
             // First round, or the daemon restarted and is counting from zero
             // again. Without this the cursor stays above every sequence number
@@ -108,8 +114,12 @@ impl LogFeed {
         self.holding.extend(remote.records);
 
         skipped += local.skipped;
-        if let Some(last) = local.records.last() {
-            self.local_cursor = last.seq;
+        // Under a legacy book the cursor stays at zero (see above); advancing
+        // it here would undo the rewind before the caller ever read from it.
+        if remote.book_id != LEGACY_BOOK_ID {
+            if let Some(last) = local.records.last() {
+                self.local_cursor = last.seq;
+            }
         }
         self.holding.extend(local.records);
 
@@ -340,6 +350,47 @@ mod tests {
         let second = feed.absorb(slice(LEGACY_BOOK_ID, lines), empty(LOCAL), 9_500);
         assert!(second.reset);
         assert_eq!(texts(&second), ["whole log"]);
+    }
+
+    /// A legacy daemon's reset replaces the view, and the GUI's own lines must
+    /// come back with it: the caller reads the local book before absorbing, so
+    /// only a cursor that stays rewound makes the next round re-send them.
+    #[test]
+    fn a_reset_re_feeds_the_guis_own_lines() {
+        let mut feed = LogFeed::new();
+        let remote_lines = vec![record(1, 0, LogSource::Xray, "whole log")];
+        let local_line = vec![record(5, 1_000, LogSource::Oxidom, "own line")];
+
+        let first = feed.absorb(
+            slice(LEGACY_BOOK_ID, remote_lines.clone()),
+            slice(LOCAL, local_line.clone()),
+            9_000,
+        );
+        assert!(first.reset);
+        assert_eq!(texts(&first), ["whole log", "own line"]);
+        assert_eq!(feed.local_cursor(), 0, "the next read starts over");
+
+        let second = feed.absorb(
+            slice(LEGACY_BOOK_ID, remote_lines),
+            slice(LOCAL, local_line),
+            9_500,
+        );
+        assert!(second.reset);
+        assert_eq!(texts(&second), ["whole log", "own line"]);
+    }
+
+    /// A reset does not swallow the gap either book reported: the batch carries
+    /// both, and the view announces the gap after replacing itself.
+    #[test]
+    fn a_reset_still_announces_the_lines_the_daemon_could_not_hand_over() {
+        let mut feed = LogFeed::new();
+        let mut remote = slice(LEGACY_BOOK_ID, vec![record(1, 0, LogSource::Xray, "kept")]);
+        remote.skipped = 7;
+
+        let batch = feed.absorb(remote, empty(LOCAL), 9_000);
+
+        assert!(batch.reset);
+        assert_eq!(batch.skipped, 7);
     }
 
     #[test]
