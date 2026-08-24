@@ -65,7 +65,10 @@ as `ipc::LatencyReading { value, measured_at_unix_ms, route, method, failure }` 
   through those constructors.
 - **Every direct id that leaves `running ∪ queued` leaves a `readings` entry behind**, including
   ids that no longer resolve and ids that were cancelled; a job for a still-current session
-  leaves its result in `proxied`. The invariant is stated over the *departure* rather than over
+  leaves its result in `proxied`. A session probe's reading lands only while the connect attempt
+  it set out to measure is still the profile's current one: the Connected check alone is true for
+  a session replaced mid-probe, and a timeout measured across the restart would overwrite the new
+  core's confirmation. The invariant is stated over the *departure* rather than over
   running to completion, because the GUI retires its spinner on the id leaving that union: a
   silent early return, by any route, leaves a card checking forever.
 - **`queued ≠ finished`.** `ProbeState` reports `running` and `queued` separately; a card waiting

@@ -14,6 +14,11 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- A latency check started before a reconnect can no longer overwrite the new core's reading with
+  a timeout measured across the restart, which showed a failure — and `oxidom status` a `—` —
+  for a healthy tunnel until the next periodic sweep.
+
 ## [0.3.1] - 2026-08-23
 
 ### Fixed
