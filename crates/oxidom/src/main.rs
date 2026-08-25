@@ -23,7 +23,9 @@ use oxidom_core::model::{Server, Subscription};
 use oxidom_core::profile::{Profile, ProfileProxy};
 use serde::Serialize;
 
-use crate::cli::{Cli, Command, CoreCommand, ListTarget, ProfileCommand};
+use crate::cli::{
+    Cli, Command, CoreCommand, DraftProtocol, ListTarget, ProfileCommand, ServerCommand,
+};
 
 /// Command completed successfully.
 const EXIT_SUCCESS: u8 = 0;
@@ -156,6 +158,7 @@ fn dispatch(cli: Cli) -> CliResult {
         Command::Ping { handle } => ping(&handle),
         Command::Alias { handle, new } => set_alias(&handle, &new),
         Command::Trust { handle, trust } => trust_certificate(&handle, trust),
+        Command::Server { command } => server_command(command),
         Command::Profile { command } => profile_command(command),
         Command::Core { command } => core_command(command),
         Command::Gui { background, debug } => {
@@ -743,6 +746,19 @@ fn edit_profile(client: &DaemonClient, name: &str) -> CliResult {
     let profile = client.profile(name).map_err(Failure::error)?;
     let original = profile.to_toml().map_err(Failure::error)?;
     let temporary = TemporaryProfile::create(original.as_bytes()).map_err(Failure::error)?;
+    open_editor(temporary.path())?;
+    let edited = std::fs::read_to_string(temporary.path()).map_err(Failure::error)?;
+    if edited == original {
+        return Ok(());
+    }
+    let profile = Profile::from_toml(&edited).map_err(Failure::error)?;
+    profile.validate(name).map_err(Failure::error)?;
+    client.save_profile(name, &profile).map_err(Failure::error)
+}
+
+/// $EDITOR, $VISUAL, or vi, on one file. Shared by everything that edits a
+/// temporary document in place.
+fn open_editor(path: &Path) -> CliResult {
     let editor = std::env::var("EDITOR")
         .ok()
         .filter(|editor| !editor.is_empty())
@@ -755,7 +771,7 @@ fn edit_profile(client: &DaemonClient, name: &str) -> CliResult {
     let arguments = oxidom_core::profile::editor_command(&editor).map_err(Failure::error)?;
     let status = std::process::Command::new(&arguments[0])
         .args(&arguments[1..])
-        .arg(temporary.path())
+        .arg(path)
         .status()
         .map_err(Failure::error)?;
     if !status.success() {
@@ -763,13 +779,138 @@ fn edit_profile(client: &DaemonClient, name: &str) -> CliResult {
             "editor exited with status {status}"
         )));
     }
-    let edited = std::fs::read_to_string(temporary.path()).map_err(Failure::error)?;
-    if edited == original {
-        return Ok(());
+    Ok(())
+}
+
+fn server_command(command: ServerCommand) -> CliResult {
+    match command {
+        ServerCommand::Add { protocol, file } => add_server(protocol, file.as_deref()),
     }
-    let profile = Profile::from_toml(&edited).map_err(Failure::error)?;
-    profile.validate(name).map_err(Failure::error)?;
-    client.save_profile(name, &profile).map_err(Failure::error)
+}
+
+/// The GUI's create dialog, as text: a draft is written as TOML — in an
+/// editor over a commented template, or handed in whole — and the daemon
+/// validates it exactly as it validates the dialog's.
+fn add_server(protocol: DraftProtocol, file: Option<&Path>) -> CliResult {
+    let client = existing_client()?;
+    let body = match file {
+        Some(path) if path == Path::new("-") => {
+            use std::io::Read;
+            let mut body = String::new();
+            std::io::stdin()
+                .read_to_string(&mut body)
+                .map_err(Failure::error)?;
+            body
+        }
+        Some(path) => std::fs::read_to_string(path).map_err(Failure::error)?,
+        None => {
+            let template = draft_template(protocol);
+            let temporary =
+                TemporaryProfile::create(template.as_bytes()).map_err(Failure::error)?;
+            open_editor(temporary.path())?;
+            let edited = std::fs::read_to_string(temporary.path()).map_err(Failure::error)?;
+            if edited == template {
+                return Err(Failure::message(
+                    "the template was left unchanged; nothing was created",
+                ));
+            }
+            edited
+        }
+    };
+    let draft: oxidom_core::draft::ServerDraft = toml::from_str(&body)
+        .map_err(|error| Failure::message(format!("the draft does not parse as TOML: {error}")))?;
+    let created = client.create_server(&draft).map_err(Failure::error)?;
+    let handle = created.alias.as_deref().unwrap_or(&created.id);
+    print_text(format!(
+        "added {} — reachable as {handle} (id {})\n",
+        created.name, created.id
+    ))
+}
+
+/// A commented TOML draft for one protocol. Every field names the JSON key it
+/// fills — the same names `docs/spec/data-model.md` binds for the dialog.
+fn draft_template(protocol: DraftProtocol) -> String {
+    let protocol_word = match protocol {
+        DraftProtocol::Vless => "vless",
+        DraftProtocol::Vmess => "vmess",
+        DraftProtocol::Trojan => "trojan",
+        DraftProtocol::Shadowsocks => "shadowsocks",
+        DraftProtocol::Socks => "socks",
+        DraftProtocol::Http => "http",
+        DraftProtocol::Hysteria2 => "hysteria2",
+    };
+    let mut template = format!(
+        "# A server, field by field. Field names are the JSON keys the daemon stores;\n\
+         # the reference is docs/spec/data-model.md. Lines starting with # are ignored.\n\
+         \n\
+         name = \"\"\n\
+         protocol = \"{protocol_word}\"\n\
+         address = \"\"\n\
+         port = 443\n\n"
+    );
+    match protocol {
+        DraftProtocol::Vless => template.push_str(
+            "uuid = \"\"\n\
+             # encryption = \"none\"\n\n",
+        ),
+        DraftProtocol::Vmess => template.push_str(
+            "uuid = \"\"\n\
+             # alter_id = 0        # alterId\n\
+             # security = \"auto\"  # the vmess user security, not TLS\n\n",
+        ),
+        DraftProtocol::Trojan => template.push_str("password = \"\"\n\n"),
+        DraftProtocol::Shadowsocks => template.push_str(
+            "method = \"aes-256-gcm\"\n\
+             password = \"\"\n\n",
+        ),
+        DraftProtocol::Socks | DraftProtocol::Http => template.push_str(
+            "# username = \"\"\n\
+             # password = \"\"\n\n",
+        ),
+        DraftProtocol::Hysteria2 => template.push_str(
+            "auth = \"\"\n\n\
+             [hysteria2]\n\
+             # sni = \"\"\n\
+             # alpn = [\"h3\"]\n\
+             # pin_sha256 = \"\"     # hex SHA-256 of the peer certificate\n\
+             # up_mbps = 100\n\
+             # down_mbps = 100\n\
+             # congestion = \"bbr\"\n\n\
+             # [hysteria2.obfs]\n\
+             # kind = \"salamander\"\n\
+             # password = \"\"\n\n",
+        ),
+    }
+    if matches!(
+        protocol,
+        DraftProtocol::Vless | DraftProtocol::Vmess | DraftProtocol::Trojan
+    ) {
+        template.push_str(
+            "[stream]\n\
+             network = \"tcp\"       # tcp | ws | grpc | xhttp | splithttp | h2\n\
+             security = \"none\"     # none | tls | reality\n\
+             # sni = \"\"\n\
+             # alpn = [\"h2\", \"http/1.1\"]\n\
+             # fingerprint = \"chrome\"  # fp\n\
+             # path = \"\"            # ws / xhttp path\n\
+             # host = \"\"            # ws host header\n\
+             # service_name = \"\"    # grpc serviceName\n\
+             # header_type = \"\"     # headerType\n\
+             # flow = \"\"            # e.g. xtls-rprx-vision (vless)\n\
+             # public_key = \"\"      # reality pbk\n\
+             # short_id = \"\"        # reality sid\n\
+             # spider_x = \"\"        # reality spx\n\
+             # pin_sha256 = \"\"      # hex SHA-256 of the peer certificate\n\n",
+        );
+    }
+    template.push_str(
+        "# A raw JSON object merged into the generated outbound (RFC 7396) for\n\
+         # anything the fields above do not model. It may not set \"tag\" or\n\
+         # \"protocol\".\n\
+         # [outbound_patch]\n\
+         # mux = { enabled = true, concurrency = 4 }\n",
+    );
+    template
 }
 
 struct TemporaryProfile {
@@ -1068,6 +1209,29 @@ fn print_text(value: String) -> CliResult {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+
+    /// Every template must parse back as a draft; one that does not strands
+    /// the user inside the editor with a syntax error of the template's own
+    /// making. (The empty required fields are the *daemon's* rejection to
+    /// give, with the field named — parsing is what the template owes.)
+    #[test]
+    fn every_draft_template_parses_back_as_a_draft() {
+        use crate::cli::DraftProtocol;
+        for protocol in [
+            DraftProtocol::Vless,
+            DraftProtocol::Vmess,
+            DraftProtocol::Trojan,
+            DraftProtocol::Shadowsocks,
+            DraftProtocol::Socks,
+            DraftProtocol::Http,
+            DraftProtocol::Hysteria2,
+        ] {
+            let template = super::draft_template(protocol);
+            let draft: oxidom_core::draft::ServerDraft = toml::from_str(&template)
+                .unwrap_or_else(|error| panic!("{protocol:?}: {error}\n{template}"));
+            assert_eq!(draft.protocol, protocol.to_model(), "{protocol:?}");
+        }
+    }
 
     use super::*;
 
