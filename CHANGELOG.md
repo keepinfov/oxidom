@@ -14,6 +14,15 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Added
+- **A server can be created by hand, field by field.** The daemon gains `CreateServer`: a draft
+  — protocol, address, port, credentials, transport and TLS/Reality, and a raw JSON field
+  merged into the generated outbound for anything the form does not model — is validated
+  through the same path that generates an Xray outbound, and nothing is created when
+  validation fails. Hand-made servers live beside pasted links in "My servers", where a
+  subscription refresh cannot touch them. Old clients keep working; a new client against an
+  old daemon says the daemon is too old.
+
 ## [0.3.1] - 2026-08-23
 
 ### Fixed

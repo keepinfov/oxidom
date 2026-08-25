@@ -8,8 +8,8 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
 use crate::ipc::{
-    ApplySettingsResult, BUS_NAME, INTERFACE, OBJECT_PATH, ProbeHistory, ProbeState, ProfileEntry,
-    RuntimeInfo, SessionInfo, StatusInfo, UpResult,
+    ApplySettingsResult, BUS_NAME, CreatedServer, INTERFACE, OBJECT_PATH, ProbeHistory, ProbeState,
+    ProfileEntry, RuntimeInfo, SessionInfo, StatusInfo, UpResult,
 };
 use crate::model::Subscription;
 use crate::profile::Profile;
@@ -278,6 +278,29 @@ impl DaemonClient {
         self.proxy
             .call("SetServerAlias", &(server_id, alias))
             .map_err(friendly)
+    }
+
+    /// Create a server described as fields rather than as a share link. The
+    /// draft travels as JSON; the daemon validates and answers with what it
+    /// stored. A daemon older than this method answers `UnknownMethod`, which
+    /// as raw bus text tells the user nothing about what to do.
+    pub fn create_server(&self, draft: &crate::draft::ServerDraft) -> Result<CreatedServer> {
+        let draft_json = serde_json::to_string(draft)?;
+        let json: String = self
+            .proxy
+            .call("CreateServer", &(draft_json.as_str(),))
+            .map_err(|error| {
+                if let zbus::Error::MethodError(name, _, _) = &error
+                    && name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
+                {
+                    return anyhow::anyhow!(
+                        "this oxidom daemon is too old to create servers by hand; \
+                         restart it to upgrade"
+                    );
+                }
+                friendly(error)
+            })?;
+        serde_json::from_str(&json).map_err(Into::into)
     }
 
     /// The certificate this server presents, as a SHA-256 hex string. Reads

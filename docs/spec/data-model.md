@@ -17,6 +17,9 @@ struct Server {
     transport_label: String,
     country: Option<String>, // ISO code, for the flag; parsed from name if present
     raw: OutboundSpec,       // everything needed to emit Xray outbound JSON
+    // RFC 7396 fragment merged onto the generated outbound; absent unless a
+    // hand-entered server carried one. See "A server entered as fields".
+    outbound_patch: Option<serde_json::Value>,
     latency_ms: Option<u32>, // last probe result (runtime only)
 }
 
@@ -49,6 +52,31 @@ struct UserInfo { upload: u64, download: u64, total: u64, expire: Option<i64> }
    `profile-title` (may be base64 with `base64:` prefix), `profile-update-interval`.
 3. Body may be base64-encoded; if it decodes to text lines, use that, else use raw text.
 4. Split into lines; parse each non-empty line as a share link (below). Skip unparseable lines.
+
+### A server entered as fields (binding)
+
+A server can enter the store without a link: a `ServerDraft` — name, protocol, address, port,
+the per-protocol credential (`uuid`, `password`, `method`+`password`, `auth`), an optional
+`stream: StreamSettings` or `hysteria2: Hysteria2Settings` block, and an optional
+`outbound_patch` — travels to the daemon as JSON over `CreateServer(s draft_json) → s`
+(answering `ipc::CreatedServer`: id, name, assigned alias). Field names are the model's serde
+names deliberately, so the JSON key a dialog labels is the key that reaches the stored server.
+
+- **Validation ends by generating.** `draft::resolve` builds the server and proves it against
+  `xray::config::outbound_tagged` — the one path every connect uses — with the patch merged.
+  A draft that fails names the field that stops it, and nothing is created.
+- **`outbound_patch` is the escape hatch** for a core option no field models: a JSON object
+  merged onto the generated outbound RFC 7396 style (objects merge, `null` removes, anything
+  else replaces), carried on the server so generation reproduces it forever. It may not set
+  `tag` or `protocol` — those belong to the protocol choice and the generator.
+- **The id is assigned when a server enters the store and never recomputed.** For link-imported
+  servers the identity is the link; for hand-made ones it is the serialized spec, patch
+  included — two drafts differing only in their patch are two servers. Editing later must
+  address by id, not re-derive it.
+- **A hand-made server lives in the local `"local"` group** — the same place pasted links
+  live — whose empty URL every refresh path filters out, so no refresh can overwrite or drop
+  it. A draft identical to a stored local server is refused loudly, naming that server; the
+  silent skip a pasted batch gets would hide the typo that made them identical.
 
 ### Share-link parsers → `Server`
 

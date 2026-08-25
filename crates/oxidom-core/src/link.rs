@@ -106,6 +106,7 @@ fn finish(
         spec,
         link: Some(link.to_string()),
         alias: None,
+        outbound_patch: None,
         latency_ms: None,
     };
     server.id = Server::stable_id(&server.identity_string());
