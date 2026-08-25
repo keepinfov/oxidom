@@ -830,15 +830,7 @@ fn add_server(protocol: DraftProtocol, file: Option<&Path>) -> CliResult {
 /// A commented TOML draft for one protocol. Every field names the JSON key it
 /// fills — the same names `docs/spec/data-model.md` binds for the dialog.
 fn draft_template(protocol: DraftProtocol) -> String {
-    let protocol_word = match protocol {
-        DraftProtocol::Vless => "vless",
-        DraftProtocol::Vmess => "vmess",
-        DraftProtocol::Trojan => "trojan",
-        DraftProtocol::Shadowsocks => "shadowsocks",
-        DraftProtocol::Socks => "socks",
-        DraftProtocol::Http => "http",
-        DraftProtocol::Hysteria2 => "hysteria2",
-    };
+    let protocol_word = protocol.to_model().as_str();
     let mut template = format!(
         "# A server, field by field. Field names are the JSON keys the daemon stores;\n\
          # the reference is docs/spec/data-model.md. Lines starting with # are ignored.\n\
