@@ -15,10 +15,11 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
-- **XHTTP and gRPC links now keep the settings that make their transports work.** XHTTP's
-  `mode` was silently rewritten to `auto`; gRPC's `authority` and multi-mode flag were dropped,
-  and a leading slash in `serviceName` reached Xray unchanged. The generated config now carries
-  those settings, so Remnawave XHTTP and gRPC nodes use the transport their links specify.
+- **XHTTP and gRPC links now keep the settings that make their transports work.** XHTTP's `mode`
+  and object-valued `extra` settings (including XMUx and padding) were dropped or silently rewritten
+  to `auto`; gRPC's `authority` and multi-mode flag were dropped, and a leading slash in
+  `serviceName` reached Xray unchanged. The generated config now carries those settings, so
+  Remnawave XHTTP and gRPC nodes use the transport their links specify.
 
 ### Changed
 - **Xray is pinned and installed automatically.** oxidom now manages Xray 26.3.27 in its private

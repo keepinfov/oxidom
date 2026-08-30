@@ -57,6 +57,10 @@ fn query_map(url: &Url) -> HashMap<String, String> {
         .collect()
 }
 
+fn xhttp_extra(raw: String) -> Option<Value> {
+    serde_json::from_str(&raw).ok().filter(Value::is_object)
+}
+
 fn stream_from_query(q: &HashMap<String, String>) -> StreamSettings {
     let get = |k: &str| q.get(k).cloned().filter(|s| !s.is_empty());
     let network = get("type").unwrap_or_else(|| "tcp".to_string());
@@ -66,6 +70,10 @@ fn stream_from_query(q: &HashMap<String, String>) -> StreamSettings {
         xhttp_mode: matches!(network.as_str(), "xhttp" | "splithttp")
             .then(|| mode.clone())
             .flatten(),
+        xhttp_extra: matches!(network.as_str(), "xhttp" | "splithttp")
+            .then(|| get("extra"))
+            .flatten()
+            .and_then(xhttp_extra),
         grpc_authority: (network == "grpc").then(|| get("authority")).flatten(),
         grpc_multi_mode: network == "grpc" && mode.as_deref() == Some("multi"),
         network,
@@ -276,6 +284,7 @@ fn parse_vmess(link: &str) -> Option<Server> {
         host: s("host"),
         service_name: s("path"),
         xhttp_mode: None,
+        xhttp_extra: None,
         grpc_authority: None,
         grpc_multi_mode: false,
         header_type: s("type"),

@@ -590,7 +590,8 @@ fn stream_settings(s: &StreamSettings) -> Value {
             v["xhttpSettings"] = trim_obj(json!({
                 "path": s.path,
                 "host": s.host,
-                "mode": xhttp_mode(s)
+                "mode": xhttp_mode(s),
+                "extra": s.xhttp_extra
             }));
         }
         "h2" | "http" => {
@@ -1696,7 +1697,9 @@ mod tests {
     fn xhttp_and_grpc_link_settings_reach_the_generated_config() {
         let xhttp = crate::link::parse_link(
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=xhttp\
-             &mode=stream-up&path=%2Fconnect&host=edge.example#XHTTP",
+             &mode=stream-up&path=%2Fconnect&host=edge.example\
+             &extra=%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A%2216-32%22%7D%2C\
+             %22xPaddingBytes%22%3A%22100-1000%22%7D#XHTTP",
         )
         .unwrap();
         let generated = generate(
@@ -1708,7 +1711,15 @@ mod tests {
         );
         assert_eq!(
             generated["outbounds"][0]["streamSettings"]["xhttpSettings"],
-            json!({ "path": "/connect", "host": "edge.example", "mode": "stream-up" })
+            json!({
+                "path": "/connect",
+                "host": "edge.example",
+                "mode": "stream-up",
+                "extra": {
+                    "xmux": { "maxConcurrency": "16-32" },
+                    "xPaddingBytes": "100-1000"
+                }
+            })
         );
 
         let grpc = crate::link::parse_link(
