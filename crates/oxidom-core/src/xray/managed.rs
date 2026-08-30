@@ -22,6 +22,9 @@ pub const VERSION: &str = "26.3.27";
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 const MAX_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024;
+// Go executables compress substantially in upstream's ZIP archive, so their
+// extracted size can exceed the bounded download size.
+const MAX_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +167,7 @@ fn install_archive(bytes: &[u8], dir: &Path) -> Result<()> {
     let binary = archive
         .by_name("xray")
         .context("the Xray archive has no xray executable")?;
-    if binary.is_dir() || binary.size() == 0 || binary.size() > MAX_ARCHIVE_BYTES {
+    if binary.is_dir() || binary.size() == 0 || binary.size() > MAX_EXECUTABLE_BYTES {
         bail!("the Xray archive contains an invalid xray executable");
     }
     drop(binary);
@@ -172,15 +175,20 @@ fn install_archive(bytes: &[u8], dir: &Path) -> Result<()> {
         let entry = archive
             .by_name(name)
             .with_context(|| format!("the Xray archive has no {name}"))?;
-        if entry.is_dir() || entry.size() > MAX_ARCHIVE_BYTES {
+        let max_size = if name == "xray" {
+            MAX_EXECUTABLE_BYTES
+        } else {
+            MAX_ARCHIVE_BYTES
+        };
+        if entry.is_dir() || entry.size() > max_size {
             bail!("the Xray archive contains an invalid {name}");
         }
         let mut content = Vec::with_capacity(entry.size() as usize);
         entry
-            .take(MAX_ARCHIVE_BYTES + 1)
+            .take(max_size + 1)
             .read_to_end(&mut content)
             .with_context(|| format!("extracting {name} from the Xray archive"))?;
-        if content.len() as u64 > MAX_ARCHIVE_BYTES {
+        if content.len() as u64 > max_size {
             bail!("{name} is too large in the Xray archive");
         }
         let target = dir.join(name);
@@ -231,7 +239,35 @@ fn download_error(asset: &str, error: ureq::Error) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct TestRoot {
+        path: PathBuf,
+    }
+
+    impl TestRoot {
+        fn install(label: &str) -> Self {
+            let suffix = NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "oxidom-managed-{label}-{}-{suffix}",
+                std::process::id()
+            ));
+            crate::paths::set_test_root(Some(path.clone()));
+            Self { path }
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            crate::paths::set_test_root(None);
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn version_script(version: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -280,5 +316,27 @@ mod tests {
         assert!(error.contains("requires Xray 26.3.27"), "{error}");
         std::fs::remove_file(matching).ok();
         std::fs::remove_file(other).ok();
+    }
+
+    #[test]
+    fn an_xray_executable_may_be_larger_than_its_compressed_archive() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("large-executable");
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        archive.start_file("xray", options)?;
+        archive.write_all(&vec![0; (MAX_ARCHIVE_BYTES + 1) as usize])?;
+        for name in ["geoip.dat", "geosite.dat"] {
+            archive.start_file(name, options)?;
+            archive.write_all(&vec![0; 1024])?;
+        }
+        let bytes = archive.finish()?.into_inner();
+        let dir = crate::paths::data_dir()?.join("xray");
+
+        install_archive(&bytes, &dir)?;
+
+        assert!(dir.join("xray").is_file());
+        Ok(())
     }
 }
