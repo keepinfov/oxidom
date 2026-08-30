@@ -465,6 +465,9 @@ fn stream_from_xray(value: Option<&Value>) -> StreamSettings {
                 .map(str::to_string)
         }),
         service_name: string(network_settings, "serviceName"),
+        xhttp_mode: string(network_settings, "mode"),
+        grpc_authority: string(network_settings, "authority"),
+        grpc_multi_mode: bool_value(network_settings.get("multiMode")).unwrap_or(false),
         header_type: network_settings
             .pointer("/header/type")
             .and_then(Value::as_str)
@@ -559,6 +562,9 @@ fn stream_from_sing_box(outbound: &Value) -> StreamSettings {
             .and_then(Value::as_str)
             .map(str::to_string),
         service_name: string(transport, "service_name"),
+        xhttp_mode: string(transport, "mode"),
+        grpc_authority: string(transport, "authority"),
+        grpc_multi_mode: bool_value(transport.get("multi_mode")).unwrap_or(false),
         header_type: None,
         flow: string(outbound, "flow"),
     }
@@ -699,6 +705,9 @@ fn stream_from_clash(proxy: &Value) -> StreamSettings {
         path,
         host,
         service_name: string(network_options, "grpc-service-name"),
+        xhttp_mode: string(network_options, "mode"),
+        grpc_authority: string(network_options, "grpc-authority"),
+        grpc_multi_mode: bool_value(network_options.get("grpc-multi-mode")).unwrap_or(false),
         header_type,
         flow: string(proxy, "flow"),
     }
@@ -863,6 +872,19 @@ fn add_stream_query(url: &mut Url, stream: &StreamSettings) {
     ] {
         if let Some(value) = value {
             pairs.append_pair(key, value);
+        }
+    }
+    if matches!(stream.network.as_str(), "xhttp" | "splithttp")
+        && let Some(mode) = &stream.xhttp_mode
+    {
+        pairs.append_pair("mode", mode);
+    }
+    if stream.network == "grpc" {
+        if let Some(authority) = &stream.grpc_authority {
+            pairs.append_pair("authority", authority);
+        }
+        if stream.grpc_multi_mode {
+            pairs.append_pair("mode", "multi");
         }
     }
     if let Some(alpn) = &stream.alpn {

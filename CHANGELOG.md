@@ -14,6 +14,18 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Fixed
+- **XHTTP and gRPC links now keep the settings that make their transports work.** XHTTP's
+  `mode` was silently rewritten to `auto`; gRPC's `authority` and multi-mode flag were dropped,
+  and a leading slash in `serviceName` reached Xray unchanged. The generated config now carries
+  those settings, so Remnawave XHTTP and gRPC nodes use the transport their links specify.
+
+### Changed
+- **Xray is pinned and installed automatically.** oxidom now manages Xray 26.3.27 in its private
+  data directory, verifies the official release archive against a SHA-256 digest pinned in source,
+  and uses that exact release for generated configurations. A configured, environment or `PATH`
+  core remains an offline fallback or override only when it reports the same version.
+
 ## [0.3.1] - 2026-08-23
 
 ### Fixed

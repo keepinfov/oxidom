@@ -105,7 +105,8 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   wrong. Whether any of it may ever be *applied*, and whether a provider may choose where
   rule or geo data is fetched from, is a separate question and not answered here.
 - **Settings view:** ports, system-proxy toggle, latency method + test URL. The Xray core group also
-  reports whether the core can load its geo data and offers to install it. What the rows offer is a
+  reports the pinned managed Xray path (or a matching-version override) and whether the core can
+  load its geo data and offers to install it. What the rows offer is a
   pure decision (`reduce::geo_offer`), not a widget-level one, because the awkward cases are the
   point: a daemon that predates the download, or one that cannot write its own asset directory,
   must be given a copyable command rather than a button that fails when pressed. A **system**

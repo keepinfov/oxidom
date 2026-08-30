@@ -581,13 +581,16 @@ fn stream_settings(s: &StreamSettings) -> Value {
         "grpc" => {
             v["grpcSettings"] = trim_obj(json!({
                 "serviceName": s.service_name.clone().or_else(|| s.path.clone())
+                    .map(|name| name.trim_start_matches('/').to_string()),
+                "authority": s.grpc_authority,
+                "multiMode": s.grpc_multi_mode.then_some(true)
             }));
         }
         "xhttp" | "splithttp" => {
             v["xhttpSettings"] = trim_obj(json!({
                 "path": s.path,
                 "host": s.host,
-                "mode": "auto"
+                "mode": xhttp_mode(s)
             }));
         }
         "h2" | "http" => {
@@ -642,6 +645,15 @@ fn stream_settings(s: &StreamSettings) -> Value {
     }
 
     v
+}
+
+/// Xray refuses unsupported XHTTP modes. Provider input is therefore reduced to
+/// the modes the pinned core accepts, with `auto` retaining Xray's default.
+fn xhttp_mode(s: &StreamSettings) -> &str {
+    match s.xhttp_mode.as_deref() {
+        Some(mode @ ("auto" | "packet-up" | "stream-up" | "stream-one")) => mode,
+        _ => "auto",
+    }
 }
 
 /// Drop null values from a JSON object (Xray rejects some explicit nulls).
@@ -1677,6 +1689,46 @@ mod tests {
         assert_eq!(out["streamSettings"]["security"], "tls");
     }
 
+    /// Remnawave's XHTTP nodes use a non-default mode and its gRPC nodes encode
+    /// service names with a leading slash. Both details must reach Xray exactly
+    /// as the core expects instead of silently falling back to another transport.
+    #[test]
+    fn xhttp_and_grpc_link_settings_reach_the_generated_config() {
+        let xhttp = crate::link::parse_link(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=xhttp\
+             &mode=stream-up&path=%2Fconnect&host=edge.example#XHTTP",
+        )
+        .unwrap();
+        let generated = generate(
+            &xhttp,
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
+        assert_eq!(
+            generated["outbounds"][0]["streamSettings"]["xhttpSettings"],
+            json!({ "path": "/connect", "host": "edge.example", "mode": "stream-up" })
+        );
+
+        let grpc = crate::link::parse_link(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=grpc\
+             &serviceName=%2Fconnect&authority=edge.example&mode=multi#GRPC",
+        )
+        .unwrap();
+        let generated = generate(
+            &grpc,
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
+        assert_eq!(
+            generated["outbounds"][0]["streamSettings"]["grpcSettings"],
+            json!({ "serviceName": "connect", "authority": "edge.example", "multiMode": true })
+        );
+    }
+
     /// A profile's own rules go ahead of the ones oxidom installs, so a rule the
     /// user wrote about a private address wins over the built-in one below it —
     /// which is the whole reason for carrying a block.
@@ -1795,7 +1847,11 @@ mod tests {
              &sni=real.example&insecure=1&up=100%20mbps&down=1%20gbps&hopInterval=30#HY2",
             "hy2://pw@h.example/",
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443\
-             ?type=ws&security=tls&sni=cdn.example&path=%2Fws&allowInsecure=1#WS",
+              ?type=ws&security=tls&sni=cdn.example&path=%2Fws&allowInsecure=1#WS",
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443\
+              ?type=xhttp&mode=stream-up&path=%2Fconnect&host=edge.example#XHTTP",
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443\
+              ?type=grpc&serviceName=%2Fconnect&authority=edge.example&mode=multi#GRPC",
         ]
         .into_iter()
         .map(|link| crate::link::parse_link(link).expect("sample link should parse"));

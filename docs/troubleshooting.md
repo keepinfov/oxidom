@@ -46,11 +46,10 @@ subscription URL.
 
 ## The core will not start
 
-### `xray` cannot be found or run
+### The managed Xray core cannot be installed
 
 ```
-`xray` was not found on $PATH (looked in …) — install xray,
-or set its full path in Settings
+could not install managed Xray 26.3.27: …; fallback core unavailable: …
 ```
 
 ```
@@ -59,9 +58,10 @@ the Xray binary … is not executable (mode 0644)
 the Xray binary … is a directory, not a program
 ```
 
-The message names both the path tried and **where that path came from** — the
-config key, the environment variable, or `PATH`. Fix it at that source. Resolution
-order is `xray_binary` → `$OXIDOM_XRAY_BIN` → `PATH`; see
+oxidom downloads its pinned Xray 26.3.27 archive automatically and checks its
+source-pinned SHA-256 before extracting it. Check the network error first. On an
+offline machine, set `xray_binary`, `$OXIDOM_XRAY_BIN`, or `PATH` to an Xray binary
+that reports exactly `Xray 26.3.27`; a different release is refused by design. See
 [configuration.md](configuration.md#finding-helper-binaries).
 
 ### The core cannot load `geoip.dat`
@@ -79,9 +79,9 @@ geo data. Every configuration oxidom generates carries the built-in
 `geoip:private` and `geosite:private` references, so a core without the lists
 refuses **every** connection, not just ones with routing rules.
 
-This happens when the core was installed by hand, because the Xray release zip
-contains the binary and nothing else. Nix and the AUR's `xray-bin` both supply the
-files.
+This does not happen with the managed Xray install, which keeps both files beside
+its binary. It can happen with an explicit external core that has no usable asset
+directory.
 
 Install them where every Xray build looks:
 

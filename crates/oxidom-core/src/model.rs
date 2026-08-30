@@ -145,6 +145,15 @@ pub struct StreamSettings {
     pub path: Option<String>,
     pub host: Option<String>,
     pub service_name: Option<String>,
+    /// XHTTP request mode. Absent means Xray's `auto` default.
+    #[serde(default)]
+    pub xhttp_mode: Option<String>,
+    /// gRPC `:authority` override.
+    #[serde(default)]
+    pub grpc_authority: Option<String>,
+    /// Whether the gRPC transport uses Xray's multi-mode framing.
+    #[serde(default)]
+    pub grpc_multi_mode: bool,
     pub header_type: Option<String>,
     /// vless flow, e.g. xtls-rprx-vision
     pub flow: Option<String>,
