@@ -135,6 +135,10 @@ pub fn draft_from_values(values: &DialogValues) -> Result<ServerDraft, String> {
         path: opt(&values.path),
         host: opt(&values.host),
         service_name: opt(&values.service_name),
+        xhttp_mode: None,
+        xhttp_extra: None,
+        grpc_authority: None,
+        grpc_multi_mode: false,
         header_type: opt(&values.header_type),
         flow: opt(&values.flow),
     });
