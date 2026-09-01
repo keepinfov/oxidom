@@ -80,7 +80,7 @@ latency_test_url = "https://www.gstatic.com/generate_204"
 subscription_user_agent = "v2rayN/6.45"    # panels gate the body *and its format* on this
 geoip_url = ""                # empty: the built-in source. https only; digest is <url>.sha256sum
 geosite_url = ""              # empty: the built-in source. Chosen separately from geoip_url
-xray_binary = ""              # empty: use $OXIDOM_XRAY_BIN, then xray on PATH
+xray_binary = ""              # empty: install/use the pinned managed Xray; env/PATH are matching-version fallbacks
 tun2socks_binary = ""         # empty: use $OXIDOM_TUN2SOCKS_BIN, then tun2socks on PATH
 nft_binary = ""               # empty: use $OXIDOM_NFT_BIN, then nft on PATH
 

@@ -231,7 +231,7 @@ in: a subscription URL opens *Add subscription*, one or more share links open
 so a link copied a moment ago is already there. Nothing importable on the
 clipboard is said in a toast rather than ignored.
 
-In a text field — any of them, including *Settings › Advanced › Xray binary* and
+In a text field — any of them, including *Settings › Advanced › Xray binary override* and
 the search entry — Ctrl+V pastes there instead. On Profiles, Settings and Logs
 it does nothing: a subscription URL pasted over the page being read answers a
 question nobody asked.

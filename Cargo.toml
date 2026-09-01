@@ -36,6 +36,9 @@ base64 = "0.22"
 # keeps aws-lc-rs — a second crypto stack — out.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 ring = "0.17"
+# Xray publishes release archives, not bare executables. This extracts the
+# source-pinned archive without invoking a system `unzip` binary.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 url = "2"
 percent-encoding = "2"
 shell-words = "1"

@@ -2021,12 +2021,12 @@ fn kill_stale_tun2socks(pid: u32, device: &str) -> bool {
 
 /// Does this PID belong to a core oxidom started?
 ///
-/// The binary name is user-configurable (`xray_binary`, `$OXIDOM_XRAY_BIN`), so
-/// insisting on `comm == "xray"` would skip a core installed as, say,
-/// `xray-linux-amd64` and leave its tunnel up with no way to stop it. The
-/// generated config path is the reliable marker: nothing else is run against
-/// it. A process merely named `xray` is not enough: with multiple sessions
-/// that could be another profile's core.
+/// The managed core is replaceable by a matching-version override, so insisting
+/// on `comm == "xray"` would skip a core installed under another name and leave
+/// its tunnel up with no way to stop it. The generated config path is the
+/// reliable marker: nothing else is run against it. A process merely named
+/// `xray` is not enough: with multiple sessions that could be another profile's
+/// core.
 fn is_our_xray(pid: u32, profile: &str) -> bool {
     let Some(cmdline) = crate::proc::cmdline(pid) else {
         return false;
@@ -2447,7 +2447,10 @@ mod tests {
     fn fake_core_binary(root: &std::path::Path) -> Result<String> {
         use std::os::unix::fs::PermissionsExt;
         let path = root.join("fake-xray");
-        std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n")?;
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$1\" in\n  version) echo 'Xray 26.3.27 (test core)' ;;\n  *) exec sleep 30 ;;\nesac\n",
+        )?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
         Ok(path.display().to_string())
     }

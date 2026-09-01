@@ -23,9 +23,25 @@ surface, packaging, or the CLI belongs here.
   subscription refresh cannot touch them. Old clients keep working; a new client against an
   old daemon says the daemon is too old.
 
+### Changed
+- **Xray is pinned and installed automatically.** oxidom now manages Xray 26.3.27 in its private
+  data directory, verifies the official release archive against a SHA-256 digest pinned in source,
+  and uses that exact release for generated configurations. A configured, environment or `PATH`
+  core remains an offline fallback or override only when it reports the same version.
+
+### Fixed
+- **XHTTP and gRPC links now keep the settings that make their transports work.** XHTTP's `mode`
+  and object-valued `extra` settings (including XMUx and padding) were dropped or silently rewritten
+  to `auto`; gRPC's `authority` and multi-mode flag were dropped, and a leading slash in
+  `serviceName` reached Xray unchanged. The generated config now carries those settings, so
+  Remnawave XHTTP and gRPC nodes use the transport their links specify.
+
 ## [0.3.1] - 2026-08-23
 
 ### Fixed
+- Against a daemon too old to keep a log cursor, the log view no longer erases the GUI's own
+  lines within half a second of their appearing, and a gap either log reported is announced
+  after the view is replaced rather than dropped with it.
 - **An automatic reconnect no longer drops the held routes while it retries.** When a core died
   under the default `on_core_exit = "hold"`, the session kept its routes and fwmark rule so the
   tunnel's traffic was dropped rather than released — but the daemon's own reconnect then tore that

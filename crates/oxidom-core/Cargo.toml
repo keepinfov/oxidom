@@ -22,6 +22,7 @@ ureq.workspace = true
 base64.workspace = true
 rustls.workspace = true
 ring.workspace = true
+zip.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
 shell-words.workspace = true
