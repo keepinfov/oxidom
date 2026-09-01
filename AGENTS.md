@@ -384,9 +384,12 @@ stop and raise it.
 - Secrets never reach a log line. Logs are expected to be safe to paste into a
   bug report.
 - The daemon owns the database. The GUI reads and writes it only over D-Bus.
-- Xray resolution order is `config.toml`'s `xray_binary`, then
-  `$OXIDOM_XRAY_BIN`, then `xray` on `PATH`. The same shape applies to
-  `tun2socks` and `nft`.
+- Xray is the managed, pinned release `26.3.27`: an empty `xray_binary` installs
+  it into the daemon's private data directory, verified against a SHA-256 digest
+  pinned in source. `$OXIDOM_XRAY_BIN` and `xray` on `PATH` are fallbacks only
+  when they report that exact version, and a non-empty `xray_binary` is a
+  matching-version override. `tun2socks` and `nft` keep the plain order:
+  `config.toml`, then `OXIDOM_*_BIN`, then `PATH`.
 - Vulnerabilities go through [SECURITY.md](SECURITY.md), never a public issue.
 
 ## For agents
