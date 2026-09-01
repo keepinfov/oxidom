@@ -35,6 +35,9 @@ surface, packaging, or the CLI belongs here.
   to `auto`; gRPC's `authority` and multi-mode flag were dropped, and a leading slash in
   `serviceName` reached Xray unchanged. The generated config now carries those settings, so
   Remnawave XHTTP and gRPC nodes use the transport their links specify.
+- A latency check started before a reconnect can no longer overwrite the new core's reading with
+  a timeout measured across the restart, which showed a failure — and `oxidom status` a `—` —
+  for a healthy tunnel until the next periodic sweep.
 
 ## [0.3.1] - 2026-08-23
 
