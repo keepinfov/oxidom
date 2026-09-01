@@ -181,7 +181,10 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   taken off the scroll offset after it, which is what leaves a reader who has scrolled up alone.
   That promise is about the position, not about following; gating the trim on following instead
   bounded the buffer only for the reader sitting at the bottom, who needed it least. Lines the
-  daemon could not hand over are announced in place, not silently dropped.
+  daemon could not hand over are announced in place, not silently dropped — on a replacement
+  round too, after the view is rebuilt. A daemon too old to keep a cursor re-sends everything
+  and the view is replaced each round; that replacement re-feeds the GUI's own lines rather than
+  erasing this process's book along with the daemon's.
 - **A problem report is assembled here (binding).** One action turns the **selected** lines —
   or, when nothing is selected, everything visible — into a report carrying the same version
   block the About dialog shows (`oxidom_core::versions`), what the connection is made of, the
