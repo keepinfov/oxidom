@@ -54,7 +54,11 @@ struct UserInfo { upload: u64, download: u64, total: u64, expire: Option<i64> }
 
 - `vless://uuid@host:port?<params>#name` — params: `type` (tcp/ws/grpc/xhttp/splithttp),
   `security` (none/tls/reality), `sni`, `pbk`, `sid`, `fp`, `flow` (xtls-rprx-vision),
-  `path`, `host`, `serviceName`, `alpn`, `encryption`. Build `transport_label` like
+  `path`, `host`, `serviceName`, `authority`, `mode`, `extra`, `alpn`, `encryption`. XHTTP preserves
+  its `mode` (`auto`, `packet-up`, `stream-up`, `stream-one`) and object-valued `extra` settings
+  such as XMUx and padding; gRPC preserves `authority` and `mode=multi`, while a leading slash in
+  `serviceName` is removed only when generating Xray JSON.
+  Build `transport_label` like
   `"vless + xhttp + reality"`.
 - `vmess://<base64 json>` — JSON with `add/port/id/aid/net/tls/host/path/sni/scy/ps`.
 - `trojan://password@host:port?<params>#name` — tls params like vless.

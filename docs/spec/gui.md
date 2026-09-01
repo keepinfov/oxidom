@@ -51,6 +51,27 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
     metadata label that is selectable answers a right-click with the text menu and the card menu
     covers everything else. Those labels are selectable so an address or a failure reason can be
     copied out; a card menu taking the press first would remove the only way to do it.
+  - **The expanded card states what identifies a server; reading it in full happens on its own
+    surface (binding).** The card carries identity — flag, name, alias, `protocol ·
+    address:port`, the transport summary (`transport_label`) — the trust marks that change what
+    a connection means (`allow_insecure`, a pinned certificate), and the latency record with its
+    failure reason. The complete field-by-field listing of the stored server, under the JSON key
+    names the editor uses, belongs to a details surface opened from the card, never to the card
+    itself. A card is glanced at among two hundred neighbours; a server is inspected one at a
+    time, and the two readings earn different surfaces. What the card deliberately leaves
+    elsewhere: which profiles or pools carry the server stays the mark above and the profiles
+    page; which subscription it came from, and when that was refreshed, stays the subscriptions
+    page. The card answers "what is this server", not "what is it doing".
+  - **The card reads; changing a server happens in a dialog.** An action on the action row may
+    open an editing surface, but nothing on the card edits in place.
+  - **Nothing added to the card may grow it past its measured height (binding).** The expanded
+    height is measured from real content and animated once; content without a small upper bound
+    scrolls inside the card's own scroller instead of resizing the grid around it. The
+    measurement targets a height the late-arriving pushes then correct, so every block added to
+    the card either has a fixed height or scrolls — a block that grows with its data re-opens
+    that correction visibly.
+  - **A secret is masked wherever it is shown.** A password, UUID or pre-shared key renders
+    masked with an explicit reveal, and a revealed value never reaches a log line.
 - **Groups:** a chip row above the grid — `All`, one chip per saved group, `+`. A group narrows
   **the one list**, and is never a second block of cards: rendering it as its own block
   shows the same server two or three times and leaves no way to tell which card is real, and
@@ -105,7 +126,8 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   wrong. Whether any of it may ever be *applied*, and whether a provider may choose where
   rule or geo data is fetched from, is a separate question and not answered here.
 - **Settings view:** ports, system-proxy toggle, latency method + test URL. The Xray core group also
-  reports whether the core can load its geo data and offers to install it. What the rows offer is a
+  reports the pinned managed Xray path (or a matching-version override) and whether the core can
+  load its geo data and offers to install it. What the rows offer is a
   pure decision (`reduce::geo_offer`), not a widget-level one, because the awkward cases are the
   point: a daemon that predates the download, or one that cannot write its own asset directory,
   must be given a copyable command rather than a button that fails when pressed. A **system**
@@ -159,7 +181,10 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   taken off the scroll offset after it, which is what leaves a reader who has scrolled up alone.
   That promise is about the position, not about following; gating the trim on following instead
   bounded the buffer only for the reader sitting at the bottom, who needed it least. Lines the
-  daemon could not hand over are announced in place, not silently dropped.
+  daemon could not hand over are announced in place, not silently dropped — on a replacement
+  round too, after the view is rebuilt. A daemon too old to keep a cursor re-sends everything
+  and the view is replaced each round; that replacement re-feeds the GUI's own lines rather than
+  erasing this process's book along with the daemon's.
 - **A problem report is assembled here (binding).** One action turns the **selected** lines —
   or, when nothing is selected, everything visible — into a report carrying the same version
   block the About dialog shows (`oxidom_core::versions`), what the connection is made of, the

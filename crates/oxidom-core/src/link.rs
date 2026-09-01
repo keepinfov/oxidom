@@ -57,11 +57,25 @@ fn query_map(url: &Url) -> HashMap<String, String> {
         .collect()
 }
 
+fn xhttp_extra(raw: String) -> Option<Value> {
+    serde_json::from_str(&raw).ok().filter(Value::is_object)
+}
+
 fn stream_from_query(q: &HashMap<String, String>) -> StreamSettings {
     let get = |k: &str| q.get(k).cloned().filter(|s| !s.is_empty());
     let network = get("type").unwrap_or_else(|| "tcp".to_string());
     let security = get("security").unwrap_or_else(|| "none".to_string());
+    let mode = get("mode");
     StreamSettings {
+        xhttp_mode: matches!(network.as_str(), "xhttp" | "splithttp")
+            .then(|| mode.clone())
+            .flatten(),
+        xhttp_extra: matches!(network.as_str(), "xhttp" | "splithttp")
+            .then(|| get("extra"))
+            .flatten()
+            .and_then(xhttp_extra),
+        grpc_authority: (network == "grpc").then(|| get("authority")).flatten(),
+        grpc_multi_mode: network == "grpc" && mode.as_deref() == Some("multi"),
         network,
         security,
         sni: get("sni").or_else(|| get("peer")),
@@ -269,6 +283,10 @@ fn parse_vmess(link: &str) -> Option<Server> {
         path: s("path"),
         host: s("host"),
         service_name: s("path"),
+        xhttp_mode: None,
+        xhttp_extra: None,
+        grpc_authority: None,
+        grpc_multi_mode: false,
         header_type: s("type"),
         flow: None,
     };
@@ -573,8 +591,6 @@ pub fn parse_links_reporting(text: &str) -> (Vec<Server>, Skipped) {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
-
     use super::*;
 
     const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
@@ -609,6 +625,28 @@ mod tests {
         assert_eq!(stream.path.as_deref(), Some("/ws"));
         assert_eq!(stream.fingerprint.as_deref(), Some("chrome"));
         assert_eq!(stream.flow.as_deref(), Some("xtls-rprx-vision"));
+    }
+
+    /// XHTTP mode and gRPC authority change the wire format, so dropping either
+    /// makes a link that looks imported correctly fail only after it connects.
+    #[test]
+    fn vless_keeps_xhttp_and_grpc_connection_settings() {
+        let xhttp = parse_link(&format!(
+            "vless://{UUID}@example.com:443?type=xhttp&mode=packet-up&path=%2Fx#XHTTP"
+        ))
+        .unwrap();
+        let stream = stream_of(&xhttp);
+        assert_eq!(stream.xhttp_mode.as_deref(), Some("packet-up"));
+        assert_eq!(stream.grpc_authority, None);
+
+        let grpc = parse_link(&format!(
+            "vless://{UUID}@example.com:443?type=grpc&serviceName=%2Fsvc&authority=edge.example&mode=multi#GRPC"
+        ))
+        .unwrap();
+        let stream = stream_of(&grpc);
+        assert_eq!(stream.service_name.as_deref(), Some("/svc"));
+        assert_eq!(stream.grpc_authority.as_deref(), Some("edge.example"));
+        assert!(stream.grpc_multi_mode);
     }
 
     /// Trojan is TLS even when the link says nothing about security.

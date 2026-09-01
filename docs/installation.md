@@ -6,8 +6,7 @@ oxidom ships two binaries:
   cleanly on a server.
 - **`oxidom-gui`** — the GTK4 / libadwaita interface. Needs a desktop.
 
-You also need an **Xray core**. oxidom drives it as a child process; it does not
-bundle one.
+oxidom downloads its pinned, verified **Xray core** automatically on first use.
 
 ## Contents
 
@@ -22,7 +21,6 @@ bundle one.
 - [From source](#from-source)
 - [Tested distro matrix](#tested-distro-matrix)
 - [Getting an Xray core](#getting-an-xray-core)
-  - [Getting the geo data](#getting-the-geo-data)
 - [Optional runtime dependencies](#optional-runtime-dependencies)
 - [Installing the assets by hand](#installing-the-assets-by-hand)
 - [Who may drive the system daemon](#who-may-drive-the-system-daemon)
@@ -271,27 +269,10 @@ makepkg -si
 sudo systemctl enable --now oxidom.service
 ```
 
-Then install an **Xray core**, which oxidom needs to connect but does not
-install for you:
-
-```sh
-yay -S xray-bin        # or xray, or xray-git — any AUR provider will do
-```
-
-No AUR helper? Build one the same way:
-
-```sh
-git clone https://aur.archlinux.org/xray-bin.git && cd xray-bin && makepkg -si
-```
-
-Every provider of an Xray core lives in the AUR rather than the official
-repositories, which is why it is an optional dependency here. Were it a hard
-one, `makepkg -si` would stop at `target not found: xray` and — because pacman
-cancels a transaction whole — install none of gtk4 or libadwaita either. oxidom
-starts without a core and says so in a banner across the top; connecting and
-checking latency both need one, since a direct latency check measures through a
-core it starts for the purpose. Point oxidom at a core you installed by hand
-under Settings → Xray core, or with `$OXIDOM_XRAY_BIN`.
+The first connection downloads oxidom's verified Xray 26.3.27 release without an
+AUR package or administrator privileges. An AUR core is useful only as an offline
+fallback when it reports that exact version; configure it under Settings → Xray
+core or with `$OXIDOM_XRAY_BIN`.
 
 The unit does not pin the proxy ports, so they come from
 `/var/lib/oxidom/config.toml` and Settings can change them. On a machine where
@@ -430,44 +411,21 @@ works on any distribution.
 
 ## Getting an Xray core
 
-oxidom needs an `xray` binary and will not start without one. **Most distributions
-do not package it** — Nix and the AUR are the exceptions.
+oxidom manages its tested Xray release automatically. On first use it downloads
+**Xray 26.3.27** into its private data directory, checks the release archive against
+a SHA-256 digest pinned in oxidom's source, and extracts the binary plus its geo
+data. No package manager or administrator privileges are needed.
 
-A few distributions do package one — Alpine (edge), Arch (via the AUR), Nix, and
-Gentoo's GURU overlay — and Homebrew packages it on macOS. **Debian, Ubuntu,
-Fedora, openSUSE and RHEL do not**, so most people download a release.
-
-Settings › Xray core names whichever of these applies to your machine, including
-the exact archive for your architecture, with buttons to copy the commands or open
-the page.
-
-By hand, on `x86_64`:
-
-```sh
-curl -LO https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-unzip -o Xray-linux-64.zip xray
-sudo install -Dm755 xray /usr/local/bin/xray
-xray version
-```
-
-On `aarch64` the archive is `Xray-linux-arm64-v8a.zip`; the release also publishes
-32-bit, riscv64, ppc64le, mips and s390x builds, and `Xray-macos-64.zip` /
-`Xray-macos-arm64-v8a.zip` for macOS. Pick the one matching `uname -m` — the
-archive holds the binary alone, which is why the geo data below is a separate
-step.
-
-**Use 26.1 or newer** if you have any Hysteria2 servers — that is where the native
-outbound landed, and an older core exits immediately rather than connecting.
-
-If the binary is somewhere unusual, point oxidom at it with the `xray_binary`
-setting or `$OXIDOM_XRAY_BIN` — see
-[configuration.md](configuration.md#finding-helper-binaries).
+The managed release is available on Linux `x86_64` and `aarch64`. An offline
+machine may instead use `xray_binary`, `$OXIDOM_XRAY_BIN`, or `xray` on `PATH`, but
+oxidom accepts those only when `xray version` reports exactly `Xray 26.3.27`.
+This prevents an untested core release from silently changing generated-config
+semantics. See [configuration.md](configuration.md#finding-helper-binaries).
 
 ### Getting the geo data
 
-The core also needs **`geoip.dat` and `geosite.dat`**, and the release above does
-not contain them — the Xray zip ships the binary alone. They are not optional and
-they are not only for routing rules you might add later: every configuration
+The core also needs **`geoip.dat` and `geosite.dat`**. The managed release installs
+them beside the binary. They are not optional and they are not only for routing rules you might add later: every configuration
 oxidom generates carries the built-in `geoip:private` and `geosite:private`
 references, and a core that cannot load the lists **refuses to start at all**:
 

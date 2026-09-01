@@ -1,22 +1,8 @@
-//! How to install an Xray core on this machine.
+//! The manual fallback for the source-pinned managed Xray release.
 //!
-//! oxidom does not install one itself. Downloading and running a binary is the
-//! one thing a program that carries other people's traffic should not do
-//! casually: it needs a signature to check, a place to put it, and privileges
-//! to get there. Xray publishes no signature — only a digest served from the
-//! same host as the file — so the first of those cannot be satisfied, and the
-//! honest answer is to tell someone exactly what to fetch rather than to fetch
-//! it for them.
-//!
-//! "Exactly" is the whole point. Pointing at a releases page was technically
-//! true and practically useless: that page carries eighty assets, and choosing
-//! between `Xray-linux-64.zip` and `Xray-linux-arm64-v8a.zip` — then knowing
-//! the archive holds a bare binary and nothing else — is where people came
-//! unstuck. This module answers with a package manager command where one
-//! exists, and otherwise with the release built for *this* machine.
-//!
-//! Note the geo data is a separate question, handled in
-//! [`crate::xray::assets`]: the archive named here contains the core alone.
+//! It is used only when automatic installation failed. Package-manager Xray
+//! builds are not suggested: their version can differ from the one this release
+//! validates, which would make the fallback unusable by design.
 
 /// What to tell someone who has no core.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,13 +83,18 @@ pub fn release_asset(os: &str, arch: &str) -> Option<&'static str> {
 /// `/usr`, which belongs to the package manager.
 const INSTALL_PREFIX: &str = "/usr/local/bin";
 
-fn download_recipe(asset: &str) -> CoreInstall {
-    let url = format!("https://github.com/XTLS/Xray-core/releases/latest/download/{asset}");
+fn download_recipe(asset: &str, sha256: &str) -> CoreInstall {
+    let url = format!(
+        "https://github.com/XTLS/Xray-core/releases/download/v{}/{}",
+        crate::xray::managed::VERSION,
+        asset
+    );
     // `unzip xray` extracts the one member: the archive also carries README and
     // LICENSE files nobody needs on their PATH.
     let commands = format!(
-        "curl -LO {url}\n\
-         unzip -o {asset} xray\n\
+        "curl -fLO {url}\n\
+         echo '{sha256}  {asset}' | sha256sum -c -\n\
+         unzip -o {asset} xray geoip.dat geosite.dat\n\
          sudo install -Dm755 xray {INSTALL_PREFIX}/xray\n\
          xray version"
     );
@@ -117,67 +108,13 @@ fn download_recipe(asset: &str) -> CoreInstall {
 /// **Debian, Ubuntu, Fedora, openSUSE and RHEL do not**, which is most people —
 /// so the download path is the common one and gets the exact asset, not a
 /// page to go hunting on.
-pub fn xray_install(os_release: &str, os: &str, arch: &str) -> CoreInstall {
-    let Some(asset) = release_asset(os, arch) else {
+pub fn xray_install(_os_release: &str, os: &str, arch: &str) -> CoreInstall {
+    let Some(release) = crate::xray::managed::release_for(os, arch) else {
         return CoreInstall::Unsupported {
             arch: arch.to_string(),
         };
     };
-
-    // Homebrew is the only packaged answer on macOS, and it is not tied to an
-    // os-release file.
-    if os == "macos" {
-        return CoreInstall::Package {
-            command: "brew install xray",
-            note: None,
-        };
-    }
-
-    let mut id = String::new();
-    let mut id_like = String::new();
-    for line in os_release.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"').to_ascii_lowercase();
-        match key.trim() {
-            "ID" => id = value,
-            "ID_LIKE" => id_like = value,
-            _ => {}
-        }
-    }
-    // ID_LIKE carries the family, so EndeavourOS and Manjaro answer as Arch
-    // without being listed one by one.
-    let family = |name: &str| id == name || id_like.split_whitespace().any(|part| part == name);
-
-    if family("nixos") {
-        return CoreInstall::Package {
-            command: "nix profile install nixpkgs#xray",
-            note: None,
-        };
-    }
-    if family("arch") {
-        return CoreInstall::Package {
-            command: "yay -S xray-bin",
-            note: Some("from the AUR; no official repository carries a core"),
-        };
-    }
-    if family("alpine") {
-        return CoreInstall::Package {
-            command: "apk add xray",
-            note: Some("packaged on edge; a stable release may not have it yet"),
-        };
-    }
-    if family("gentoo") {
-        return CoreInstall::Package {
-            command: "eselect repository enable guru && emerge net-proxy/xray",
-            note: Some("from the GURU overlay, not the main tree"),
-        };
-    }
-    // Everyone else, which is most people: Debian, Ubuntu, Fedora, openSUSE,
-    // RHEL and their derivatives package nothing. Inventing an `apt install
-    // xray` that fails would be trusted over the documentation.
-    download_recipe(asset)
+    download_recipe(release.asset, release.sha256)
 }
 
 /// Answer for the machine this is running on.
@@ -193,85 +130,15 @@ pub fn xray_install_here() -> CoreInstall {
 mod tests {
     use super::*;
 
-    fn linux(os_release: &str) -> CoreInstall {
-        xray_install(os_release, "linux", "x86_64")
-    }
-
     #[test]
-    fn arch_and_its_family_are_pointed_at_the_aur() {
-        let arch = "NAME=\"Arch Linux\"\nID=arch\nBUILD_ID=rolling\n";
-        assert!(matches!(
-            linux(arch),
-            CoreInstall::Package {
-                command: "yay -S xray-bin",
-                ..
-            }
-        ));
-
-        // EndeavourOS names itself, and says what it is through ID_LIKE.
-        let endeavour = "NAME=\"EndeavourOS\"\nID=endeavouros\nID_LIKE=\"arch\"\n";
-        assert!(matches!(
-            linux(endeavour),
-            CoreInstall::Package {
-                command: "yay -S xray-bin",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn nixos_installs_from_nixpkgs() {
-        let nixos = "NAME=NixOS\nID=nixos\nVERSION=\"25.11 (Xantusia)\"\n";
-        assert!(matches!(
-            linux(nixos),
-            CoreInstall::Package {
-                command: "nix profile install nixpkgs#xray",
-                ..
-            }
-        ));
-    }
-
-    /// A package that exists but not where the user is looking is a half
-    /// answer, and the half that is missing is the one that wastes their time.
-    #[test]
-    fn a_package_outside_the_default_setup_says_so() {
-        for (id, fragment) in [("alpine", "edge"), ("gentoo", "GURU"), ("arch", "AUR")] {
-            let CoreInstall::Package { note, .. } = linux(&format!("ID={id}\n")) else {
-                panic!("{id} packages a core");
-            };
-            let note = note.unwrap_or_else(|| panic!("{id} needs a caveat"));
-            assert!(note.contains(fragment), "{id}: {note}");
-        }
-    }
-
-    /// Debian, Ubuntu, Fedora, openSUSE and RHEL package no core — which is
-    /// most people. They used to be handed a releases page carrying eighty
-    /// assets; they now get the one built for this machine, and the commands
-    /// that end with a core on `$PATH`.
-    #[test]
-    fn a_distribution_that_packages_no_core_gets_the_exact_release_for_this_machine() {
-        for text in [
-            "ID=ubuntu\nID_LIKE=debian\n",
-            "ID=debian\n",
-            "ID=fedora\nID_LIKE=\"rhel centos\"\n",
-            "ID=opensuse-tumbleweed\n",
-            "",
-            "malformed without any equals sign\n",
-        ] {
-            let CoreInstall::Download { url, commands } = linux(text) else {
-                panic!("{text:?} packages no core, so it must get a download");
-            };
-            assert!(url.ends_with("/Xray-linux-64.zip"), "{url}");
-            assert!(
-                !url.ends_with("/releases"),
-                "a page of eighty assets is not an answer: {url}"
-            );
-            assert!(commands.contains("install -Dm755"), "{commands}");
-            assert!(
-                commands.contains("xray version"),
-                "the recipe ends by proving it worked: {commands}"
-            );
-        }
+    fn the_manual_fallback_is_the_same_pinned_release() {
+        let CoreInstall::Download { url, commands } = xray_install("ID=arch\n", "linux", "x86_64")
+        else {
+            panic!("the supported platform needs a manual release fallback");
+        };
+        assert!(url.contains("/v26.3.27/Xray-linux-64.zip"), "{url}");
+        assert!(commands.contains("sha256sum -c"), "{commands}");
+        assert!(commands.contains("geoip.dat geosite.dat"), "{commands}");
     }
 
     /// The asset has to match the machine, or the recipe hands someone an
@@ -282,11 +149,6 @@ mod tests {
         assert_eq!(
             release_asset("linux", "aarch64"),
             Some("Xray-linux-arm64-v8a.zip")
-        );
-        assert_eq!(release_asset("macos", "x86_64"), Some("Xray-macos-64.zip"));
-        assert_eq!(
-            release_asset("macos", "aarch64"),
-            Some("Xray-macos-arm64-v8a.zip")
         );
     }
 
@@ -303,36 +165,5 @@ mod tests {
         );
         assert!(answer.link().is_none(), "nothing to open");
         assert!(answer.summary().contains("sparc64"));
-    }
-
-    /// macOS has one packaged answer and it does not come from os-release.
-    #[test]
-    fn macos_is_answered_by_homebrew_whatever_the_os_release_says() {
-        assert!(matches!(
-            xray_install("", "macos", "aarch64"),
-            CoreInstall::Package {
-                command: "brew install xray",
-                ..
-            }
-        ));
-    }
-
-    /// Copy has to leave something that finishes the job. A URL on the
-    /// clipboard still leaves the unzip, the install and the mode to guess at.
-    #[test]
-    fn copying_a_download_yields_the_commands_and_not_just_the_link() {
-        let answer = linux("ID=debian\n");
-        assert!(answer.clipboard().contains("curl -LO"));
-        assert!(answer.clipboard().contains("sudo install"));
-        assert_ne!(answer.clipboard(), answer.summary());
-        // A package manager answer is one line, and the two agree.
-        let packaged = linux("ID=nixos\n");
-        assert_eq!(packaged.clipboard(), packaged.summary());
-    }
-
-    /// Quoting in os-release is optional and inconsistent between distros.
-    #[test]
-    fn quoted_and_bare_values_read_the_same() {
-        assert_eq!(linux("ID=\"arch\"\n"), linux("ID=arch\n"));
     }
 }

@@ -735,7 +735,8 @@ impl Shared {
                 Some(resolved.path.clone()),
                 Some(resolved.path.display().to_string()),
                 None,
-                Some(resolved.source),
+                (!oxidom_core::xray::managed::is_managed(&resolved.path))
+                    .then_some(resolved.source),
             ),
             Err(error) => (None, None, Some(format!("{error:#}")), None),
         };
