@@ -8,7 +8,10 @@ missing files (treat as defaults/empty).
 
 - `~/.config/oxidom/config.toml` — user settings (see schema).
 - `~/.config/oxidom/profiles/<name>.toml` — named CLI/systemd connection profiles.
-- `~/.local/share/oxidom/subscriptions.json` — cached subscriptions + parsed servers.
+- `~/.local/share/oxidom/subscriptions.json` — cached subscriptions + parsed servers. A server
+  may carry `outbound_patch` (a raw JSON object merged onto its generated outbound; see
+  `docs/spec/data-model.md`); the key is absent, not null, on every server without one, so
+  files predating it round-trip byte-identically.
 - `~/.local/share/oxidom/state.toml` — ephemeral `[[sessions]]` records: profile, server id,
   loopback address, fixed SOCKS/HTTP ports, recovery PIDs and the planned interface routes/rule.
   Interface intent is written before kernel application so crash cleanup may safely over-delete

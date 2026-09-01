@@ -125,6 +125,16 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   Nothing carried is said as nothing — never "0 rules", which reads as an import that went
   wrong. Whether any of it may ever be *applied*, and whether a provider may choose where
   rule or geo data is fetched from, is a separate question and not answered here.
+  - **A server can be typed in (binding).** *Create server* offers the fields per protocol —
+    vless, vmess, trojan, shadowsocks, hysteria2 — plus transport and TLS/Reality, and a raw
+    JSON field merged into the generated outbound, so a core option the form does not model is
+    still reachable. Row titles are the draft's JSON keys, deliberately: the dialog, the CLI
+    template and the stored server must read as one thing, and a prettier label would be a
+    third name for the same field. Passwords, UUIDs and pre-shared keys are masked with a
+    reveal. Validation is `oxidom_core::draft::resolve` — the same validator the daemon runs —
+    so the dialog and the daemon reject with one sentence, and the sentence names the field;
+    an untouched dialog is incomplete, not wrong, and shows no error. The created server joins
+    **My servers**, where pasted links live and no refresh reaches.
 - **Settings view:** ports, system-proxy toggle, latency method + test URL. The Xray core group also
   reports the pinned managed Xray path (or a matching-version override) and whether the core can
   load its geo data and offers to install it. What the rows offer is a

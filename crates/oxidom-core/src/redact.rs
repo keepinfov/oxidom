@@ -1399,6 +1399,7 @@ mod tests {
             },
             link: None,
             alias: Some(alias.to_string()),
+            outbound_patch: None,
             latency_ms: None,
         }
     }

@@ -2280,6 +2280,25 @@ impl Service {
         engine.save().map_err(failed)
     }
 
+    /// Create a server described as fields, validated through the same path
+    /// that generates an Xray outbound; nothing is created when validation
+    /// fails. The draft arrives as JSON so the method can grow fields without
+    /// the wire signature moving.
+    fn create_server(&self, draft: String) -> fdo::Result<String> {
+        let draft: oxidom_core::draft::ServerDraft = serde_json::from_str(&draft)
+            .map_err(|error| failed(format!("the draft does not parse: {error}")))?;
+        let server = oxidom_core::draft::resolve(&draft).map_err(failed)?;
+        let stored = oxidom_core::sync::lock(&self.shared.engine)
+            .add_server(server)
+            .map_err(failed)?;
+        serde_json::to_string(&oxidom_core::ipc::CreatedServer {
+            id: stored.id,
+            name: stored.name,
+            alias: stored.alias,
+        })
+        .map_err(failed)
+    }
+
     /// Read the certificate a server presents, without judging it.
     ///
     /// Two steps rather than one — inspect, then trust — so the value stored is
@@ -5155,6 +5174,47 @@ mod tests {
             .get("default")
             .context("the departure left a reading, not a silence")?;
         assert!(reading.value.is_none(), "nothing was measured");
+        Ok(())
+    }
+
+    /// The daemon end of creating a server by hand: a draft arrives as JSON,
+    /// is validated through the outbound generator, stored in the local group
+    /// with an alias, refused loudly as a duplicate, and removable.
+    #[test]
+    fn a_server_created_by_hand_is_listed_refused_twice_and_removable() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("create-server-by-hand")?;
+        let service = for_test();
+        let draft = serde_json::json!({
+            "name": "Typed",
+            "protocol": "trojan",
+            "address": "one.example.invalid",
+            "port": 443,
+            "password": "invented"
+        })
+        .to_string();
+
+        let created: oxidom_core::ipc::CreatedServer =
+            serde_json::from_str(&service.create_server(draft.clone())?)?;
+        assert!(created.alias.is_some(), "an alias was assigned");
+        {
+            let engine = oxidom_core::sync::lock(&service.shared.engine);
+            assert!(
+                engine
+                    .all_servers()
+                    .any(|server| server.id == created.id && server.link.is_none()),
+                "the created server is listed, with no share link claimed"
+            );
+        }
+
+        let error = service
+            .create_server(draft)
+            .expect_err("duplicates are refused");
+        assert!(error.to_string().contains("Typed"), "{error}");
+
+        service.remove_server(created.id.clone())?;
+        let engine = oxidom_core::sync::lock(&service.shared.engine);
+        assert!(!engine.all_servers().any(|server| server.id == created.id));
         Ok(())
     }
 

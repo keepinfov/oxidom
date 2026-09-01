@@ -339,6 +339,7 @@ fn xray_profile_server(
         },
         link: None,
         alias: None,
+        outbound_patch: None,
         latency_ms: None,
     };
     server.id = Server::stable_id(&server.identity_string());
@@ -743,6 +744,7 @@ fn finish_server(
         spec,
         link: None,
         alias: None,
+        outbound_patch: None,
         latency_ms: None,
     };
     server.link = canonical_share_link(&server);

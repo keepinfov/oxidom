@@ -250,6 +250,26 @@ should be restarted.
 measuring. The daemon does accept `CancelProbes`, which drops what is still queued,
 but no command here sends it.
 
+### `oxidom server add [--protocol P] [--file PATH|-]`
+
+Create a server by hand, field by field — the way to enter one whose parameters
+did not arrive as a share link. Without `--file`, your editor opens on a
+commented TOML template for the chosen protocol (default `vless`); every field
+names the JSON key it fills, and the reference is
+[spec/data-model.md](spec/data-model.md). With `--file` the draft is read whole
+from a file, or from stdin with `-`:
+
+```sh
+oxidom server add --protocol trojan          # edit a template
+oxidom server add --file server.toml         # scripted
+```
+
+The daemon validates the draft through the same path that generates the Xray
+outbound and creates nothing when validation fails; the error names the field.
+The created server appears under **My servers**, next to pasted links, where a
+subscription refresh cannot touch it. A `[outbound_patch]` table is merged into
+the generated outbound verbatim, for core options the fields do not model.
+
 ### `oxidom trust <HANDLE> [--trust]`
 
 Show the certificate a server presents, and accept it.

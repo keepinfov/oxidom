@@ -271,15 +271,7 @@ impl Registry {
             }
             return Err(anyhow!("no valid share-links found"));
         }
-        let idx = match self.subscriptions.iter().position(|s| s.id == LOCAL_ID) {
-            Some(idx) => idx,
-            None => {
-                let mut sub = Subscription::new(String::new(), Some("My servers".to_string()));
-                sub.id = LOCAL_ID.to_string();
-                self.subscriptions.insert(0, sub);
-                0
-            }
-        };
+        let idx = self.local_group_index();
         let mut added = 0;
         for server in parsed {
             if !self.subscriptions[idx]
@@ -294,6 +286,52 @@ impl Registry {
         alias::assign(&mut self.subscriptions);
         store::save(&self.subscriptions)?;
         Ok((added, unsupported))
+    }
+
+    /// The local "My servers" group, created on first use. Standalone servers
+    /// — pasted links and hand-made ones alike — live here, where no refresh
+    /// can overwrite or drop them: the group's URL is empty, and every refresh
+    /// path filters on a non-empty URL.
+    fn local_group_index(&mut self) -> usize {
+        match self.subscriptions.iter().position(|s| s.id == LOCAL_ID) {
+            Some(idx) => idx,
+            None => {
+                let mut sub = Subscription::new(String::new(), Some("My servers".to_string()));
+                sub.id = LOCAL_ID.to_string();
+                self.subscriptions.insert(0, sub);
+                0
+            }
+        }
+    }
+
+    /// Add one resolved server to the local group.
+    ///
+    /// A duplicate is a loud error rather than the silent skip `import_links`
+    /// does for a pasted batch: a hand-typed server that quietly goes nowhere
+    /// hides the typo that made it identical. Returns the stored server, alias
+    /// assigned.
+    pub fn add_server(&mut self, server: Server) -> Result<Server> {
+        let idx = self.local_group_index();
+        if let Some(existing) = self.subscriptions[idx]
+            .servers
+            .iter()
+            .find(|stored| stored.id == server.id)
+        {
+            return Err(anyhow!(
+                "an identical server already exists as {:?}",
+                existing.name
+            ));
+        }
+        let id = server.id.clone();
+        self.subscriptions[idx].servers.push(server);
+        alias::assign(&mut self.subscriptions);
+        store::save(&self.subscriptions)?;
+        let stored = self.subscriptions[idx]
+            .servers
+            .iter()
+            .find(|stored| stored.id == id)
+            .expect("just pushed");
+        Ok(stored.clone())
     }
 
     /// Remove a single server from the local group, dropping the group when it
@@ -934,6 +972,10 @@ impl Engine {
 
     pub fn import_links(&mut self, text: &str) -> Result<(usize, usize)> {
         self.registry.import_links(text)
+    }
+
+    pub fn add_server(&mut self, server: Server) -> Result<Server> {
+        self.registry.add_server(server)
     }
 
     pub fn remove_server(&mut self, server_id: &str) -> Result<bool> {
@@ -2667,6 +2709,83 @@ mod tests {
             .ok_or_else(|| anyhow!("the local group disappeared"))?;
         assert_eq!(group.id, LOCAL_ID);
         assert_eq!(group.servers.len(), 1);
+        Ok(())
+    }
+
+    fn typed_draft() -> crate::draft::ServerDraft {
+        crate::draft::ServerDraft {
+            name: "Typed".to_string(),
+            protocol: crate::model::Protocol::Trojan,
+            address: "one.example.invalid".to_string(),
+            port: 443,
+            password: Some("invented".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// A hand-made server is stored where standalone links are stored: the
+    /// local group, whose empty URL every refresh path filters out. A refresh
+    /// sweep therefore cannot overwrite or drop it.
+    #[test]
+    fn a_hand_made_server_survives_a_subscription_refresh() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("hand-made-survives-refresh")?;
+        let mut engine = Engine::load();
+        let stored = engine.add_server(crate::draft::resolve(&typed_draft())?)?;
+        assert!(stored.alias.is_some(), "an alias was assigned");
+
+        engine.refresh_all()?;
+
+        let group = engine
+            .registry
+            .subscriptions
+            .iter()
+            .find(|sub| sub.id == LOCAL_ID)
+            .ok_or_else(|| anyhow!("the local group disappeared"))?;
+        assert!(group.servers.iter().any(|server| server.id == stored.id));
+        Ok(())
+    }
+
+    /// The id is assigned when the server enters the store and never
+    /// recomputed: a reload — which migrates ids for subscription servers —
+    /// hands the hand-made server back unchanged, alias included.
+    #[test]
+    fn a_hand_made_servers_id_survives_a_reload() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("hand-made-id-reload")?;
+        let stored = {
+            let mut engine = Engine::load();
+            engine.add_server(crate::draft::resolve(&typed_draft())?)?
+        };
+
+        let reloaded = Engine::load();
+
+        let server = reloaded
+            .registry
+            .subscriptions
+            .iter()
+            .flat_map(|sub| sub.servers.iter())
+            .find(|server| server.id == stored.id)
+            .ok_or_else(|| anyhow!("the created server did not survive the reload"))?;
+        assert_eq!(server.alias, stored.alias);
+        Ok(())
+    }
+
+    /// A duplicate is refused loudly, naming the server it repeats. The silent
+    /// skip `import_links` does for a pasted batch would hide the typo that
+    /// made a hand-typed server identical to an existing one.
+    #[test]
+    fn a_duplicate_draft_names_the_server_it_repeats() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("hand-made-duplicate")?;
+        let mut engine = Engine::load();
+        engine.add_server(crate::draft::resolve(&typed_draft())?)?;
+
+        let error = engine
+            .add_server(crate::draft::resolve(&typed_draft())?)
+            .expect_err("the identical server is refused");
+
+        assert!(error.to_string().contains("Typed"), "{error:#}");
         Ok(())
     }
 

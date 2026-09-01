@@ -18,6 +18,8 @@ use super::{dialog_content, icon_button, set_transient_parent, set_validation, v
 pub struct SubscriptionCallbacks {
     pub add: Rc<dyn Fn(String, Option<String>, bool)>,
     pub import: Rc<dyn Fn(String)>,
+    /// Create a server from a hand-filled draft.
+    pub create: Rc<dyn Fn(oxidom_core::draft::ServerDraft)>,
     pub refresh: Rc<dyn Fn(String)>,
     pub refresh_all: Rc<dyn Fn()>,
     pub remove: Rc<dyn Fn(String)>,
@@ -360,8 +362,15 @@ fn make_header_controls(
         .focusable(true)
         .build();
     import_server.add_css_class("flat");
+    let create_server = gtk::Button::builder()
+        .label("Create server")
+        .halign(gtk::Align::Fill)
+        .focusable(true)
+        .build();
+    create_server.add_css_class("flat");
     menu_content.append(&add_subscription);
     menu_content.append(&import_server);
+    menu_content.append(&create_server);
     let popover = gtk::Popover::builder().child(&menu_content).build();
     add_menu.set_popover(Some(&popover));
 
@@ -406,6 +415,25 @@ fn make_header_controls(
             return;
         };
         show_import_servers(&root, callbacks, None);
+    });
+
+    let root_weak = root.downgrade();
+    let callbacks_for_create = callbacks.clone();
+    let popover_for_create = popover.clone();
+    create_server.connect_clicked(move |_| {
+        popover_for_create.popdown();
+        let Some(root) = root_weak.upgrade() else {
+            return;
+        };
+        let Some(callbacks) = callbacks_for_create.borrow().clone() else {
+            return;
+        };
+        super::server_dialog::show_server_dialog(
+            &root,
+            super::server_dialog::ServerDialogCallbacks {
+                create: callbacks.create.clone(),
+            },
+        );
     });
 
     update_all.connect_clicked(move |_| {

@@ -2196,6 +2196,14 @@ impl Controller {
                     }
                 })
             },
+            create: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |draft| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.create_server(draft);
+                    }
+                })
+            },
             refresh: {
                 let weak = Rc::downgrade(self);
                 Rc::new(move |id| {
@@ -3304,6 +3312,26 @@ impl Controller {
                     controller.show_message(&message);
                 }
                 Err(error) => controller.show_error("Could not import", &format!("{error:#}")),
+            },
+        );
+    }
+
+    fn create_server(self: &Rc<Self>, draft: oxidom_core::draft::ServerDraft) {
+        self.client_job(
+            UiOperation::new(UiOperationKind::CreateServer),
+            move |client| client.create_server(&draft),
+            |controller, result| match result {
+                Ok(created) => {
+                    controller.rebuild_views();
+                    let message = match &created.alias {
+                        Some(alias) => format!("Created {} — alias {alias}", created.name),
+                        None => format!("Created {}", created.name),
+                    };
+                    controller.show_message(&message);
+                }
+                Err(error) => {
+                    controller.show_error("Could not create server", &format!("{error:#}"))
+                }
             },
         );
     }

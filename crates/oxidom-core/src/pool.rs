@@ -446,6 +446,7 @@ mod tests {
             },
             link: None,
             alias: alias.map(str::to_string),
+            outbound_patch: None,
             latency_ms: None,
         }
     }
@@ -467,6 +468,7 @@ mod tests {
             },
             link: None,
             alias: Some("provider-balance".to_string()),
+            outbound_patch: None,
             latency_ms: None,
         }
     }
