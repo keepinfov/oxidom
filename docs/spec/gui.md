@@ -51,6 +51,27 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
     metadata label that is selectable answers a right-click with the text menu and the card menu
     covers everything else. Those labels are selectable so an address or a failure reason can be
     copied out; a card menu taking the press first would remove the only way to do it.
+  - **The expanded card states what identifies a server; reading it in full happens on its own
+    surface (binding).** The card carries identity — flag, name, alias, `protocol ·
+    address:port`, the transport summary (`transport_label`) — the trust marks that change what
+    a connection means (`allow_insecure`, a pinned certificate), and the latency record with its
+    failure reason. The complete field-by-field listing of the stored server, under the JSON key
+    names the editor uses, belongs to a details surface opened from the card, never to the card
+    itself. A card is glanced at among two hundred neighbours; a server is inspected one at a
+    time, and the two readings earn different surfaces. What the card deliberately leaves
+    elsewhere: which profiles or pools carry the server stays the mark above and the profiles
+    page; which subscription it came from, and when that was refreshed, stays the subscriptions
+    page. The card answers "what is this server", not "what is it doing".
+  - **The card reads; changing a server happens in a dialog.** An action on the action row may
+    open an editing surface, but nothing on the card edits in place.
+  - **Nothing added to the card may grow it past its measured height (binding).** The expanded
+    height is measured from real content and animated once; content without a small upper bound
+    scrolls inside the card's own scroller instead of resizing the grid around it. The
+    measurement targets a height the late-arriving pushes then correct, so every block added to
+    the card either has a fixed height or scrolls — a block that grows with its data re-opens
+    that correction visibly.
+  - **A secret is masked wherever it is shown.** A password, UUID or pre-shared key renders
+    masked with an explicit reveal, and a revealed value never reaches a log line.
 - **Groups:** a chip row above the grid — `All`, one chip per saved group, `+`. A group narrows
   **the one list**, and is never a second block of cards: rendering it as its own block
   shows the same server two or three times and leaves no way to tell which card is real, and
