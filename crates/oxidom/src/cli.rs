@@ -107,6 +107,11 @@ pub enum Command {
         #[arg(long)]
         trust: bool,
     },
+    /// Manage stored servers.
+    Server {
+        #[command(subcommand)]
+        command: ServerCommand,
+    },
     /// Manage named connection profiles.
     Profile {
         #[command(subcommand)]
@@ -177,6 +182,53 @@ pub enum ProfileCommand {
     Edit { name: String },
     /// Remove one profile.
     Rm { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServerCommand {
+    /// Create a server by hand, field by field.
+    ///
+    /// Without --file, opens $EDITOR, $VISUAL, or vi on a commented TOML
+    /// template for the chosen protocol; every field names the JSON key it
+    /// fills. The daemon validates the draft through the same path that
+    /// generates an Xray outbound, and creates nothing when validation fails.
+    Add {
+        /// Protocol the template is written for.
+        #[arg(long, value_enum, default_value_t = DraftProtocol::Vless)]
+        protocol: DraftProtocol,
+        /// Read the draft as TOML from this file instead ('-' for stdin).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+}
+
+/// The protocols a draft can describe, as CLI words. Mirrors
+/// `oxidom_core::model::Protocol`; the mapping is one match away because a
+/// clap `ValueEnum` cannot be derived on a foreign type.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum DraftProtocol {
+    Vless,
+    Vmess,
+    Trojan,
+    Shadowsocks,
+    Socks,
+    Http,
+    Hysteria2,
+}
+
+impl DraftProtocol {
+    pub fn to_model(self) -> oxidom_core::model::Protocol {
+        use oxidom_core::model::Protocol;
+        match self {
+            DraftProtocol::Vless => Protocol::Vless,
+            DraftProtocol::Vmess => Protocol::Vmess,
+            DraftProtocol::Trojan => Protocol::Trojan,
+            DraftProtocol::Shadowsocks => Protocol::Shadowsocks,
+            DraftProtocol::Socks => Protocol::Socks,
+            DraftProtocol::Http => Protocol::Http,
+            DraftProtocol::Hysteria2 => Protocol::Hysteria2,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]

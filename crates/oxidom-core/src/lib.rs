@@ -6,6 +6,7 @@ pub mod config;
 pub mod core_options;
 pub mod country;
 pub mod distro;
+pub mod draft;
 pub mod egress;
 pub mod engine;
 pub mod fsutil;

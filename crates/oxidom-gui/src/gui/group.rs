@@ -195,6 +195,7 @@ mod tests {
                 },
                 link: None,
                 alias: None,
+                outbound_patch: None,
                 latency_ms: None,
             })
             .collect();

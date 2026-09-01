@@ -252,6 +252,16 @@ unaffected. Files already present elsewhere — from a distribution package or a
 used where they lie; oxidom offers to copy them into its own directory only because the variable
 names a single directory and another program's may change under it.
 
+### The outbound patch (binding)
+
+A server carrying `outbound_patch` has the fragment merged onto its generated outbound —
+after the typed fields are emitted, RFC 7396 style: objects merge key by key, `null` removes a
+key, anything else replaces. The merge lives in `xray::config::merge_patch` and is applied
+inside `outbound_tagged`, so every consumer of the outbound — connect, probe, pool member —
+sees the same patched result. `tag` and `protocol` are rejected at draft time and therefore
+never merged. Verbatim is not unchecked, in the same sense as the routing block above: the
+fragment must be a JSON object, and a draft is proved to generate before anything is stored.
+
 ## Xray process supervisor
 
 - Resolve the **pinned Xray 26.3.27** binary before spawning. With an empty `xray_binary`, oxidom

@@ -14,6 +14,21 @@ surface, packaging, or the CLI belongs here.
 
 ## [Unreleased]
 
+### Added
+- **A server can be created by hand, field by field.** The daemon gains `CreateServer`: a draft
+  — protocol, address, port, credentials, transport and TLS/Reality, and a raw JSON field
+  merged into the generated outbound for anything the form does not model — is validated
+  through the same path that generates an Xray outbound, and nothing is created when
+  validation fails. Hand-made servers live beside pasted links in "My servers", where a
+  subscription refresh cannot touch them. Old clients keep working; a new client against an
+  old daemon says the daemon is too old.
+
+### Changed
+- **Xray is pinned and installed automatically.** oxidom now manages Xray 26.3.27 in its private
+  data directory, verifies the official release archive against a SHA-256 digest pinned in source,
+  and uses that exact release for generated configurations. A configured, environment or `PATH`
+  core remains an offline fallback or override only when it reports the same version.
+
 ### Fixed
 - **XHTTP and gRPC links now keep the settings that make their transports work.** XHTTP's `mode`
   and object-valued `extra` settings (including XMUx and padding) were dropped or silently rewritten
@@ -23,12 +38,6 @@ surface, packaging, or the CLI belongs here.
 - A latency check started before a reconnect can no longer overwrite the new core's reading with
   a timeout measured across the restart, which showed a failure — and `oxidom status` a `—` —
   for a healthy tunnel until the next periodic sweep.
-
-### Changed
-- **Xray is pinned and installed automatically.** oxidom now manages Xray 26.3.27 in its private
-  data directory, verifies the official release archive against a SHA-256 digest pinned in source,
-  and uses that exact release for generated configurations. A configured, environment or `PATH`
-  core remains an offline fallback or override only when it reports the same version.
 
 ## [0.3.1] - 2026-08-23
 

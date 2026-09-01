@@ -294,6 +294,13 @@ pub struct Server {
     /// carried across subscription refreshes, so a unit name never moves.
     #[serde(default)]
     pub alias: Option<String>,
+    /// A raw JSON fragment merged onto the generated outbound at config time,
+    /// RFC 7396 style (objects merge, `null` removes, anything else replaces).
+    /// The escape hatch for a core option no form field models; carried on the
+    /// server so generation can reproduce it forever. Absent for every server
+    /// that predates it, and skipped when absent so those serialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_patch: Option<serde_json::Value>,
     /// Last latency probe result (runtime only, not persisted).
     #[serde(skip)]
     pub latency_ms: Option<u32>,
@@ -328,6 +335,17 @@ impl Server {
                 "balancer_tag": balancer_tag,
             }))
         {
+            return identity;
+        }
+        if let Some(patch) = &self.outbound_patch
+            && let Ok(identity) = serde_json::to_string(&serde_json::json!({
+                "spec": self.spec,
+                "outbound_patch": patch,
+            }))
+        {
+            // Two hand-made servers differing only in their patch are two
+            // servers; leaving the patch out of the identity would make the
+            // second a "duplicate" of the first.
             return identity;
         }
         self.identity_from_serialized_spec(serde_json::to_string(&self.spec).ok())
@@ -588,6 +606,7 @@ mod tests {
             spec,
             link: None,
             alias: None,
+            outbound_patch: None,
             latency_ms: None,
         }
     }
@@ -676,6 +695,35 @@ mod tests {
         let stream: StreamSettings = serde_json::from_str(json).unwrap();
         assert!(stream.allow_insecure);
         assert_eq!(stream.pin_sha256, None);
+    }
+
+    /// Every server that predates `outbound_patch` must serialize exactly as
+    /// it used to — the key absent, not null — and a stored one without the
+    /// key must still load. A byte-level change here would move stored files
+    /// for everybody on the next save.
+    #[test]
+    fn a_server_without_a_patch_serializes_as_before() {
+        let server = Server {
+            id: "aaaaaaaaaaaaaaaa".to_string(),
+            name: "Plain".to_string(),
+            protocol: Protocol::Trojan,
+            address: "one.example.invalid".to_string(),
+            port: 443,
+            transport_label: "trojan".to_string(),
+            country: None,
+            spec: OutboundSpec::Trojan {
+                password: "invented".to_string(),
+                stream: StreamSettings::default(),
+            },
+            link: None,
+            alias: None,
+            outbound_patch: None,
+            latency_ms: None,
+        };
+        let json = serde_json::to_string(&server).unwrap();
+        assert!(!json.contains("outbound_patch"), "{json}");
+        let reloaded: Server = serde_json::from_str(&json).unwrap();
+        assert!(reloaded.outbound_patch.is_none());
     }
 
     #[test]

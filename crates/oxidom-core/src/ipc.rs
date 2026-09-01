@@ -665,6 +665,16 @@ pub fn error_action(message: &str) -> ErrorAction {
     }
 }
 
+/// What `CreateServer` answers: the identifiers the caller shows next —
+/// the id it will address the server by, and the alias the daemon assigned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedServer {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

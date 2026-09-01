@@ -29,6 +29,12 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
   `oxidom ping <HANDLE>` are read commands and never spawn a session daemon.
 - `oxidom tun [PROFILE] [--down]` inspects the session interface or explicitly removes it.
 - `oxidom alias <HANDLE> <NEW>` changes a server alias.
+- `oxidom server add [--protocol P] [--file PATH|-]` creates a server by hand. Without
+  `--file` it opens `$EDITOR`/`$VISUAL`/vi on a commented TOML template for the protocol;
+  with it, the draft is read whole from a file or stdin. The body is a `ServerDraft`
+  (`docs/spec/data-model.md`), and validation is the daemon's: the CLI sends the draft and
+  prints the daemon's error, so the dialog and the command line reject with one voice. An
+  unchanged template creates nothing. `server` is a reserved profile name.
 - `oxidom profile {list,show,new,edit,rm}` manages daemon-owned profiles.
 - `oxidom daemon [--system --socks-port --http-port]` runs the D-Bus service.
 - `oxidom <PROFILE> run -- <cmd>...` and `oxidom <PROFILE> run -c "<cmd>"` run one command
