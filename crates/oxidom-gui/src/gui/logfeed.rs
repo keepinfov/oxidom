@@ -116,10 +116,10 @@ impl LogFeed {
         skipped += local.skipped;
         // Under a legacy book the cursor stays at zero (see above); advancing
         // it here would undo the rewind before the caller ever read from it.
-        if remote.book_id != LEGACY_BOOK_ID {
-            if let Some(last) = local.records.last() {
-                self.local_cursor = last.seq;
-            }
+        if remote.book_id != LEGACY_BOOK_ID
+            && let Some(last) = local.records.last()
+        {
+            self.local_cursor = last.seq;
         }
         self.holding.extend(local.records);
 
