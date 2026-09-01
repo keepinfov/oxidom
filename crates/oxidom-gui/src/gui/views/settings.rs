@@ -47,7 +47,7 @@ pub struct SettingsValues {
     /// which is what clearing the field back to the default looks like.
     pub geoip_url: String,
     pub geosite_url: String,
-    /// Empty means "let the daemon fall back to $OXIDOM_XRAY_BIN, then $PATH".
+    /// Empty means "use the daemon's managed, pinned Xray core".
     pub xray_binary: String,
     /// Kept in the draft so applying unrelated GUI settings cannot erase a
     /// path configured outside the GUI.
@@ -372,7 +372,7 @@ impl SettingsView {
         geo_source.add_row(&geosite_url);
 
         let xray_binary = adw::EntryRow::builder()
-            .title("Xray binary")
+            .title("Xray binary override")
             .text(&applied.xray_binary)
             .build();
         let tun2socks_binary = adw::EntryRow::builder()
@@ -417,17 +417,14 @@ impl SettingsView {
         let xray_group = adw::PreferencesGroup::builder()
             .title("Xray core")
             .description(
-                "Leave empty to use $OXIDOM_XRAY_BIN, then the first xray on PATH. \
-                 A system-wide oxidom service cannot read paths under /home.",
+                "Leave empty to install and use the pinned managed core. An override must report \
+                 the same version; a system-wide service cannot read paths under /home.",
             )
             .build();
-        // Shown only while no core is resolved. oxidom does not install one —
-        // fetching and running a binary is the last thing a program carrying
-        // other people's traffic should do casually — but naming the command
-        // the distribution already has costs nothing and is what people asked
-        // for when they asked for a download button.
+        // Shown only when the verified managed download failed, so an offline
+        // machine still has a copyable, checksum-verifying fallback.
         let install_hint = adw::ActionRow::builder()
-            .title("Install a core")
+            .title("Install the pinned core manually")
             .subtitle_selectable(true)
             .visible(false)
             .build();

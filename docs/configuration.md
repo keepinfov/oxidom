@@ -90,7 +90,7 @@ nft_binary = ""
 | `subscription_user_agent` | string | `"v2rayN/6.45"` | Sent when fetching subscriptions. Many panels serve a different body — or a different *format*, or a web page — depending on it. See [the format it selects](subscriptions-and-protocols.md#the-user-agent-decides-the-format). |
 | `geoip_url` | URL | `""` | Where `geoip.dat` is fetched from. Empty is the built-in source (v2fly). Must be `https`. |
 | `geosite_url` | URL | `""` | Where `geosite.dat` is fetched from. Empty is the built-in source. Must be `https`. |
-| `xray_binary` | path | `""` | Empty falls through to the env var, then `PATH`. |
+| `xray_binary` | path | `""` | A matching Xray 26.3.27 override. Empty installs and uses oxidom's verified private copy; when that download is unavailable, the env var then `PATH` are accepted only when they report the same version. |
 | `tun2socks_binary` | path | `""` | Same. Needed only for TUN mode. |
 | `nft_binary` | path | `""` | Same. Needed only for `oxidom run`. |
 
@@ -329,7 +329,7 @@ is decided by probing the local SOCKS port, not by watching the log.
 
 ## Finding helper binaries
 
-Three external programs may be needed. Each resolves in the same order:
+Three external programs may be needed. `tun2socks` and `nft` resolve in this order:
 
 **config key → environment variable → `PATH`**
 
@@ -339,9 +339,12 @@ Three external programs may be needed. Each resolves in the same order:
 | `tun2socks` | TUN mode only | `tun2socks_binary` | `OXIDOM_TUN2SOCKS_BIN` |
 | `nft` | `oxidom run` only | `nft_binary` | `OXIDOM_NFT_BIN` |
 
-Resolution happens **before** the core is spawned, so a missing or unusable binary
-is reported as an actionable error naming both the path tried and where that path
-came from — not as a core that mysteriously fails to start.
+With an empty `xray_binary`, oxidom first installs its SHA-256-verified, pinned
+Xray 26.3.27 release into the daemon's private data directory. If that is unavailable,
+an environment or `PATH` core is an offline fallback only when it reports the same
+version; a configured path is subject to the same check. Resolution happens **before**
+the core is spawned, so a missing, unverified, or differently-versioned binary is
+reported directly rather than as a core that mysteriously fails to start.
 
 Three more are invoked by bare name, with no override: `gsettings` (GNOME proxy),
 `ping` (ICMP probes), `systemd-run` (`oxidom run`).
@@ -371,7 +374,7 @@ files in your home directory. A session daemon installs into
 | Variable | Effect |
 |---|---|
 | `RUST_LOG` | Log level. Overrides the default (`info` for `daemon`, `warn` otherwise). |
-| `OXIDOM_XRAY_BIN` | Xray core path, when `xray_binary` is empty. |
+| `OXIDOM_XRAY_BIN` | Offline fallback Xray path when `xray_binary` is empty. It must report Xray 26.3.27. |
 | `OXIDOM_TUN2SOCKS_BIN` | tun2socks path. |
 | `OXIDOM_NFT_BIN` | `nft` path. |
 | `OXIDOM_BIN` | Which `oxidom` binary the GUI spawns as a session daemon. Set by the Nix wrapper. |

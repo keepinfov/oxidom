@@ -37,8 +37,9 @@ pub struct Config {
     /// address back to the default without needing a second flag.
     pub geoip_url: String,
     pub geosite_url: String,
-    /// Path (or bare command name) of the Xray core. Empty falls back to
-    /// `$OXIDOM_XRAY_BIN` — set by the nix wrapper — and then `xray` on `$PATH`.
+    /// Matching-version override for the managed Xray core. Empty installs the
+    /// pinned release; `$OXIDOM_XRAY_BIN` and `xray` on `$PATH` are offline
+    /// fallbacks only when they report the same version.
     pub xray_binary: String,
     /// Path (or bare command name) of tun2socks. Empty falls back to
     /// `$OXIDOM_TUN2SOCKS_BIN` — set by the nix wrapper — and then `PATH`.

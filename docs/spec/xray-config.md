@@ -226,8 +226,8 @@ reported by count, the same call as the pool membership in `profile_dialog.rs`.
 
 Geo data is a runtime dependency of **every** config oxidom generates, not just of future routing
 rules: `geoip:private` has been in the default rule set from the start, and without `geoip.dat` the
-core refuses to start rather than quietly not matching. `pkgs.xray` is a wrapper that sets
-`XRAY_LOCATION_ASSET`; a hand-set `xray_binary` pointing at an unwrapped core will fail at spawn.
+core refuses to start rather than quietly not matching. The managed Xray install carries both lists
+beside its binary; an explicit `xray_binary` must provide usable lists itself.
 
 **Whether the data is usable is decided by the core, never by looking at the filesystem.** oxidom
 asks with `xray run -test` over a configuration carrying exactly the two references above and
@@ -254,11 +254,14 @@ names a single directory and another program's may change under it.
 
 ## Xray process supervisor
 
-- Resolve the binary in priority order: the `xray_binary` config key, then the
-  `OXIDOM_XRAY_BIN` environment variable (set by the Nix wrapper and the dev shell), then `xray`
-  on `PATH`. Resolution is a preflight (`xray::resolve`) that runs before spawning, so a missing
-  core is reported as an actionable error naming both the path tried and where it came from.
-  Then spawn `<resolved> run -c <configfile>`. Capture stdout/stderr into the process log book
+- Resolve the **pinned Xray 26.3.27** binary before spawning. With an empty `xray_binary`, oxidom
+  installs the matching official Linux archive into `data_dir()/xray/26.3.27`, verifying its
+  source-pinned SHA-256 before extraction; that private copy is used thereafter. If the install is
+  unavailable (for example, offline), `$OXIDOM_XRAY_BIN` and then `xray` on `PATH` are accepted only
+  when `xray version` reports exactly `Xray 26.3.27`. An explicit `xray_binary` is likewise a
+  matching-version override. A differently-versioned core is refused rather than silently given a
+  configuration it was not tested against. Then spawn `<resolved> run -c <configfile>`. Capture
+  stdout/stderr into the process log book
   (`oxidom_core::logbook`), tagged `xray`, parsed for the `[Level]` and subsystem the core prints.
   `tun2socks` writes to the same book tagged `tun2socks`, and oxidom's own reasoning — the `log`
   facade as well as `note`/`fail` — is tagged `oxidom`. The Logs view therefore explains a failure

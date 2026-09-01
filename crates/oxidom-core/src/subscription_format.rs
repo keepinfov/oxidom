@@ -465,6 +465,13 @@ fn stream_from_xray(value: Option<&Value>) -> StreamSettings {
                 .map(str::to_string)
         }),
         service_name: string(network_settings, "serviceName"),
+        xhttp_mode: string(network_settings, "mode"),
+        xhttp_extra: network_settings
+            .get("extra")
+            .filter(|extra| extra.is_object())
+            .cloned(),
+        grpc_authority: string(network_settings, "authority"),
+        grpc_multi_mode: bool_value(network_settings.get("multiMode")).unwrap_or(false),
         header_type: network_settings
             .pointer("/header/type")
             .and_then(Value::as_str)
@@ -559,6 +566,13 @@ fn stream_from_sing_box(outbound: &Value) -> StreamSettings {
             .and_then(Value::as_str)
             .map(str::to_string),
         service_name: string(transport, "service_name"),
+        xhttp_mode: string(transport, "mode"),
+        xhttp_extra: transport
+            .get("extra")
+            .filter(|extra| extra.is_object())
+            .cloned(),
+        grpc_authority: string(transport, "authority"),
+        grpc_multi_mode: bool_value(transport.get("multi_mode")).unwrap_or(false),
         header_type: None,
         flow: string(outbound, "flow"),
     }
@@ -699,6 +713,13 @@ fn stream_from_clash(proxy: &Value) -> StreamSettings {
         path,
         host,
         service_name: string(network_options, "grpc-service-name"),
+        xhttp_mode: string(network_options, "mode"),
+        xhttp_extra: network_options
+            .get("extra")
+            .filter(|extra| extra.is_object())
+            .cloned(),
+        grpc_authority: string(network_options, "grpc-authority"),
+        grpc_multi_mode: bool_value(network_options.get("grpc-multi-mode")).unwrap_or(false),
         header_type,
         flow: string(proxy, "flow"),
     }
@@ -863,6 +884,25 @@ fn add_stream_query(url: &mut Url, stream: &StreamSettings) {
     ] {
         if let Some(value) = value {
             pairs.append_pair(key, value);
+        }
+    }
+    if matches!(stream.network.as_str(), "xhttp" | "splithttp")
+        && let Some(mode) = &stream.xhttp_mode
+    {
+        pairs.append_pair("mode", mode);
+    }
+    if matches!(stream.network.as_str(), "xhttp" | "splithttp")
+        && let Some(extra) = &stream.xhttp_extra
+        && let Ok(extra) = serde_json::to_string(extra)
+    {
+        pairs.append_pair("extra", &extra);
+    }
+    if stream.network == "grpc" {
+        if let Some(authority) = &stream.grpc_authority {
+            pairs.append_pair("authority", authority);
+        }
+        if stream.grpc_multi_mode {
+            pairs.append_pair("mode", "multi");
         }
     }
     if let Some(alpn) = &stream.alpn {
@@ -1422,6 +1462,40 @@ proxies:
         };
         assert_eq!(method, "aes-256-gcm");
         assert_eq!(password, "pa/ss+word");
+    }
+
+    #[test]
+    fn xhttp_extra_survives_an_imported_config_and_canonical_link() {
+        let body = r#"[{
+          "outbounds": [{
+            "protocol": "vless",
+            "settings": {"vnext": [{
+              "address": "edge.example", "port": 443,
+              "users": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "encryption": "none"}]
+            }]},
+            "streamSettings": {
+              "network": "xhttp", "security": "tls",
+              "xhttpSettings": {
+                "path": "/connect", "host": "edge.example", "mode": "auto",
+                "extra": {"xmux": {"maxConcurrency": "16-32"}, "xPaddingBytes": "100-1000"}
+              }
+            }
+          }]
+        }]"#;
+        let (servers, _skipped) = parse(body).unwrap();
+        let link = servers[0].link.as_deref().expect("a canonical share link");
+        let reparsed = crate::link::parse_link(link).expect("generated link must parse back");
+        let extra = reparsed
+            .spec
+            .stream()
+            .and_then(|stream| stream.xhttp_extra.as_ref());
+        assert_eq!(
+            extra,
+            Some(&serde_json::json!({
+                "xmux": { "maxConcurrency": "16-32" },
+                "xPaddingBytes": "100-1000"
+            }))
+        );
     }
 
     #[test]
