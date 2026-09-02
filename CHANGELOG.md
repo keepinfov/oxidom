@@ -38,6 +38,9 @@ surface, packaging, or the CLI belongs here.
 - A latency check started before a reconnect can no longer overwrite the new core's reading with
   a timeout measured across the restart, which showed a failure — and `oxidom status` a `—` —
   for a healthy tunnel until the next periodic sweep.
+- A log slice fetched by a running operation no longer repeats the lines the periodic poll
+  already absorbed, which showed every line written during a multi-second operation twice in
+  the log view, and could move the log cursor backwards and re-append a whole round after it.
 
 ## [0.3.1] - 2026-08-23
 

@@ -80,9 +80,9 @@ impl LogFeed {
     }
 
     /// Take one round of both books and return what is now safe to display.
-    pub fn absorb(&mut self, remote: LogSlice, local: LogSlice, now_ms: u64) -> FeedBatch {
+    pub fn absorb(&mut self, mut remote: LogSlice, local: LogSlice, now_ms: u64) -> FeedBatch {
         let mut reset = false;
-        let mut skipped = remote.skipped;
+        let mut skipped;
 
         // A daemon with no cursor re-sends its whole log every time, so the only
         // correct move is to replace what is shown. This is the pre-cursor
@@ -98,20 +98,41 @@ impl LogFeed {
             // wrote. Without the re-feed they survive one round of a legacy
             // daemon and are gone from the view for good.
             self.local_cursor = 0;
-        } else if self.remote_book != Some(remote.book_id) {
+            skipped = remote.skipped;
+            if let Some(last) = remote.records.last() {
+                self.remote_cursor = last.seq;
+            }
+            self.holding.extend(remote.records);
+        } else {
             // First round, or the daemon restarted and is counting from zero
             // again. Without this the cursor stays above every sequence number
             // the new book will ever issue and the view goes quietly dead.
-            reset = self.remote_book.is_some();
-            self.remote_book = Some(remote.book_id);
-            self.holding.clear();
-            self.remote_cursor = 0;
-        }
+            if self.remote_book != Some(remote.book_id) {
+                reset = self.remote_book.is_some();
+                self.remote_book = Some(remote.book_id);
+                self.holding.clear();
+                self.remote_cursor = 0;
+            }
 
-        if let Some(last) = remote.records.last() {
-            self.remote_cursor = last.seq;
+            // Two fetchers share this cursor, and one of them fetches late: an
+            // operation's worker reads the log only after a D-Bus call that can
+            // take seconds, from the cursor as of the operation's start. What
+            // the poll absorbed in the meantime comes back in that slice — in
+            // its records and counted again in its skipped — so neither is
+            // taken on faith: the gap is measured from this feed's own cursor
+            // to the first record it has not seen.
+            let cursor = self.remote_cursor;
+            match remote.records.iter().position(|record| record.seq > cursor) {
+                Some(first_fresh) => {
+                    skipped = remote.records[first_fresh].seq - cursor - 1;
+                    self.remote_cursor = remote.records[remote.records.len() - 1].seq;
+                    self.holding.extend(remote.records.drain(first_fresh..));
+                }
+                None => {
+                    skipped = remote.first_seq.saturating_sub(cursor + 1);
+                }
+            }
         }
-        self.holding.extend(remote.records);
 
         skipped += local.skipped;
         // Under a legacy book the cursor stays at zero (see above); advancing
@@ -393,10 +414,141 @@ mod tests {
         assert_eq!(batch.skipped, 7);
     }
 
+    /// Two fetchers share one cursor: the poll's rounds and an operation's
+    /// snapshot, read after a D-Bus call that can take seconds, from the
+    /// cursor as of the operation's start. What the poll absorbed meanwhile
+    /// comes back in that slice — its records are not taken a second time.
+    #[test]
+    fn a_slice_from_an_older_cursor_does_not_repeat_what_the_poll_absorbed() {
+        let mut feed = LogFeed::new();
+        feed.absorb(
+            slice(
+                DAEMON,
+                vec![
+                    record(1, 1_000, LogSource::Xray, "a"),
+                    record(2, 1_000, LogSource::Xray, "b"),
+                ],
+            ),
+            empty(LOCAL),
+            9_000,
+        );
+        // The poll takes the next round while the operation runs.
+        feed.absorb(
+            slice(
+                DAEMON,
+                vec![
+                    record(3, 1_100, LogSource::Xray, "c"),
+                    record(4, 1_100, LogSource::Xray, "d"),
+                ],
+            ),
+            empty(LOCAL),
+            9_000,
+        );
+
+        // The operation's fetch started from the cursor as of its spawn, so
+        // it re-sends 3 and 4 and carries 5 and 6 written since.
+        let batch = feed.absorb(
+            slice(
+                DAEMON,
+                vec![
+                    record(3, 1_100, LogSource::Xray, "c"),
+                    record(4, 1_100, LogSource::Xray, "d"),
+                    record(5, 1_200, LogSource::Xray, "e"),
+                    record(6, 1_200, LogSource::Xray, "f"),
+                ],
+            ),
+            empty(LOCAL),
+            9_000,
+        );
+
+        assert_eq!(
+            texts(&batch),
+            ["e", "f"],
+            "the re-sent records must not be appended a second time"
+        );
+        assert_eq!(feed.remote_cursor(), 6);
+    }
+
+    /// The stale fetch can return a shorter run than the poll already took,
+    /// so its last record sits below the feed's cursor. A cursor that moves
+    /// backwards makes the next round append the same records again.
+    #[test]
+    fn a_slice_from_an_older_cursor_does_not_move_the_cursor_backwards() {
+        let mut feed = LogFeed::new();
+        feed.absorb(
+            slice(
+                DAEMON,
+                vec![
+                    record(3, 1_000, LogSource::Xray, "c"),
+                    record(4, 1_000, LogSource::Xray, "d"),
+                ],
+            ),
+            empty(LOCAL),
+            9_000,
+        );
+        assert_eq!(feed.remote_cursor(), 4);
+
+        let batch = feed.absorb(
+            slice(DAEMON, vec![record(3, 1_000, LogSource::Xray, "c")]),
+            empty(LOCAL),
+            9_000,
+        );
+        assert_eq!(feed.remote_cursor(), 4);
+        assert!(batch.records.is_empty());
+
+        // The next round fetches from the cursor and nothing re-arrives.
+        let batch = feed.absorb(
+            slice(DAEMON, vec![record(5, 1_100, LogSource::Xray, "e")]),
+            empty(LOCAL),
+            9_000,
+        );
+        assert_eq!(texts(&batch), ["e"]);
+    }
+
+    /// The stale fetch counts its shortfall against the cursor it was given,
+    /// so records the poll already absorbed come back counted as skipped.
+    /// Only what this feed has not yet taken counts as missing.
+    #[test]
+    fn a_slice_from_an_older_cursor_does_not_reannounce_a_gap_the_poll_already_absorbed() {
+        let mut feed = LogFeed::new();
+        feed.absorb(
+            slice(
+                DAEMON,
+                vec![
+                    record(1, 1_000, LogSource::Xray, "a"),
+                    record(2, 1_000, LogSource::Xray, "b"),
+                    record(3, 1_000, LogSource::Xray, "c"),
+                    record(4, 1_000, LogSource::Xray, "d"),
+                ],
+            ),
+            empty(LOCAL),
+            9_000,
+        );
+
+        // Fetched from cursor 2 after the book evicted 1..=4: it counts 3
+        // and 4 as skipped, though the poll took them.
+        let mut stale = slice(
+            DAEMON,
+            vec![
+                record(5, 1_100, LogSource::Xray, "e"),
+                record(6, 1_100, LogSource::Xray, "f"),
+            ],
+        );
+        stale.first_seq = 5;
+        stale.skipped = 2;
+
+        let batch = feed.absorb(stale, empty(LOCAL), 9_000);
+
+        assert_eq!(batch.skipped, 0, "nothing new is missing from this feed");
+    }
+
     #[test]
     fn a_gap_reported_by_either_book_reaches_the_caller() {
         let mut feed = LogFeed::new();
+        // A book that evicted everything up to 13: nothing to return, and
+        // twelve records the fetcher never saw.
         let mut remote = empty(DAEMON);
+        remote.first_seq = 13;
         remote.skipped = 12;
         let mut local = empty(LOCAL);
         local.skipped = 3;
