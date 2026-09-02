@@ -41,6 +41,9 @@ surface, packaging, or the CLI belongs here.
 - A log slice fetched by a running operation no longer repeats the lines the periodic poll
   already absorbed, which showed every line written during a multi-second operation twice in
   the log view, and could move the log cursor backwards and re-append a whole round after it.
+- A daemon restart no longer erases the GUI's own log lines from the log view. The reset round
+  now carries this process's lines back with it, so what the app itself did around the restart
+  stays readable beside the new run's output.
 
 ## [0.3.1] - 2026-08-23
 

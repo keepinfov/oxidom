@@ -13,6 +13,8 @@
 //! [`REORDER_WINDOW_MS`] is past the point where a straggler can still arrive to
 //! sit in front of it, and can be appended in timestamp order for good.
 
+use std::collections::VecDeque;
+
 use oxidom_core::logbook::{CAPACITY, LEGACY_BOOK_ID, LogRecord, LogSlice};
 
 /// How long a record waits before it is considered safely ordered.
@@ -54,7 +56,20 @@ pub struct LogFeed {
     remote_book: Option<u64>,
     local_cursor: u64,
     /// Records that have arrived but are not yet old enough to be ordered.
-    holding: Vec<LogRecord>,
+    holding: Vec<Held>,
+    /// This process's own lines already handed over, kept until the view's
+    /// capacity. A daemon restart replaces the daemon's book, not ours — but
+    /// the view is append-only and cannot keep a subset by itself, so the
+    /// reset round has to carry our lines back to it.
+    released_ours: VecDeque<LogRecord>,
+}
+
+/// One held record, with the book it came from: the two books die
+/// independently, and a daemon restart must carry only one of them away.
+#[derive(Debug)]
+struct Held {
+    record: LogRecord,
+    ours: bool,
 }
 
 impl LogFeed {
@@ -82,6 +97,7 @@ impl LogFeed {
     /// Take one round of both books and return what is now safe to display.
     pub fn absorb(&mut self, mut remote: LogSlice, local: LogSlice, now_ms: u64) -> FeedBatch {
         let mut reset = false;
+        let mut restart_reset = false;
         let mut skipped;
 
         // A daemon with no cursor re-sends its whole log every time, so the only
@@ -102,15 +118,24 @@ impl LogFeed {
             if let Some(last) = remote.records.last() {
                 self.remote_cursor = last.seq;
             }
-            self.holding.extend(remote.records);
+            self.holding
+                .extend(remote.records.drain(..).map(|record| Held {
+                    record,
+                    ours: false,
+                }));
         } else {
             // First round, or the daemon restarted and is counting from zero
             // again. Without this the cursor stays above every sequence number
             // the new book will ever issue and the view goes quietly dead.
-            if self.remote_book != Some(remote.book_id) {
+            let restarted = self.remote_book != Some(remote.book_id);
+            if restarted {
                 reset = self.remote_book.is_some();
+                restart_reset = reset;
                 self.remote_book = Some(remote.book_id);
-                self.holding.clear();
+                // The dead book's stragglers die with it; ours do not. A
+                // line of ours still inside the window has not been handed
+                // over yet, and dropping it here would lose it for good.
+                self.holding.retain(|held| held.ours);
                 self.remote_cursor = 0;
             }
 
@@ -126,7 +151,11 @@ impl LogFeed {
                 Some(first_fresh) => {
                     skipped = remote.records[first_fresh].seq - cursor - 1;
                     self.remote_cursor = remote.records[remote.records.len() - 1].seq;
-                    self.holding.extend(remote.records.drain(first_fresh..));
+                    self.holding
+                        .extend(remote.records.drain(first_fresh..).map(|record| Held {
+                            record,
+                            ours: false,
+                        }));
                 }
                 None => {
                     skipped = remote.first_seq.saturating_sub(cursor + 1);
@@ -142,19 +171,30 @@ impl LogFeed {
         {
             self.local_cursor = last.seq;
         }
-        self.holding.extend(local.records);
+        self.holding.extend(
+            local
+                .records
+                .into_iter()
+                .map(|record| Held { record, ours: true }),
+        );
 
         // A record with no usable timestamp — a reconstructed one from an older
         // daemon — sorts first and is released at once; there is nothing to
         // order it against.
-        self.holding.sort_by_key(|record| record.unix_ms);
+        self.holding.sort_by_key(|held| held.record.unix_ms);
         let cutoff = now_ms.saturating_sub(REORDER_WINDOW_MS);
         let settled = self
             .holding
             .iter()
-            .take_while(|record| record.unix_ms <= cutoff)
+            .take_while(|held| held.record.unix_ms <= cutoff)
             .count();
-        let mut records: Vec<LogRecord> = self.holding.drain(..settled).collect();
+        let drained: Vec<Held> = self.holding.drain(..settled).collect();
+        let mut fresh_ours: Vec<LogRecord> = drained
+            .iter()
+            .filter(|held| held.ours)
+            .map(|held| held.record.clone())
+            .collect();
+        let mut records: Vec<LogRecord> = drained.into_iter().map(|held| held.record).collect();
 
         // Over the ceiling, the oldest of what is still held goes out anyway,
         // ordering unproven. Releasing early is the right way to lose this
@@ -167,7 +207,32 @@ impl LogFeed {
         // after keeps the batch in order.
         if self.holding.len() > HOLD_CAPACITY {
             let excess = self.holding.len() - HOLD_CAPACITY;
-            records.extend(self.holding.drain(..excess));
+            let overflow: Vec<Held> = self.holding.drain(..excess).collect();
+            fresh_ours.extend(
+                overflow
+                    .iter()
+                    .filter(|held| held.ours)
+                    .map(|h| h.record.clone()),
+            );
+            records.extend(overflow.into_iter().map(|held| held.record));
+        }
+
+        // The redelivery carries what was ours before this round; this round's
+        // own lines are already in `records`, so a line never rides twice.
+        let redeliver = if restart_reset {
+            self.released_ours.make_contiguous().to_vec()
+        } else {
+            Vec::new()
+        };
+        self.released_ours.extend(fresh_ours);
+        while self.released_ours.len() > CAPACITY {
+            self.released_ours.pop_front();
+        }
+        if restart_reset {
+            let mut all = redeliver;
+            all.extend(records);
+            all.sort_unstable_by_key(|record| record.unix_ms);
+            records = all;
         }
 
         FeedBatch {
@@ -554,6 +619,106 @@ mod tests {
         local.skipped = 3;
 
         assert_eq!(feed.absorb(remote, local, 9_000).skipped, 15);
+    }
+
+    /// A restart replaces the daemon's book, not this process's own lines:
+    /// the reset round carries them back, so a daemon restarting cannot wipe
+    /// the GUI's own record of what it did. The legacy shape — a rewound
+    /// cursor re-fed on the next round — does not transfer here, because a
+    /// restart resets only once: lines re-fed a round later would land under
+    /// the new book's fresher lines, out of timestamp order.
+    #[test]
+    fn a_daemon_restart_returns_the_guis_own_lines_with_the_reset() {
+        let mut feed = LogFeed::new();
+        let batch = feed.absorb(
+            slice(DAEMON, vec![record(1, 1_000, LogSource::Xray, "old run")]),
+            slice(LOCAL, vec![record(5, 1_000, LogSource::Oxidom, "own line")]),
+            9_000,
+        );
+        assert_eq!(texts(&batch), ["old run", "own line"]);
+
+        let batch = feed.absorb(
+            slice(
+                DAEMON + 1,
+                vec![record(1, 2_000, LogSource::Xray, "new run")],
+            ),
+            empty(LOCAL),
+            9_000,
+        );
+
+        assert!(batch.reset, "the dead run's lines are still dropped");
+        assert_eq!(
+            texts(&batch),
+            ["own line", "new run"],
+            "this process's own lines come back in the same round, in order"
+        );
+    }
+
+    /// What survives one restart must survive the next: the feed keeps its
+    /// own released lines until the view's capacity, not until the first
+    /// reset hands them over.
+    #[test]
+    fn the_guis_own_lines_survive_a_second_restart() {
+        let mut feed = LogFeed::new();
+        feed.absorb(
+            empty(DAEMON),
+            slice(LOCAL, vec![record(5, 1_000, LogSource::Oxidom, "own line")]),
+            9_000,
+        );
+        feed.absorb(
+            slice(DAEMON + 1, vec![record(1, 2_000, LogSource::Xray, "run 2")]),
+            empty(LOCAL),
+            9_000,
+        );
+        let batch = feed.absorb(
+            slice(DAEMON + 2, vec![record(1, 3_000, LogSource::Xray, "run 3")]),
+            empty(LOCAL),
+            9_000,
+        );
+
+        assert!(batch.reset);
+        assert_eq!(texts(&batch), ["own line", "run 3"]);
+    }
+
+    /// A line of ours still inside the reorder window when the daemon
+    /// restarted has not been handed over yet — the reset must not lose it
+    /// with the dead book's stragglers, and it settles before the new
+    /// book's fresher line, as its older stamp says it should.
+    #[test]
+    fn an_own_line_still_in_the_window_survives_a_restart() {
+        let mut feed = LogFeed::new();
+        let batch = feed.absorb(
+            empty(DAEMON),
+            slice(
+                LOCAL,
+                vec![record(5, 8_500, LogSource::Oxidom, "own fresh line")],
+            ),
+            9_000,
+        );
+        assert!(
+            batch.records.is_empty(),
+            "8_500 is inside the window at 9_000"
+        );
+
+        let restart = feed.absorb(
+            slice(
+                DAEMON + 1,
+                vec![record(1, 9_100, LogSource::Xray, "new run")],
+            ),
+            empty(LOCAL),
+            9_000,
+        );
+        assert!(restart.reset);
+        assert!(
+            restart.records.is_empty(),
+            "nothing is settled in this round"
+        );
+
+        let batch = feed.absorb(empty(DAEMON + 1), empty(LOCAL), 9_100);
+        assert_eq!(texts(&batch), ["own fresh line"]);
+
+        let batch = feed.absorb(empty(DAEMON + 1), empty(LOCAL), 9_700);
+        assert_eq!(texts(&batch), ["new run"]);
     }
 
     fn texts(batch: &FeedBatch) -> Vec<&str> {
