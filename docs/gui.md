@@ -120,7 +120,15 @@ Hysteria2 is QUIC over UDP and has no TCP port to open.
 
 **An expanded card says more than the badge can.** The badge has a glyph and a
 tooltip to work with, and "the server did not answer" covers a refused handshake,
-a wrong TLS parameter and a dead network alike. Opening a card whose last check
+a wrong TLS parameter and a dead network alike. Between the server's identity and
+the checks, the expanded card lists every parameter the stored server carries —
+the transport, the TLS or Reality settings, the flow, everything — under the same
+JSON key names the server dialog labels its rows with, so the listing and the
+editor read as one thing. Credentials (passwords, UUIDs, auth) are masked until
+you press the 👁 next to them, and every value is selectable text, like the
+address. Only fields the server actually carries are listed.
+
+Opening a card whose last check
 produced no number shows the reason the daemon gave, how the check was made — the
 method really used, and whether it went through the tunnel — and how long ago. It
 sits under the recent checks rather than above them, so everything the card says

@@ -15,6 +15,11 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Added
+- **The expanded card lists every parameter the server carries.** The transport, the TLS or
+  Reality settings, the flow and the mux setting appear under the same JSON key names the
+  server dialog uses, credentials are masked with a reveal toggle, and the values are
+  selectable text — so the first question about a server that will not connect is answered
+  in the application rather than by reading the subscription body outside it.
 - **A server can be created by hand, field by field.** The daemon gains `CreateServer`: a draft
   — protocol, address, port, credentials, transport and TLS/Reality, and a raw JSON field
   merged into the generated outbound for anything the form does not model — is validated
