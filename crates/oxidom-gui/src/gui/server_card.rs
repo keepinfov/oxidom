@@ -919,10 +919,85 @@ impl ServerCard {
         history.append(&history_chart);
         history.append(&history_failures);
 
+        // Every parameter the stored server carries, under the same JSON key
+        // names the editor uses. When a server will not connect, the first
+        // question is which transport and TLS it is actually configured
+        // with; before this block, the only way to answer it was to read the
+        // subscription body outside the application.
+        let parameters = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let mut group_shown = "";
+        for parameter in oxidom_core::draft::parameters(server) {
+            if parameter.group != group_shown {
+                group_shown = parameter.group;
+                let heading = gtk::Label::builder()
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .label(parameter.group)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .css_classes(["server-meta", "server-history-title"])
+                    .build();
+                parameters.append(&heading);
+            }
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let key = gtk::Label::builder()
+                .label(parameter.key)
+                .xalign(0.0)
+                .width_request(110)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["dim-label", "server-meta"])
+                .build();
+            // Credentials stay masked until revealed: a screenshot of an
+            // expanded card is exactly where one ends up pasted somewhere
+            // it should not be. The value is one toggle away for the person
+            // typing it elsewhere.
+            let shown = if parameter.secret {
+                "••••••••".to_string()
+            } else {
+                parameter.value.clone()
+            };
+            let value = gtk::Label::builder()
+                .label(shown)
+                .xalign(0.0)
+                .hexpand(true)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .max_width_chars(1)
+                .selectable(true)
+                .css_classes(["server-meta"])
+                .build();
+            row.append(&key);
+            row.append(&value);
+            if parameter.secret {
+                let secret = parameter.value.clone();
+                let value = value.clone();
+                let reveal = gtk::ToggleButton::builder()
+                    .icon_name("view-reveal-symbolic")
+                    .tooltip_text("Reveal")
+                    .valign(gtk::Align::Center)
+                    .css_classes(["flat", "server-action"])
+                    .build();
+                reveal.update_property(&[gtk::accessible::Property::Label("Reveal")]);
+                reveal.connect_toggled(move |button| {
+                    if button.is_active() {
+                        value.set_text(&secret);
+                        button.set_tooltip_text(Some("Hide"));
+                        button.update_property(&[gtk::accessible::Property::Label("Hide")]);
+                    } else {
+                        value.set_text("••••••••");
+                        button.set_tooltip_text(Some("Reveal"));
+                        button.update_property(&[gtk::accessible::Property::Label("Reveal")]);
+                    }
+                });
+                row.append(&reveal);
+            }
+            parameters.append(&row);
+        }
+
         let metadata = gtk::Box::new(gtk::Orientation::Vertical, 6);
         metadata.append(&full_name);
         metadata.append(&meta);
         metadata.append(&alias);
+        metadata.append(&parameters);
         // The record first, the newest failure under it. Both are about checks
         // and they used to sit either side of the chart, which put the count of
         // failures at the bottom of one block and the reason for the newest at

@@ -221,6 +221,241 @@ fn normalized_stream(mut stream: StreamSettings) -> StreamSettings {
     stream
 }
 
+/// One line of the expanded card's parameter listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parameter {
+    /// The dialog group the field sits in, so the card and the editor read
+    /// as one thing rather than as two spellings of the same fields.
+    pub group: &'static str,
+    /// The JSON key the editor labels the field with.
+    pub key: &'static str,
+    /// The value as a person reads it.
+    pub value: String,
+    /// A credential: shown masked until revealed.
+    pub secret: bool,
+}
+
+const SERVER: &str = "Server";
+const CREDENTIALS: &str = "Credentials";
+const TRANSPORT: &str = "Transport and TLS";
+const HYSTERIA2: &str = "hysteria2";
+const PATCH: &str = "outbound_patch";
+
+/// Every parameter the stored server carries, spelled the way the editor
+/// spells them.
+///
+/// Only what is present is listed — an optional the server does not carry is
+/// not a parameter of it. A composite Xray profile is deliberately not
+/// listed: it is provider JSON with no fields of its own, and a listing that
+/// pretends otherwise would be a third spelling nobody can edit.
+pub fn parameters(server: &Server) -> Vec<Parameter> {
+    use crate::model::OutboundSpec;
+
+    let mut rows = Vec::new();
+    let mut plain = |key: &'static str, value: String| {
+        rows.push(Parameter {
+            group: SERVER,
+            key,
+            value,
+            secret: false,
+        });
+    };
+    plain("protocol", server.protocol.as_str().to_string());
+    plain("address", server.address.clone());
+    plain("port", server.port.to_string());
+
+    let credential = |key: &'static str, value: String, rows: &mut Vec<Parameter>| {
+        rows.push(Parameter {
+            group: CREDENTIALS,
+            key,
+            value,
+            secret: true,
+        });
+    };
+
+    match &server.spec {
+        OutboundSpec::Vless {
+            uuid,
+            encryption,
+            stream,
+        } => {
+            credential("uuid", uuid.clone(), &mut rows);
+            if encryption != "none" {
+                rows.push(Parameter {
+                    group: CREDENTIALS,
+                    key: "encryption",
+                    value: encryption.clone(),
+                    secret: false,
+                });
+            }
+            stream_parameters(stream, &mut rows);
+        }
+        OutboundSpec::Vmess {
+            uuid,
+            alter_id,
+            security,
+            stream,
+        } => {
+            credential("uuid", uuid.clone(), &mut rows);
+            if *alter_id != 0 {
+                rows.push(Parameter {
+                    group: CREDENTIALS,
+                    key: "alter_id",
+                    value: alter_id.to_string(),
+                    secret: false,
+                });
+            }
+            if security != "auto" {
+                rows.push(Parameter {
+                    group: CREDENTIALS,
+                    key: "security",
+                    value: security.clone(),
+                    secret: false,
+                });
+            }
+            stream_parameters(stream, &mut rows);
+        }
+        OutboundSpec::Trojan { password, stream } => {
+            credential("password", password.clone(), &mut rows);
+            stream_parameters(stream, &mut rows);
+        }
+        OutboundSpec::Shadowsocks { method, password } => {
+            rows.push(Parameter {
+                group: CREDENTIALS,
+                key: "method",
+                value: method.clone(),
+                secret: false,
+            });
+            credential("password", password.clone(), &mut rows);
+        }
+        OutboundSpec::Socks { username, password } | OutboundSpec::Http { username, password } => {
+            for (key, value) in [("username", username), ("password", password)] {
+                if let Some(value) = value {
+                    credential(key, value.clone(), &mut rows);
+                }
+            }
+        }
+        OutboundSpec::Hysteria2 { auth, settings } => {
+            credential("auth", auth.clone(), &mut rows);
+            let hysteria_rows = &mut rows;
+            let mut field = |key: &'static str, value: String, secret: bool| {
+                hysteria_rows.push(Parameter {
+                    group: HYSTERIA2,
+                    key,
+                    value,
+                    secret,
+                });
+            };
+            if let Some(sni) = &settings.sni {
+                field("sni", sni.clone(), false);
+            }
+            if let Some(alpn) = &settings.alpn {
+                field("alpn", alpn.join(", "), false);
+            }
+            if let Some(obfs) = &settings.obfs {
+                field("obfs.password", obfs.password.clone(), true);
+            }
+            for (key, value) in [
+                ("up_mbps", settings.up_mbps),
+                ("down_mbps", settings.down_mbps),
+                ("hop_interval_secs", settings.hop_interval_secs),
+                ("udp_idle_timeout_secs", settings.udp_idle_timeout_secs),
+            ] {
+                if let Some(value) = value {
+                    field(key, value.to_string(), false);
+                }
+            }
+            if let Some(congestion) = &settings.congestion {
+                field("congestion", congestion.clone(), false);
+            }
+            if !settings.port_hop.is_empty() {
+                let ranges = settings
+                    .port_hop
+                    .iter()
+                    .map(|range| {
+                        if range.start == range.end {
+                            range.start.to_string()
+                        } else {
+                            format!("{}-{}", range.start, range.end)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                field("port_hop", ranges, false);
+            }
+            if settings.allow_insecure {
+                field("allow_insecure", "true".to_string(), false);
+            }
+            if let Some(pin) = &settings.pin_sha256 {
+                field("pin_sha256", pin.clone(), false);
+            }
+        }
+        OutboundSpec::XrayProfile { .. } => {}
+    }
+
+    if let Some(patch) = &server.outbound_patch {
+        rows.push(Parameter {
+            group: PATCH,
+            key: "outbound_patch",
+            value: serde_json::to_string_pretty(patch).unwrap_or_default(),
+            secret: false,
+        });
+    }
+    rows
+}
+
+/// The transport and TLS half, shared by the three stream-carrying
+/// protocols. Present fields only; `network` and `security` are always
+/// carried, normalized to `tcp` and `none` when a link said nothing.
+fn stream_parameters(stream: &StreamSettings, rows: &mut Vec<Parameter>) {
+    let mut field = |key: &'static str, value: String| {
+        rows.push(Parameter {
+            group: TRANSPORT,
+            key,
+            value,
+            secret: false,
+        });
+    };
+    field("network", stream.network.clone());
+    field("security", stream.security.clone());
+    for (key, value) in [
+        ("sni", &stream.sni),
+        ("fingerprint", &stream.fingerprint),
+        ("path", &stream.path),
+        ("host", &stream.host),
+        ("service_name", &stream.service_name),
+        ("xhttp_mode", &stream.xhttp_mode),
+        ("grpc_authority", &stream.grpc_authority),
+        ("header_type", &stream.header_type),
+        ("flow", &stream.flow),
+        ("public_key", &stream.public_key),
+        ("short_id", &stream.short_id),
+        ("spider_x", &stream.spider_x),
+        ("pin_sha256", &stream.pin_sha256),
+    ] {
+        if let Some(value) = value {
+            field(key, value.clone());
+        }
+    }
+    if let Some(alpn) = &stream.alpn {
+        field("alpn", alpn.join(", "));
+    }
+    if let Some(extra) = &stream.xhttp_extra {
+        field(
+            "xhttp_extra",
+            serde_json::to_string_pretty(extra).unwrap_or_default(),
+        );
+    }
+    for (key, carried) in [
+        ("allow_insecure", stream.allow_insecure),
+        ("grpc_multi_mode", stream.grpc_multi_mode),
+    ] {
+        if carried {
+            field(key, "true".to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +673,137 @@ mod tests {
         let plain = resolve(&plain).expect("resolves");
         let patched = resolve(&patched).expect("resolves");
         assert_ne!(plain.id, patched.id);
+    }
+
+    /// The listing spells a vless server exactly as the editor does, with
+    /// the credential masked-worthy and the absent options absent.
+    #[test]
+    fn a_resolved_vless_server_lists_the_editors_fields() {
+        let draft = ServerDraft {
+            uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            stream: Some(StreamSettings {
+                network: "ws".to_string(),
+                security: "tls".to_string(),
+                sni: Some("cover.example.invalid".to_string()),
+                path: Some("/ws".to_string()),
+                ..StreamSettings::default()
+            }),
+            ..base(Protocol::Vless)
+        };
+        let server = resolve(&draft).expect("resolves");
+        assert_eq!(
+            parameters(&server)
+                .into_iter()
+                .map(|parameter| (parameter.group, parameter.key, parameter.secret))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Server", "protocol", false),
+                ("Server", "address", false),
+                ("Server", "port", false),
+                ("Credentials", "uuid", true),
+                ("Transport and TLS", "network", false),
+                ("Transport and TLS", "security", false),
+                ("Transport and TLS", "sni", false),
+                ("Transport and TLS", "path", false),
+            ]
+        );
+        let listed = parameters(&server);
+        assert_eq!(listed[0].value, "vless");
+        assert_eq!(listed[1].value, "server.example.invalid");
+        assert_eq!(listed[2].value, "443");
+        assert_eq!(listed[3].value, "11111111-2222-3333-4444-555555555555");
+    }
+
+    /// A plain trojan carries nothing beyond the basics and the password:
+    /// normalized `tcp` and `none`, no absent options.
+    #[test]
+    fn a_plain_trojan_lists_nothing_it_does_not_carry() {
+        let mut draft = base(Protocol::Trojan);
+        draft.password = Some("invented".to_string());
+        let server = resolve(&draft).expect("resolves");
+        assert_eq!(
+            parameters(&server)
+                .into_iter()
+                .map(|parameter| (parameter.group, parameter.key))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Server", "protocol"),
+                ("Server", "address"),
+                ("Server", "port"),
+                ("Credentials", "password"),
+                ("Transport and TLS", "network"),
+                ("Transport and TLS", "security"),
+            ]
+        );
+    }
+
+    /// The hysteria2 half, including the obfs password as a secret and the
+    /// port-hopping ranges a link may carry.
+    #[test]
+    fn a_hysteria2_server_lists_its_settings_and_marks_the_obfs_secret() {
+        let mut draft = base(Protocol::Hysteria2);
+        draft.auth = Some("invented-auth".to_string());
+        draft.hysteria2 = Some(Hysteria2Settings {
+            sni: Some("cover.example.invalid".to_string()),
+            obfs: Some(crate::model::Hysteria2Obfs {
+                kind: "salamander".to_string(),
+                password: "also-invented".to_string(),
+            }),
+            up_mbps: Some(100),
+            down_mbps: Some(500),
+            port_hop: vec![
+                crate::model::PortRange {
+                    start: 40_000,
+                    end: 50_000,
+                },
+                crate::model::PortRange {
+                    start: 60_000,
+                    end: 60_000,
+                },
+            ],
+            ..Hysteria2Settings::default()
+        });
+        let server = resolve(&draft).expect("resolves");
+        let listed = parameters(&server);
+        let pairs = listed
+            .iter()
+            .map(|parameter| (parameter.key, parameter.secret))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            vec![
+                ("protocol", false),
+                ("address", false),
+                ("port", false),
+                ("auth", true),
+                ("sni", false),
+                ("obfs.password", true),
+                ("up_mbps", false),
+                ("down_mbps", false),
+                ("port_hop", false),
+            ]
+        );
+        let port_hop = listed.iter().find(|p| p.key == "port_hop").expect("listed");
+        assert_eq!(port_hop.value, "40000-50000, 60000");
+        let up = listed.iter().find(|p| p.key == "up_mbps").expect("listed");
+        assert_eq!(up.value, "100");
+    }
+
+    /// The patch rides along, pretty-printed, in the group of its own.
+    #[test]
+    fn a_servers_patch_is_listed_pretty() {
+        let mut draft = base(Protocol::Trojan);
+        draft.password = Some("invented".to_string());
+        draft.outbound_patch = Some(serde_json::json!({ "mux": { "enabled": true } }));
+        let server = resolve(&draft).expect("resolves");
+        let patch = parameters(&server)
+            .into_iter()
+            .find(|parameter| parameter.key == "outbound_patch")
+            .expect("the patch is carried");
+        assert_eq!(patch.group, "outbound_patch");
+        assert_eq!(
+            patch.value,
+            "{\n  \"mux\": {\n    \"enabled\": true\n  }\n}"
+        );
     }
 }
