@@ -889,10 +889,12 @@ impl Engine {
                 }
                 continue;
             }
-            if core_clean
-                && interface_clean
-                && (saved.xray_pid.is_some() || saved.interface.is_some())
-            {
+            // A session with neither a PID nor an interface was shut down
+            // cleanly: the drop path clears the PID as its clean marker, and
+            // a plain proxy session never had an interface. There is no
+            // runtime left to restore and none to clean, so it is removed
+            // with the rest rather than kept as a phantom.
+            if core_clean && interface_clean {
                 cleaned_profiles.push(saved.profile.clone());
             }
         }
@@ -2665,6 +2667,32 @@ mod tests {
         Ok(())
     }
 
+    /// A graceful shutdown persists the session with the Xray PID cleared —
+    /// that is the clean marker the drop path writes. A session with no core
+    /// to adopt and no interface to recover has no runtime left, and keeping
+    /// it made the next start list a session that answers `up` with "already
+    /// up" while nothing listens on its ports.
+    #[test]
+    fn a_session_shut_down_cleanly_is_not_remembered_as_up() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("recover-clean-shutdown")?;
+        // Exactly what `Engine::drop` leaves behind for a plain proxy
+        // session: the PID cleared, no interface ever created.
+        State {
+            sessions: vec![saved_profile_session("work", None)],
+        }
+        .save()?;
+
+        let engine = Engine::load();
+
+        assert!(
+            engine.state.sessions.is_empty(),
+            "a clean shutdown's session is a memory, not a session"
+        );
+        assert!(engine.sessions.get("work").is_none());
+        Ok(())
+    }
+
     #[test]
     fn recovery_does_not_forget_an_unrelated_live_process() -> Result<()> {
         use std::process::{Command, Stdio};
@@ -2791,6 +2819,8 @@ mod tests {
 
     #[test]
     fn migration_preserves_the_active_server_and_server_count() -> Result<()> {
+        use std::process::{Command, Stdio};
+
         let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("identity-migration")?;
         let subscription = old_subscription(
@@ -2804,8 +2834,18 @@ mod tests {
         let expected_active = Server::stable_id(&subscription.servers[1].identity_string());
         let server_count = subscription.servers.len();
         store::save(&[subscription])?;
+        // The session is the vehicle for the active-selection assertion, so
+        // it has to survive recovery: a live PID that is not ours is kept,
+        // and with it the selection the migration has to carry across.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut session = saved_session(Some(old_active));
+        session.xray_pid = Some(child.id());
         State {
-            sessions: vec![saved_session(Some(old_active))],
+            sessions: vec![session],
         }
         .save()?;
 
@@ -2821,6 +2861,8 @@ mod tests {
                 .all_servers()
                 .all(|server| server.alias.as_ref().is_some_and(|alias| !alias.is_empty()))
         );
+        child.kill()?;
+        child.wait()?;
         Ok(())
     }
 
@@ -2856,6 +2898,8 @@ mod tests {
 
     #[test]
     fn migration_keeps_the_first_server_when_old_ids_collapse() -> Result<()> {
+        use std::process::{Command, Stdio};
+
         let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("identity-collision")?;
         let mut subscription = old_subscription(
@@ -2867,8 +2911,15 @@ mod tests {
         duplicate.name = "Second".to_string();
         subscription.servers.push(duplicate);
         store::save(&[subscription])?;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut session = saved_session(Some("different-old-id".to_string()));
+        session.xray_pid = Some(child.id());
         State {
-            sessions: vec![saved_session(Some("different-old-id".to_string()))],
+            sessions: vec![session],
         }
         .save()?;
 
@@ -2886,6 +2937,8 @@ mod tests {
             engine.active_server_id(),
             engine.all_servers().next().map(|server| server.id.clone())
         );
+        child.kill()?;
+        child.wait()?;
         Ok(())
     }
 

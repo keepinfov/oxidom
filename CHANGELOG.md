@@ -44,6 +44,8 @@ surface, packaging, or the CLI belongs here.
 - A daemon restart no longer erases the GUI's own log lines from the log view. The reset round
   now carries this process's lines back with it, so what the app itself did around the restart
   stays readable beside the new run's output.
+- A plain proxy session shut down cleanly is no longer remembered as up after a daemon restart,
+  which made `up` answer "already up" for a profile whose ports nothing was listening on.
 
 ## [0.3.1] - 2026-08-23
 

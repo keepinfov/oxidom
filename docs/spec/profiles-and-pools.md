@@ -198,4 +198,7 @@ The single GNOME system-proxy owner is runtime state in `Sessions`, not persiste
 it is released when its session stops or its core dies. On daemon startup, each recovered Xray
 PID is checked against its own `current-config-<profile>.json`, each tun2socks PID must contain
 `--device <our-device>`, and recorded interface resources are removed before the state entry is
-forgotten.
+forgotten. A session with nothing to recover — the PID cleared as the clean-shutdown marker, and
+no interface — is forgotten as well: a session is a running profile, not a remembered
+connection. Only a live pool core is adopted, and an entry that could not be confirmed stopped
+stays recorded for the next start to try again.
