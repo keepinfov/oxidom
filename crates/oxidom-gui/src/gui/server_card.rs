@@ -393,6 +393,10 @@ pub struct CardHandlers {
     /// Take the provider's value back for one overridden field, named as
     /// the override keys spell it (`stream.sni`, `port`).
     pub drop_override: Rc<dyn Fn(String)>,
+    /// A share-link was copied, with what it does not carry — so the action
+    /// names its limits rather than handing over a server that works here
+    /// and not there.
+    pub share_copied: Rc<dyn Fn(Vec<String>)>,
     /// Open the log page narrowed to this server. Offered only beside a failed
     /// check, because that is the one place where what the core printed is the
     /// next thing anybody wants and the log is where it went.
@@ -557,6 +561,7 @@ impl ServerCard {
             toggle_favourite,
             edit: on_edit,
             drop_override: on_drop_override,
+            share_copied: on_share_copied,
             show_logs: on_show_logs,
             report: on_report,
         } = handlers;
@@ -760,20 +765,32 @@ impl ServerCard {
         edit_button.add_css_class("server-action");
         edit_button.set_visible(editable);
         edit_button.connect_clicked(move |_| on_edit());
+        // A server with no link of its own still has one to give: the
+        // canonical form of its stored fields. What that link cannot
+        // express — a pinned certificate, a patch, a vmess gRPC authority —
+        // is named when it is copied, so handing a server to somebody else
+        // does not silently hand them one that works here and not there.
+        let link = oxidom_core::subscription_format::share_link(server);
+        let not_carried = oxidom_core::subscription_format::link_cannot_carry(server);
         let copy_button = gtk::Button::builder()
             .icon_name("edit-copy-symbolic")
-            .tooltip_text(if server.link.is_some() {
+            .tooltip_text(if link.is_some() {
                 "Copy share-link"
             } else {
-                "Composite profiles cannot be copied as one share-link"
+                "A composite profile is several outbounds; no single share-link can express it"
             })
             .valign(gtk::Align::Center)
-            .sensitive(server.link.is_some())
+            .sensitive(link.is_some())
             .css_classes(["flat", "server-action"])
             .build();
         copy_button.update_property(&[gtk::accessible::Property::Label("Copy share-link")]);
-        if let Some(link) = server.link.clone() {
-            copy_button.connect_clicked(move |button| button.clipboard().set_text(&link));
+        if let Some(link) = link {
+            let not_carried = not_carried.clone();
+            let on_share_copied = on_share_copied.clone();
+            copy_button.connect_clicked(move |button| {
+                button.clipboard().set_text(&link);
+                on_share_copied(not_carried.clone());
+            });
         }
         let ping_button = gtk::Button::builder()
             .icon_name(ping_icon(false))

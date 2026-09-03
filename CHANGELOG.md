@@ -15,6 +15,10 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Added
+- **Handing a server to somebody else names what the share-link cannot carry.** The copy
+  action produces a link even for a server typed by hand, and announces the fields the link
+  drops — a pinned certificate, an outbound patch, a vmess gRPC authority — in the editor's
+  own spelling. A composite profile says why it cannot be one link instead of guessing.
 - **An existing server can be edited without being removed and added again.** The expanded
   card gains an edit action that opens the same dialog a server is created in, prefilled; the
   id, the alias and the pinned certificate stay. For a subscription's server the changed

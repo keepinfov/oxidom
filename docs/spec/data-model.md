@@ -138,6 +138,19 @@ it would mean a server stopped matching its own refreshed entry the moment someo
 certificate, losing the alias and the stable id along with the pin. A pin the provider itself
 sends is not overwritten by a carried one.
 
+### Handing a server back as a share link (binding)
+
+`subscription_format::share_link(server)` is the link the copy action produces: the server's own
+link when it arrived as one, otherwise the canonical form of its stored fields — so a server
+typed by hand still has something to hand over. Only a composite Xray profile yields `None`.
+
+`subscription_format::link_cannot_carry(server)` names what that link would drop, as draft field
+names. It is measured, not maintained: the canonical link is written from the stored fields,
+parsed back, and the two drafts diffed — a field that reads back absent is what the link cannot
+express (a pinned certificate, an `outbound_patch`, a vmess gRPC `authority`). The writer and
+the list are the same code, and the copy action announces the list rather than handing over a
+server that works for one person and not the other.
+
 Derive `country` from a leading flag emoji, or from a leading two-letter token that is an
 assigned ISO 3166-1 alpha-2 code — `🇩🇪 Frankfurt` and `DE-2 HYSTERIA2` both give `DE`. Only the
 **first** token counts, and only a real code (binding): `IS`, `IT`, `NO`, `ME`, `AT` and `WS` are

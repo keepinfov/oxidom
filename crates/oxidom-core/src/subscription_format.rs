@@ -754,6 +754,40 @@ fn finish_server(
     server
 }
 
+/// The share link a stored server can be handed over as — its own link when
+/// it arrived as one, otherwise the canonical form of its stored fields.
+/// `None` only for a composite profile, which no single link can express.
+pub fn share_link(server: &Server) -> Option<String> {
+    server.link.clone().or_else(|| canonical_share_link(server))
+}
+
+/// What a share link for this server would not carry, as draft field names
+/// — the names the editor and the card's listing spell.
+///
+/// Measured, not maintained: the canonical link is written from the stored
+/// fields, parsed back, and the two drafts compared. A field that reads
+/// back absent is what the link cannot express, so the writer and this
+/// list cannot drift apart — they are the same code.
+pub fn link_cannot_carry(server: &Server) -> Vec<String> {
+    let Some(link) = canonical_share_link(server) else {
+        return Vec::new();
+    };
+    let Some(read_back) = crate::link::parse_link(&link) else {
+        log::warn!(
+            "the canonical share link of {:?} does not parse back",
+            server.name
+        );
+        return Vec::new();
+    };
+    let before = crate::draft::draft_from_server(server);
+    let after = crate::draft::draft_from_server(&read_back);
+    crate::draft::diff(&before, &after)
+        .into_iter()
+        .filter(|(_key, value)| value.is_null())
+        .map(|(key, _)| key)
+        .collect()
+}
+
 fn canonical_share_link(server: &Server) -> Option<String> {
     match &server.spec {
         OutboundSpec::Hysteria2 { auth, settings } => {
@@ -1224,6 +1258,8 @@ fn string_vec(value: Option<&Value>) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{link_cannot_carry, share_link};
+
     /// A sing-box body of the shape a panel actually serves: nodes, a rule
     /// list, and named sets — one of which is a pointer to somewhere else.
     /// The servers come through and nothing else does, which is correct; the
@@ -1942,6 +1978,113 @@ proxies:
             assert!(
                 !error.contains("<html") && !error.contains("subscription</title>"),
                 "the body is classified, never quoted back: {error}"
+            );
+        }
+
+        /// A hand-made server has no link of its own, and every field a
+        /// plain trojan carries fits its share link: the copy action has
+        /// something to hand over and nothing to warn about.
+        #[test]
+        fn a_hand_made_server_gets_a_link_that_carries_everything() {
+            let mut draft = crate::draft::ServerDraft {
+                name: "Typed".to_string(),
+                protocol: crate::model::Protocol::Trojan,
+                address: "server.example.invalid".to_string(),
+                port: 443,
+                password: Some("invented".to_string()),
+                ..Default::default()
+            };
+            draft.stream = Some(crate::model::StreamSettings::default());
+            let server = crate::draft::resolve(&draft).expect("resolves");
+            assert!(
+                server.link.is_none(),
+                "a typed server carries no link of its own"
+            );
+
+            let link = share_link(&server).expect("the stored fields express a link");
+            assert!(link.starts_with("trojan://"), "{link}");
+            assert_eq!(
+                link_cannot_carry(&server),
+                Vec::<String>::new(),
+                "everything the server carries rides the link"
+            );
+        }
+
+        /// A pinned certificate and an outbound patch never travel: the pin
+        /// is this machine's decision, the patch is a local escape hatch.
+        /// Both are named, in the editor's own spelling.
+        #[test]
+        fn a_link_names_what_it_cannot_carry() {
+            let mut draft = crate::draft::ServerDraft {
+                name: "Typed".to_string(),
+                protocol: crate::model::Protocol::Vless,
+                address: "server.example.invalid".to_string(),
+                port: 443,
+                uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
+                ..Default::default()
+            };
+            draft.stream = Some(crate::model::StreamSettings {
+                network: "tcp".to_string(),
+                security: "tls".to_string(),
+                pin_sha256: Some("a".repeat(64)),
+                ..Default::default()
+            });
+            draft.outbound_patch = Some(serde_json::json!({ "mux": { "enabled": true } }));
+            let server = crate::draft::resolve(&draft).expect("resolves");
+
+            assert_eq!(
+                link_cannot_carry(&server),
+                vec![
+                    "outbound_patch".to_string(),
+                    "stream.pin_sha256".to_string()
+                ],
+                "the writer and the list are the same code: what left is what the link \
+                 cannot express"
+            );
+        }
+
+        /// The vmess link has nowhere to put a gRPC authority; the list
+        /// says so rather than handing over a server that works here and
+        /// not there.
+        #[test]
+        fn a_vmess_link_cannot_carry_a_grpc_authority() {
+            let mut draft = crate::draft::ServerDraft {
+                name: "Typed".to_string(),
+                protocol: crate::model::Protocol::Vmess,
+                address: "server.example.invalid".to_string(),
+                port: 443,
+                uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
+                ..Default::default()
+            };
+            draft.stream = Some(crate::model::StreamSettings {
+                network: "grpc".to_string(),
+                security: "tls".to_string(),
+                service_name: Some("gun".to_string()),
+                grpc_authority: Some("cover.example.invalid".to_string()),
+                ..Default::default()
+            });
+            let server = crate::draft::resolve(&draft).expect("resolves");
+
+            assert_eq!(
+                link_cannot_carry(&server),
+                vec!["stream.grpc_authority".to_string()]
+            );
+        }
+
+        /// A server's own link wins over the canonical rewrite — the link it
+        /// arrived as is the one to hand back.
+        #[test]
+        fn a_servers_own_link_wins_over_the_canonical_form() {
+            let server = crate::link::parse_link(
+                "vless://test-id@example.com:443?encryption=none&type=tcp&security=none#Kept",
+            )
+            .expect("parses");
+
+            let link = share_link(&server).expect("expressible");
+
+            assert_eq!(
+                link,
+                "vless://test-id@example.com:443?encryption=none&type=tcp&security=none#Kept"
             );
         }
     }

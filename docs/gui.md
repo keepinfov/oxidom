@@ -274,6 +274,16 @@ its own.
 An edit does not restart a connected profile; the next connect uses the edited
 fields.
 
+### Handing a server to somebody else
+
+The copy action on an expanded card produces a share-link even for a server
+typed by hand — the canonical form of what it carries. A share link is not the
+whole server: what it cannot express (a pinned certificate, an `outbound_patch`,
+a vmess gRPC `authority`) is named right after copying, so the server you hand
+over does not quietly work for you and not for them. A composite profile —
+several outbounds behind a balancer — cannot be one link at all, and the button
+says so instead of guessing.
+
 Opening a subscription shows two rows only when they have something to report,
 because a row reading "none" on every healthy subscription is furniture:
 

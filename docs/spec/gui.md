@@ -57,6 +57,10 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
      field is marked and carries a per-row action that drops the override and takes the
      provider's value back — the drop is `DropOverride`, not a local repaint, so the store and
      the card cannot disagree. A composite profile shows no edit action: it has no fields.
+   - **The copy action hands over a link and names its limits.** A server without a link of its
+     own — typed by hand — gets the canonical form of its stored fields. When the link cannot
+     carry something the server has, the action says so after copying, in the field names the
+     editor uses; a composite profile's button is insensitive and its tooltip says why.
   - **Selectable text keeps its own menu.** The gesture bubbles rather than captures, so a
     metadata label that is selectable answers a right-click with the text menu and the card menu
     covers everything else. Those labels are selectable so an address or a failure reason can be

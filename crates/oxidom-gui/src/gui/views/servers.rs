@@ -70,6 +70,8 @@ pub struct CardCallbacks {
     pub edit: Rc<dyn Fn(String)>,
     /// Take the provider's value back for one overridden field.
     pub drop_override: Rc<dyn Fn(String, String)>,
+    /// A share-link was copied, with what it does not carry.
+    pub share_copied: Rc<dyn Fn(Vec<String>)>,
     pub create_pool: Rc<dyn Fn(PoolQuery)>,
     /// Run the group on screen, now. Writes no profile and confirms nothing —
     /// `create_pool` is where a selection is saved, and it is a separate,
@@ -896,6 +898,10 @@ impl ServersView {
                     let id = id.clone();
                     move |field| cb(id.clone(), field)
                 };
+                let on_share_copied = {
+                    let cb = callbacks.share_copied.clone();
+                    move |not_carried| cb(not_carried)
+                };
                 let on_show_logs = {
                     let cb = callbacks.show_logs.clone();
                     let id = id.clone();
@@ -937,6 +943,7 @@ impl ServersView {
                         },
                         edit: Rc::new(on_edit),
                         drop_override: Rc::new(on_drop_override),
+                        share_copied: Rc::new(on_share_copied),
                         show_logs: Rc::new(on_show_logs),
                         report: Rc::new(on_report),
                     },
