@@ -2164,6 +2164,21 @@ impl Controller {
                     }
                 })
             },
+            share_copied: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |not_carried: Vec<String>| {
+                    if let Some(controller) = weak.upgrade() {
+                        if not_carried.is_empty() {
+                            controller.show_message("Copied share-link");
+                        } else {
+                            controller.show_message(&format!(
+                                "Copied share-link — it does not carry: {}",
+                                not_carried.join(", ")
+                            ));
+                        }
+                    }
+                })
+            },
             create_pool: {
                 let weak = Rc::downgrade(self);
                 Rc::new(move |query| {
