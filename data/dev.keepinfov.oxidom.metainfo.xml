@@ -43,6 +43,32 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.4.0" date="2026-09-04">
+      <description>
+        <p>
+          Servers are no longer only what a provider sends. One can be typed
+          in field by field, edited in place without losing its alias or its
+          pinned certificate — and on a subscription, an edit survives every
+          refresh, with the card marking what was overridden and offering to
+          take the provider's value back. The expanded card lists every
+          parameter the server carries, credentials masked until revealed,
+          and handing a server to somebody else as a share-link now names
+          what the link cannot carry instead of passing on a server that
+          works for one person and not the other.
+        </p>
+        <p>
+          The Xray core is managed: the tested release is downloaded into
+          oxidom's own data directory on first use and verified against a
+          digest pinned in its source, so nothing has to be installed by
+          hand. XHTTP and gRPC nodes keep the transport settings their links
+          specify, a latency check started before a reconnect no longer
+          paints a healthy tunnel as failed, the log view neither repeats
+          lines written during an operation nor loses the app's own lines to
+          a daemon restart, and a session shut down cleanly is no longer
+          remembered as running when nothing listens on its ports.
+        </p>
+      </description>
+    </release>
     <release version="0.3.1" date="2026-08-23">
       <description>
         <p>
