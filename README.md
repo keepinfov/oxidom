@@ -54,10 +54,11 @@ before running it.
 page](https://github.com/keepinfov/oxidom/releases): `chmod +x` and run it. It
 carries its own GTK, libadwaita, glibc *and* an Xray core.
 
-**An Xray core is required and is not bundled** (except in the AppImage). No
-distribution packages one, so no package here can depend on it: run
-`oxidom status` and it names the exact download for this machine. Settings ›
-Xray core will fetch it for you.
+**The Xray core is managed for you.** On first use oxidom downloads the tested
+Xray release into its own private data directory and verifies the archive
+against a digest pinned in its source — no package manager and no
+administrator needed. An offline machine can point `xray_binary` at a core of
+the same version instead.
 
 Everything else — NixOS, Nix, Arch, from source, the tested distro matrix — is in
 **[docs/installation.md](docs/installation.md)**.
@@ -110,7 +111,7 @@ services.oxidom.tun.enable = true;      # allow TUN interfaces
 ```
 
 **From source:** a Rust toolchain (1.85+), GTK4 and libadwaita development
-packages, and an `xray` binary.
+packages. The Xray core needs no installing first — it is managed, above.
 
 Full instructions, the tested distro matrix, and the from-source asset list are in
 **[docs/installation.md](docs/installation.md)**.
