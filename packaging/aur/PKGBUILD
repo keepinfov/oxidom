@@ -7,12 +7,14 @@ arch=(x86_64 aarch64)
 url="https://github.com/keepinfov/oxidom"
 license=(MIT)
 depends=(gcc-libs gdk-pixbuf2 glib2 glibc gtk4 hicolor-icon-theme libadwaita pango)
-# Every provider of an Xray core — xray, xray-bin, xray-git — lives in the AUR,
-# and pacman cancels an entire transaction when one target is missing. As a hard
-# dependency it therefore took gtk4 and libadwaita down with it, and `makepkg -si`
-# failed before it reached a compiler. oxidom starts without a core and says so
-# in a banner; connecting and checking latency both need one.
-optdepends=('xray: the proxy core — nothing can connect without it (AUR)'
+# oxidom manages its own Xray core — an empty `xray_binary` installs the
+# pinned release into the daemon's private data directory — so a system core
+# is an override, accepted only when it reports that same version. Every
+# provider — xray, xray-bin, xray-git — lives in the AUR, and pacman cancels
+# an entire transaction when one target is missing: as a hard dependency it
+# took gtk4 and libadwaita down with it, and `makepkg -si` failed before it
+# reached a compiler.
+optdepends=('xray: override for the managed pinned core, same version only (AUR)'
             'tun2socks: TUN interface mode'
             'nftables: per-app routing for `oxidom run`')
 makedepends=(git cargo)

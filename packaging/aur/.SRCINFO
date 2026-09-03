@@ -16,7 +16,7 @@ pkgbase = oxidom-git
 	depends = hicolor-icon-theme
 	depends = libadwaita
 	depends = pango
-	optdepends = xray: the proxy core — nothing can connect without it (AUR)
+	optdepends = xray: override for the managed pinned core, same version only (AUR)
 	optdepends = tun2socks: TUN interface mode
 	optdepends = nftables: per-app routing for `oxidom run`
 	provides = oxidom=0.1.0.r120.gb92035a
