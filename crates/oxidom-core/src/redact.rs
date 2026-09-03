@@ -1400,6 +1400,7 @@ mod tests {
             link: None,
             alias: Some(alias.to_string()),
             outbound_patch: None,
+            overrides: None,
             latency_ms: None,
         }
     }

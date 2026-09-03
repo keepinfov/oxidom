@@ -345,6 +345,134 @@ impl Registry {
         store::save(&self.subscriptions)?;
         Ok(())
     }
+
+    /// Edit one stored server through the same validator a draft passes.
+    ///
+    /// The id never changes: profiles, aliases and unit names hang off it.
+    /// In the local group the edit replaces the fields. A subscription's
+    /// server instead records the changed fields as overrides, so the next
+    /// refresh — which brings the provider's copy — puts them back on top.
+    /// An edit back to what the provider last sent clears the override
+    /// rather than recording a decision that matches the default.
+    pub fn update_server(
+        &mut self,
+        server_id: &str,
+        draft: &crate::draft::ServerDraft,
+    ) -> Result<Server> {
+        let resolved = crate::draft::resolve(draft).map_err(|error| anyhow!("{error}"))?;
+        let (sub_index, server_index) = self
+            .subscriptions
+            .iter()
+            .enumerate()
+            .find_map(|(sub_index, sub)| {
+                sub.servers
+                    .iter()
+                    .position(|server| server.id == server_id)
+                    .map(|server_index| (sub_index, server_index))
+            })
+            .ok_or_else(|| anyhow!("server not found"))?;
+        let subscription_server = self.subscriptions[sub_index].id != LOCAL_ID;
+        {
+            let stored = &self.subscriptions[sub_index].servers[server_index];
+            if subscription_server && resolved.protocol != stored.protocol {
+                return Err(anyhow!(
+                    "a subscription server cannot change protocol; add another server instead"
+                ));
+            }
+            if let Some(existing) = self.local_group_server(resolved.id.as_str())
+                && existing.id != server_id
+            {
+                return Err(anyhow!(
+                    "the edit would make this server identical to {:?}",
+                    existing.name
+                ));
+            }
+        }
+
+        let stored = self.subscriptions[sub_index].servers[server_index].clone();
+        let mut effective = resolved;
+        effective.id = stored.id.clone();
+        effective.alias = stored.alias.clone();
+        effective.link = stored.link.clone();
+        effective.latency_ms = stored.latency_ms;
+        if subscription_server {
+            let before = crate::draft::draft_from_server(&stored);
+            let changed = crate::draft::diff(&before, draft);
+            let mut overrides = stored.overrides.clone().unwrap_or_default();
+            for (key, value) in changed {
+                if !overrides.provider.contains_key(&key)
+                    && let Some(base) = crate::draft::field_value(&stored, &key)
+                {
+                    overrides.provider.insert(key.clone(), base);
+                }
+                // `null` is the diff's spelling for a cleared field; the one
+                // non-optional string spells it as empty.
+                let value = if key == "name" && value.is_null() {
+                    serde_json::Value::String(String::new())
+                } else {
+                    value
+                };
+                overrides.values.insert(key, value);
+            }
+            let settled: Vec<String> = overrides
+                .values
+                .iter()
+                .filter(|(key, value)| Some(*value) == overrides.provider.get(*key))
+                .map(|(key, _)| (*key).clone())
+                .collect();
+            for key in settled {
+                overrides.values.remove(&key);
+                overrides.provider.remove(&key);
+            }
+            effective.overrides = (!overrides.values.is_empty()).then_some(overrides);
+        }
+        self.subscriptions[sub_index].servers[server_index] = effective;
+        store::save(&self.subscriptions)?;
+        Ok(self.subscriptions[sub_index].servers[server_index].clone())
+    }
+
+    /// Drop one override and take back what the provider last sent for the
+    /// field. Any other override stays.
+    pub fn drop_server_override(&mut self, server_id: &str, field: &str) -> Result<Server> {
+        let (sub_index, server_index) = self
+            .subscriptions
+            .iter()
+            .enumerate()
+            .find_map(|(sub_index, sub)| {
+                sub.servers
+                    .iter()
+                    .position(|server| server.id == server_id)
+                    .map(|server_index| (sub_index, server_index))
+            })
+            .ok_or_else(|| anyhow!("server not found"))?;
+        let stored = self.subscriptions[sub_index].servers[server_index].clone();
+        let mut overrides = stored
+            .overrides
+            .clone()
+            .ok_or_else(|| anyhow!("nothing is overridden for this server"))?;
+        let value = overrides
+            .provider
+            .remove(field)
+            .ok_or_else(|| anyhow!("{field:?} is not overridden"))?;
+        overrides.values.remove(field);
+        let restored = std::iter::once((field.to_string(), value)).collect();
+        let mut effective = crate::draft::apply_overrides(&stored, &restored).ok_or_else(|| {
+            anyhow!("the provider's {field} no longer resolves with the rest of the server")
+        })?;
+        effective.overrides = (!overrides.values.is_empty()).then_some(overrides);
+        self.subscriptions[sub_index].servers[server_index] = effective;
+        store::save(&self.subscriptions)?;
+        Ok(self.subscriptions[sub_index].servers[server_index].clone())
+    }
+
+    fn local_group_server(&self, server_id: &str) -> Option<&Server> {
+        self.subscriptions
+            .iter()
+            .find(|sub| sub.id == LOCAL_ID)?
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+    }
 }
 
 /// Runtime half of a profile interface. Its plan remains available while the
@@ -978,6 +1106,21 @@ impl Engine {
 
     pub fn add_server(&mut self, server: Server) -> Result<Server> {
         self.registry.add_server(server)
+    }
+
+    /// Edit a stored server. A running session keeps its current core: the
+    /// next connect uses the edited fields, and restarting a live tunnel is
+    /// not a side effect an edit should have.
+    pub fn update_server(
+        &mut self,
+        server_id: &str,
+        draft: &crate::draft::ServerDraft,
+    ) -> Result<Server> {
+        self.registry.update_server(server_id, draft)
+    }
+
+    pub fn drop_server_override(&mut self, server_id: &str, field: &str) -> Result<Server> {
+        self.registry.drop_server_override(server_id, field)
     }
 
     pub fn remove_server(&mut self, server_id: &str) -> Result<bool> {
@@ -2814,6 +2957,193 @@ mod tests {
             .expect_err("the identical server is refused");
 
         assert!(error.to_string().contains("Typed"), "{error:#}");
+        Ok(())
+    }
+
+    /// Fixing a typo in a hand-made server keeps the server's history: the
+    /// id, the alias and the last reading stay, and no override is recorded
+    /// — the local group has no provider to override.
+    #[test]
+    fn editing_a_hand_made_server_keeps_its_id_and_alias() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("edit-hand-made")?;
+        let mut engine = Engine::load();
+        let stored = engine.add_server(crate::draft::resolve(&typed_draft())?)?;
+        let mut edited = typed_draft();
+        edited.port = 2053;
+
+        let updated = engine.update_server(&stored.id, &edited)?;
+
+        assert_eq!(updated.id, stored.id, "the server stays itself");
+        assert_eq!(updated.alias, stored.alias);
+        assert_eq!(updated.port, 2053);
+        assert!(
+            updated.overrides.is_none(),
+            "there is no provider to override"
+        );
+        let reread = engine
+            .registry
+            .subscriptions
+            .iter()
+            .flat_map(|sub| sub.servers.iter())
+            .find(|server| server.id == stored.id)
+            .ok_or_else(|| anyhow!("the server vanished"))?;
+        assert_eq!(reread.port, 2053, "the edit reached the store");
+        Ok(())
+    }
+
+    /// Editing a subscription's server records the changed fields as
+    /// overrides against what the provider last sent, and the unchanged
+    /// fields stay as the provider delivered them.
+    #[test]
+    fn editing_a_subscription_server_records_overrides() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("edit-subscription")?;
+        let link = "vless://test-id@example.com:443?encryption=none&type=tcp&security=tls&sni=old.example.com#Edited";
+        let subscription = old_subscription("https://subscription.example/token", &[link]);
+        crate::state::store::save(&[subscription])?;
+        let mut engine = Engine::load();
+        let stored = engine
+            .registry
+            .subscriptions
+            .iter()
+            .flat_map(|sub| sub.servers.iter())
+            .find(|server| server.address == "example.com")
+            .ok_or_else(|| anyhow!("the subscription server is missing"))?
+            .clone();
+        let mut draft = crate::draft::draft_from_server(&stored);
+        draft.port = 8443;
+        draft.stream.as_mut().expect("vless carries a stream").sni =
+            Some("edited.example.invalid".to_string());
+
+        let updated = engine.update_server(&stored.id, &draft)?;
+
+        assert_eq!(updated.id, stored.id, "editing never changes the id");
+        assert_eq!(updated.port, 8443);
+        let overrides = updated.overrides.as_ref().expect("recorded");
+        assert_eq!(
+            overrides.values,
+            vec![
+                ("port".to_string(), serde_json::json!(8443)),
+                (
+                    "stream.sni".to_string(),
+                    serde_json::json!("edited.example.invalid")
+                ),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+        );
+        assert_eq!(
+            overrides.provider.get("port"),
+            Some(&serde_json::json!(443)),
+            "the base is what the provider last sent"
+        );
+        Ok(())
+    }
+
+    /// An edit back to what the provider last sent clears the override
+    /// rather than recording a decision that matches the default.
+    #[test]
+    fn editing_back_to_the_providers_value_clears_the_override() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("edit-back-clears")?;
+        let link = "trojan://invented@example.com:443?security=none#Editable";
+        let subscription = old_subscription("https://subscription.example/token", &[link]);
+        crate::state::store::save(&[subscription])?;
+        let mut engine = Engine::load();
+        let stored = engine
+            .registry
+            .subscriptions
+            .iter()
+            .flat_map(|sub| sub.servers.iter())
+            .find(|server| server.address == "example.com")
+            .ok_or_else(|| anyhow!("the subscription server is missing"))?
+            .clone();
+        let mut draft = crate::draft::draft_from_server(&stored);
+        draft.port = 8443;
+        let overridden = engine.update_server(&stored.id, &draft)?;
+        assert!(overridden.overrides.is_some());
+
+        let mut draft = crate::draft::draft_from_server(&overridden);
+        draft.port = 443;
+        let restored = engine.update_server(&stored.id, &draft)?;
+
+        assert!(restored.overrides.is_none(), "the decision was withdrawn");
+        assert_eq!(restored.port, 443);
+        Ok(())
+    }
+
+    /// Dropping an override takes back the provider's last value and keeps
+    /// every other decision.
+    #[test]
+    fn dropping_an_override_takes_the_providers_value_back() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("drop-override")?;
+        let link = "vless://test-id@example.com:443?encryption=none&type=ws&security=none&path=%2Fws#Droppable";
+        let subscription = old_subscription("https://subscription.example/token", &[link]);
+        crate::state::store::save(&[subscription])?;
+        let mut engine = Engine::load();
+        let stored = engine
+            .registry
+            .subscriptions
+            .iter()
+            .flat_map(|sub| sub.servers.iter())
+            .find(|server| server.address == "example.com")
+            .ok_or_else(|| anyhow!("the subscription server is missing"))?
+            .clone();
+        let mut draft = crate::draft::draft_from_server(&stored);
+        draft.port = 8443;
+        draft.stream.as_mut().expect("vless carries a stream").host =
+            Some("edited.example.invalid".to_string());
+        let overridden = engine.update_server(&stored.id, &draft)?;
+        assert_eq!(overridden.port, 8443);
+
+        let restored = engine.drop_server_override(&stored.id, "port")?;
+
+        assert_eq!(restored.port, 443, "the provider's value came back");
+        assert_eq!(
+            restored
+                .spec
+                .stream()
+                .and_then(|stream| stream.host.clone()),
+            Some("edited.example.invalid".to_string()),
+            "the other override stands"
+        );
+        assert_eq!(
+            restored.overrides.as_ref().map(|o| o.values.len()),
+            Some(1),
+            "only the one decision was dropped"
+        );
+        Ok(())
+    }
+
+    /// A subscription server's protocol is its own; the fields under another
+    /// protocol would not be the same server with a typo fixed.
+    #[test]
+    fn a_subscription_server_cannot_change_protocol() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("edit-protocol-refused")?;
+        let link = "trojan://invented@example.com:443?security=none#Immutable";
+        let subscription = old_subscription("https://subscription.example/token", &[link]);
+        crate::state::store::save(&[subscription])?;
+        let mut engine = Engine::load();
+        let stored = engine
+            .registry
+            .subscriptions
+            .iter()
+            .flat_map(|sub| sub.servers.iter())
+            .find(|server| server.address == "example.com")
+            .ok_or_else(|| anyhow!("the subscription server is missing"))?
+            .clone();
+        let mut draft = crate::draft::draft_from_server(&stored);
+        draft.protocol = crate::model::Protocol::Vless;
+        draft.uuid = Some("11111111-2222-3333-4444-555555555555".to_string());
+
+        let error = engine
+            .update_server(&stored.id, &draft)
+            .expect_err("the protocol change is refused");
+
+        assert!(error.to_string().contains("protocol"), "{error:#}");
         Ok(())
     }
 

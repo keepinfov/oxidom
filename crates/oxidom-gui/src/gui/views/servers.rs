@@ -66,6 +66,10 @@ pub struct CardCallbacks {
     pub recheck: Rc<dyn Fn(Vec<String>)>,
     pub refresh: Rc<dyn Fn(String)>,
     pub set_alias: Rc<dyn Fn(String, String)>,
+    /// Open the server dialog prefilled with this server.
+    pub edit: Rc<dyn Fn(String)>,
+    /// Take the provider's value back for one overridden field.
+    pub drop_override: Rc<dyn Fn(String, String)>,
     pub create_pool: Rc<dyn Fn(PoolQuery)>,
     /// Run the group on screen, now. Writes no profile and confirms nothing —
     /// `create_pool` is where a selection is saved, and it is a separate,
@@ -882,6 +886,16 @@ impl ServersView {
                     let id = id.clone();
                     move |alias| cb(id.clone(), alias)
                 };
+                let on_edit = {
+                    let cb = callbacks.edit.clone();
+                    let id = id.clone();
+                    move || cb(id.clone())
+                };
+                let on_drop_override = {
+                    let cb = callbacks.drop_override.clone();
+                    let id = id.clone();
+                    move |field| cb(id.clone(), field)
+                };
                 let on_show_logs = {
                     let cb = callbacks.show_logs.clone();
                     let id = id.clone();
@@ -921,6 +935,8 @@ impl ServersView {
                             let id = id.clone();
                             Rc::new(move || view.toggle_favourite(&id))
                         },
+                        edit: Rc::new(on_edit),
+                        drop_override: Rc::new(on_drop_override),
                         show_logs: Rc::new(on_show_logs),
                         report: Rc::new(on_report),
                     },

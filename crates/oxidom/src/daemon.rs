@@ -2325,6 +2325,39 @@ impl Service {
         .map_err(failed)
     }
 
+    /// Edit one stored server, validated through the same path that
+    /// generates an Xray outbound; the id never changes. The draft arrives
+    /// as JSON, as with `CreateServer`, so the wire signature stays put
+    /// while the draft grows fields. A subscription's server records the
+    /// changed fields as overrides; a hand-made one is simply rewritten.
+    fn update_server(&self, server_id: String, draft: String) -> fdo::Result<String> {
+        let draft: oxidom_core::draft::ServerDraft = serde_json::from_str(&draft)
+            .map_err(|error| failed(format!("the draft does not parse: {error}")))?;
+        let stored = oxidom_core::sync::lock(&self.shared.engine)
+            .update_server(&server_id, &draft)
+            .map_err(failed)?;
+        serde_json::to_string(&oxidom_core::ipc::CreatedServer {
+            id: stored.id,
+            name: stored.name,
+            alias: stored.alias,
+        })
+        .map_err(failed)
+    }
+
+    /// Drop one override from a subscription's server and take back what
+    /// the provider last sent for the field.
+    fn drop_override(&self, server_id: String, field: String) -> fdo::Result<String> {
+        let stored = oxidom_core::sync::lock(&self.shared.engine)
+            .drop_server_override(&server_id, &field)
+            .map_err(failed)?;
+        serde_json::to_string(&oxidom_core::ipc::CreatedServer {
+            id: stored.id,
+            name: stored.name,
+            alias: stored.alias,
+        })
+        .map_err(failed)
+    }
+
     /// Read the certificate a server presents, without judging it.
     ///
     /// Two steps rather than one — inspect, then trust — so the value stored is

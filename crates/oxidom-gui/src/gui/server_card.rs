@@ -387,6 +387,12 @@ pub struct CardHandlers {
     pub trust: Rc<dyn Fn()>,
     pub set_alias: Rc<dyn Fn(String)>,
     pub toggle_favourite: Rc<dyn Fn()>,
+    /// Open the server dialog prefilled with this server. Not offered for a
+    /// composite profile, which has no fields to edit.
+    pub edit: Rc<dyn Fn()>,
+    /// Take the provider's value back for one overridden field, named as
+    /// the override keys spell it (`stream.sni`, `port`).
+    pub drop_override: Rc<dyn Fn(String)>,
     /// Open the log page narrowed to this server. Offered only beside a failed
     /// check, because that is the one place where what the core printed is the
     /// next thing anybody wants and the log is where it went.
@@ -549,6 +555,8 @@ impl ServerCard {
             trust: on_trust,
             set_alias: on_set_alias,
             toggle_favourite,
+            edit: on_edit,
+            drop_override: on_drop_override,
             show_logs: on_show_logs,
             report: on_report,
         } = handlers;
@@ -740,6 +748,18 @@ impl ServerCard {
         edit_alias.connect_clicked(move |button| {
             show_alias_dialog(button, current_alias.as_deref(), on_set_alias.clone());
         });
+        // The same dialog a server is created in, prefilled — the pencil
+        // next to it only ever changed one field. A composite profile has
+        // no fields to edit, so it gets no button rather than a dialog that
+        // cannot be filled.
+        let editable = !matches!(
+            server.spec,
+            oxidom_core::model::OutboundSpec::XrayProfile { .. }
+        );
+        let edit_button = icon_button("document-properties-symbolic", "Edit server");
+        edit_button.add_css_class("server-action");
+        edit_button.set_visible(editable);
+        edit_button.connect_clicked(move |_| on_edit());
         let copy_button = gtk::Button::builder()
             .icon_name("edit-copy-symbolic")
             .tooltip_text(if server.link.is_some() {
@@ -800,6 +820,7 @@ impl ServerCard {
         action_row.set_hexpand(true);
         action_row.append(&favourite_button);
         action_row.append(&edit_alias);
+        action_row.append(&edit_button);
         action_row.append(&copy_button);
         action_row.append(&ping_button);
         let action_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -946,6 +967,13 @@ impl ServerCard {
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["dim-label", "server-meta"])
                 .build();
+            // What the user overrode reads as their decision: marked, with
+            // a way back to what the provider sends that does not wait for
+            // the next refresh.
+            if parameter.overridden {
+                key.add_css_class("server-param-overridden");
+                key.set_tooltip_text(Some("Edited here; the provider sends another value"));
+            }
             // Credentials stay masked until revealed: a screenshot of an
             // expanded card is exactly where one ends up pasted somewhere
             // it should not be. The value is one toggle away for the person
@@ -967,6 +995,16 @@ impl ServerCard {
                 .build();
             row.append(&key);
             row.append(&value);
+            if parameter.overridden
+                && let Some(field) =
+                    oxidom_core::draft::override_key(parameter.group, parameter.key)
+            {
+                let take_back = icon_button("edit-clear-symbolic", "Use the provider's value");
+                take_back.add_css_class("server-action");
+                let on_drop_override = on_drop_override.clone();
+                take_back.connect_clicked(move |_| on_drop_override(field.clone()));
+                row.append(&take_back);
+            }
             if parameter.secret {
                 let secret = parameter.value.clone();
                 let value = value.clone();

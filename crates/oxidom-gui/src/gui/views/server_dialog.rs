@@ -15,7 +15,7 @@ use adw::prelude::*;
 
 use oxidom_core::draft::ServerDraft;
 use oxidom_core::model::{
-    Hysteria2Obfs, Hysteria2Settings, Protocol, StreamSettings, parse_bandwidth_mbps,
+    Hysteria2Obfs, Hysteria2Settings, Protocol, Server, StreamSettings, parse_bandwidth_mbps,
 };
 
 use super::{set_transient_parent, set_validation, validation_label};
@@ -96,6 +96,78 @@ fn alpn_list(value: &str) -> Option<Vec<String>> {
         .map(str::to_string)
         .collect();
     (!list.is_empty()).then_some(list)
+}
+
+fn combo_index(options: &[&str], value: &str) -> usize {
+    options
+        .iter()
+        .position(|option| *option == value)
+        .unwrap_or(0)
+}
+
+/// A stored server as the dialog shows it — the prefill for editing. The
+/// inverse of [`draft_from_values`]: an absent optional is an empty row,
+/// not a placeholder.
+pub fn values_from_server(server: &Server) -> DialogValues {
+    let draft = oxidom_core::draft::draft_from_server(server);
+    let stream = draft.stream.unwrap_or_default();
+    let hysteria2 = draft.hysteria2.unwrap_or_default();
+    let option = |value: &Option<String>| value.clone().unwrap_or_default();
+    DialogValues {
+        name: draft.name,
+        protocol_index: combo_index(
+            &PROTOCOLS
+                .iter()
+                .map(|(_, label)| *label)
+                .collect::<Vec<_>>(),
+            server.protocol.as_str(),
+        ),
+        address: draft.address,
+        port: draft.port,
+        uuid: option(&draft.uuid),
+        alter_id: draft.alter_id.unwrap_or(0),
+        vmess_security: option(&draft.security),
+        method: option(&draft.method),
+        password: option(&draft.password),
+        auth: option(&draft.auth),
+        network_index: combo_index(&NETWORKS, &stream.network),
+        security_index: combo_index(&SECURITIES, &stream.security),
+        sni: option(&stream.sni),
+        alpn: stream
+            .alpn
+            .clone()
+            .map(|list| list.join(", "))
+            .unwrap_or_default(),
+        fingerprint: option(&stream.fingerprint),
+        path: option(&stream.path),
+        host: option(&stream.host),
+        service_name: option(&stream.service_name),
+        header_type: option(&stream.header_type),
+        flow: option(&stream.flow),
+        public_key: option(&stream.public_key),
+        short_id: option(&stream.short_id),
+        spider_x: option(&stream.spider_x),
+        h2_sni: option(&hysteria2.sni),
+        h2_alpn: hysteria2
+            .alpn
+            .clone()
+            .map(|list| list.join(", "))
+            .unwrap_or_default(),
+        h2_obfs_password: hysteria2.obfs.map(|obfs| obfs.password).unwrap_or_default(),
+        h2_up: hysteria2
+            .up_mbps
+            .map(|up| up.to_string())
+            .unwrap_or_default(),
+        h2_down: hysteria2
+            .down_mbps
+            .map(|down| down.to_string())
+            .unwrap_or_default(),
+        patch: draft
+            .outbound_patch
+            .as_ref()
+            .map(|patch| serde_json::to_string_pretty(patch).unwrap_or_default())
+            .unwrap_or_default(),
+    }
 }
 
 /// The widgets' state as a draft — or the sentence that stops it, before the
@@ -183,8 +255,44 @@ pub fn values_issue(values: &DialogValues) -> Option<String> {
 }
 
 pub fn show_server_dialog(parent: &impl IsA<gtk::Widget>, callbacks: ServerDialogCallbacks) {
+    build_dialog(
+        parent,
+        "Create server",
+        "Create",
+        None,
+        false,
+        callbacks.create,
+    );
+}
+
+/// The same rows, prefilled from a stored server. `lock_protocol` is set
+/// for a subscription's server, whose protocol is the provider's own.
+pub fn show_server_edit_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    prefill: DialogValues,
+    lock_protocol: bool,
+    on_save: Rc<dyn Fn(ServerDraft)>,
+) {
+    build_dialog(
+        parent,
+        "Edit server",
+        "Save",
+        Some(Box::new(prefill)),
+        lock_protocol,
+        on_save,
+    );
+}
+
+fn build_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    title: &str,
+    button_label: &str,
+    prefill: Option<Box<DialogValues>>,
+    lock_protocol: bool,
+    on_confirm: Rc<dyn Fn(ServerDraft)>,
+) {
     let window = adw::Window::builder()
-        .title("Create server")
+        .title(title)
         .modal(true)
         .default_width(520)
         .default_height(680)
@@ -193,7 +301,7 @@ pub fn show_server_dialog(parent: &impl IsA<gtk::Widget>, callbacks: ServerDialo
 
     let header = adw::HeaderBar::new();
     let cancel = gtk::Button::with_label("Cancel");
-    let create = gtk::Button::with_label("Create");
+    let create = gtk::Button::with_label(button_label);
     create.add_css_class("suggested-action");
     create.set_sensitive(false);
     header.pack_start(&cancel);
@@ -353,6 +461,49 @@ pub fn show_server_dialog(parent: &impl IsA<gtk::Widget>, callbacks: ServerDialo
         port: 443,
         ..DialogValues::default()
     }));
+
+    if let Some(prefill) = prefill {
+        // The rows carry the server as it stands, not a blank form: the
+        // protocol is a fact about the server being edited, and for a
+        // subscription's server it is the provider's fact, not a choice.
+        name.set_text(&prefill.name);
+        protocol.set_selected(
+            PROTOCOLS
+                .iter()
+                .position(|(candidate, _)| *candidate == prefill.protocol())
+                .unwrap_or(0) as u32,
+        );
+        protocol.set_sensitive(!lock_protocol);
+        address.set_text(&prefill.address);
+        port.set_value(f64::from(prefill.port));
+        uuid.set_text(&prefill.uuid);
+        alter_id.set_value(f64::from(prefill.alter_id));
+        vmess_security.set_text(&prefill.vmess_security);
+        method.set_text(&prefill.method);
+        password.set_text(&prefill.password);
+        auth.set_text(&prefill.auth);
+        network.set_selected(prefill.network_index as u32);
+        security.set_selected(prefill.security_index as u32);
+        sni.set_text(&prefill.sni);
+        alpn.set_text(&prefill.alpn);
+        fingerprint.set_text(&prefill.fingerprint);
+        path.set_text(&prefill.path);
+        host.set_text(&prefill.host);
+        service_name.set_text(&prefill.service_name);
+        header_type.set_text(&prefill.header_type);
+        flow.set_text(&prefill.flow);
+        public_key.set_text(&prefill.public_key);
+        short_id.set_text(&prefill.short_id);
+        spider_x.set_text(&prefill.spider_x);
+        h2_sni.set_text(&prefill.h2_sni);
+        h2_alpn.set_text(&prefill.h2_alpn);
+        h2_obfs_password.set_text(&prefill.h2_obfs_password);
+        h2_up.set_text(&prefill.h2_up);
+        h2_down.set_text(&prefill.h2_down);
+        if !prefill.patch.is_empty() {
+            patch_buffer.set_text(&prefill.patch);
+        }
+    }
 
     let collect = {
         let values = values.clone();
@@ -544,7 +695,7 @@ pub fn show_server_dialog(parent: &impl IsA<gtk::Widget>, callbacks: ServerDialo
         if oxidom_core::draft::resolve(&draft).is_err() {
             return;
         }
-        (callbacks.create)(draft);
+        on_confirm(draft);
         window_for_create.close();
     });
 

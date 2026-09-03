@@ -78,6 +78,38 @@ names deliberately, so the JSON key a dialog labels is the key that reaches the 
   it. A draft identical to a stored local server is refused loudly, naming that server; the
   silent skip a pasted batch gets would hide the typo that made them identical.
 
+### Editing a stored server (binding)
+
+`UpdateServer(s server_id, s draft_json) → s` (answering `ipc::CreatedServer`) edits a stored
+server through the same `draft::resolve` validator `CreateServer` ends in, and **the id never
+changes** — profiles, aliases and unit names hang off it, and a refresh still matches the entry
+by that id.
+
+- **The stored entry is the effective server**: the provider's fields with the user's decisions
+  applied. `draft_from_server` reads it back as the draft the dialog prefills with, and an edit
+  is `diff` between that prefill and the dialog's output.
+- **A subscription's server records edits as overrides** — `ServerOverrides { values, provider }`
+  keyed by draft field names, the nested blocks dotted (`stream.sni`, `hysteria2.up_mbps`):
+  `values` holds the user's decisions, `provider` what the provider last sent for those same
+  keys, so a drop needs no refresh. A hand-made server in the local group is simply rewritten;
+  it has no provider to override.
+- **A subscription's server cannot change protocol.** The fields under another protocol would
+  not be the same server with a typo fixed; adding a server is the honest route.
+- **Every refresh puts the values back on top.** `preserve_server_identity` carries `overrides`
+  across like the alias, restamps `provider` from the entry as the refresh brought it (so a
+  drop falls back to the newest provider value), and applies `values` through
+  `draft::apply_overrides` — the same validator again, with the untouched nested blocks riding
+  along whole.
+- **Matching sees through the overrides.** The stored entry carries the user's port; the fresh
+  one does not, so they never describe the same connection under `same_connection_as`. A third
+  matcher compares the provider base against the fresh entry and accepts when everything that
+  drifted is the display name or an overridden field. Id and strict matchers run first, and the
+  one-pass `used` guard bounds the ambiguity.
+- **Editing back to the provider's own value clears the override** rather than recording a
+  decision that matches the default, and `DropOverride(s server_id, s field) → s` takes the
+  provider's value back for one field, leaving the other decisions alone.
+- **An edit does not restart a connected profile.** The next connect uses the edited fields.
+
 ### Share-link parsers → `Server`
 
 - `vless://uuid@host:port?<params>#name` — params: `type` (tcp/ws/grpc/xhttp/splithttp),

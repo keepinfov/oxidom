@@ -289,17 +289,32 @@ impl DaemonClient {
         let json: String = self
             .proxy
             .call("CreateServer", &(draft_json.as_str(),))
-            .map_err(|error| {
-                if let zbus::Error::MethodError(name, _, _) = &error
-                    && name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
-                {
-                    return anyhow::anyhow!(
-                        "this oxidom daemon is too old to create servers by hand; \
-                         restart it to upgrade"
-                    );
-                }
-                friendly(error)
-            })?;
+            .map_err(|error| unknown_method(error, "create servers by hand"))?;
+        serde_json::from_str(&json).map_err(Into::into)
+    }
+
+    /// Edit one stored server through the same validator a draft passes.
+    /// The draft travels as JSON, like `CreateServer`; a daemon older than
+    /// the method answers `UnknownMethod`.
+    pub fn update_server(
+        &self,
+        server_id: &str,
+        draft: &crate::draft::ServerDraft,
+    ) -> Result<CreatedServer> {
+        let draft_json = serde_json::to_string(draft)?;
+        let json: String = self
+            .proxy
+            .call("UpdateServer", &(server_id, draft_json.as_str()))
+            .map_err(|error| unknown_method(error, "edit servers"))?;
+        serde_json::from_str(&json).map_err(Into::into)
+    }
+
+    /// Drop one override and take back what the provider last sent.
+    pub fn drop_override(&self, server_id: &str, field: &str) -> Result<CreatedServer> {
+        let json: String = self
+            .proxy
+            .call("DropOverride", &(server_id, field))
+            .map_err(|error| unknown_method(error, "edit servers"))?;
         serde_json::from_str(&json).map_err(Into::into)
     }
 
@@ -656,6 +671,18 @@ impl DaemonClient {
     pub fn clear_logs(&self) -> Result<()> {
         self.proxy.call("ClearLogs", &()).map_err(friendly)
     }
+}
+
+/// Does this daemon simply not have the method we called? Turned into a
+/// sentence that says what to do about it, for the methods a daemon older
+/// than the feature cannot answer.
+fn unknown_method(error: zbus::Error, what: &str) -> anyhow::Error {
+    if let zbus::Error::MethodError(name, _, _) = &error
+        && name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
+    {
+        return anyhow::anyhow!("this oxidom daemon is too old to {what}; restart it to upgrade");
+    }
+    friendly(error)
 }
 
 /// Does this daemon simply not have the method we called?

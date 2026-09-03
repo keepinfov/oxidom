@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::link::Skipped;
@@ -301,9 +303,29 @@ pub struct Server {
     /// that predates it, and skipped when absent so those serialize unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_patch: Option<serde_json::Value>,
+    /// Field-level user decisions over what a subscription's provider sends,
+    /// carried across refreshes the way the alias is. Absent for every server
+    /// without one, and for every server that predates them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<ServerOverrides>,
     /// Last latency probe result (runtime only, not persisted).
     #[serde(skip)]
     pub latency_ms: Option<u32>,
+}
+
+/// A user's per-field decisions over what a subscription's provider sends.
+///
+/// Keys are draft field names — the JSON keys the editor labels — with the
+/// nested blocks dotted: `stream.sni`, `hysteria2.up_mbps`. Only a
+/// subscription's server can carry them; a hand-made server is its own
+/// provider.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerOverrides {
+    /// The edited values, applied on top of every refresh.
+    pub values: BTreeMap<String, serde_json::Value>,
+    /// What the provider last sent for those same keys, so an override can
+    /// be dropped without waiting for the next refresh.
+    pub provider: BTreeMap<String, serde_json::Value>,
 }
 
 impl Server {
@@ -607,6 +629,7 @@ mod tests {
             link: None,
             alias: None,
             outbound_patch: None,
+            overrides: None,
             latency_ms: None,
         }
     }
@@ -718,6 +741,7 @@ mod tests {
             link: None,
             alias: None,
             outbound_patch: None,
+            overrides: None,
             latency_ms: None,
         };
         let json = serde_json::to_string(&server).unwrap();
