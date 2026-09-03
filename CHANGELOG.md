@@ -12,7 +12,7 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
-## [Unreleased]
+## [0.4.0] - 2026-09-04
 
 ### Added
 - **Handing a server to somebody else names what the share-link cannot carry.** The copy
