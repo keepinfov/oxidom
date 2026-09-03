@@ -15,6 +15,12 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Added
+- **An existing server can be edited without being removed and added again.** The expanded
+  card gains an edit action that opens the same dialog a server is created in, prefilled; the
+  id, the alias and the pinned certificate stay. For a subscription's server the changed
+  fields are stored as the user's decisions and survive every refresh — the card marks them
+  and offers to take the provider's value back — and editing back to the provider's own value
+  clears the mark on its own.
 - **The expanded card lists every parameter the server carries.** The transport, the TLS or
   Reality settings, the flow and the mux setting appear under the same JSON key names the
   server dialog uses, credentials are masked with a reveal toggle, and the values are

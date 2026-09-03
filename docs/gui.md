@@ -258,6 +258,22 @@ for anything the form does not model. The same thing exists on the command line
 as `oxidom server add` ([cli.md](cli.md)). Created servers join **My servers**,
 where a subscription refresh cannot touch them.
 
+### Editing a server
+
+The *Edit server* button on an expanded card opens the same dialog a server is
+created in, prefilled with what the server carries — so fixing a typo costs a
+field, not the server's history: the id, the alias and the pinned certificate
+stay. A server that came from a subscription keeps its protocol (the fields
+under another protocol would not be the same server with a typo fixed), and the
+fields you change are stored as your decisions: a refresh brings the provider's
+copy and puts them back on top. The card marks an overridden field in bold,
+with an ✗ beside it that takes the provider's value back without waiting for
+the next refresh. Editing back to the provider's own value clears the mark on
+its own.
+
+An edit does not restart a connected profile; the next connect uses the edited
+fields.
+
 Opening a subscription shows two rows only when they have something to report,
 because a row reading "none" on every healthy subscription is furniture:
 

@@ -230,6 +230,12 @@ fn preserve_server_identity(previous: &[Server], refreshed: &mut [Server]) {
                     .enumerate()
                     .find(|(index, old)| !used[*index] && old.same_connection_as(server))
             })
+            .or_else(|| {
+                previous
+                    .iter()
+                    .enumerate()
+                    .find(|(index, old)| !used[*index] && drift_is_only_overrides(old, server))
+            })
             .map(|(index, _)| index);
 
         let Some(index) = previous_index else {
@@ -251,7 +257,63 @@ fn preserve_server_identity(previous: &[Server], refreshed: &mut [Server]) {
         {
             stream.pin_sha256 = Some(pin);
         }
+        // The user's field-level decisions ride across the same way. The
+        // provider base is restamped from the entry as this refresh brought
+        // it, before the values go on top, so an override dropped later
+        // falls back to the newest provider value rather than the one the
+        // override was originally made against.
+        if let Some(mut overrides) = previous[index].overrides.clone() {
+            for key in overrides.values.keys().cloned().collect::<Vec<_>>() {
+                if let Some(value) = crate::draft::field_value(server, &key) {
+                    overrides.provider.insert(key, value);
+                }
+            }
+            let values = overrides.values.clone();
+            match crate::draft::apply_overrides(server, &values) {
+                Some(applied) => {
+                    *server = applied;
+                    server.overrides = (!overrides.values.is_empty()).then_some(overrides);
+                }
+                None => {
+                    // The combination no longer resolves — the provider moved
+                    // a field somewhere the draft cannot express. The
+                    // overrides stay recorded and the entry stays as the
+                    // provider sent it, rather than vanishing over an edit.
+                    log::warn!(
+                        "overrides no longer apply to server {:?}; keeping the refreshed entry",
+                        server.name
+                    );
+                    server.overrides = Some(overrides);
+                }
+            }
+        }
     }
+}
+
+/// Whether a refreshed entry is the previous one wearing the provider's
+/// changes: everything that differs between the provider's last state of
+/// it and the fresh entry is a display name or a field the user overrode.
+///
+/// The strict comparison cannot see this — the stored entry carries the
+/// override, the fresh one does not, so they never describe the same
+/// connection however the provider moved. Two servers that differ only in
+/// a field the user overrode on one could cross-match here; the id and
+/// strict matchers run first and the one-pass `used` guard bounds the
+/// damage to entries the strict matchers already refused.
+fn drift_is_only_overrides(previous: &Server, refreshed: &Server) -> bool {
+    let Some(overrides) = &previous.overrides else {
+        return false;
+    };
+    let Some(base) = crate::draft::apply_overrides(previous, &overrides.provider) else {
+        return false;
+    };
+    let drift = crate::draft::diff(
+        &crate::draft::draft_from_server(&base),
+        &crate::draft::draft_from_server(refreshed),
+    );
+    drift
+        .keys()
+        .all(|key| key == "name" || overrides.values.contains_key(key))
 }
 
 fn decode_maybe_b64_header(raw: &str) -> String {
@@ -419,6 +481,108 @@ mod tests {
                 .unwrap()
                 .to_ascii_lowercase()
                 .contains("x-hwid: installation-id")
+        );
+    }
+
+    /// The user's field-level decisions are theirs, not the provider's: a
+    /// refresh brings the entry as sent, and the overrides go back on top.
+    /// The stored entry is the effective one — overrides applied — so the
+    /// match has to see through them to the provider state underneath.
+    #[test]
+    fn a_refresh_keeps_the_users_overrides_on_top_of_the_new_entry() {
+        let base = parse_link(
+            "vless://test-id@example.com:443?encryption=none&type=tcp&security=tls&sni=old.example.com#Old",
+        )
+        .unwrap();
+        let overrides = crate::model::ServerOverrides {
+            values: vec![
+                ("port".to_string(), serde_json::json!(8443)),
+                (
+                    "stream.sni".to_string(),
+                    serde_json::json!("edited.example.invalid"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            provider: vec![
+                ("port".to_string(), serde_json::json!(443)),
+                (
+                    "stream.sni".to_string(),
+                    serde_json::json!("old.example.com"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let mut previous =
+            crate::draft::apply_overrides(&base, &overrides.values).expect("the overrides resolve");
+        previous.overrides = Some(overrides);
+        let id = previous.id.clone();
+
+        let mut refreshed = vec![parse_link(
+            "vless://test-id@example.com:443?encryption=none&type=tcp&security=tls&sni=fresh.example.com#New",
+        )
+        .unwrap()];
+
+        preserve_server_identity(&[previous], &mut refreshed);
+
+        let server = &refreshed[0];
+        assert_eq!(server.id, id);
+        assert_eq!(server.port, 8443, "the override still wins");
+        assert_eq!(
+            server.spec.stream().and_then(|stream| stream.sni.clone()),
+            Some("edited.example.invalid".to_string())
+        );
+        assert_eq!(
+            server.name, "New",
+            "what the provider renamed it to is still what it is called"
+        );
+        let overrides = server.overrides.as_ref().expect("still recorded");
+        assert_eq!(
+            overrides.provider.get("stream.sni"),
+            Some(&serde_json::json!("fresh.example.com")),
+            "the base is restamped from what this refresh brought"
+        );
+    }
+
+    /// A provider that changed the same field does not silently undo the
+    /// user's edit — the override wins, and the provider's new value waits
+    /// in the base for the override to be dropped.
+    #[test]
+    fn a_provider_changing_the_overridden_field_does_not_undo_the_edit() {
+        let base = parse_link(
+            "vless://test-id@example.com:443?encryption=none&type=tcp&security=none#Old",
+        )
+        .unwrap();
+        let overrides = crate::model::ServerOverrides {
+            values: vec![("port".to_string(), serde_json::json!(8443))]
+                .into_iter()
+                .collect(),
+            provider: vec![("port".to_string(), serde_json::json!(443))]
+                .into_iter()
+                .collect(),
+        };
+        let mut previous =
+            crate::draft::apply_overrides(&base, &overrides.values).expect("the override resolves");
+        previous.overrides = Some(overrides);
+
+        let mut refreshed = vec![
+            parse_link(
+                "vless://test-id@example.com:2053?encryption=none&type=tcp&security=none#New",
+            )
+            .unwrap(),
+        ];
+
+        preserve_server_identity(&[previous], &mut refreshed);
+
+        assert_eq!(refreshed[0].port, 8443, "the user's decision stands");
+        assert_eq!(
+            refreshed[0]
+                .overrides
+                .as_ref()
+                .and_then(|overrides| overrides.provider.get("port")),
+            Some(&serde_json::json!(2053)),
+            "and the provider's new value is what a drop would restore"
         );
     }
 

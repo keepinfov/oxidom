@@ -199,6 +199,7 @@ pub fn resolve(draft: &ServerDraft) -> Result<Server, DraftError> {
         link: None,
         alias: None,
         outbound_patch: draft.outbound_patch.clone(),
+        overrides: None,
         latency_ms: None,
     };
     server.id = Server::stable_id(&server.identity_string());
@@ -221,6 +222,219 @@ fn normalized_stream(mut stream: StreamSettings) -> StreamSettings {
     stream
 }
 
+/// The stored server as the editor shows it: every field a draft carries,
+/// read back out of the spec. Editing is this, a dialog, and [`diff`].
+pub fn draft_from_server(server: &Server) -> ServerDraft {
+    use crate::model::OutboundSpec;
+    let (uuid, encryption, alter_id, security, method, password, username, auth, stream, hysteria2) =
+        match &server.spec {
+            OutboundSpec::Vless {
+                uuid,
+                encryption,
+                stream,
+            } => (
+                Some(uuid.clone()),
+                Some(encryption.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(stream.clone()),
+                None,
+            ),
+            OutboundSpec::Vmess {
+                uuid,
+                alter_id,
+                security,
+                stream,
+            } => (
+                Some(uuid.clone()),
+                None,
+                Some(*alter_id),
+                Some(security.clone()),
+                None,
+                None,
+                None,
+                None,
+                Some(stream.clone()),
+                None,
+            ),
+            OutboundSpec::Trojan { password, stream } => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(password.clone()),
+                None,
+                None,
+                Some(stream.clone()),
+                None,
+            ),
+            OutboundSpec::Shadowsocks { method, password } => (
+                None,
+                None,
+                None,
+                None,
+                Some(method.clone()),
+                Some(password.clone()),
+                None,
+                None,
+                None,
+                None,
+            ),
+            OutboundSpec::Socks { username, password }
+            | OutboundSpec::Http { username, password } => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                password.clone(),
+                username.clone(),
+                None,
+                None,
+                None,
+            ),
+            OutboundSpec::Hysteria2 { auth, settings } => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(auth.clone()),
+                None,
+                Some(settings.clone()),
+            ),
+            OutboundSpec::XrayProfile { .. } => {
+                (None, None, None, None, None, None, None, None, None, None)
+            }
+        };
+    ServerDraft {
+        name: server.name.clone(),
+        protocol: server.protocol,
+        address: server.address.clone(),
+        port: server.port,
+        uuid,
+        encryption,
+        alter_id,
+        security,
+        method,
+        password,
+        username,
+        auth,
+        stream,
+        hysteria2,
+        outbound_patch: server.outbound_patch.clone(),
+    }
+}
+
+/// What changed between the draft a dialog was prefilled with and the one
+/// it produced: override keys to their new values. Leaves only, the nested
+/// blocks dotted — `stream.sni`, `hysteria2.up_mbps` — so an override marks
+/// a field, not a whole block. A field the edit removed is recorded as
+/// `null`.
+pub fn diff(
+    before: &ServerDraft,
+    after: &ServerDraft,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut changed = std::collections::BTreeMap::new();
+    let before = serde_json::to_value(before).unwrap_or(serde_json::Value::Null);
+    let after = serde_json::to_value(after).unwrap_or(serde_json::Value::Null);
+    diff_objects("", &before, &after, &mut changed);
+    changed
+}
+
+fn diff_objects(
+    prefix: &str,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    changed: &mut std::collections::BTreeMap<String, serde_json::Value>,
+) {
+    let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        return;
+    };
+    for (key, value) in after {
+        let path = format!("{prefix}{key}");
+        match before.get(key) {
+            Some(other) if other == value => {}
+            Some(other) if other.is_object() && value.is_object() => {
+                diff_objects(&format!("{path}."), other, value, changed);
+            }
+            _ => {
+                changed.insert(path, value.clone());
+            }
+        }
+    }
+    for key in before.keys() {
+        if !after.contains_key(key) {
+            changed.insert(format!("{prefix}{key}"), serde_json::Value::Null);
+        }
+    }
+}
+
+/// One field of the stored server, as override keys spell it.
+pub fn field_value(server: &Server, key: &str) -> Option<serde_json::Value> {
+    let draft = serde_json::to_value(draft_from_server(server)).ok()?;
+    let mut current = &draft;
+    for part in key.split('.') {
+        current = current.get(part)?;
+    }
+    Some(current.clone())
+}
+
+/// Rebuild a server with override values applied, through the same
+/// validator a draft passes — the nested blocks ride along whole, so an
+/// XHTTP `extra` the provider sent survives an edit that never mentions it.
+///
+/// The id, the alias, the link and the last reading are carried from the
+/// input: an override changes what the server is, not which server it is.
+/// The overrides themselves are the caller's to set.
+pub fn apply_overrides(
+    server: &Server,
+    values: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Option<Server> {
+    let mut draft = serde_json::to_value(draft_from_server(server)).ok()?;
+    let object = draft.as_object_mut()?;
+    for (key, value) in values {
+        set_dotted(object, key, value.clone());
+    }
+    let draft: ServerDraft = serde_json::from_value(draft).ok()?;
+    let mut resolved = resolve(&draft).ok()?;
+    resolved.id = server.id.clone();
+    resolved.alias = server.alias.clone();
+    resolved.link = server.link.clone();
+    resolved.latency_ms = server.latency_ms;
+    Some(resolved)
+}
+
+fn set_dotted(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+) {
+    let mut parts = key.split('.');
+    let Some(first) = parts.next() else { return };
+    let mut rest = parts.peekable();
+    if rest.peek().is_none() {
+        object.insert(first.to_string(), value);
+        return;
+    }
+    let nested = object
+        .entry(first.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !nested.is_object() {
+        *nested = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(nested) = nested.as_object_mut() {
+        set_dotted(nested, &rest.collect::<Vec<_>>().join("."), value);
+    }
+}
+
 /// One line of the expanded card's parameter listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parameter {
@@ -233,6 +447,21 @@ pub struct Parameter {
     pub value: String,
     /// A credential: shown masked until revealed.
     pub secret: bool,
+    /// The user overrode this field against what the provider sends.
+    pub overridden: bool,
+}
+
+/// How a listing row spells as an override key: the same names, save for
+/// the two nested blocks. Public for the card, which offers the drop
+/// action per row.
+pub fn override_key(group: &str, key: &str) -> Option<String> {
+    match group {
+        SERVER | CREDENTIALS => Some(key.to_string()),
+        TRANSPORT => Some(format!("stream.{key}")),
+        HYSTERIA2 => Some(format!("hysteria2.{key}")),
+        PATCH => Some("outbound_patch".to_string()),
+        _ => None,
+    }
 }
 
 const SERVER: &str = "Server";
@@ -251,6 +480,11 @@ const PATCH: &str = "outbound_patch";
 pub fn parameters(server: &Server) -> Vec<Parameter> {
     use crate::model::OutboundSpec;
 
+    let overridden_keys: std::collections::BTreeSet<String> = server
+        .overrides
+        .as_ref()
+        .map(|overrides| overrides.values.keys().cloned().collect())
+        .unwrap_or_default();
     let mut rows = Vec::new();
     let mut plain = |key: &'static str, value: String| {
         rows.push(Parameter {
@@ -258,6 +492,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
             key,
             value,
             secret: false,
+            overridden: false,
         });
     };
     plain("protocol", server.protocol.as_str().to_string());
@@ -270,6 +505,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
             key,
             value,
             secret: true,
+            overridden: false,
         });
     };
 
@@ -286,6 +522,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
                     key: "encryption",
                     value: encryption.clone(),
                     secret: false,
+                    overridden: false,
                 });
             }
             stream_parameters(stream, &mut rows);
@@ -303,6 +540,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
                     key: "alter_id",
                     value: alter_id.to_string(),
                     secret: false,
+                    overridden: false,
                 });
             }
             if security != "auto" {
@@ -311,6 +549,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
                     key: "security",
                     value: security.clone(),
                     secret: false,
+                    overridden: false,
                 });
             }
             stream_parameters(stream, &mut rows);
@@ -325,6 +564,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
                 key: "method",
                 value: method.clone(),
                 secret: false,
+                overridden: false,
             });
             credential("password", password.clone(), &mut rows);
         }
@@ -344,6 +584,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
                     key,
                     value,
                     secret,
+                    overridden: false,
                 });
             };
             if let Some(sni) = &settings.sni {
@@ -399,7 +640,13 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
             key: "outbound_patch",
             value: serde_json::to_string_pretty(patch).unwrap_or_default(),
             secret: false,
+            overridden: false,
         });
+    }
+    for row in &mut rows {
+        if let Some(path) = override_key(row.group, row.key) {
+            row.overridden = overridden_keys.contains(&path);
+        }
     }
     rows
 }
@@ -414,6 +661,7 @@ fn stream_parameters(stream: &StreamSettings, rows: &mut Vec<Parameter>) {
             key,
             value,
             secret: false,
+            overridden: false,
         });
     };
     field("network", stream.network.clone());
@@ -461,6 +709,7 @@ mod tests {
     use super::*;
     use crate::link::parse_link;
     use crate::xray::config::outbound_tagged;
+    use std::collections::BTreeMap;
 
     fn base(protocol: Protocol) -> ServerDraft {
         ServerDraft {
@@ -805,5 +1054,225 @@ mod tests {
             patch.value,
             "{\n  \"mux\": {\n    \"enabled\": true\n  }\n}"
         );
+    }
+
+    /// The prefill is faithful: reading a resolved server back as a draft
+    /// and resolving it again reproduces the server, for every protocol the
+    /// editor offers.
+    #[test]
+    fn a_server_reads_back_as_the_draft_that_made_it() {
+        let cases = [
+            ServerDraft {
+                uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
+                stream: Some(StreamSettings {
+                    network: "xhttp".to_string(),
+                    security: "reality".to_string(),
+                    public_key: Some("invented-public-key".to_string()),
+                    short_id: Some("ab".to_string()),
+                    spider_x: Some("/".to_string()),
+                    xhttp_mode: Some("packet-up".to_string()),
+                    ..StreamSettings::default()
+                }),
+                ..base(Protocol::Vless)
+            },
+            ServerDraft {
+                uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
+                stream: Some(StreamSettings {
+                    network: "grpc".to_string(),
+                    security: "tls".to_string(),
+                    service_name: Some("gun".to_string()),
+                    grpc_authority: Some("cover.example.invalid".to_string()),
+                    grpc_multi_mode: true,
+                    ..StreamSettings::default()
+                }),
+                ..base(Protocol::Vmess)
+            },
+            {
+                let mut draft = base(Protocol::Trojan);
+                draft.password = Some("invented".to_string());
+                draft
+            },
+            {
+                let mut draft = base(Protocol::Shadowsocks);
+                draft.method = Some("aes-256-gcm".to_string());
+                draft.password = Some("invented".to_string());
+                draft
+            },
+            ServerDraft {
+                auth: Some("invented-auth".to_string()),
+                hysteria2: Some(Hysteria2Settings {
+                    sni: Some("cover.example.invalid".to_string()),
+                    up_mbps: Some(100),
+                    ..Hysteria2Settings::default()
+                }),
+                ..base(Protocol::Hysteria2)
+            },
+        ];
+        for draft in cases {
+            let server = resolve(&draft).expect("resolves");
+            let read_back = resolve(&draft_from_server(&server)).expect("reads back");
+            assert_eq!(read_back.spec, server.spec, "{:?}", draft.protocol);
+            assert_eq!(read_back.name, server.name);
+            assert_eq!(read_back.address, server.address);
+            assert_eq!(read_back.port, server.port);
+            assert_eq!(read_back.transport_label, server.transport_label);
+            assert_eq!(read_back.id, server.id);
+        }
+    }
+
+    /// An edit names the fields it touched, leaves only, the nested blocks
+    /// dotted; a cleared field is a `null`, and an untouched field does not
+    /// appear even when the block around it changed.
+    #[test]
+    fn a_diff_names_the_touched_leaves_and_nothing_else() {
+        let before = ServerDraft {
+            uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            stream: Some(StreamSettings {
+                network: "ws".to_string(),
+                security: "tls".to_string(),
+                sni: Some("old-cover.example.invalid".to_string()),
+                path: Some("/ws".to_string()),
+                ..StreamSettings::default()
+            }),
+            ..base(Protocol::Vless)
+        };
+        let after = ServerDraft {
+            address: "edited.example.invalid".to_string(),
+            port: 8443,
+            stream: Some(StreamSettings {
+                network: "ws".to_string(),
+                security: "tls".to_string(),
+                sni: Some("new-cover.example.invalid".to_string()),
+                ..StreamSettings::default()
+            }),
+            ..before.clone()
+        };
+        assert_eq!(
+            diff(&before, &after),
+            vec![
+                (
+                    "address".to_string(),
+                    serde_json::json!("edited.example.invalid")
+                ),
+                ("port".to_string(), serde_json::json!(8443)),
+                ("stream.path".to_string(), serde_json::Value::Null),
+                (
+                    "stream.sni".to_string(),
+                    serde_json::json!("new-cover.example.invalid")
+                ),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    /// Overrides are applied through the validator, and what the edit never
+    /// mentioned rides along: the XHTTP `extra` a provider sent survives a
+    /// port override untouched.
+    #[test]
+    fn an_override_rebuilds_the_server_and_keeps_the_untouched_fields() {
+        let mut draft = base(Protocol::Vless);
+        draft.uuid = Some("11111111-2222-3333-4444-555555555555".to_string());
+        draft.stream = Some(StreamSettings {
+            network: "xhttp".to_string(),
+            security: "reality".to_string(),
+            public_key: Some("invented-public-key".to_string()),
+            xhttp_extra: Some(serde_json::json!({ "xmux": { "maxConcurrency": 2 } })),
+            ..StreamSettings::default()
+        });
+        let server = resolve(&draft).expect("resolves");
+        let alias = Some("kept".to_string());
+        let mut with_alias = server.clone();
+        with_alias.alias = alias.clone();
+
+        let edited = apply_overrides(
+            &with_alias,
+            &vec![
+                ("port".to_string(), serde_json::json!(8443)),
+                (
+                    "stream.sni".to_string(),
+                    serde_json::json!("cover.example.invalid"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("applies");
+
+        assert_eq!(edited.port, 8443);
+        assert_eq!(
+            edited.spec.stream().and_then(|stream| stream.sni.clone()),
+            Some("cover.example.invalid".to_string())
+        );
+        assert_eq!(
+            edited
+                .spec
+                .stream()
+                .and_then(|stream| stream.xhttp_extra.clone()),
+            Some(serde_json::json!({ "xmux": { "maxConcurrency": 2 } })),
+            "the untouched extra rides along"
+        );
+        assert_eq!(edited.id, server.id, "the server stays itself");
+        assert_eq!(edited.alias, alias);
+        assert_eq!(edited.transport_label, server.transport_label);
+    }
+
+    /// What a field holds, spelled the way override keys spell it — the
+    /// provider base a dropped override falls back to.
+    #[test]
+    fn a_field_value_reads_the_nested_blocks_dotted() {
+        let mut draft = base(Protocol::Hysteria2);
+        draft.auth = Some("invented-auth".to_string());
+        draft.hysteria2 = Some(Hysteria2Settings {
+            up_mbps: Some(100),
+            ..Hysteria2Settings::default()
+        });
+        let server = resolve(&draft).expect("resolves");
+        assert_eq!(field_value(&server, "port"), Some(serde_json::json!(443)));
+        assert_eq!(
+            field_value(&server, "hysteria2.up_mbps"),
+            Some(serde_json::json!(100))
+        );
+        assert_eq!(field_value(&server, "stream.network"), None);
+    }
+
+    /// The listing marks what the user overrode, with the override keys'
+    /// own spelling — including into the nested blocks.
+    #[test]
+    fn the_listing_marks_the_overridden_fields() {
+        let mut draft = base(Protocol::Vless);
+        draft.uuid = Some("11111111-2222-3333-4444-555555555555".to_string());
+        draft.stream = Some(StreamSettings {
+            network: "ws".to_string(),
+            security: "tls".to_string(),
+            sni: Some("provider.example.invalid".to_string()),
+            ..StreamSettings::default()
+        });
+        let mut server = resolve(&draft).expect("resolves");
+        server.overrides = Some(crate::model::ServerOverrides {
+            values: vec![
+                ("port".to_string(), serde_json::json!(8443)),
+                (
+                    "stream.sni".to_string(),
+                    serde_json::json!("edited.example.invalid"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            provider: BTreeMap::new(),
+        });
+
+        let listed = parameters(&server);
+        let port = listed.iter().find(|p| p.key == "port").expect("listed");
+        assert!(port.overridden);
+        let sni = listed
+            .iter()
+            .find(|p| p.key == "sni" && p.group == "Transport and TLS")
+            .expect("listed");
+        assert!(sni.overridden);
+        let address = listed.iter().find(|p| p.key == "address").expect("listed");
+        assert!(!address.overridden);
+        let uuid = listed.iter().find(|p| p.key == "uuid").expect("listed");
+        assert!(!uuid.overridden);
     }
 }

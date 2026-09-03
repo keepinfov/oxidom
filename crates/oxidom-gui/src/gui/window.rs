@@ -2148,6 +2148,22 @@ impl Controller {
                     }
                 })
             },
+            edit: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |server_id: String| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.edit_server(server_id);
+                    }
+                })
+            },
+            drop_override: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |server_id: String, field: String| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.drop_override(server_id, field);
+                    }
+                })
+            },
             create_pool: {
                 let weak = Rc::downgrade(self);
                 Rc::new(move |query| {
@@ -3342,6 +3358,76 @@ impl Controller {
             UiOperation::for_server(UiOperationKind::DeleteServer, server_id),
             move |client| client.remove_server(&work_id),
             |controller, result| controller.finish_removal("remove server", result),
+        );
+    }
+
+    /// Open the server dialog prefilled with a stored server — the same
+    /// rows a server is created in. A subscription's server keeps its
+    /// protocol: the fields under another protocol would not be the same
+    /// server with a typo fixed.
+    fn edit_server(self: &Rc<Self>, server_id: String) {
+        let Some(server) = self
+            .state
+            .borrow()
+            .subscriptions
+            .iter()
+            .flat_map(|subscription| subscription.servers.iter())
+            .find(|server| server.id == server_id)
+            .cloned()
+        else {
+            return;
+        };
+        let lock_protocol = !self
+            .state
+            .borrow()
+            .subscriptions
+            .iter()
+            .any(|subscription| {
+                subscription.id == "local" && subscription.servers.iter().any(|s| s.id == server_id)
+            });
+        let values = super::views::server_dialog::values_from_server(&server);
+        let weak = Rc::downgrade(self);
+        super::views::server_dialog::show_server_edit_dialog(
+            &self.window,
+            values,
+            lock_protocol,
+            Rc::new(move |draft| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.update_server(server_id.clone(), draft);
+                }
+            }),
+        );
+    }
+
+    fn update_server(self: &Rc<Self>, server_id: String, draft: oxidom_core::draft::ServerDraft) {
+        let work_id = server_id.clone();
+        self.client_job(
+            UiOperation::for_server(UiOperationKind::EditServer, server_id),
+            move |client| client.update_server(&work_id, &draft),
+            |controller, result| match result {
+                Ok(updated) => {
+                    controller.rebuild_views();
+                    let message = match &updated.alias {
+                        Some(alias) => format!("Saved {} — alias {alias}", updated.name),
+                        None => format!("Saved {}", updated.name),
+                    };
+                    controller.show_message(&message);
+                }
+                Err(error) => controller.show_error("Could not save server", &format!("{error:#}")),
+            },
+        );
+    }
+
+    fn drop_override(self: &Rc<Self>, server_id: String, field: String) {
+        let work_id = server_id.clone();
+        self.client_job(
+            UiOperation::for_server(UiOperationKind::EditServer, server_id),
+            move |client| client.drop_override(&work_id, &field),
+            |controller, result| match result {
+                Ok(_) => controller.rebuild_views(),
+                Err(error) => controller
+                    .show_error("Could not take the provider's value", &format!("{error:#}")),
+            },
         );
     }
 
@@ -5208,6 +5294,7 @@ fn install_css() {
         .server-history { border-left: 2px solid alpha(@window_fg_color, 0.25); padding-left: 8px; }
         .server-failure-reason,
         .server-history-title { font-weight: 500; }
+        .server-param-overridden { font-weight: 700; }
         /* The chart itself paints nothing: every column is a child widget, so
            the palette stays in CSS where the rest of the application's colours
            are. A measured check is the accent the reachable badge already uses,
