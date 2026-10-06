@@ -48,6 +48,10 @@ the daemon's own signal handler, and anything that leaks is reaped on the next s
   `on_core_exit = "hold"`; `"release"` reproduces the teardown-first behaviour, and a profile's
   own setting wins over the machine's. The answer is snapshotted when the session comes up, so a
   profile edited mid-session does not change what happens to the tunnel already running.
+  The hold ends when a new core has been confirmed to carry traffic — a core that starts and then
+  fails its confirmation is not a confirmation, and a failed one leaves the session holding again
+  rather than tearing down the routes the hold is made of — or when the session is explicitly
+  taken down under a policy of release.
 - A reconnect under a held interface **adds nothing**: `start_interface` finds it already up and
   returns. Its tun2socks is the exception — the one part of an interface that is a process rather
   than kernel state — and is restarted alone if it did not survive the outage, leaving every route

@@ -685,10 +685,10 @@ impl Session {
         self.core
             .connect(server, self.address, &self.profile, &self.core_options)?;
         self.selection = Some(SessionSelection::Server(server.id.clone()));
-        // A core is carrying traffic again, so the session is no longer holding
-        // it. Cleared here rather than by whoever reconnected, because this is
-        // the one place both a first connect and a reconnect pass through.
-        self.holding_traffic = false;
+        // The hold is deliberately *not* cleared here. A core that started and
+        // then failed its confirmation never carried anything, and the window
+        // between the two is exactly the one the hold covers; it ends in
+        // [`Engine::confirm_traffic`], once a confirmation has succeeded.
         self.api_port = 0;
         self.pool_name.clear();
         self.pool_expected = 0;
@@ -720,7 +720,7 @@ impl Session {
             members.iter().map(|server| server.id.clone()).collect(),
             pool.strategy.to_string(),
         ));
-        self.holding_traffic = false;
+        // As in `Session::connect`: only a confirmation ends a hold.
         self.api_port = pool.api_port;
         self.pool_name = pool.name.to_string();
         self.pool_expected = pool.expected;
@@ -1340,6 +1340,56 @@ impl Engine {
             "profile {profile:?} lost its core and is holding its routes: traffic for this \
              tunnel is dropped, not sent out unprotected"
         );
+        true
+    }
+
+    /// The core has been confirmed to carry traffic, so a session that was
+    /// holding its routes is no longer holding them.
+    ///
+    /// This is the other end of the hold [`Engine::note_core_exit`] starts. It
+    /// is not cleared where the core starts, because a core that starts and
+    /// then fails its confirmation never carried anything: the window between
+    /// the two is the one the hold exists for.
+    pub fn confirm_traffic(&mut self, profile: &str) {
+        let Some(session) = self.sessions.get_mut(profile) else {
+            return;
+        };
+        session.holding_traffic = false;
+    }
+
+    /// A confirmation failed for a session whose core reported `Connected`.
+    ///
+    /// A session that must hold its traffic goes straight back to holding: its
+    /// interface, routes and fwmark rule are still exactly where the retry
+    /// window needs them. `stop_session` there removed the routing domain the
+    /// hold was made of, which released the cgroup it protects for the whole
+    /// window — the automatic reconnect's own way of losing the protection an
+    /// explicit switch loses. Anything that is not holding is stopped, as it
+    /// was before.
+    ///
+    /// Answers whether the session is holding.
+    pub fn confirmation_failed(&mut self, profile: &str, reason: &str) -> bool {
+        let holds = self.sessions.get(profile).is_some_and(|session| {
+            session.holds_traffic
+                && session
+                    .interface
+                    .as_ref()
+                    .is_some_and(|interface| interface.up)
+        });
+        if !holds {
+            if let Some(session) = self.sessions.get_mut(profile) {
+                session.core.note(reason);
+            }
+            self.stop_session(profile);
+            return false;
+        }
+        if let Some(session) = self.sessions.get_mut(profile) {
+            // The retry has to be able to rebind the SOCKS port, and the status
+            // a client reads has to name the reason this attempt failed.
+            session.core.disconnect();
+            session.core.fail(reason);
+        }
+        self.note_core_exit(profile);
         true
     }
 
@@ -2941,8 +2991,8 @@ mod tests {
 
         let session = engine.sessions.get("work").context("session")?;
         assert!(
-            !session.holding_traffic,
-            "a core is carrying traffic again, so the hold is over"
+            session.holding_traffic,
+            "a started core is not a confirmed one: the hold outlives the reconnect"
         );
         let interface = session
             .interface
@@ -2952,6 +3002,16 @@ mod tests {
             interface.up,
             "the routes and the rule survived the reconnect instead of being \
              removed while the retry ran"
+        );
+        // The hold ends when the new core has been confirmed to carry traffic,
+        // and not a moment earlier.
+        engine.confirm_traffic("work");
+        assert!(
+            !engine
+                .sessions
+                .get("work")
+                .context("session")?
+                .holding_traffic
         );
         engine.stop_session("work");
         Ok(())
@@ -2996,8 +3056,8 @@ mod tests {
 
         let session = engine.sessions.get("work").context("session")?;
         assert!(
-            !session.holding_traffic,
-            "a core is carrying traffic again, so the hold is over"
+            session.holding_traffic,
+            "a started core is not a confirmed one: the hold outlives the reconnect"
         );
         let interface = session
             .interface
@@ -3008,7 +3068,89 @@ mod tests {
             "the routes and the rule survived the reconnect instead of being \
              removed while the retry ran"
         );
+        // The hold ends when the new core has been confirmed to carry traffic,
+        // and not a moment earlier.
+        engine.confirm_traffic("work");
+        assert!(
+            !engine
+                .sessions
+                .get("work")
+                .context("session")?
+                .holding_traffic
+        );
         engine.stop_session("work");
+        Ok(())
+    }
+
+    /// The second path to the same leak, on the automatic side: a reconnect
+    /// starts a core, the core reports `Connected`, and its confirmation fails.
+    /// `stop_session` there removed the routes and the fwmark rule the hold was
+    /// made of, so the whole retry window was spent with the cgroup released —
+    /// the hold's purpose inverted. A session that must hold goes back to
+    /// holding instead, with everything it was holding still in place.
+    #[test]
+    fn a_failed_confirmation_leaves_a_held_tunnel_holding() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("failed-confirmation-holds")?;
+        let (mut engine, slice) = engine_bound_to_run_cgroup(&root.path, true)?;
+        let mut interface = held_interface("work");
+        interface.cgroup = Some(slice.clone());
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(interface);
+        assert!(engine.note_core_exit("work"), "the default is to hold");
+
+        assert!(
+            engine.confirmation_failed("work", "the check never answered"),
+            "a session that was holding keeps holding"
+        );
+
+        let session = engine.sessions.get("work").context("session")?;
+        assert!(
+            session.holding_traffic,
+            "the session is holding its traffic"
+        );
+        let interface = session.interface.as_ref().context("interface")?;
+        assert!(
+            interface.up,
+            "the routes and the rule the hold is made of are still installed"
+        );
+        assert_eq!(engine.teardown_verdict("work"), Verdict::Block(slice));
+        Ok(())
+    }
+
+    /// The counterpart: `on_core_exit = "release"` is a profile asking for no
+    /// protection, so a failed confirmation still takes it down — and its
+    /// bound cgroup with it.
+    #[test]
+    fn a_failed_confirmation_still_stops_a_session_that_does_not_hold() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("failed-confirmation-releases")?;
+        let (mut engine, _slice) = engine_bound_to_run_cgroup(&root.path, true)?;
+        engine.configure_hold_traffic("work", Some(OnCoreExit::Release));
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(held_interface("work"));
+
+        assert!(
+            !engine.confirmation_failed("work", "the check never answered"),
+            "a session set to release is not held"
+        );
+
+        let session = engine.sessions.get("work").context("session")?;
+        assert!(!session.holding_traffic);
+        assert!(
+            !session
+                .interface
+                .as_ref()
+                .is_some_and(|interface| interface.up),
+            "a released session is taken down, as it was before"
+        );
+        assert_eq!(engine.teardown_verdict("work"), Verdict::Release);
         Ok(())
     }
 

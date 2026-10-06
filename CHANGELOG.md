@@ -23,6 +23,11 @@ surface, packaging, or the CLI belongs here.
   never put it back, so a command started before the switch kept reaching the network directly for
   as long as it ran. The block ends when a tunnel marks the cgroup again, when the scope ends, or
   immediately for a profile set to `on_core_exit = "release"`.
+- **A reconnect that fails its own check no longer releases a held tunnel.** The hold used to be
+  cleared the moment the new core started, before anything had asked whether it could carry
+  traffic, and a confirmation that then failed called for a full teardown — so the retry window was
+  spent with the routes, the fwmark rule and the cgroup mark gone. The hold now ends only when a
+  confirmation has succeeded.
 
 ## [0.4.0] - 2026-09-04
 
