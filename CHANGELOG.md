@@ -12,6 +12,18 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
+## [Unreleased]
+
+### Fixed
+- **`oxidom run` no longer reaches IPv6 by the ordinary route.** The mark a scoped command's packets
+  carry selects an IPv4 table, and the rule pointing at it is an IPv4 rule, so an IPv6 packet kept
+  the mark and was then routed like any other — leaving with the machine's own address while the
+  IPv4 half of the same command went through the tunnel. IPv6 from a marked cgroup is now refused
+  by the profile's own chain, in the same atomic transaction as the mark. `fe80::/10` and
+  `ff00::/8` are excepted, so neighbour discovery keeps working. A command that needs an IPv6-only
+  destination now fails inside `oxidom run` rather than using the ordinary path; `oxidom env` is
+  unaffected.
+
 ## [0.4.0] - 2026-09-04
 
 ### Added
