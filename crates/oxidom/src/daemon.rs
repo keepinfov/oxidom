@@ -1494,10 +1494,11 @@ impl Shared {
                 if current {
                     if let Err(error) = engine.start_interface(&profile) {
                         let reason = format!("could not bring up the profile interface: {error:#}");
-                        if let Some(session) = engine.sessions.get(&profile) {
-                            session.core.note(&reason);
-                        }
-                        engine.stop_session(&profile);
+                        // A held session that could not be brought up keeps
+                        // holding: its block is what the retry window depends
+                        // on, and `confirmation_failed` decides that from the
+                        // session rather than from the failure.
+                        engine.confirmation_failed(&profile, &reason);
                         if origin == ConnectionOrigin::Explicit {
                             oxidom_core::sync::lock(&shared.override_status).insert(
                                 profile.clone(),
@@ -1510,6 +1511,9 @@ impl Shared {
                         let _ = confirmed.send(false);
                         return;
                     }
+                    // The core is carrying traffic: a hold, if there was one,
+                    // ends here rather than where the core started.
+                    engine.confirm_traffic(&profile);
                     if engine.registry.config.system_proxy
                         && let Err(error) = engine.sessions.claim_system_proxy(&profile)
                     {
@@ -1546,12 +1550,9 @@ impl Shared {
                     && session.status() == Status::Connected
             });
             if still_active {
-                // Leave the reason in the log buffer too: the tunnel is
-                // torn down below, so the core's own status is lost.
-                if let Some(session) = engine.sessions.get(&profile) {
-                    session.core.note(&reason);
-                }
-                engine.stop_session(&profile);
+                // Leave the reason in the log buffer too: a tunnel that is
+                // holding is torn down below only when it is not holding.
+                engine.confirmation_failed(&profile, &reason);
                 if origin == ConnectionOrigin::Explicit {
                     oxidom_core::sync::lock(&shared.override_status).insert(
                         profile.clone(),

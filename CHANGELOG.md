@@ -12,6 +12,23 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
+## [Unreleased]
+
+### Fixed
+- **Switching a profile no longer drops an `oxidom run` command onto the ordinary route.** The
+  cgroup an `oxidom run` scope belongs to is now recorded apart from the session that bound it, and
+  its nftables chain is turned into a drop whenever no tunnel carries it — a switch, a start that
+  fails, a core that exits under `on_core_exit = "hold"`, a failed automatic reconnect, `down`, or
+  a daemon restart that finds the scope still running. Previously a switch removed the chain and
+  never put it back, so a command started before the switch kept reaching the network directly for
+  as long as it ran. The block ends when a tunnel marks the cgroup again, when the scope ends, or
+  immediately for a profile set to `on_core_exit = "release"`.
+- **A reconnect that fails its own check no longer releases a held tunnel.** The hold used to be
+  cleared the moment the new core started, before anything had asked whether it could carry
+  traffic, and a confirmation that then failed called for a full teardown — so the retry window was
+  spent with the routes, the fwmark rule and the cgroup mark gone. The hold now ends only when a
+  confirmation has succeeded.
+
 ## [0.4.0] - 2026-09-04
 
 ### Added

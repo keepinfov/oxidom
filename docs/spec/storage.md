@@ -17,6 +17,11 @@ missing files (treat as defaults/empty).
   Interface intent is written before kernel application so crash cleanup may safely over-delete
   idempotent records but can never forget an applied route. The legacy flat active-server fields
   are accepted only as migration input.
+  `[[run_cgroups]]` records are the same file's other half: the profile, cgroup path and ancestor
+  level of an `oxidom run` scope whose traffic must not reach the ordinary path while no tunnel
+  carries it. They are deliberately not part of `[[sessions]]` — `down` removes the session while
+  the scope keeps running — and a restart rebuilds the block from them. A record whose cgroup no
+  longer exists is dropped, with its chain, on the next start or teardown.
 - `~/.local/share/oxidom/hwid` — random per-install id (only generated/used if a sub opts in).
 - `~/.local/share/oxidom/oxidom-gui.log` — the graphical client's own log, `0600`, rotated at 2MB
   with one `.log.1` kept. Written only by the GUI, which detaches and sends stderr to `/dev/null`

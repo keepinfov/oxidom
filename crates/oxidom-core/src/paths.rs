@@ -84,6 +84,20 @@ pub fn state_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("state.toml"))
 }
 
+/// Root of the cgroup v2 hierarchy. A profile's `oxidom run` scope lives below
+/// it, so its presence is what tells a bound cgroup from one that has already
+/// ended. Redirected by `set_test_root`, like every other path here, so a test
+/// can decide whether the scope it just bound still exists.
+pub fn cgroup_dir(slice_path: &str) -> PathBuf {
+    cgroup_root().join(slice_path)
+}
+
+fn cgroup_root() -> PathBuf {
+    test_root()
+        .map(|root| root.join("cgroup"))
+        .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"))
+}
+
 pub fn hwid_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("hwid"))
 }
