@@ -112,20 +112,36 @@ fn quote(value: &str) -> Result<String> {
 ///
 /// Restoration is keyed on this profile's exact mark, so no foreign mark — the
 /// user's own routing classes, tailscale — is ever touched.
+///
+/// The same chain refuses IPv6 from a marked cgroup. The mark it assigns
+/// selects a table, and both that table and the rule pointing at it are IPv4
+/// only, so an IPv6 packet would keep its mark and then be routed by the
+/// ordinary table like any other — the tunnel's traffic leaving by the
+/// machine's own address. oxidom does not tunnel IPv6; refusing it is the
+/// honest answer, and it is refused here rather than left to a system-wide
+/// setting. Link-local and multicast are excepted because neighbour discovery
+/// is made of them and carries no traffic anywhere.
 pub fn install_ruleset(profile: &str, slice: &CgroupSlice, mark: u32) -> Result<String> {
     let chain = chain_name(profile)?;
     let restore = restore_chain_name(profile)?;
     let comment = quote(&format!("oxidom profile {profile}"))?;
+    let ipv6 = quote(&format!("oxidom profile {profile}: IPv6 is not tunnelled"))?;
+    let net = format!(
+        "socket cgroupv2 level {} {}",
+        slice.level,
+        quote(&slice.path)?
+    );
     Ok(format!(
         "add table inet oxidom\n\
          add chain inet oxidom {chain} {{ type route hook output priority mangle; policy accept; }}\n\
          flush chain inet oxidom {chain}\n\
-         add rule inet oxidom {chain} socket cgroupv2 level {} {} counter meta mark set {mark:#x} ct mark set {mark:#x} comment {comment}\n\
+         add rule inet oxidom {chain} {net} counter meta mark set {mark:#x} ct mark set {mark:#x} comment {comment}\n\
+         add rule inet oxidom {chain} {net} ip6 daddr fe80::/10 counter accept comment {ipv6}\n\
+         add rule inet oxidom {chain} {net} ip6 daddr ff00::/8 counter accept comment {ipv6}\n\
+         add rule inet oxidom {chain} {net} meta nfproto ipv6 counter reject comment {ipv6}\n\
          add chain inet oxidom {restore} {{ type filter hook prerouting priority mangle; policy accept; }}\n\
          flush chain inet oxidom {restore}\n\
-         add rule inet oxidom {restore} ct mark {mark:#x} counter meta mark set {mark:#x} comment {comment}\n",
-        slice.level,
-        quote(&slice.path)?,
+         add rule inet oxidom {restore} ct mark {mark:#x} counter meta mark set {mark:#x} comment {comment}\n"
     ))
 }
 
@@ -162,12 +178,77 @@ mod tests {
              add rule inet oxidom profile_work socket cgroupv2 level 4 \
              \"user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice\" counter meta mark \
              set 0x6f21 ct mark set 0x6f21 comment \"oxidom profile work\"\n\
+             add rule inet oxidom profile_work socket cgroupv2 level 4 \
+             \"user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice\" ip6 daddr fe80::/10 \
+             counter accept comment \"oxidom profile work: IPv6 is not tunnelled\"\n\
+             add rule inet oxidom profile_work socket cgroupv2 level 4 \
+             \"user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice\" ip6 daddr ff00::/8 \
+             counter accept comment \"oxidom profile work: IPv6 is not tunnelled\"\n\
+             add rule inet oxidom profile_work socket cgroupv2 level 4 \
+             \"user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice\" meta nfproto ipv6 \
+             counter reject comment \"oxidom profile work: IPv6 is not tunnelled\"\n\
              add chain inet oxidom restore_work { type filter hook prerouting priority mangle; policy accept; }\n\
              flush chain inet oxidom restore_work\n\
              add rule inet oxidom restore_work ct mark 0x6f21 counter meta mark set 0x6f21 comment \
              \"oxidom profile work\"\n"
         );
-        assert_eq!(ruleset.matches("socket cgroupv2").count(), 1);
+        assert_eq!(
+            ruleset
+                .matches("meta mark set 0x6f21 ct mark set 0x6f21")
+                .count(),
+            1,
+            "exactly one rule may assign the mark"
+        );
+    }
+
+    /// The mark selects a table, and that table — like the rule pointing at it —
+    /// is IPv4 only: `plan_routes` plans `Ipv4Addr` routes and `Net::rule_add`
+    /// adds an `.v4()` rule. An IPv6 packet from a marked cgroup would therefore
+    /// keep its mark and be routed by the ordinary table, which is the tunnel's
+    /// traffic leaving by the machine's own address. oxidom does not tunnel
+    /// IPv6, so the chain refuses it, before the packet is routed and after the
+    /// two exceptions neighbour discovery is made of.
+    #[test]
+    fn a_marked_cgroup_cannot_route_ipv6_around_its_tunnel() {
+        let slice = crate::run::user_slice("work", 1000).unwrap();
+        let ruleset = install_ruleset("work", &slice, 0x6f21).unwrap();
+        let for_this_cgroup = ruleset
+            .lines()
+            .filter(|line| line.contains("socket cgroupv2"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            for_this_cgroup.len(),
+            4,
+            "one rule per family decision: {ruleset}"
+        );
+        let refusal = for_this_cgroup
+            .iter()
+            .position(|line| line.contains("meta nfproto ipv6") && line.contains("reject"))
+            .unwrap_or_else(|| panic!("IPv6 from a marked cgroup is not refused: {ruleset}"));
+        for exception in ["fe80::/10", "ff00::/8"] {
+            let at = for_this_cgroup
+                .iter()
+                .position(|line| line.contains(exception) && line.contains("accept"))
+                .unwrap_or_else(|| {
+                    panic!("{exception} is refused with everything else: {ruleset}")
+                });
+            assert!(
+                at < refusal,
+                "{exception} is refused before the rule that accepts it"
+            );
+        }
+    }
+
+    /// The refusal is part of the one rule set that owns the cgroup, so it is
+    /// installed and replaced in the same atomic transaction as the mark. A
+    /// separate chain could be flushed and re-added on its own, which is the
+    /// kind of gap this whole mechanism exists to avoid.
+    #[test]
+    fn the_ipv6_refusal_is_matched_at_the_same_cgroup_level_as_the_mark() {
+        let slice = crate::run::user_slice("work", 1000).unwrap();
+        let ruleset = install_ruleset("work", &slice, 0x6f21).unwrap();
+        let mark = format!("socket cgroupv2 level {} \"{}\"", slice.level, slice.path);
+        assert_eq!(ruleset.matches(&mark).count(), 4, "{ruleset}");
     }
 
     /// Restoration has to reach the packet before the reverse path is checked,

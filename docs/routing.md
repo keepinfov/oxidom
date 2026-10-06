@@ -179,6 +179,23 @@ Cleanup removes the profile's nftables chain *before* taking down its routing
 domain, so traffic is never briefly released onto the ordinary default route on
 the way down.
 
+### IPv6
+
+`oxidom run` carries IPv4. The mark it sets selects a table, that table holds
+IPv4 routes, and the rule pointing at it is an IPv4 rule — so an IPv6 packet
+would keep the mark and then be routed exactly like any other, leaving by the
+machine's own address while the IPv4 half of the same program went through the
+tunnel.
+
+Rather than leave that to be noticed later, the profile's chain refuses IPv6
+from a marked cgroup. A program that only speaks IPv6 to a destination fails
+inside `oxidom run`, and says so, instead of quietly using your real address.
+Link-local and multicast are excepted, so neighbour discovery keeps working, and
+the LAN reachability the private table provides is unchanged for IPv4.
+
+`oxidom env` is not affected: it exports IPv4 proxies, and a program that honours
+them makes its own choices.
+
 ## Rules of your own
 
 The three layers above decide *what* reaches the tunnel. Where a given request
