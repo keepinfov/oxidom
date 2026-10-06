@@ -11,6 +11,32 @@ use crate::{bind, fsutil, paths};
 #[serde(default)]
 pub struct State {
     pub sessions: Vec<SessionState>,
+    /// `oxidom run` cgroups that must not reach the ordinary path while no
+    /// tunnel is carrying them.
+    ///
+    /// Kept apart from the session that bound them on purpose: `down` removes
+    /// the session while the command inside the scope keeps running, and a
+    /// daemon restart has to rebuild the block for a scope that outlived it.
+    /// Neither the session nor the running process can be the only record.
+    pub run_cgroups: Vec<RunCgroupRecord>,
+}
+
+/// One bound `oxidom run` cgroup, as the state file carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunCgroupRecord {
+    pub profile: String,
+    pub path: String,
+    pub level: u32,
+}
+
+impl RunCgroupRecord {
+    pub fn slice(&self) -> crate::run::CgroupSlice {
+        crate::run::CgroupSlice {
+            path: self.path.clone(),
+            level: self.level,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +181,7 @@ impl RouteRecord {
 #[serde(default)]
 struct StoredState {
     sessions: Vec<SessionState>,
+    run_cgroups: Vec<RunCgroupRecord>,
     active_server_id: Option<String>,
     active_profile: Option<String>,
     xray_pid: Option<u32>,
@@ -190,8 +217,15 @@ impl State {
 }
 
 fn migrate(stored: StoredState, config: &Config) -> State {
-    if !stored.sessions.is_empty() {
-        let mut sessions = stored.sessions;
+    let StoredState {
+        sessions: stored_sessions,
+        run_cgroups,
+        active_server_id,
+        active_profile,
+        xray_pid,
+    } = stored;
+    if !stored_sessions.is_empty() {
+        let mut sessions = stored_sessions;
         // B2 recorded only system routes and reconstructed the private
         // default during recovery. Promote that old on-disk shape once so B3
         // cleanup has one source of truth and an upgrade after a crash cannot
@@ -218,35 +252,40 @@ fn migrate(stored: StoredState, config: &Config) -> State {
                 );
             }
         }
-        return State { sessions };
+        return State {
+            sessions,
+            run_cgroups,
+        };
     }
-    if stored.active_server_id.is_none()
-        && stored.active_profile.is_none()
-        && stored.xray_pid.is_none()
-    {
-        return State::default();
+    if active_server_id.is_none() && active_profile.is_none() && xray_pid.is_none() {
+        return State {
+            sessions: Vec::new(),
+            run_cgroups,
+        };
     }
 
-    let profile = stored
-        .active_profile
-        .unwrap_or_else(|| "default".to_string());
+    let profile = active_profile.unwrap_or_else(|| "default".to_string());
     let Some(address) = bind::address_for(&profile, &[]) else {
         log::warn!("could not allocate a loopback address while migrating state for {profile:?}");
-        return State::default();
+        return State {
+            sessions: Vec::new(),
+            run_cgroups,
+        };
     };
     let state = State {
         sessions: vec![SessionState {
             profile,
-            server_id: stored.active_server_id,
+            server_id: active_server_id,
             address,
             socks_port: config.socks_port,
             http_port: config.http_port,
-            xray_pid: stored.xray_pid,
+            xray_pid,
             interface: None,
             pool_members: Vec::new(),
             pool_strategy: String::new(),
             api_port: 0,
         }],
+        run_cgroups,
     };
     if let Err(error) = state.save() {
         log::warn!("could not persist the migrated session state: {error:#}");
@@ -413,6 +452,7 @@ mod tests {
         let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("no-rewrite");
         let state = State {
+            run_cgroups: Vec::new(),
             sessions: vec![SessionState {
                 profile: "default".to_string(),
                 server_id: Some("server-id".to_string()),
@@ -447,6 +487,7 @@ mod tests {
         let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("pool-session");
         let state = State {
+            run_cgroups: Vec::new(),
             sessions: vec![SessionState {
                 profile: "spread".to_string(),
                 server_id: None,

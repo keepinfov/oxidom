@@ -30,6 +30,15 @@ the daemon's own signal handler, and anything that leaks is reaped on the next s
 - Ordinary `down` stops tun2socks and removes oxidom routes/rule but leaves the persistent device,
   preserving hand-written routes across reconnects. `tun --down` and crash recovery additionally
   delete the device only when oxidom created it.
+- **A bound `oxidom run` cgroup is blocked, not released (binding).** The cgroup a profile's
+  `oxidom run` commands belong to is recorded in the state file, independently of the session that
+  installed it, and its nftables chain is turned into a drop for every family whenever no tunnel
+  carries it: a switch that re-plans the interface, a start that fails halfway, a core that exits
+  under `on_core_exit = "hold"`, a failed automatic reconnect, `down`, `tun --down`, and a daemon
+  restart that finds the scope still running. The chain becomes a mark again only when a tunnel
+  carries the cgroup. It is released when the profile's policy is `on_core_exit = "release"`, when
+  the scope has ended, or when the daemon that restarts finds no cgroup at all — so a chain is
+  never left blocking a name. `down` removes the session; it does not remove that record.
 - **A core exiting is not a `down` (binding).** When the Xray process of a session exits by itself
   — or a live core stops answering and the watchdog revives it — the session keeps its routes, its
   fwmark rule and its ownership of the desktop proxy setting until it is either reconnected or

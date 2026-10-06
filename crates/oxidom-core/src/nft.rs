@@ -22,6 +22,16 @@ impl Nft {
         self.apply(&install_ruleset(profile, slice, mark)?)
     }
 
+    /// Turn this profile's chain into one that drops its `oxidom run` cgroup.
+    ///
+    /// The chain survives a teardown on purpose. Removing it is what released a
+    /// bound cgroup onto the ordinary default route — for a switch that lasted
+    /// until someone happened to run `oxidom run` again — so the teardown of an
+    /// interface that is about to be replaced arrives here instead.
+    pub fn block(&self, profile: &str, slice: &CgroupSlice) -> Result<()> {
+        self.apply(&block_ruleset(profile, slice)?)
+    }
+
     pub fn remove(&self, profile: &str) -> Result<()> {
         self.apply(&remove_ruleset(profile)?)
     }
@@ -124,6 +134,28 @@ pub fn install_ruleset(profile: &str, slice: &CgroupSlice, mark: u32) -> Result<
          add chain inet oxidom {restore} {{ type filter hook prerouting priority mangle; policy accept; }}\n\
          flush chain inet oxidom {restore}\n\
          add rule inet oxidom {restore} ct mark {mark:#x} counter meta mark set {mark:#x} comment {comment}\n",
+        slice.level,
+        quote(&slice.path)?,
+    ))
+}
+
+/// A chain that drops everything this profile's `oxidom run` cgroup sends, in
+/// every family, while no tunnel carries it.
+///
+/// The restore chain is emptied rather than kept: it exists to put the mark
+/// back on replies so the reverse path check sends them through the profile's
+/// table, and a blocked cgroup has neither a mark nor a table to reach.
+pub fn block_ruleset(profile: &str, slice: &CgroupSlice) -> Result<String> {
+    let chain = chain_name(profile)?;
+    let restore = restore_chain_name(profile)?;
+    let comment = quote(&format!("oxidom profile {profile} blocked"))?;
+    Ok(format!(
+        "add table inet oxidom\n\
+         add chain inet oxidom {chain} {{ type route hook output priority mangle; policy accept; }}\n\
+         flush chain inet oxidom {chain}\n\
+         add rule inet oxidom {chain} socket cgroupv2 level {} {} counter drop comment {comment}\n\
+         add chain inet oxidom {restore} {{ type filter hook prerouting priority mangle; policy accept; }}\n\
+         flush chain inet oxidom {restore}\n",
         slice.level,
         quote(&slice.path)?,
     ))

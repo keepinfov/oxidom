@@ -179,6 +179,24 @@ Cleanup removes the profile's nftables chain *before* taking down its routing
 domain, so traffic is never briefly released onto the ordinary default route on
 the way down.
 
+### What a switch does to a command that is already running
+
+An `oxidom run` command is inside a scope that outlives the session which
+created it, so it cannot be asked when the tunnel is going away. Switching a
+profile — or bringing a profile up while its scope is still busy — therefore
+does not release it: the daemon turns the profile's chain into a **block**, and
+the command's packets are dropped until the new tunnel marks them again.
+
+The same protection covers a tunnel that fails to start, a core that dies
+(`on_core_exit = "hold"`, the default), a failed automatic reconnect, and
+`oxidom down` while a command is still running. `oxidom status` reports such a
+session as holding its traffic rather than carrying it.
+
+The block is not permanent. It ends when a tunnel for the profile carries the
+cgroup again, when the command's scope ends, or — for a profile set to
+`on_core_exit = "release"` — immediately, since that setting is a profile saying
+it wants no protection at all.
+
 ## Rules of your own
 
 The three layers above decide *what* reaches the tunnel. Where a given request
