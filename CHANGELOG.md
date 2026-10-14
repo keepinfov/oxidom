@@ -12,7 +12,7 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
-## [Unreleased]
+## [0.5.0] - 2026-10-14
 
 ### Fixed
 - **Switching or reconnecting a profile no longer drops an `oxidom run` command onto the ordinary route or leaves it unmarked on a second run.** The bound cgroup is blocked across interface re-plans, failed starts, core exits under `on_core_exit = "hold"`, and failed reconnect confirmations; `mark_cgroup` re-applies the nftables rule on every new scope so a recreated slice inode is always matched; and IPv6 packets from a marked cgroup are refused rather than routed around the IPv4 tunnel.

@@ -43,6 +43,30 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.5.0" date="2026-10-14">
+      <description>
+        <p>
+          Switching servers or reconnecting a tunnel no longer leaves a command
+          started with oxidom run unprotected: the bound cgroup is blocked
+          whenever no tunnel carries it, re-marked on every new scope, and
+          prevented from routing IPv6 around the IPv4 tunnel. Full-tunnel
+          sessions stop the previous interface before resolving a new server's
+          domain name, and install host bypass routes for every resolved IPv4
+          address and composite outbound.
+        </p>
+        <p>
+          Share-link and subscription imports carry httpupgrade, kcp, raw TCP
+          HTTP camouflage, TLS ECH and certificate verification fields, Clash
+          xhttp-opts and VLESS encryption, Sing-box host lists and certificate
+          pins, VMess URL and XHTTP/gRPC settings, plaintext Trojan, and
+          Hysteria2 hop intervals and certificate pins through to the generated
+          Xray config. Expanded server cards now stay compact and open their
+          full parameter list in a dedicated details dialog, server edits keep
+          unmodeled fields intact, and Settings wires Geo URL presets and
+          overrides cleanly.
+        </p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-09-04">
       <description>
         <p>
