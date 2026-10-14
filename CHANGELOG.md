@@ -12,6 +12,19 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
+## [Unreleased]
+
+### Added
+- **A pool can be raised in a named session.** `ConnectPool` now carries the target session name (defaulting to `default` for older clients), so the group Connect bar runs in the profile selected in the header and two pools in two sessions can run at once without colliding on ports.
+- **One window picks what to connect to.** Reachable from the Filter pill, the main menu (`Ctrl+K`) and the system tray (`Pick connection…`), the selection window offers saved groups, country, protocol, subscription, an `Alive only` switch, a latency ceiling, rotation width, a live server list, and direct **Connect** and **Save** actions.
+- **The local proxy can answer while nothing is connected.** Setting `standby_proxy = true` in `config.toml` (or **Answer on local ports while disconnected** in Settings) serves direct SOCKS5 and HTTP on `127.0.0.1` at the configured ports only while no profile session is connected, connecting or holding traffic. It is off by default and never automatically takes over the GNOME system proxy.
+
+### Fixed
+- **Group Connect and Disconnect stay in the selected session.** Connecting leaves profile files untouched, and Disconnect matches that session's resolved members without stopping the same pool in another session.
+- **The connection picker's preview matches Connect.** Country, protocol, subscription and health filters compose without a hidden page search. Alive-only and inclusive latency ceilings use direct readings only, excluding unknown and failed checks; saving a group and saving a profile are explicit, separate actions.
+- **Direct standby cannot outlive a tunnel start or bypass held routes.** Starting any session closes accepted direct connections as well as listeners first. GUI and CLI status explicitly report active direct service even when a failed default session remains recorded, and any profile holding traffic prevents standby.
+- **Connecting no longer fails with a bare "active server did not pass its latency check" after a passing ping.** The initial connection confirmation now uses the 6-second cold-start budget (`REAL_DELAY_TIMEOUT`) instead of the 3-second periodic liveness timeout, waits briefly for Xray's pipe reader on failure, records the HTTP method actually attempted over SOCKS, and reports the specific cause (TLS/REALITY handshake timeout, connection reset, DNS failure, or why an ICMP/TCP ping passed while the proxy outbound did not).
+
 ## [0.5.0] - 2026-10-14
 
 ### Fixed

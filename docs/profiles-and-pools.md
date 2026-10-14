@@ -160,6 +160,8 @@ probe_interval = "5m"
 | `countries` | list | `[]` | ISO 3166 alpha-2, case-insensitive. |
 | `protocols` | list | `[]` | `vless`, `trojan`, … |
 | `exclude` | list | `[]` | Alias or id, matched **exactly** — a substring here would silently drop half a pool. |
+| `alive_only` | bool | `false` | Require a successful direct latency reading. Unknown and failed checks are excluded. |
+| `max_latency_ms` | int | unset | Require a successful direct reading at or below this many milliseconds. A tunnel's proxied reading does not qualify. |
 | `max` | int | `0` | Cap on members. `0` is uncapped. At most 64. |
 | `expected` | int | `0` | How many nodes to keep in rotation. Only `leastLoad` reads it. `0` means all. |
 | `probe_interval` | string | `"5m"` | How often the core re-measures members. `30s`, `5m`, `1h`. |
@@ -167,6 +169,12 @@ probe_interval = "5m"
 A pool session has **no active server**. `oxidom status` reports its live exit
 from the core's own observatory rather than naming the first member — because the
 first member is not the exit, it is just first.
+
+Country, protocol, subscription and health filters all narrow the same selection.
+Without `alive_only` or a latency ceiling, unmeasured and failed servers remain
+eligible. With either enabled, measure candidates directly first; a successful
+check through a running tunnel is not evidence for these filters. Membership is
+resolved when you connect, not changed under live connections as readings arrive.
 
 When `max` truncates a pool, members are first dealt one per distinct endpoint, so
 `max = 8` cannot come back as eight spellings of the same host. `oxidom up` warns
@@ -202,14 +210,18 @@ it would silently join.
 
 ## Groups in the GUI
 
-A **group** in the GUI is a saved pool query under a name. Connecting to one writes
-it straight into `select.pool`; the daemon never learns a second noun for it.
+A **group** in the GUI is a saved pool query under a name. Connecting to one runs
+it in the profile session selected in the header (`default` if none was chosen),
+without creating or changing a profile file. That session uses its profile's
+interface, core settings, routing and core-exit policy; named sessions use their
+profile ports, while `default` uses the daemon's configured ports. Two named
+sessions can run pools independently on their own loopback addresses.
 
 Because a group *is* a filter, group membership is edited where the servers are —
-on the Servers page, in the one Selection dialog the `Filter` pill, `New group` and
-`⋮ → Edit…` all open. The profile editor reports the pool and edits only
-`strategy`, `max`, `expected` and `probe_interval`, carrying *which* servers
-through untouched. Two independent editors for one thing is how a saved profile
+in the one connection picker opened by `Filter`, the header's **Pick connection…**
+(`Ctrl+K`), the tray, `New group` and `⋮ → Edit…`. The profile editor reports the
+pool and edits only `strategy`, `max`, `expected` and `probe_interval`, carrying
+*which* servers through untouched. Two independent editors for one thing is how a saved profile
 comes to disagree with the group it was made from.
 
 The window calls this a **group** everywhere. `pool` is the word in the profile
@@ -218,7 +230,16 @@ so — the two are the same thing seen from either side.
 
 The Connect bar carries a rotation width (default 6), written into `expected`. It
 is deliberately not also stored on the group: a group answers "which servers", the
-width answers "how many at once, this run".
+width answers "how many at once, this run". The picker offers 2, 4, 6, 8 or 12,
+plus an explicit **All**; the effective width cannot exceed the matching nodes.
+
+Disconnect on the bar stops only the selected session when its pool has the same
+resolved members. A matching pool in another session is left alone. To stop that
+one, select its profile in the header first.
+
+**Save** in the picker keeps a selection as a group chip. **New profile from this…**
+in the selection menu writes `select.pool` to a
+profile for the CLI or systemd. Neither save happens merely by connecting.
 
 ## systemd
 

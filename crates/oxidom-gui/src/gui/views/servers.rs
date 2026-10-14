@@ -6,17 +6,19 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::glib;
 
+use oxidom_core::ipc::LatencyReading;
 use oxidom_core::model::Subscription;
-use oxidom_core::pool::PoolQuery;
+use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
 
 use super::super::group::subscription_description;
 use super::super::prefs::{FAVOURITES_ID, GroupKind, GuiPrefs, ServerGroup};
 use super::super::reduce::{
     FailureReport, FilterOption, GROUP_CONNECT_SESSION, HistoryChart, ServerProfiles,
     available_countries, available_protocols, available_subscriptions, connect_bar_session_note,
-    connect_button_tooltip, connect_choices, describe_rule, excludable_servers, filtered_ids,
+    connect_button_tooltip, connect_choices, describe_rule, direct_latencies, excludable_servers,
     filters_to_query, group_member_ids, groups_holding, moved_in_order, ordered_subscriptions,
-    query_equals_group, toggled_member, upsert_group,
+    preview_height, profile_selection, query_equals_group, replace_picker_selection,
+    rotation_options, selection_ids, selection_query, toggled_member, upsert_group,
 };
 use super::super::server_card::{
     CARD_MEASURE_WIDTH, COMPACT_CARD_HEIGHT, CardConnectionState, CardHandlers, LatencyState,
@@ -79,6 +81,8 @@ pub struct CardCallbacks {
     /// server ids, which is how the window recognises a session that is already
     /// running it.
     pub connect_pool: Rc<dyn Fn(PoolQuery, Vec<String>)>,
+    pub connect_selection: Rc<dyn Fn(PoolQuery)>,
+    pub clear_search: Rc<dyn Fn()>,
     /// Show the log page narrowed to one server. Offered from the expanded
     /// card beside a failed check, where what the core printed is the next
     /// thing anybody wants.
@@ -119,6 +123,7 @@ type BrowseCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 type PoolCallback = Rc<RefCell<Option<Rc<dyn Fn(PoolQuery)>>>>;
 /// Like [`PoolCallback`], plus the ids the query resolved to.
 type ResolvedPoolCallback = Rc<RefCell<Option<Rc<dyn Fn(PoolQuery, Vec<String>)>>>>;
+type PickerRefresh = Rc<RefCell<Option<std::rc::Weak<dyn Fn()>>>>;
 /// Server id to its checkbox, in the order the picker laid them out.
 type PickerChecks = Rc<RefCell<Vec<(String, gtk::CheckButton)>>>;
 /// The handles a picker's checkboxes write into. Shared with whoever will save
@@ -150,16 +155,45 @@ enum FilterField {
 /// commits once can also be abandoned.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct FilterDraft {
+    list: bool,
     countries: Vec<String>,
     protocols: Vec<String>,
     subscriptions: Vec<String>,
     exclude: Vec<String>,
-    /// Servers named by hand. Non-empty means the rule is not in force at all —
-    /// the same precedence `pool::resolve` gives a list over a rule.
+    alive_only: bool,
+    max_latency_ms: Option<u32>,
+    /// Servers named by hand. `list` also preserves an empty saved list; its
+    /// lack of members must never activate the rule underneath it.
     members: Vec<String>,
 }
 
 impl FilterDraft {
+    fn reset(&mut self, list_only: bool) {
+        *self = Self {
+            list: list_only,
+            ..Self::default()
+        };
+    }
+    fn connection_query(
+        &self,
+        name: String,
+        session: String,
+        strategy: Strategy,
+        expected: usize,
+    ) -> Option<PoolQuery> {
+        if self.kind() == GroupKind::List && self.members.is_empty() {
+            return None;
+        }
+        let mut query = self.to_query(name, self.kind());
+        query.session = if session.is_empty() {
+            GROUP_CONNECT_SESSION.into()
+        } else {
+            session
+        };
+        query.strategy = strategy;
+        query.expected = expected;
+        Some(query)
+    }
     /// How many of the rule's fields are set. The hand-picked members are not
     /// one of them: they are the other answer to the same question, not a
     /// narrower rule.
@@ -169,6 +203,8 @@ impl FilterDraft {
             self.protocols.is_empty(),
             self.subscriptions.is_empty(),
             self.exclude.is_empty(),
+            !self.alive_only,
+            self.max_latency_ms.is_none(),
         ]
         .into_iter()
         .filter(|empty| !empty)
@@ -186,10 +222,10 @@ impl FilterDraft {
     /// in the vocabulary of how groups are stored, as the first step of making
     /// one.
     fn kind(&self) -> GroupKind {
-        if self.members.is_empty() {
-            GroupKind::Rule
-        } else {
+        if self.list || !self.members.is_empty() {
             GroupKind::List
+        } else {
+            GroupKind::Rule
         }
     }
 
@@ -207,6 +243,8 @@ impl FilterDraft {
                 protocols: self.protocols.clone(),
                 subscriptions: self.subscriptions.clone(),
                 exclude: self.exclude.clone(),
+                alive_only: self.alive_only,
+                max_latency_ms: self.max_latency_ms,
                 ..PoolQuery::default()
             },
         }
@@ -251,7 +289,7 @@ pub struct ServersView {
     can_cancel_probes: Rc<Cell<bool>>,
     /// The profile the header is showing, which a group Connect deliberately
     /// does not use. Kept here so the bar can say so.
-    selected_profile: RefCell<String>,
+    selected_profile: Rc<RefCell<String>>,
     subscriptions: Rc<RefCell<Vec<Subscription>>>,
     /// Lowercased "name transport protocol address:port country" per server.
     /// The search matches this, never transient widget text like the
@@ -265,10 +303,13 @@ pub struct ServersView {
     /// it — `PoolQuery.exclude` is where a rule says "everything German except
     /// this one", which no combination of the other three can express.
     filter_exclude: Rc<RefCell<Vec<String>>>,
+    filter_alive_only: Rc<Cell<bool>>,
+    filter_max_latency_ms: Rc<Cell<Option<u32>>>,
     /// Members of the selected group when that group is a frozen list. Not a
     /// widget's contents — a list has no filter row to live in — so it is
     /// carried here and folded into `current_filter` by `apply_filter`.
     scope_members: Rc<RefCell<Vec<String>>>,
+    scope_kind: Rc<Cell<PoolKind>>,
     /// What the visible selection would be saved as: a list of exactly the
     /// visible servers, or the rule that matched them.
     current_filter: Rc<RefCell<PoolQuery>>,
@@ -294,6 +335,10 @@ pub struct ServersView {
     /// the callbacks that carried it went out of scope.
     on_create_pool: PoolCallback,
     on_connect_pool: ResolvedPoolCallback,
+    on_connect_selection: PoolCallback,
+    on_clear_search: BrowseCallback,
+    direct_latencies: Rc<RefCell<HashMap<String, Option<u32>>>>,
+    picker_refresh: PickerRefresh,
     /// The row of saved scopes, above the subscription blocks.
     chip_bar: gtk::Box,
     chip_scroll: gtk::ScrolledWindow,
@@ -489,7 +534,7 @@ impl ServersView {
             // Assumed absent until told otherwise: an unasked question must not
             // paint a control that cannot work.
             can_cancel_probes: Rc::new(Cell::new(false)),
-            selected_profile: RefCell::new(GROUP_CONNECT_SESSION.to_string()),
+            selected_profile: Rc::new(RefCell::new(GROUP_CONNECT_SESSION.to_string())),
             chip_bar,
             chip_scroll,
             chip_hint,
@@ -504,6 +549,7 @@ impl ServersView {
             filter_button,
             filter_label,
             scope_members: Rc::new(RefCell::new(Vec::new())),
+            scope_kind: Rc::new(Cell::new(PoolKind::Rule)),
             active_group: Rc::new(RefCell::new(None)),
             saved_groups: Rc::new(RefCell::new(Vec::new())),
             scopes: Rc::new(RefCell::new(None)),
@@ -511,6 +557,10 @@ impl ServersView {
             switching_scope: Rc::new(Cell::new(false)),
             on_create_pool: Rc::new(RefCell::new(None)),
             on_connect_pool: Rc::new(RefCell::new(None)),
+            on_connect_selection: Rc::new(RefCell::new(None)),
+            on_clear_search: Rc::new(RefCell::new(None)),
+            direct_latencies: Rc::new(RefCell::new(HashMap::new())),
+            picker_refresh: Rc::new(RefCell::new(None)),
             on_browse_subscriptions: Rc::new(RefCell::new(None)),
             cards: Rc::new(RefCell::new(HashMap::new())),
             blocks: Rc::new(RefCell::new(Vec::new())),
@@ -521,6 +571,8 @@ impl ServersView {
             filter_protocols: Rc::new(RefCell::new(Vec::new())),
             filter_subscriptions: Rc::new(RefCell::new(Vec::new())),
             filter_exclude: Rc::new(RefCell::new(Vec::new())),
+            filter_alive_only: Rc::new(Cell::new(false)),
+            filter_max_latency_ms: Rc::new(Cell::new(None)),
             current_filter: Rc::new(RefCell::new(PoolQuery::default())),
             columns: Rc::new(Cell::new(1)),
             pending_columns: Rc::new(Cell::new(1)),
@@ -651,6 +703,9 @@ impl ServersView {
         self.search_texts.borrow_mut().clear();
         *self.on_create_pool.borrow_mut() = Some(callbacks.create_pool.clone());
         *self.on_connect_pool.borrow_mut() = Some(callbacks.connect_pool.clone());
+        *self.on_connect_selection.borrow_mut() = Some(callbacks.connect_selection.clone());
+        let clear_search = callbacks.clear_search.clone();
+        *self.on_clear_search.borrow_mut() = Some(Box::new(move || clear_search()));
         *self.latencies.borrow_mut() = latency_states
             .iter()
             .filter_map(|(id, state)| sort_value(*state).map(|value| (id.clone(), value)))
@@ -1027,6 +1082,14 @@ impl ServersView {
             self.set_selected_immediately(server_id);
         }
         self.schedule_expanded_remeasure();
+        let refresh = self
+            .picker_refresh
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade);
+        if let Some(refresh) = refresh {
+            refresh();
+        }
     }
 
     /// The row of saved scopes: Filter, All, one chip per group, then "+".
@@ -1191,10 +1254,24 @@ impl ServersView {
             let popover = popover.clone();
             move |_| {
                 popover.popdown();
-                let query = view.current_filter.borrow().clone();
+                let Some(query) =
+                    profile_selection(&view.current_filter.borrow(), view.scope_kind.get())
+                else {
+                    return;
+                };
                 if let Some(callback) = view.on_create_pool.borrow().as_ref() {
                     callback(query);
                 }
+            }
+        });
+        popover.connect_show({
+            let view = self.clone();
+            let create_pool = create_pool.clone();
+            move |_| {
+                create_pool.set_sensitive(
+                    profile_selection(&view.current_filter.borrow(), view.scope_kind.get())
+                        .is_some(),
+                )
             }
         });
         list.append(&create_pool);
@@ -1241,9 +1318,11 @@ impl ServersView {
                 let query = match group.kind {
                     GroupKind::List => PoolQuery {
                         name: group.name.clone(),
-                        members: filtered_ids(
+                        members: selection_ids(
                             &view.current_filter.borrow(),
+                            view.scope_kind.get(),
                             &view.subscriptions.borrow(),
+                            &view.direct_latencies.borrow(),
                         ),
                         ..PoolQuery::default()
                     },
@@ -1407,7 +1486,14 @@ impl ServersView {
         list.set_margin_start(6);
         list.set_margin_end(6);
         let popover = gtk::Popover::builder().child(&list).build();
-        for value in ROTATION_CHOICES {
+        let available = selection_ids(
+            &self.current_filter.borrow(),
+            self.scope_kind.get(),
+            &self.subscriptions.borrow(),
+            &self.direct_latencies.borrow(),
+        )
+        .len();
+        for value in rotation_options(available) {
             let button = gtk::Button::builder()
                 .label(rotation_label(value))
                 .css_classes(["flat"])
@@ -1427,17 +1513,27 @@ impl ServersView {
         self.connect_rotation.set_popover(Some(&popover));
     }
 
-    /// Hand the visible selection to the window as a pool.
+    // Hand the visible selection to the window as a pool.
     fn connect_active_group(&self) {
         let Some(query) = self.connect_query() else {
             return;
         };
         // Resolved here, where the subscriptions already are, and for the same
         // reason the bar's count is: what Connect runs is what the page shows.
-        let members = filtered_ids(&query, &self.subscriptions.borrow());
+        let members = selection_ids(
+            &query,
+            self.scope_kind.get(),
+            &self.subscriptions.borrow(),
+            &self.direct_latencies.borrow(),
+        );
         if let Some(callback) = self.on_connect_pool.borrow().as_ref() {
             callback(query, members);
         }
+    }
+
+    /// Open the connection picker window from outside the page (header or tray).
+    pub fn open_connection_picker(&self) {
+        self.present_selection_dialog(SelectionIntent::Filter);
     }
 
     /// What Connect would run: exactly what is on screen, under a name and the
@@ -1455,13 +1551,26 @@ impl ServersView {
             None if self.active_filter_fields() > 0 => {
                 suggested_group_name(&self.rule_from_filters(String::new()))
             }
-            None => return None,
+            None => "All".into(),
         };
         let mut query = self.current_filter.borrow().clone();
-        if filtered_ids(&query, &self.subscriptions.borrow()).is_empty() {
+        if selection_ids(
+            &query,
+            self.scope_kind.get(),
+            &self.subscriptions.borrow(),
+            &self.direct_latencies.borrow(),
+        )
+        .is_empty()
+        {
             return None;
         }
         query.name = name;
+        let session = self.selected_profile.borrow().clone();
+        query.session = if session.is_empty() {
+            GROUP_CONNECT_SESSION.into()
+        } else {
+            session
+        };
         query.strategy = connect_choices()
             .get(self.connect_strategy.get())
             .map(|choice| choice.strategy)
@@ -1479,7 +1588,12 @@ impl ServersView {
     /// does not consult the search box.
     fn sync_connect_bar(&self) {
         let subscriptions = self.subscriptions.borrow().clone();
-        let visible_ids = filtered_ids(&self.current_filter.borrow(), &subscriptions);
+        let visible_ids = selection_ids(
+            &self.current_filter.borrow(),
+            self.scope_kind.get(),
+            &subscriptions,
+            &self.direct_latencies.borrow(),
+        );
         let visible = visible_ids.len();
         let unsaved = self.active_group_value().is_none();
         let title = match self.active_group_value() {
@@ -1516,22 +1630,27 @@ impl ServersView {
             .into_iter()
             .nth(self.connect_strategy.get());
         self.connect_button.set_sensitive(visible > 0);
+        let selected_profile = self.selected_profile.borrow().clone();
+        let selected_profile = if selected_profile.is_empty() {
+            GROUP_CONNECT_SESSION.to_string()
+        } else {
+            selected_profile
+        };
         let pool_active = {
             let connection = self.last_connection.borrow();
             let active_pool_count = connection
                 .profiles
                 .values()
-                .filter(|profiles| profiles.in_pool.iter().any(|p| p == GROUP_CONNECT_SESSION))
+                .filter(|profiles| profiles.in_pool.iter().any(|p| p == &selected_profile))
                 .count();
             visible > 0
                 && active_pool_count == visible
                 && visible_ids.iter().all(|id| {
                     connection.profiles.get(id).is_some_and(|profiles| {
-                        profiles.in_pool.iter().any(|p| p == GROUP_CONNECT_SESSION)
+                        profiles.in_pool.iter().any(|p| p == &selected_profile)
                     })
                 })
         };
-        let selected_profile = self.selected_profile.borrow().clone();
         if pool_active {
             self.connect_button.set_label("Disconnect");
             self.connect_button.remove_css_class("suggested-action");
@@ -1559,6 +1678,7 @@ impl ServersView {
         self.connect_save.set_visible(unsaved);
         self.connect_save.set_sensitive(visible > 0);
         self.connect_bar.set_visible(true);
+        self.build_rotation_menu();
     }
 
     /// One editor for what is selected, whether or not it ends up with a name.
@@ -1602,37 +1722,47 @@ impl ServersView {
             // A rule's members are whatever it happens to match today, so
             // loading them would turn every edit of a rule into a freeze.
             Some(group) => FilterDraft {
+                list: group.kind == GroupKind::List,
                 countries: group.query.countries.clone(),
                 protocols: group.query.protocols.clone(),
                 subscriptions: group.query.subscriptions.clone(),
                 exclude: group.query.exclude.clone(),
+                alive_only: group.query.alive_only,
+                max_latency_ms: group.query.max_latency_ms,
                 members: match group.kind {
                     GroupKind::List => group_member_ids(group, &subscriptions),
                     GroupKind::Rule => Vec::new(),
                 },
             },
             None => FilterDraft {
+                list: self.scope_kind.get() == PoolKind::List
+                    || (matches!(intent, SelectionIntent::Name) && !self.query.borrow().is_empty()),
                 countries: self.filter_countries.borrow().clone(),
                 protocols: self.filter_protocols.borrow().clone(),
                 subscriptions: self.filter_subscriptions.borrow().clone(),
                 exclude: self.filter_exclude.borrow().clone(),
+                alive_only: self.filter_alive_only.get(),
+                max_latency_ms: self.filter_max_latency_ms.get(),
                 members: self.starting_members(&intent, &subscriptions),
             },
         }));
 
-        let dialog = adw::Dialog::builder()
+        let dialog = adw::Window::builder()
             .title(match editing.as_ref() {
                 Some(group) => group.name.as_str(),
                 None => "Selection",
             })
-            .content_width(420)
-            .content_height(620)
+            .default_width(980)
+            .default_height(780)
+            .modal(true)
             .build();
+        if let Some(parent) = self.root.root().and_downcast::<gtk::Window>() {
+            dialog.set_transient_for(Some(&parent));
+        }
         let navigation = adw::NavigationView::new();
 
-        // Save is the obvious button where a group is being changed, Apply where
-        // the page is. Both are always present: the whole point of one editor is
-        // that naming a selection is not a different errand.
+        // Save is the obvious button where a group is being changed, Connect where
+        // the picker is opened to connect or filter.
         let suggest = |wanted: bool| -> Vec<&str> {
             if wanted {
                 vec!["suggested-action"]
@@ -1644,6 +1774,10 @@ impl ServersView {
         let apply = gtk::Button::builder()
             .label("Apply")
             .tooltip_text("Show this selection on the page, without saving it")
+            .build();
+        let connect_now = gtk::Button::builder()
+            .label("Connect")
+            .tooltip_text("Connect to this selection now, without writing a profile")
             .css_classes(suggest(!editing_group))
             .build();
         let save = gtk::Button::builder()
@@ -1656,6 +1790,7 @@ impl ServersView {
             .show_start_title_buttons(false)
             .build();
         header.pack_start(&cancel);
+        header.pack_end(&connect_now);
         header.pack_end(&save);
         header.pack_end(&apply);
 
@@ -1735,8 +1870,72 @@ impl ServersView {
                     &draft.borrow().to_query(String::new(), GroupKind::Rule),
                 ));
             }
+            None if self.active_group_value().is_some() => {
+                if let Some(group) = self.active_group_value() {
+                    name_row.set_text(&group.name);
+                    icon_row.set_text(&group.icon);
+                }
+            }
             None => {}
         }
+
+        let alive_row = adw::SwitchRow::builder()
+            .title("Alive only")
+            .subtitle("Keep only servers whose last latency check succeeded")
+            .active(draft.borrow().alive_only)
+            .build();
+        let ceiling_choices: [(Option<u32>, &str); 5] = [
+            (None, "Any latency"),
+            (Some(100), "At most 100 ms"),
+            (Some(200), "At most 200 ms"),
+            (Some(350), "At most 350 ms"),
+            (Some(500), "At most 500 ms"),
+        ];
+        let ceiling_strings = gtk::StringList::new(
+            &ceiling_choices
+                .iter()
+                .map(|(_, label)| *label)
+                .collect::<Vec<_>>(),
+        );
+        let initial_ceiling_idx = ceiling_choices
+            .iter()
+            .position(|(val, _)| *val == draft.borrow().max_latency_ms)
+            .unwrap_or(0) as u32;
+        let ceiling_row = adw::ComboRow::builder()
+            .title("Latency ceiling")
+            .model(&ceiling_strings)
+            .selected(initial_ceiling_idx)
+            .build();
+        let rotation_strings = gtk::StringList::new(&[]);
+        let rotation_values = Rc::new(RefCell::new(Vec::<usize>::new()));
+        let syncing_rotation = Rc::new(Cell::new(false));
+        let rotation_row = adw::ComboRow::builder()
+            .title("Rotation width")
+            .subtitle("How many nodes carry traffic at once")
+            .model(&rotation_strings)
+            .build();
+        let saved_groups_list = self.saved_groups.borrow().clone();
+        let saved_groups_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        saved_groups_box.set_visible(!saved_groups_list.is_empty());
+        let saved_groups_scroll = gtk::ScrolledWindow::builder()
+            .child(&saved_groups_box)
+            .hscrollbar_policy(gtk::PolicyType::External)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .visible(!saved_groups_list.is_empty())
+            .build();
+        let preview_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        // At least ten rows visible before the preview list scrolls (#87).
+        let preview_scroll = gtk::ScrolledWindow::builder()
+            .child(&preview_list)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_height(480)
+            .vexpand(true)
+            .build();
+        let narrow = Rc::new(Cell::new(false));
 
         let checks: Rc<RefCell<Vec<(FilterField, String, gtk::CheckButton)>>> =
             Rc::new(RefCell::new(Vec::new()));
@@ -1774,11 +1973,16 @@ impl ServersView {
         // a programmatic `set_active` exactly as for a click, so without this each
         // write would run the read-back once per checkbox.
         let syncing = Rc::new(Cell::new(false));
+        let picker_query = Rc::new(RefCell::new(PoolQuery::default()));
+        let sync_except: Rc<RefCell<Option<SelectionChanged>>> = Rc::new(RefCell::new(None));
+        let sync_only: Rc<RefCell<Option<SelectionChanged>>> = Rc::new(RefCell::new(None));
 
         // One closure both directions of the sync go through, so the subtitles,
         // the summary, the draft and whether Save means anything cannot describe
         // different things.
         let refresh: Rc<dyn Fn()> = Rc::new({
+            let sync_except = sync_except.clone();
+            let sync_only = sync_only.clone();
             let checks = checks.clone();
             let field_rows = field_rows.clone();
             let exclude_row = exclude_row.clone();
@@ -1786,11 +1990,20 @@ impl ServersView {
             let rows = rows.clone();
             let matches = matches.clone();
             let draft = draft.clone();
-            let subscriptions = subscriptions.clone();
             let view = self.clone();
             let name_row = name_row.clone();
             let save = save.clone();
+            let connect_now = connect_now.clone();
+            let rotation_row = rotation_row.clone();
+            let rotation_strings = rotation_strings.clone();
+            let rotation_values = rotation_values.clone();
+            let syncing_rotation = syncing_rotation.clone();
+            let preview_list = preview_list.clone();
+            let preview_scroll = preview_scroll.clone();
+            let narrow = narrow.clone();
+            let picker_query = picker_query.clone();
             move || {
+                let subscriptions = view.subscriptions.borrow().clone();
                 let borrowed = checks.borrow();
                 for (field, row) in field_rows.borrow().iter() {
                     let mut chosen = 0;
@@ -1811,12 +2024,19 @@ impl ServersView {
                     });
                 }
                 drop(borrowed);
-                let draft = draft.borrow();
+                let draft = draft.borrow().clone();
+                for (values, sync) in [(&draft.exclude, &sync_except), (&draft.members, &sync_only)]
+                {
+                    let sync = sync.borrow().clone();
+                    if let Some(sync) = sync {
+                        sync(values);
+                    }
+                }
                 exclude_row.set_subtitle(&exclude_label(&draft.exclude));
                 only_row.set_subtitle(&picked_label(draft.members.len()));
                 // Named servers win over a rule wherever this is resolved, so the
                 // rule is disabled rather than left writable and ignored.
-                let by_hand = !draft.members.is_empty();
+                let by_hand = draft.kind() == GroupKind::List;
                 rows.set_sensitive(!by_hand && !list_only);
                 rows.set_tooltip_text(if list_only {
                     Some("Favourites holds the servers you star, so it has no rule.")
@@ -1828,27 +2048,84 @@ impl ServersView {
                 });
                 // The same computation the page will do on Apply, so the number
                 // promised here is the number that appears.
-                let count = if by_hand {
-                    filtered_ids(
-                        &PoolQuery {
-                            members: draft.members.clone(),
-                            ..PoolQuery::default()
-                        },
-                        &subscriptions,
-                    )
-                    .len()
+                let kind = if by_hand {
+                    PoolKind::List
                 } else {
-                    let query = filters_to_query(
-                        &subscriptions,
-                        &draft.subscriptions,
-                        &draft.countries,
-                        &draft.protocols,
-                        &draft.exclude,
-                        &view.search_texts.borrow(),
-                        "",
-                    );
-                    filtered_ids(&query, &subscriptions).len()
+                    PoolKind::Rule
                 };
+                let mut query = draft
+                    .connection_query(
+                        name_row.text().trim().into(),
+                        view.selected_profile.borrow().clone(),
+                        connect_choices()[view.connect_strategy.get()].strategy,
+                        view.connect_rotation_value.get(),
+                    )
+                    .unwrap_or_else(|| draft.to_query(name_row.text().trim().into(), draft.kind()));
+                let matched_ids = selection_ids(
+                    &query,
+                    kind,
+                    &subscriptions,
+                    &view.direct_latencies.borrow(),
+                );
+                let count = matched_ids.len();
+                let options = rotation_options(count);
+                let rot_value = view.connect_rotation_value.get();
+                let selected = options
+                    .iter()
+                    .position(|value| *value == rot_value)
+                    .unwrap_or(options.len() - 1) as u32;
+                query.expected = options[selected as usize];
+                *picker_query.borrow_mut() = query;
+                // GTK notifies synchronously while a model/selection is replaced.
+                // Never read the model back or re-enter refresh during this write.
+                syncing_rotation.set(true);
+                if *rotation_values.borrow() != options {
+                    let labels = options
+                        .iter()
+                        .map(|value| rotation_label(*value))
+                        .collect::<Vec<_>>();
+                    *rotation_values.borrow_mut() = options;
+                    rotation_strings.splice(
+                        0,
+                        rotation_strings.n_items(),
+                        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+                    );
+                }
+                rotation_row.set_selected(selected);
+                syncing_rotation.set(false);
+                rotation_row.set_subtitle(&rotation_summary(rot_value, count));
+                rotation_row.set_sensitive(count > 2);
+                connect_now.set_sensitive(count > 0);
+                while let Some(child) = preview_list.first_child() {
+                    preview_list.remove(&child);
+                }
+                let latencies = view.direct_latencies.borrow();
+                for id in &matched_ids {
+                    if let Some(server) = subscriptions
+                        .iter()
+                        .flat_map(|s| s.servers.iter())
+                        .find(|s| &s.id == id)
+                    {
+                        let subtitle = match latencies.get(id).copied() {
+                            Some(Some(ms)) => format!("{} · {ms} ms", server.transport_label),
+                            Some(None) => format!("{} · unreachable", server.transport_label),
+                            None => server.transport_label.clone(),
+                        };
+                        let row = adw::ActionRow::builder()
+                            .title(&server.name)
+                            .title_lines(1)
+                            .build();
+                        row.add_suffix(
+                            &gtk::Label::builder()
+                                .label(&subtitle)
+                                .ellipsize(gtk::pango::EllipsizeMode::End)
+                                .max_width_chars(22)
+                                .css_classes(["dim-label", "caption"])
+                                .build(),
+                        );
+                        preview_list.append(&row);
+                    }
+                }
                 matches.set_label(&selection_summary(&draft, count, list_only));
                 // A greyed-out Save says "not ready yet"; a live one that
                 // silently does nothing says the app is broken. An unnamed
@@ -1864,11 +2141,18 @@ impl ServersView {
                     (_, false) => "Pick some servers or set a filter first",
                     _ => "Keep this selection as a group in the chip row",
                 }));
+                if !narrow.get() {
+                    measure_preview(&preview_list, &preview_scroll);
+                }
             }
         });
         name_row.connect_changed({
-            let refresh = refresh.clone();
-            move |_| refresh()
+            let refresh = Rc::downgrade(&refresh);
+            move |_| {
+                if let Some(refresh) = refresh.upgrade() {
+                    refresh();
+                }
+            }
         });
 
         // Read every box rather than tracking the one that moved: the boxes are
@@ -1878,7 +2162,9 @@ impl ServersView {
             let checks = checks.clone();
             let draft = draft.clone();
             let syncing = syncing.clone();
-            let refresh = refresh.clone();
+            let refresh = Rc::downgrade(&refresh);
+            let alive_row = alive_row.clone();
+            let ceiling_row = ceiling_row.clone();
             move || {
                 if syncing.get() {
                     return;
@@ -1898,10 +2184,110 @@ impl ServersView {
                             FilterField::Subscription => draft.subscriptions.push(value.clone()),
                         }
                     }
+                    draft.alive_only = alive_row.is_active();
+                    draft.max_latency_ms = ceiling_choices
+                        .get(ceiling_row.selected() as usize)
+                        .and_then(|(val, _)| *val);
                 }
-                refresh();
+                if let Some(refresh) = refresh.upgrade() {
+                    refresh();
+                }
             }
         });
+        alive_row.connect_active_notify({
+            let read_back = Rc::downgrade(&read_back);
+            move |_| {
+                if let Some(read_back) = read_back.upgrade() {
+                    read_back();
+                }
+            }
+        });
+        ceiling_row.connect_selected_notify({
+            let read_back = Rc::downgrade(&read_back);
+            move |_| {
+                if let Some(read_back) = read_back.upgrade() {
+                    read_back();
+                }
+            }
+        });
+        rotation_row.connect_selected_notify({
+            let view = self.clone();
+            let refresh = Rc::downgrade(&refresh);
+            let rotation_values = rotation_values.clone();
+            let syncing_rotation = syncing_rotation.clone();
+            move |row| {
+                if syncing_rotation.get() {
+                    return;
+                }
+                let value = rotation_values
+                    .borrow()
+                    .get(row.selected() as usize)
+                    .copied()
+                    .unwrap_or(0);
+                view.connect_rotation_value.set(value);
+                view.sync_connect_bar();
+                if let Some(refresh) = refresh.upgrade() {
+                    refresh();
+                }
+            }
+        });
+        for saved in &saved_groups_list {
+            let button = gtk::Button::builder()
+                .label(saved.label())
+                .sensitive(!list_only || saved.kind == GroupKind::List)
+                .css_classes(["pill", "flat"])
+                .build();
+            button.connect_clicked({
+                let saved = saved.clone();
+                let draft = draft.clone();
+                let checks = checks.clone();
+                let alive_row = alive_row.clone();
+                let ceiling_row = ceiling_row.clone();
+                let name_row = name_row.clone();
+                let icon_row = icon_row.clone();
+                let syncing = syncing.clone();
+                let refresh = Rc::downgrade(&refresh);
+                let subscriptions = subscriptions.clone();
+                move |_| {
+                    let next = FilterDraft {
+                        list: saved.kind == GroupKind::List,
+                        countries: saved.query.countries.clone(),
+                        protocols: saved.query.protocols.clone(),
+                        subscriptions: saved.query.subscriptions.clone(),
+                        exclude: saved.query.exclude.clone(),
+                        alive_only: saved.query.alive_only,
+                        max_latency_ms: saved.query.max_latency_ms,
+                        members: match saved.kind {
+                            GroupKind::List => group_member_ids(&saved, &subscriptions),
+                            GroupKind::Rule => Vec::new(),
+                        },
+                    };
+                    syncing.set(true);
+                    name_row.set_text(&saved.name);
+                    icon_row.set_text(&saved.icon);
+                    alive_row.set_active(next.alive_only);
+                    let c_idx = ceiling_choices
+                        .iter()
+                        .position(|(val, _)| *val == next.max_latency_ms)
+                        .unwrap_or(0) as u32;
+                    ceiling_row.set_selected(c_idx);
+                    for (field, value, check) in checks.borrow().iter() {
+                        let on = match field {
+                            FilterField::Country => next.countries.contains(value),
+                            FilterField::Protocol => next.protocols.contains(value),
+                            FilterField::Subscription => next.subscriptions.contains(value),
+                        };
+                        check.set_active(on);
+                    }
+                    *draft.borrow_mut() = next;
+                    syncing.set(false);
+                    if let Some(refresh) = refresh.upgrade() {
+                        refresh();
+                    }
+                }
+            });
+            saved_groups_box.append(&button);
+        }
 
         let countries = available_countries(&subscriptions)
             .into_iter()
@@ -1942,8 +2328,12 @@ impl ServersView {
                 let check = gtk::CheckButton::new();
                 check.set_active(chosen.contains(&option.value));
                 check.connect_toggled({
-                    let read_back = read_back.clone();
-                    move |_| read_back()
+                    let read_back = Rc::downgrade(&read_back);
+                    move |_| {
+                        if let Some(read_back) = read_back.upgrade() {
+                            read_back();
+                        }
+                    }
                 });
                 let inner = adw::ActionRow::builder()
                     .title(&option.label)
@@ -1961,15 +2351,32 @@ impl ServersView {
             rows.append(&row);
             field_rows.borrow_mut().push((field, row));
         }
+        rows.append(&alive_row);
+        rows.append(&ceiling_row);
+        let rotation_group = adw::PreferencesGroup::new();
+        rotation_group.add(&rotation_row);
 
         let naming = adw::PreferencesGroup::new();
         naming.add(&name_row);
         naming.add(&icon_row);
+        if !saved_groups_list.is_empty() {
+            body.append(&section_title("Saved groups"));
+            body.append(&saved_groups_scroll);
+        }
         body.append(&naming);
         body.append(&section_title("Matching"));
         body.append(&rows);
         body.append(&section_title("Or name them"));
         body.append(&picked);
+        body.append(&rotation_group);
+        let preview_pane = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        preview_pane.set_hexpand(true);
+        preview_pane.set_vexpand(true);
+        preview_pane.set_margin_top(12);
+        preview_pane.set_margin_bottom(12);
+        preview_pane.set_margin_end(12);
+        preview_pane.append(&section_title("Matching servers"));
+        preview_pane.append(&preview_scroll);
 
         let reset = gtk::Button::builder()
             .label("Reset")
@@ -1978,16 +2385,22 @@ impl ServersView {
         reset.connect_clicked({
             let draft = draft.clone();
             let checks = checks.clone();
+            let alive_row = alive_row.clone();
+            let ceiling_row = ceiling_row.clone();
             let syncing = syncing.clone();
-            let refresh = refresh.clone();
+            let refresh = Rc::downgrade(&refresh);
             move |_| {
-                *draft.borrow_mut() = FilterDraft::default();
+                draft.borrow_mut().reset(list_only);
                 syncing.set(true);
+                alive_row.set_active(false);
+                ceiling_row.set_selected(0);
                 for (_, _, check) in checks.borrow().iter() {
                     check.set_active(false);
                 }
                 syncing.set(false);
-                refresh();
+                if let Some(refresh) = refresh.upgrade() {
+                    refresh();
+                }
             }
         });
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -2008,10 +2421,12 @@ impl ServersView {
                 Rc::new(RefCell::new(initial)),
                 Rc::new({
                     let draft = draft.clone();
-                    let refresh = refresh.clone();
+                    let refresh = Rc::downgrade(&refresh);
                     move |values: &[String]| {
                         write(&mut draft.borrow_mut(), values.to_vec());
-                        refresh();
+                        if let Some(refresh) = refresh.upgrade() {
+                            refresh();
+                        }
                     }
                 }),
             );
@@ -2027,35 +2442,44 @@ impl ServersView {
             // and with `hscrollbar-policy: never` above them their width demand
             // reached the dialog, so it jumped sideways too. Still lazy, because
             // nothing is built until the row is activated at all.
-            (page, picker.fill)
+            (page, picker.fill, picker.sync)
         };
 
-        let (except_page, fill_except) = picker_page(
+        let (except_page, fill_except, sync) = picker_page(
             "Except",
             "except",
             draft.borrow().exclude.clone(),
             Rc::new(|draft: &mut FilterDraft, values| draft.exclude = values),
         );
+        *sync_except.borrow_mut() = Some(sync);
         exclude_row.connect_activated({
-            let navigation = navigation.clone();
+            let navigation = navigation.downgrade();
             move |_| {
-                fill_except();
-                navigation.push(&except_page);
+                if let Some(navigation) = navigation.upgrade() {
+                    fill_except();
+                    navigation.push(&except_page);
+                }
             }
         });
         rows.append(&exclude_row);
 
-        let (only_page, fill_only) = picker_page(
+        let (only_page, fill_only, sync) = picker_page(
             "Only these servers",
             "only",
             draft.borrow().members.clone(),
-            Rc::new(|draft: &mut FilterDraft, values| draft.members = values),
+            Rc::new(move |draft: &mut FilterDraft, values| {
+                draft.list = list_only || !values.is_empty();
+                draft.members = values;
+            }),
         );
+        *sync_only.borrow_mut() = Some(sync);
         only_row.connect_activated({
-            let navigation = navigation.clone();
+            let navigation = navigation.downgrade();
             move |_| {
-                fill_only();
-                navigation.push(&only_page);
+                if let Some(navigation) = navigation.upgrade() {
+                    fill_only();
+                    navigation.push(&only_page);
+                }
             }
         });
 
@@ -2064,36 +2488,103 @@ impl ServersView {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
-        let toolbar = adw::ToolbarView::builder().content(&scroll).build();
+        scroll.set_hexpand(true);
+        let panes = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        panes.set_homogeneous(true);
+        panes.append(&scroll);
+        panes.append(&preview_pane);
+        let breakpoint = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse("max-width: 760px or max-height: 650px")
+                .expect("valid picker breakpoint"),
+        );
+        breakpoint.connect_apply({
+            let panes = panes.clone();
+            let preview_scroll = preview_scroll.clone();
+            let narrow = narrow.clone();
+            move |_| {
+                narrow.set(true);
+                panes.set_orientation(gtk::Orientation::Vertical);
+                preview_scroll.set_min_content_height(0);
+            }
+        });
+        breakpoint.connect_unapply({
+            let panes = panes.clone();
+            let preview_scroll = preview_scroll.clone();
+            let preview_list = preview_list.clone();
+            let narrow = narrow.clone();
+            move |_| {
+                narrow.set(false);
+                panes.set_orientation(gtk::Orientation::Horizontal);
+                measure_preview(&preview_list, &preview_scroll);
+            }
+        });
+        dialog.add_breakpoint(breakpoint);
+        let toolbar = adw::ToolbarView::builder().content(&panes).build();
         toolbar.add_top_bar(&header);
         toolbar.add_bottom_bar(&footer);
         navigation.add(
             &adw::NavigationPage::builder()
-                .title(dialog.title().as_str())
+                .title(dialog.title().as_deref().unwrap_or("Selection"))
                 .tag("selection")
                 .child(&toolbar)
                 .build(),
         );
-        dialog.set_child(Some(&navigation));
+        dialog.set_content(Some(&navigation));
 
         cancel.connect_clicked({
-            let dialog = dialog.clone();
+            let dialog = dialog.downgrade();
             move |_| {
-                dialog.close();
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
             }
         });
         apply.connect_clicked({
             let view = self.clone();
-            let dialog = dialog.clone();
+            let dialog = dialog.downgrade();
             let draft = draft.clone();
             move |_| {
-                dialog.close();
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
                 view.show_selection(&draft.borrow());
+            }
+        });
+        connect_now.connect_clicked({
+            let view = self.clone();
+            let dialog = dialog.downgrade();
+            let draft = draft.clone();
+            let picker_query = picker_query.clone();
+            move |_| {
+                let draft = draft.borrow().clone();
+                let query = picker_query.borrow().clone();
+                let kind = if draft.kind() == GroupKind::List {
+                    PoolKind::List
+                } else {
+                    PoolKind::Rule
+                };
+                if selection_ids(
+                    &query,
+                    kind,
+                    &view.subscriptions.borrow(),
+                    &view.direct_latencies.borrow(),
+                )
+                .is_empty()
+                {
+                    return;
+                }
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+                view.show_selection(&draft);
+                if let Some(callback) = view.on_connect_selection.borrow().clone() {
+                    callback(query);
+                }
             }
         });
         save.connect_clicked({
             let view = self.clone();
-            let dialog = dialog.clone();
+            let dialog = dialog.downgrade();
             let draft = draft.clone();
             let name_row = name_row.clone();
             let icon_row = icon_row.clone();
@@ -2102,8 +2593,10 @@ impl ServersView {
                 if name.is_empty() {
                     return;
                 }
-                dialog.close();
-                let draft = draft.borrow();
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+                let draft = draft.borrow().clone();
                 let kind = if list_only {
                     GroupKind::List
                 } else {
@@ -2119,7 +2612,19 @@ impl ServersView {
             }
         });
         (*refresh)();
-        dialog.present(Some(&self.root));
+        measure_preview(&preview_list, &preview_scroll);
+        *self.picker_refresh.borrow_mut() = Some(Rc::downgrade(&refresh));
+        dialog.connect_close_request({
+            let picker_refresh = self.picker_refresh.clone();
+            let refresh = refresh.clone();
+            let read_back = read_back.clone();
+            move |_| {
+                let _keep_alive = (&refresh, &read_back);
+                picker_refresh.borrow_mut().take();
+                glib::Propagation::Proceed
+            }
+        });
+        dialog.present();
         // The name is what "New group" came for; everything else on the form
         // already holds what the page was showing.
         if matches!(intent, SelectionIntent::Name) {
@@ -2140,13 +2645,24 @@ impl ServersView {
         subscriptions: &[Subscription],
     ) -> Vec<String> {
         if matches!(intent, SelectionIntent::Name) && !self.query.borrow().is_empty() {
-            return filtered_ids(&self.current_filter.borrow(), subscriptions);
+            return selection_ids(
+                &self.current_filter.borrow(),
+                self.scope_kind.get(),
+                subscriptions,
+                &self.direct_latencies.borrow(),
+            );
         }
         self.scope_members.borrow().clone()
     }
 
     /// Put a selection on the page without saving it anywhere.
     fn show_selection(&self, draft: &FilterDraft) {
+        self.query.borrow_mut().clear();
+        *self.active_group.borrow_mut() = None;
+        self.scope_kind.set(match draft.kind() {
+            GroupKind::List => PoolKind::List,
+            GroupKind::Rule => PoolKind::Rule,
+        });
         self.filter_countries
             .borrow_mut()
             .clone_from(&draft.countries);
@@ -2157,10 +2673,13 @@ impl ServersView {
             .borrow_mut()
             .clone_from(&draft.subscriptions);
         self.filter_exclude.borrow_mut().clone_from(&draft.exclude);
+        self.filter_alive_only.set(draft.alive_only);
+        self.filter_max_latency_ms.set(draft.max_latency_ms);
         self.scope_members.borrow_mut().clone_from(&draft.members);
-        // The saved scope is kept, not cleared: narrowing "Germany" is a
-        // narrowed view of Germany, which the chip marks with a "·" and
-        // offers to save.
+        if let Some(clear_search) = self.on_clear_search.borrow().as_ref() {
+            clear_search();
+        }
+        self.build_chip_bar();
         self.apply_filter();
     }
 
@@ -2176,6 +2695,17 @@ impl ServersView {
                 .cloned()
         });
         *self.active_group.borrow_mut() = group.as_ref().map(|group| group.id.clone());
+        self.query.borrow_mut().clear();
+        self.scope_kind.set(
+            if group
+                .as_ref()
+                .is_some_and(|group| group.kind == GroupKind::List)
+            {
+                PoolKind::List
+            } else {
+                PoolKind::Rule
+            },
+        );
         match group {
             // A list has no filter rows to load, so the filters are cleared and
             // the members are carried separately.
@@ -2191,6 +2721,9 @@ impl ServersView {
                 self.scope_members.borrow_mut().clear();
                 self.set_filter_values(&PoolQuery::default());
             }
+        }
+        if let Some(clear_search) = self.on_clear_search.borrow().as_ref() {
+            clear_search();
         }
         self.build_chip_bar();
         self.fade_through(|view| view.apply_filter());
@@ -2245,6 +2778,8 @@ impl ServersView {
             .borrow_mut()
             .clone_from(&query.subscriptions);
         self.filter_exclude.borrow_mut().clone_from(&query.exclude);
+        self.filter_alive_only.set(query.alive_only);
+        self.filter_max_latency_ms.set(query.max_latency_ms);
     }
 
     /// Names of the groups that currently hold `server_id`. The subscriptions
@@ -2363,6 +2898,8 @@ impl ServersView {
             protocols: self.filter_protocols.borrow().clone(),
             subscriptions: self.filter_subscriptions.borrow().clone(),
             exclude: self.filter_exclude.borrow().clone(),
+            alive_only: self.filter_alive_only.get(),
+            max_latency_ms: self.filter_max_latency_ms.get(),
             ..PoolQuery::default()
         }
     }
@@ -2483,11 +3020,13 @@ impl ServersView {
             self.filter_protocols.borrow().is_empty(),
             self.filter_subscriptions.borrow().is_empty(),
             self.filter_exclude.borrow().is_empty(),
+            !self.filter_alive_only.get(),
+            self.filter_max_latency_ms.get().is_none(),
             // Servers named by hand count as a field too, now that the dialog can
             // write them: without this a hand-picked selection left the pill
             // reading "Filter" and, worse, gave the Connect bar no reason to
             // appear — so there was no way to run what had just been chosen.
-            self.scope_members.borrow().is_empty(),
+            self.scope_kind.get() != PoolKind::List,
         ]
         .into_iter()
         .filter(|empty| !empty)
@@ -2510,43 +3049,40 @@ impl ServersView {
         // rebuilt separately and left to drift.
         let subscriptions = self.subscriptions.borrow().clone();
         let members = self.scope_members.borrow().clone();
-        let query = if members.is_empty() {
-            filters_to_query(
+        let query = if self.scope_kind.get() == PoolKind::Rule {
+            let mut query = filters_to_query(
                 &subscriptions,
                 &self.filter_subscriptions.borrow(),
                 &self.filter_countries.borrow(),
                 &self.filter_protocols.borrow(),
                 &self.filter_exclude.borrow(),
                 &self.search_texts.borrow(),
-                &self.query.borrow(),
-            )
+                "",
+            );
+            query.alive_only = self.filter_alive_only.get();
+            query.max_latency_ms = self.filter_max_latency_ms.get();
+            query
         } else {
-            // A frozen list narrowed by the search box is still a list: there
-            // is no filter to intersect with, only members to drop. Building it
-            // through `filtered_ids` keeps the resolved order and silently
-            // loses handles whose server is gone, which is what a list is for.
-            let text = self.query.borrow().clone();
-            let texts = self.search_texts.borrow();
-            let listed = PoolQuery {
-                members,
-                ..PoolQuery::default()
-            };
             PoolQuery {
-                members: filtered_ids(&listed, &subscriptions)
-                    .into_iter()
-                    .filter(|id| {
-                        text.is_empty()
-                            || texts
-                                .get(id)
-                                .is_some_and(|haystack| haystack.contains(&text))
-                    })
-                    .collect(),
+                members,
                 ..PoolQuery::default()
             }
         };
-        let filtered = filtered_ids(&query, &subscriptions)
-            .into_iter()
-            .collect::<HashSet<_>>();
+        let query = selection_query(
+            query,
+            self.scope_kind.get(),
+            &subscriptions,
+            &self.search_texts.borrow(),
+            &self.query.borrow(),
+        );
+        let filtered = selection_ids(
+            &query,
+            self.scope_kind.get(),
+            &subscriptions,
+            &self.direct_latencies.borrow(),
+        )
+        .into_iter()
+        .collect::<HashSet<_>>();
         *self.current_filter.borrow_mut() = query;
         // The query now describes what is on screen, so the "modified" marker can
         // be trusted again.
@@ -2668,14 +3204,21 @@ impl ServersView {
         }
     }
 
-    /// Record which profile the header is showing, so the Connect bar can say
-    /// that it will not be the one used.
+    /// Record the session both the bar and picker will connect in.
     pub fn set_selected_profile(&self, profile: &str) {
         if self.selected_profile.borrow().as_str() == profile {
             return;
         }
         *self.selected_profile.borrow_mut() = profile.to_string();
         self.sync_connect_bar();
+        let refresh = self
+            .picker_refresh
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade);
+        if let Some(refresh) = refresh {
+            refresh();
+        }
     }
 
     /// Record whether the daemon can call a check off, which decides whether
@@ -2790,6 +3333,27 @@ impl ServersView {
                 self.latencies.borrow_mut().remove(server_id);
             }
             None => {}
+        }
+    }
+
+    pub fn set_direct_readings(&self, readings: &HashMap<String, LatencyReading>) {
+        let next = direct_latencies(readings);
+        if *self.direct_latencies.borrow() == next {
+            return;
+        }
+        *self.direct_latencies.borrow_mut() = next;
+        if self.filter_alive_only.get() || self.filter_max_latency_ms.get().is_some() {
+            self.apply_filter();
+        } else {
+            self.sync_connect_bar();
+        }
+        let refresh = self
+            .picker_refresh
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade);
+        if let Some(refresh) = refresh {
+            refresh();
         }
     }
 
@@ -3257,6 +3821,9 @@ fn selection_summary(draft: &FilterDraft, matched: usize, list_only: bool) -> St
         // one thing an empty Favourites is not.
         return "No servers yet — star one on a card, or pick some here.".to_string();
     }
+    if draft.kind() == GroupKind::List {
+        return "No servers chosen — this frozen list is empty.".to_string();
+    }
     if draft.rule_fields() == 0 {
         return format!("Every server — {matched} right now.");
     }
@@ -3277,10 +3844,6 @@ fn suggested_group_name(rule: &PoolQuery) -> String {
         _ => String::new(),
     }
 }
-
-/// Widths the rotation picker offers. `0` is "every live node", which is what
-/// `expected` has always meant on disk.
-const ROTATION_CHOICES: [usize; 6] = [2, 4, 6, 8, 12, 0];
 
 fn rotation_label(value: usize) -> String {
     match value {
@@ -3316,6 +3879,19 @@ fn rotation_summary(value: usize, available: usize) -> String {
     }
 }
 
+fn measure_preview(list: &gtk::ListBox, scroll: &gtk::ScrolledWindow) {
+    let mut heights = Vec::new();
+    let mut child = list.first_child();
+    while let Some(row) = child {
+        heights.push(row.measure(gtk::Orientation::Vertical, 430).1);
+        if heights.len() == 10 {
+            break;
+        }
+        child = row.next_sibling();
+    }
+    scroll.set_min_content_height(preview_height(&heights));
+}
+
 /// A searchable checkbox per server, grouped by the subscription it came from.
 ///
 /// One implementation behind both pages of the selection editor — "Except" and
@@ -3326,6 +3902,7 @@ struct ServerPicker {
     root: gtk::Box,
     /// Builds the rows. Safe to call more than once; only the first does work.
     fill: Rc<dyn Fn()>,
+    sync: SelectionChanged,
 }
 
 fn server_picker(
@@ -3361,6 +3938,24 @@ fn server_picker(
     root.append(&search);
 
     let checks: PickerChecks = Rc::new(RefCell::new(Vec::new()));
+    let syncing = Rc::new(Cell::new(false));
+    let sync: SelectionChanged = Rc::new({
+        let selected = selected.clone();
+        let checks = checks.clone();
+        let syncing = syncing.clone();
+        move |values| {
+            let checks = checks.borrow().clone();
+            let ids = checks.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+            let active = replace_picker_selection(&mut selected.borrow_mut(), values, &ids);
+            // Programmatic toggles must not write a partial selection back to
+            // the draft, or re-enter refresh while its widgets are being synced.
+            syncing.set(true);
+            for ((_, check), active) in checks.iter().zip(active) {
+                check.set_active(active);
+            }
+            syncing.set(false);
+        }
+    });
     // Directly under the search, because they act on what the search left on
     // screen and nothing else: "select all shown" after typing "de" is the
     // shortest honest way to say "every German node", and it is the reason the
@@ -3431,7 +4026,11 @@ fn server_picker(
                         let selected = selected.clone();
                         let value = server.value.clone();
                         let on_change = on_change.clone();
+                        let syncing = syncing.clone();
                         move |check| {
+                            if syncing.get() {
+                                return;
+                            }
                             let mut values = selected.borrow_mut();
                             if check.is_active() {
                                 if !values.contains(&value) {
@@ -3482,7 +4081,7 @@ fn server_picker(
         }
     });
 
-    ServerPicker { root, fill }
+    ServerPicker { root, fill, sync }
 }
 
 fn picked_label(count: usize) -> String {
@@ -3708,7 +4307,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        FilterDraft, GroupKind, ROTATION_CHOICES, collapse_would_shift, columns_for_width,
+        FilterDraft, GroupKind, collapse_would_shift, columns_for_width,
         columns_for_width_with_hysteresis, distribute_columns, rotation_summary, selection_summary,
         sorted_by_latency,
     };
@@ -3740,6 +4339,108 @@ mod tests {
         let query = rule.to_query("DE".into(), rule.kind());
         assert!(query.members.is_empty());
         assert_eq!(query.countries, vec!["de".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_saved_list_keeps_its_list_intent() {
+        let draft = FilterDraft {
+            list: true,
+            ..FilterDraft::default()
+        };
+        assert_eq!(draft.kind(), GroupKind::List);
+        assert!(
+            draft
+                .to_query("Favourites".into(), draft.kind())
+                .members
+                .is_empty()
+        );
+        let missing = FilterDraft {
+            list: true,
+            members: vec!["gone".into()],
+            ..FilterDraft::default()
+        };
+        let mut narrowed = missing.clone();
+        narrowed.members.clear();
+        assert_eq!(narrowed.kind(), GroupKind::List);
+        assert!(selection_summary(&narrowed, 0, false).starts_with("No servers"));
+    }
+
+    #[test]
+    fn resetting_nested_pickers_preserves_list_only_intent_without_old_members() {
+        let ids = vec!["a".into(), "b".into()];
+        for list_only in [false, true] {
+            let mut draft = FilterDraft {
+                list: true,
+                members: vec!["a".into()],
+                exclude: vec!["b".into()],
+                ..FilterDraft::default()
+            };
+            let mut only = draft.members.clone();
+            let mut except = draft.exclude.clone();
+            draft.reset(list_only);
+            assert_eq!(
+                super::replace_picker_selection(&mut only, &draft.members, &ids),
+                [false; 2]
+            );
+            assert_eq!(
+                super::replace_picker_selection(&mut except, &draft.exclude, &ids),
+                [false; 2]
+            );
+            assert!(only.is_empty());
+            assert!(except.is_empty());
+            assert_eq!(
+                draft.kind(),
+                if list_only {
+                    GroupKind::List
+                } else {
+                    GroupKind::Rule
+                }
+            );
+            only.push("b".into());
+            assert_eq!(
+                only,
+                ["b"],
+                "the next tick after Reset must not resurrect A"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unfiltered_picker_supplies_its_exact_query_to_connect() {
+        let draft = FilterDraft::default();
+        let query = draft
+            .connection_query(
+                "All".into(),
+                "work".into(),
+                oxidom_core::pool::Strategy::RoundRobin,
+                2,
+            )
+            .expect("All is a connectable selection");
+        assert_eq!(
+            query,
+            oxidom_core::pool::PoolQuery {
+                name: "All".into(),
+                session: "work".into(),
+                strategy: oxidom_core::pool::Strategy::RoundRobin,
+                expected: 2,
+                ..Default::default()
+            }
+        );
+        let draft = FilterDraft {
+            countries: vec!["de".into()],
+            ..FilterDraft::default()
+        };
+        let query = draft
+            .connection_query(
+                "Germany".into(),
+                "".into(),
+                oxidom_core::pool::Strategy::LeastLoad,
+                0,
+            )
+            .unwrap();
+        assert_eq!(query.countries, ["de"]);
+        assert_eq!(query.name, "Germany");
+        assert_eq!(query.session, "default");
     }
 
     /// The line under the form is the only place the difference is stated now,
@@ -3788,12 +4489,10 @@ mod tests {
 
     #[test]
     fn the_rotation_picker_offers_all_nodes_exactly_once() {
-        assert_eq!(
-            ROTATION_CHOICES.iter().filter(|value| **value == 0).count(),
-            1
-        );
+        let choices = super::rotation_options(42);
+        assert_eq!(choices.iter().filter(|value| **value == 0).count(), 1);
         // Ascending, with "all" last: the list reads as widening.
-        let capped = &ROTATION_CHOICES[..ROTATION_CHOICES.len() - 1];
+        let capped = &choices[..choices.len() - 1];
         assert!(capped.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(capped.contains(&oxidom_core::pool::DEFAULT_POOL_ROTATION));
     }

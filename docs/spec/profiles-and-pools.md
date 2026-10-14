@@ -39,6 +39,8 @@ subscriptions  = ["main"]         # empty = every group, including "My servers"
 countries      = ["ch", "de", "nl"]
 protocols      = ["vless", "trojan"]
 exclude        = ["ch-trojan-3"]
+alive_only     = false            # require a successful direct reading
+# max_latency_ms = 200            # optional inclusive direct-latency ceiling
 max            = 8                # 0 = uncapped
 probe_interval = "5m"
 ```
@@ -59,34 +61,40 @@ pool never makes a running session stale. Both `name` and `members` are `skip_se
 empty, so every pool profile written before lists existed still round-trips to the same bytes.
 
 The same `PoolQuery` drives the balancer and the GUI's server filter: a filter is a pool
-constructor, not a second search. A **group** in the GUI is a saved `PoolQuery` under a name, so
-connecting one writes it straight into `select.pool` — the daemon never learns a new noun. Group
-membership is therefore edited only where the servers are, in the Selection dialog on the Servers
+constructor, not a second search. A **group** in the GUI is a saved `PoolQuery` under a name.
+Connecting one passes the query to `ConnectPool` in the selected profile's session and writes no
+profile file; saving it as `select.pool` requires an explicit **New profile from this…** action. Group
+membership is edited only where the servers are, in the connection picker on the Servers
 page; the profile editor reports the pool and edits only `strategy`, `max`, `expected` and
 `probe_interval`, carrying everything about *which* servers through untouched. The window says
 **group** for all of this; `pool` stays the word in the TOML, the CLI and the IPC payload, and one
 line in the profile editor says the two are the same thing.
 
-**One dialog says what a selection is; a name is what saves it.** `present_selection_dialog`
+**One picker says what a selection is; a name is what saves it.** `present_selection_dialog`
 (`SelectionIntent::{Filter, Name, Edit}`) is the only editor: optional `Name` and `Icon` at the
 top, then the matching rows — three `AdwExpanderRow`s (Country, Protocol, Subscription) holding a
 checkbox per choice, `Except` as an `AdwActionRow` with a picker of its own because it is a search
-over a provider's two hundred nodes — then the hand-picked list, then a summary line. `Apply`
-shows the selection without saving it, `Save` needs a name. The `Filter` pill, `New group` and
-`⋮ → Edit…` all open this one dialog, differing only in what it opens with.
+over a provider's two hundred nodes — plus `Alive only`, an inclusive latency ceiling, rotation
+width, the hand-picked list and a matching-server preview with a count. It opens as a window,
+not a small popover, from the `Filter` pill, the header's **Pick connection…** (`Ctrl+K`), the
+tray, `New group` and `⋮ → Edit…`, differing only in what it opens with. `Apply` shows the
+selection without saving it; `Connect` runs the previewed query, not a hidden page search.
+**Save** needs a name and stores a group chip. Profile creation is a separate action in the
+selection menu, not a picker button.
 
 **`GroupKind` is derived, never asked.** Naming servers by hand is what freezing them means, so a
 draft with members saves as `List`; a rule with no members keeps matching, so an empty member list
 saves as `Rule`. The List/Rule radio that used to ask this was the user classifying their own
 selection in storage vocabulary before they had made it, and it could only tell the truth by
 disabling itself. What it conveyed that way is now stated: a selection named while the search box
-is non-empty freezes into a list (search has no rule equivalent), and `Save` refuses a nameless-
+is non-empty freezes into a list (search has no rule equivalent), and **Save** refuses a nameless-
 rule-with-no-fields, which would mean every server. Favourites is `list_only`: the star writes
 members, and a Favourites with filters is a pool `Profile::validate` rejects.
 
 **`⋮` acts on the selection on screen, not on the selected group.** It is never insensitive.
-`New profile from this…` lives there — it is the only way to make a *new* profile from the visible
-selection, and it needs no name for that selection, so it works on an unsaved filter too. The
+`New profile from this…` lives there as an explicit save-as-profile action. It needs no saved
+group, so it works on an unsaved filter too. An empty frozen list must not cross this boundary
+as an unfiltered rule: the action is disabled and its callback rejects it. The
 group-only items (`Edit…`, `Update to what's shown`, `Move left/right`, `Delete`) are simply
 absent when no group is selected, rather than present and dead.
 
@@ -94,12 +102,9 @@ absent when no group is selected, rather than present and dead.
 picker defaulting to `pool::DEFAULT_POOL_ROTATION` (6), and `connect_query` writes it into
 `expected`. It is deliberately *not* also stored on the group: a group answers "which servers",
 the width answers "how many at once for this run", and a second copy is how the two come to
-disagree. Consequently `same_pool` compares selection only while `same_rotation` compares
-`expected`, and a changed width yields `PoolAction::RetuneAndUp` — neither a no-op (which would
-drop the width just chosen) nor `RepointAndUp` (which would ask the user to confirm replacing a
-pool with itself). It rewrites without a dialog and says so in a toast. `pool_for_profile` takes
-`expected` from what the bar chose and still carries `max` and `probe_interval` through from the
-saved profile, because nothing outside the profile editor can express those two.
+disagree. The picker offers bounded widths (2, 4, 6, 8, 12) and an explicit **All** choice;
+activation clamps the requested width to the resolved member count. Choosing a width for an
+ad-hoc run never rewrites the saved profile.
 The default exists because `expected = 0` means "all", and a country-wide pool is mostly repeats
 of a handful of hosts: rotating over all 42 buys no more spread than its 9 distinct addresses
 while costing an observatory ping per entry.
@@ -124,9 +129,16 @@ companions report it once, at `up`, where a user can act: `excluded_composites` 
 servers that cannot become outbounds, and `missing_members` for handles a list names that no
 subscription holds any more. Neither is fatal — only an empty result is.
 
-**Activation resolves through `pool.resolve_ranked`, not `resolve`** (binding). Membership is
-identical — a test pins that — but the order is not, and two jobs ride on the order that
-subscription order does badly:
+**Activation resolves through `pool.resolve_ranked`, not `resolve`** (binding). It first applies
+`alive_only` and `max_latency_ms` to the metadata matches, using only direct readings from
+`ProbeState.readings`, never a session's proxied latency. `alive_only` requires a successful
+reading; a ceiling requires a successful value **at or below** that many milliseconds. Unknown,
+failed and proxied-only readings satisfy neither constraint. Country, protocol, subscription and
+these health constraints compose by intersection. With neither health constraint, unmeasured or
+failed servers remain eligible. The picker preview, count and Connect use this same query and
+direct-reading eligibility; changed readings may change the next activation, not a running pool.
+Ranking then orders the eligible candidates before `max` truncates them. Two jobs ride on the
+order that subscription order does badly:
 
 - **A pool spreads over exit addresses, not over subscription entries.** Providers list one host
   many times; in one observed provider list, 26 of 42 German entries shared `31.12.75.21:2087`
@@ -144,8 +156,8 @@ subscription order does badly:
   41-node German rule took ~25 s to confirm with nothing measured and **70 ms** once two of its
   nodes had been probed.
 
-Ranking never changes who is in the pool, so a list still gets everyone the user named; losing a
-named member stays `missing_members`' job.
+Ranking itself changes order, not eligibility; health constraints and `max` can narrow the
+result. Losing a named member stays `missing_members`' job.
 
 **The exit count is reported, not only logged.** `SelectionInfo.endpoints` carries it to every
 surface, and both `oxidom status` (`… 42 nodes on 9 exits …`) and the Profiles page's `Nodes` row
@@ -180,11 +192,19 @@ address, ports, optional interface and status. “Connect one server” means th
 not a separate global mode. Several profiles may run at once, including several profiles on the
 same server.
 
-A session does not require a profile file. `Connect` runs one server under `default` and reads
-`default.toml` only to learn whether an interface was asked for; `ConnectPool` does the same for a
-selection, taking the query the interface resolved and writing **nothing** — the profiles directory
-is untouched, and connecting a group therefore neither needs a profile nor modifies one. Saving a
-selection is a separate act (`SaveProfile`), and repointing a saved profile still rewrites its file.
+A session does not require a profile file. `Connect` runs one server under `default`;
+`ConnectPool` runs a selection in `PoolQuery.session`, with an absent or empty string meaning
+`default`. When present, `<session>.toml` supplies interface, `[core]`, routing and core-exit
+policy, plus the ports for a named session; `default` uses the daemon's configured ports.
+Neither call writes a profile file. Connecting a group therefore neither needs a profile nor
+modifies one. Saving a selection is a separate act (`SaveProfile`), and repointing a saved
+profile still rewrites its file. Two named sessions can run the same or different pools on
+independent loopback endpoints, reusing port numbers without sharing a runtime.
+
+The GUI's group Disconnect matches resolved member ids **only within the selected session**.
+A matching pool in another session is not a stop target. Switching the header selection is how
+the user chooses which runtime to stop; a failed session that is not holding traffic is a new
+Connect target, not a Disconnect target.
 
 A session's selection is a single server **or** a pool, and a pool session has no active server:
 `Session::server_id()` returns `None` for it, deliberately, so nothing can quietly pick the first
@@ -202,3 +222,19 @@ forgotten. A session with nothing to recover — the PID cleared as the clean-sh
 no interface — is forgotten as well: a session is a running profile, not a remembered
 connection. Only a live pool core is adopted, and an entry that could not be confirmed stopped
 stays recorded for the next start to try again.
+
+### Pool control over D-Bus (binding)
+
+`ConnectPool(s query_json) -> s session_name` on `dev.keepinfov.oxidom1` keeps its method signature.
+The JSON `PoolQuery` gains additive, defaulted fields: `session` defaults to `""` (meaning
+`default`), `alive_only` to `false`, and `max_latency_ms` to `null` (no ceiling). They are omitted
+when empty, false or absent, respectively. An old JSON client sending none of them still connects
+the default session without health filters. `session` selects the runtime for this call, not pool
+membership or a destination profile file; `UpProfile` still runs the profile it was asked to run.
+
+For example, this query runs the matching Swiss nodes with successful direct readings at or
+below 200 ms in `work`, without writing `work.toml`:
+
+```json
+{"session":"work","countries":["ch"],"alive_only":true,"max_latency_ms":200,"expected":6}
+```

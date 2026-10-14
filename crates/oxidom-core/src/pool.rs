@@ -88,6 +88,13 @@ pub struct PoolQuery {
     /// stale (see `engine::pool_fingerprint`, which hashes resolved members).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
+    /// Which session `ConnectPool` should raise this pool in.
+    ///
+    /// Empty means `"default"` — the session a client older than this field
+    /// always got — and it is omitted when empty so that a profile file's
+    /// `[select.pool]` table keeps its exact TOML shape.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session: String,
     #[serde(default)]
     pub strategy: Strategy,
     /// Exact handles — server id or alias — making up a frozen list. Non-empty
@@ -104,6 +111,12 @@ pub struct PoolQuery {
     pub protocols: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Keep only servers with a measured latency at or below this ceiling (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_latency_ms: Option<u32>,
+    /// Keep only servers whose last measurement succeeded.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub alive_only: bool,
     #[serde(default)]
     pub max: usize,
     /// How many members `leastLoad` keeps in rotation. Zero means the whole
@@ -114,6 +127,10 @@ pub struct PoolQuery {
     pub expected: usize,
     #[serde(default)]
     pub probe_interval: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl PoolQuery {
@@ -132,6 +149,29 @@ impl PoolQuery {
             || !self.countries.is_empty()
             || !self.protocols.is_empty()
             || !self.exclude.is_empty()
+            || self.max_latency_ms.is_some()
+            || self.alive_only
+    }
+
+    /// Whether `known` satisfies any `alive_only` / `max_latency_ms` constraint
+    /// on this query.
+    pub fn matches_known(&self, known: Known) -> bool {
+        if let Some(ceiling) = self.max_latency_ms {
+            return matches!(known, Known::Reachable(ms) if ms <= ceiling);
+        }
+        if self.alive_only {
+            return matches!(known, Known::Reachable(_));
+        }
+        true
+    }
+
+    /// Session name for `ConnectPool`, defaulting to `"default"` when absent.
+    pub fn session_or_default(&self) -> &str {
+        if self.session.is_empty() {
+            "default"
+        } else {
+            &self.session
+        }
     }
 
     pub fn probe_interval_or_default(&self) -> &str {
@@ -261,7 +301,13 @@ pub fn resolve_ranked<'a>(
 ) -> Result<Vec<&'a Server>> {
     let mut uncapped = query.clone();
     uncapped.max = 0;
-    let matches = resolve(&uncapped, groups)?;
+    let matches: Vec<&'a Server> = resolve(&uncapped, groups)?
+        .into_iter()
+        .filter(|server| query.matches_known(known(server)))
+        .collect();
+    if matches.is_empty() {
+        bail!("{}", empty_pool_message(query));
+    }
 
     // Group by exit endpoint, keeping first-seen order so the result stays
     // deterministic for two candidates nothing is known about.
@@ -415,6 +461,11 @@ fn empty_pool_message(query: &PoolQuery) -> String {
     if !query.exclude.is_empty() {
         filters.push(format!("exclude: {}", query.exclude.join(", ")));
     }
+    if let Some(ceiling) = query.max_latency_ms {
+        filters.push(format!("max_latency_ms: {ceiling}"));
+    } else if query.alive_only {
+        filters.push("alive_only: true".to_string());
+    }
     if filters.is_empty() {
         filters.push("no filters".to_string());
     }
@@ -558,6 +609,24 @@ mod tests {
                 "dead-2",
                 "dead-3"
             ]
+        );
+
+        let alive_only = PoolQuery {
+            alive_only: true,
+            ..query.clone()
+        };
+        assert_eq!(
+            ids(resolve_ranked(&alive_only, &groups, known_for).unwrap()),
+            ["live-1", "live-2"]
+        );
+
+        let under_335 = PoolQuery {
+            max_latency_ms: Some(334),
+            ..query
+        };
+        assert_eq!(
+            ids(resolve_ranked(&under_335, &groups, known_for).unwrap()),
+            ["live-1"]
         );
     }
 

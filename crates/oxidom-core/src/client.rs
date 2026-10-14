@@ -546,6 +546,16 @@ impl DaemonClient {
             })
     }
 
+    pub fn connect_pool_in_session(
+        &self,
+        session: &str,
+        query: &crate::pool::PoolQuery,
+    ) -> Result<String> {
+        let mut query = query.clone();
+        query.session = session.to_string();
+        self.connect_pool(&query)
+    }
+
     pub fn probe_state(&self) -> Result<ProbeState> {
         let json: String = self.proxy.call("ProbeState", &()).map_err(friendly)?;
         Ok(serde_json::from_str(&json)?)

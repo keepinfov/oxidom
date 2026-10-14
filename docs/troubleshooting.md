@@ -139,10 +139,28 @@ works, so these messages are the account of *why* it was torn down:
 | Message | Meaning |
 |---|---|
 | `the local SOCKS inbound never came up — the core is not carrying traffic` | The core started but never bound its inbound. Check the Logs page. |
-| `active server did not pass its latency check` | The core is up; the server did not answer through it. |
+| `active server did not pass its latency check` followed by a cause | HTTP confirmation through SOCKS failed. Read the appended handshake timeout, reset, refusal, DNS, closed-connection or local-failure reason; the generic prefix alone does not mean the server is dead. |
 | `the pool carried no traffic within 20s — 2 of 8 nodes were in rotation` | The pool's members are mostly unreachable. |
 | `the pool carried no traffic within 20s — its health check could not be reached through 8 of 8 nodes — the address is [core] pool_probe_url` | The members may be fine. The balancer only puts a node in rotation once it has reached the health-check address through it, and that address answered through none of them. Point `[core] pool_probe_url` at something reachable from where you are — see [configuration.md](configuration.md#pool_probe_url). |
 | `Xray exited unexpectedly` | The core died. The reason is in the log buffer. |
+
+Initial HTTP confirmation allows **6 seconds** for the cold request, like a direct
+HTTP latency check using a fresh core; periodic session checks use **3 seconds**.
+DNS, TCP and TLS/REALITY handshakes can make the first request slower than later
+ones. If an ICMP or TCP check passes but connecting fails, those checks proved
+only that the host or port answered. Confirmation still has to carry an HTTP
+request through the proxy. Recognised Xray diagnostics take priority over a
+generic timeout, so inspect the appended cause and the Logs page before changing
+servers or TLS settings.
+
+**Direct proxy** in the GUI, or `direct` in `oxidom status` / `oxidom list
+sessions`, is not a tunnel: opt-in [standby](configuration.md#direct-standby) is
+using the ordinary connection. It stays visible even if a failed default session
+is still recorded. **Holding traffic** is deliberately fail-closed instead:
+traffic is dropped on held routes and no direct standby runs while any profile
+holds them. Starting any session closes standby's accepted direct connections
+before the tunnel starts. Standby never automatically enables the GNOME system
+proxy.
 
 Things that look like a broken tunnel but are not:
 

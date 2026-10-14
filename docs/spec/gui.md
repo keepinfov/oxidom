@@ -87,36 +87,53 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   shows the same server two or three times and leaves no way to tell which card is real, and
   "show it only in its highest-priority group" makes a starred server vanish from its
   subscription. Cards stay in their subscription; the chip narrows what is shown. Selecting a
-  chip reveals a Connect bar that **runs the visible selection immediately**: no profile is read,
-  written or confirmed, and the session is the daemon's `default` — the same one a bare `Connect`
-  on a single server uses, over `ConnectPool`, its pool counterpart. Pressing it again stops the
-  session running that selection, matched on the server ids rather than on the query, so a saved
-  group and the same servers arrived at by hand are one session.
+  chip reveals a Connect bar that **runs the visible selection immediately**: no
+  profile is written or confirmed, and the session is the selected profile's (`default` when none
+  was chosen) over `ConnectPool`. Pressing it again stops the session running that selection,
+  matched on the server ids rather than on the query **within the selected session only**, so a
+  saved group and the same servers arrived at by hand are one selection. A matching pool in a
+  different session must never be disconnected by this bar.
   - **The bar names the session (binding).** "Writing nothing" is not "touching nothing":
-    `default.toml`'s ports, its interface, its `[core]` and its routing block are the ones that
-    apply, and which session runs decides which ports are opened and which routing holds. The
-    button says which session it will use, and where the header is showing a different profile the
-    bar says on its face — not only in a tooltip — that the shown profile is not the one used.
-  - **The header's selection governs the single-server click and not this one.** A card click
-    honours the selection and offers to repoint the profile; a group Connect does not read it at
-    all. Two adjacent controls reading one selection two ways is allowed, and stated here, but not
-    left to be discovered: the header goes on reporting the selected profile's own status, which is
-    true, and the bar carries the difference.
+    `<session>.toml`'s interface, `[core]` and routing block apply, along with its ports for a named
+    session (`default` uses the daemon's configured ports). Which session runs decides which
+    endpoints are opened and which routing holds. The button says which session it will use,
+    and where the header is showing a non-default profile
+    the bar says on its face — not only in a tooltip — that it runs in that session.
+  - **The header's selection governs both the single-server click and the group Connect.** A card
+    click honours the selection and offers to repoint the profile; a group Connect raises the pool
+    in the selected profile's session without writing its `.toml` file, and an absent session name
+    on `ConnectPool` still means `default` so older clients keep working.
   - **A `default` session running a pool is reported as a group, not as another profile.** The
     banner exists to name what is out of sight; a pool raised by the bar on screen is not, and
     `default` is not a profile anybody named. Reported by count, it read as the connection having
     happened somewhere else.
 
-  Saving stays explicit and stays separate: **New profile from this…**. Repointing a saved profile still rewrites a file and still
+  Saving stays explicit and separate: the picker's **Save** stores a group chip; the selection
+  menu's **New profile from this…** stores a profile and refuses an empty frozen selection.
+  Repointing a saved profile still rewrites a file and still
   asks first, which is what connecting a *profile* means. Favourites is a built-in list; the card's star is what fills it, and it
   cannot be deleted because the star would have nowhere to put things.
+- **Connection picker (binding):** the `Filter` pill, header menu's **Pick connection…**,
+  `Ctrl+K` and tray's **Pick connection…** open the same window, not separate pickers or a small
+  popover. Saved groups, country/protocol/subscription filters, exclusions, hand-picked members,
+  `Alive only`, a latency ceiling and rotation width share a matching-server preview and count.
+  Choices within one metadata field are alternatives; the different fields and health constraints
+  intersect. Health filtering reads only the daemon's direct `ProbeState.readings`, never the
+  displayed badge when it comes from `proxied`. Unknown and failed readings are excluded by
+  either health constraint; a ceiling includes values equal to its maximum. Without a health
+  constraint they stay eligible. **Connect** runs the query previewed in this window, without
+  silently intersecting it with the Servers page's search text. Preview, count and activation
+  use the same eligibility rules; new direct readings may change the next result. Rotation
+  defaults to 6, offers bounded widths and an explicit **All**, and is clamped to the result size.
+  **Apply** shows the draft on the page; **Save** stores a named group. Profile creation remains
+  in the selection menu, separate from Connect; connecting never saves a profile.
 - **Server grid:** a top block of "loose"/favorite servers, then one **block per subscription**:
   each block shows its **title** + **description** (name + quota/expiry from userinfo) followed by
   that subscription's server cards. In the code a block is `SubscriptionBlock` — never a "group",
   which the window uses only for the saved selections in the chip row. Multi-column grid in wide mode, single column in narrow
   (use `adw::WrapBox`/`FlowBox` with a breakpoint via `adw::Breakpoint`).
 - **Connect control:** a single primary **Connect/Disconnect** toggle in the header for the
-  compatibility `default` session. It shows its live status (Connecting/Connected/Error) and
+  selected profile's session (`default` initially). It shows its live status (Connecting/Connected/Error) and
   active latency. If other sessions run, a persistent banner reports their count and points to
   `oxidom status`.
 - **Subscriptions view:** add (URL + optional name), update-now, delete; per-sub **"send HWID"**
@@ -168,9 +185,17 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   actually configured, and it quotes the file sizes only for the built-in pair, which is the one
   case where they are known. The manual recipe for a daemon that cannot install quotes the
   configured addresses for the same reason.
+- **Direct standby is explicit (binding).** **Answer on local ports while disconnected** is off
+  by default. When enabled, only `127.0.0.1` on the daemon's configured SOCKS/HTTP ports answers
+  directly, and only while no session in any profile is connected, connecting or holding traffic.
+  Starting any session first stops the listeners and closes accepted direct connections. The GUI
+  reports **Direct proxy** while standby is actually active, even if a failed `default` session
+  remains inspectable; it must not imply a tunnel or hide direct service behind that error.
+  Standby never takes automatic ownership of the GNOME system proxy. A session **holding traffic**
+  is fail-closed, not direct standby, and suppresses standby until the hold is released.
 - **Primary menu and About:** one menu button on the right of the header, outermost so that it
   does not move when a page's own menus appear beside it. It is the only header control that is
-  not about the current view, and it carries Quit and About.
+  not about the current view, and it carries Pick connection, Quit and About.
   The About dialog is where the interface says **which versions are running**, which is three
   programs and not one: this window, the daemon it is talking to, and the core the daemon
   resolved. The daemon's and the core's arrive over `RuntimeInfo` (`daemon_version` and

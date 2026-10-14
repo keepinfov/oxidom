@@ -1152,12 +1152,15 @@ mod tests {
                 // Neither of these has a widget in the dialog, which is
                 // exactly why they belong in this test.
                 name: "Europe".to_string(),
+                session: String::new(),
                 members: Vec::new(),
                 strategy: Strategy::LeastPing,
                 subscriptions: vec!["main".to_string()],
                 countries: vec!["ch".to_string(), "de".to_string()],
                 protocols: vec!["vless".to_string()],
                 exclude: vec!["slow".to_string()],
+                max_latency_ms: Some(200),
+                alive_only: true,
                 max: 8,
                 expected: 4,
                 probe_interval: "30s".to_string(),

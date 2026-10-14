@@ -77,6 +77,7 @@ again, and a cursor left above every number the new book will issue makes the vi
 socks_port = 10808            # local SOCKS inbound
 http_port  = 10809            # local HTTP inbound
 system_proxy = false          # toggle GNOME/env system proxy on connect
+standby_proxy = false         # direct SOCKS/HTTP only when every session is idle and none holds traffic
 reconnect = false             # reconnect after an unexpected core exit; explicit opt-in
 on_core_exit = "hold"         # hold | release — a core that exits by itself keeps its routes,
                               # so traffic is dropped rather than released; a profile overrides
@@ -109,3 +110,37 @@ that carries none gains no key.
 Every `[core]` key is optional at both levels, and an untouched section is not written to the file
 at all. See [Advanced core settings](xray-config.md#advanced-core-settings-binding) for what each
 one generates.
+
+### Direct standby (binding)
+
+`standby_proxy` is opt-in, defaults to false, and is serialized explicitly so disabling it also
+travels through `SetSettings`. When enabled, it
+serves direct SOCKS5 and HTTP on **`127.0.0.1` only**, at the daemon's configured `socks_port`
+and `http_port`, not each profile's loopback address or ports. Traffic uses the machine's
+ordinary connection and is not protected by a tunnel.
+
+Standby may run only when **no session in any profile** is connected, connecting or holding
+traffic. Starting any session must stop both listeners and close already accepted direct
+connections before the session starts; closing only the listening sockets would leave direct
+traffic alive alongside the tunnel. A held route suppresses standby even if its core is gone.
+`on_core_exit = "hold"` remains fail-closed, never an implicit direct fallback. Once all sessions
+are idle and no hold remains, enabled standby can resume. It never automatically claims the
+GNOME system proxy.
+
+After an unexpected core exit with `on_core_exit = "release"` and reconnect disabled, standby
+resumes once the death is noticed. An automatic reconnect pending or retrying suppresses direct
+standby until that lifecycle ends; it must not open a direct window between attempts.
+
+### Standby over D-Bus (binding)
+
+On `dev.keepinfov.oxidom1`, `GetSettings() -> s json` and `SetSettings(s config_json) -> s json`
+retain their signatures. `Config.standby_proxy` is an additive boolean, defaulting to false when
+loading old files or settings. A `SetSettings` payload **omitting** it preserves the daemon's
+current value so an old client cannot clear an opt-in. Explicit `false` disables it.
+
+`Status() -> s json` adds `StatusInfo.standby_proxy`, defaulting to false for older daemons. It
+reports **actual direct service**, not merely the configured preference. Existing `state` values
+(`disconnected`, `connecting`, `connected`, `error`) and the session list keep their shapes; no
+new D-Bus state enum variant is needed. A failed default session may remain in `sessions` while
+standby is active, so clients must inspect the flag independently of that session's error.
+The CLI's `direct` presentation is described in [cli.md](cli.md), not a new tunnel session.

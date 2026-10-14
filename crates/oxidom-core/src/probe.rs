@@ -25,7 +25,7 @@ const PROBE_CORE_READY_TIMEOUT: Duration = Duration::from_secs(4);
 /// tunnel repeats. Measured against a healthy REALITY server, a first request
 /// lands around 1.5 s, so a 3 s budget reported working servers as dead often
 /// enough to see it happen twice in a row.
-const REAL_DELAY_TIMEOUT: Duration = Duration::from_secs(6);
+pub const REAL_DELAY_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// A local failure worth a log line but not worth its own wire vocabulary:
 /// the user can do nothing specific about a missing port or an unwritable
@@ -89,6 +89,24 @@ pub enum ProbeOutcome {
 /// back to a direct probe: that would report a healthy number for a tunnel
 /// carrying nothing.
 pub fn measure(server: &Server, config: &Config, route: Route, bind: Ipv4Addr) -> ProbeOutcome {
+    measure_with_timeout(server, config, route, bind, TIMEOUT)
+}
+
+/// Like [`measure`], with an explicit budget for `Route::Proxied`.
+///
+/// The confirmation right after a connect uses [`REAL_DELAY_TIMEOUT`] rather
+/// than [`TIMEOUT`]: the session's core has only just started, so its first
+/// request pays the same DNS, TCP and TLS/REALITY handshake cost that a
+/// throwaway `real_delay` probe core pays. Giving the direct probe 6 s and the
+/// confirmation 3 s made a server that answered in 4 s pass its check in the
+/// list and then fail every connect.
+pub fn measure_with_timeout(
+    server: &Server,
+    config: &Config,
+    route: Route,
+    bind: Ipv4Addr,
+    proxied_timeout: Duration,
+) -> ProbeOutcome {
     let method = config.latency_method;
     match (route, method) {
         (Route::Direct, LatencyMethod::Icmp) => icmp_ping(&server.address),
@@ -105,7 +123,7 @@ pub fn measure(server: &Server, config: &Config, route: Route, bind: Ipv4Addr) -
                     config.socks_port,
                     &config.latency_test_url,
                     verb,
-                    TIMEOUT,
+                    proxied_timeout,
                 ),
                 Route::Direct => real_delay(server, config, verb),
             }

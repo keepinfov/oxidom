@@ -8,6 +8,7 @@ use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayCommand {
     ShowWindow,
+    PickConnection,
     Toggle(String),
     Quit,
 }
@@ -85,6 +86,14 @@ impl ksni::Tray for OxidomTray {
             menu.push(MenuItem::Separator);
         }
         menu.extend([
+            StandardItem {
+                label: "Pick connection…".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.commands.send(TrayCommand::PickConnection);
+                }),
+                ..Default::default()
+            }
+            .into(),
             StandardItem {
                 label: "Show oxidom".to_string(),
                 activate: Box::new(|tray: &mut Self| {
