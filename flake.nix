@@ -74,6 +74,7 @@
             # $PATH and a systemd unit has none.
             postFixup = ''
               wrapProgram $out/bin/oxidom \
+                --prefix PATH : ${lib.makeBinPath [pkgs.iputils]} \
                 --set-default OXIDOM_XRAY_BIN ${pkgs.xray}/bin/xray \
                 --set-default OXIDOM_TUN2SOCKS_BIN ${pkgs.tun2socks}/bin/tun2socks \
                 --set-default OXIDOM_NFT_BIN ${pkgs.nftables}/bin/nft

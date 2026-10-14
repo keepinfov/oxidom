@@ -12,7 +12,7 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
-## [Unreleased]
+## [0.5.0] - 2026-10-14
 
 ### Fixed
 - **Switching or reconnecting a profile no longer drops an `oxidom run` command onto the ordinary route or leaves it unmarked on a second run.** The bound cgroup is blocked across interface re-plans, failed starts, core exits under `on_core_exit = "hold"`, and failed reconnect confirmations; `mark_cgroup` re-applies the nftables rule on every new scope so a recreated slice inode is always matched; and IPv6 packets from a marked cgroup are refused rather than routed around the IPv4 tunnel.
@@ -20,6 +20,7 @@ surface, packaging, or the CLI belongs here.
 - **Share-link and subscription imports preserve transport and TLS options through to the generated Xray configuration.** Added `httpupgrade` (`httpupgradeSettings`), `kcp`/`mkcp` (`kcpSettings`), `raw` TCP HTTP camouflage, TLS `ech` (`echConfigList`), `vcn` (`verifyPeerCertByName`), `pcs` (`pinnedPeerCertSha256`), and REALITY `pqv` (`mldsa65Verify`); fixed Clash `xhttp-opts` and VLESS `encryption`, Sing-box `transport.host` and `certificate_sha256`, Xray JSON `httpSettings.host` arrays and `tcpSettings` paths, VMess URL and XHTTP/gRPC fields, plaintext Trojan (`security=none`), and Hysteria2 `hop_interval` durations and certificate pinning.
 - **Editing a server or changing Geo URLs in Settings now saves every field.** Wired the Geo preset and URL signals on the Settings page, preserved unmodeled transport/TLS/Hysteria2 fields in the server edit dialog, updated `share_link` after edits, and kept hand-made server IDs stable across daemon restarts.
 - **Expanded server cards stay compact and open full parameters in a dedicated details dialog.** Moved the full field-by-field parameter listing out of the inline card into a modal dialog, fixed subscription block reordering on the Servers page, updated the group Connect button to show `Disconnect` while active, and corrected action icons on server cards and the sidebar.
+- **NixOS packages and the system daemon use the wrapped Xray binary and include `ping` on `PATH`.** When `$OXIDOM_XRAY_BIN` points at a matching `26.3.27` core, the daemon uses it directly instead of downloading a duplicate archive into `/var/lib/oxidom/xray`, and `iputils` is included on the daemon's `PATH` so ICMP latency checks work under `services.oxidom`.
 
 ## [0.4.0] - 2026-09-04
 

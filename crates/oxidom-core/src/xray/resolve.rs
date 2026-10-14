@@ -22,6 +22,16 @@ pub fn resolve(configured: &str) -> Result<ResolvedXray> {
         return Ok(resolved);
     }
 
+    // When a package wrapper (such as NixOS or AppImage) or the user explicitly
+    // points `$OXIDOM_XRAY_BIN` at a matching pinned core, use it directly
+    // rather than downloading a duplicate archive into `/var/lib/oxidom`.
+    if std::env::var_os(XRAY.env_var).is_some_and(|val| !val.is_empty())
+        && let Ok(resolved) = crate::resolve::resolve(&XRAY, "")
+        && crate::xray::managed::require_version(&resolved.path).is_ok()
+    {
+        return Ok(resolved);
+    }
+
     match crate::xray::managed::ensure_installed() {
         Ok(path) => Ok(ResolvedXray {
             path,

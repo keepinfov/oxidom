@@ -116,6 +116,7 @@ in {
         wantedBy = ["multi-user.target"];
         wants = ["network-online.target"];
         after = ["network-online.target" "dbus.service"];
+        path = [pkgs.iputils];
         serviceConfig =
           {
             # D-Bus activation: the unit counts as started once it owns the name,
