@@ -348,14 +348,14 @@ fn tun(profile: &str, down: bool) -> CliResult {
 fn run(profile: &str, args: &[String], command: Option<&str>) -> CliResult {
     let argv = oxidom_core::run::command_argv(args, command).map_err(Failure::error)?;
     let client = existing_client()?;
-    let configured = client.profile(profile).map_err(Failure::error)?;
     let session = session_status_for(&client, profile)?;
-    oxidom_core::run::validate_interface(
-        profile,
-        session.interface.as_ref(),
-        configured.interface.enable,
-    )
-    .map_err(Failure::error)?;
+    let interface_enabled = session.interface.is_some()
+        || client
+            .profile(profile)
+            .map(|configured| configured.interface.enable)
+            .unwrap_or(false);
+    oxidom_core::run::validate_interface(profile, session.interface.as_ref(), interface_enabled)
+        .map_err(Failure::error)?;
     let uid = nix::unistd::Uid::effective().as_raw();
     let status = oxidom_core::run::run_in_scope(profile, uid, &argv).map_err(Failure::error)?;
     if status.success() {

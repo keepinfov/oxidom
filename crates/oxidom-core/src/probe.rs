@@ -90,10 +90,10 @@ pub enum ProbeOutcome {
 /// carrying nothing.
 pub fn measure(server: &Server, config: &Config, route: Route, bind: Ipv4Addr) -> ProbeOutcome {
     let method = config.latency_method;
-    match method {
-        LatencyMethod::Icmp => icmp_ping(&server.address),
-        LatencyMethod::Tcp => direct_ping(server),
-        LatencyMethod::HttpHead | LatencyMethod::HttpGet => {
+    match (route, method) {
+        (Route::Direct, LatencyMethod::Icmp) => icmp_ping(&server.address),
+        (Route::Direct, LatencyMethod::Tcp) => direct_ping(server),
+        (Route::Proxied, _) | (Route::Direct, LatencyMethod::HttpHead | LatencyMethod::HttpGet) => {
             let verb = if method == LatencyMethod::HttpHead {
                 "HEAD"
             } else {
@@ -202,7 +202,8 @@ impl ProbeCore {
         // exiting immediately is then indistinguishable from an unreachable
         // server, which is why the gap is kept as short as possible.
         let socks_port = free_port().map_err(|_| local("no free port for a probe core"))?;
-        let http_port = free_port().map_err(|_| local("no free port for a probe core"))?;
+        let http_port = crate::engine::free_port(Ipv4Addr::LOCALHOST, &[socks_port])
+            .map_err(|_| local("no free port for a probe core"))?;
         // The machine-wide `[core]` and nothing else: a probe belongs to a
         // server, not to a profile, and there is no profile here to fold in.
         // It does mean a server that only works with a profile's fragmentation

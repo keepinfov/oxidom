@@ -337,6 +337,7 @@ pub struct ServersView {
     /// The card whose inline details are open (at most one).
     selected: Rc<RefCell<Option<String>>>,
     requested_selected: Rc<RefCell<Option<String>>>,
+    last_connection: Rc<RefCell<CardConnection>>,
     /// Shown when a search hides every card. Kept as one persistent widget
     /// rather than rebuilt, so toggling it costs nothing on each keystroke.
     no_matches: adw::StatusPage,
@@ -528,6 +529,7 @@ impl ServersView {
             latencies: Rc::new(RefCell::new(HashMap::new())),
             selected: Rc::new(RefCell::new(None)),
             requested_selected: Rc::new(RefCell::new(None)),
+            last_connection: Rc::new(RefCell::new(CardConnection::default())),
             prefs: Rc::new(RefCell::new(GuiPrefs::load(subscriptions))),
         };
         // Once, not per rebuild: the split button outlives every rebuild, and
@@ -637,6 +639,12 @@ impl ServersView {
             self.servers_area.remove(&child);
         }
         self.servers_area.set_opacity(1.0);
+        let previous_orders: HashMap<String, Vec<String>> = self
+            .blocks
+            .borrow()
+            .iter()
+            .map(|block| (block.id.clone(), block.display_order.borrow().clone()))
+            .collect();
         self.cards.borrow_mut().clear();
         self.blocks.borrow_mut().clear();
         *self.subscriptions.borrow_mut() = subscriptions.to_vec();
@@ -982,14 +990,26 @@ impl ServersView {
             root.append(&header);
             root.append(&columns_box);
             self.servers_area.append(&root);
+            let raw_order: Vec<String> = block_cards.iter().map(|(id, _)| id.clone()).collect();
+            let display_order = if let Some(prev) = previous_orders.get(&subscription.id) {
+                let valid: HashSet<&str> = raw_order.iter().map(String::as_str).collect();
+                let mut kept: Vec<String> = prev
+                    .iter()
+                    .filter(|id| valid.contains(id.as_str()))
+                    .cloned()
+                    .collect();
+                let seen: HashSet<String> = kept.iter().cloned().collect();
+                kept.extend(raw_order.into_iter().filter(|id| !seen.contains(id)));
+                kept
+            } else {
+                raw_order
+            };
             let block = SubscriptionBlock {
                 id: subscription.id.clone(),
                 root: root.upcast::<gtk::Widget>(),
                 columns_box,
                 column_boxes: Rc::new(RefCell::new(Vec::new())),
-                display_order: Rc::new(RefCell::new(
-                    block_cards.iter().map(|(id, _)| id.clone()).collect(),
-                )),
+                display_order: Rc::new(RefCell::new(display_order)),
                 cards: block_cards,
                 sort_button: sort,
                 speed_button: speed,
@@ -1459,7 +1479,8 @@ impl ServersView {
     /// does not consult the search box.
     fn sync_connect_bar(&self) {
         let subscriptions = self.subscriptions.borrow().clone();
-        let visible = filtered_ids(&self.current_filter.borrow(), &subscriptions).len();
+        let visible_ids = filtered_ids(&self.current_filter.borrow(), &subscriptions);
+        let visible = visible_ids.len();
         let unsaved = self.active_group_value().is_none();
         let title = match self.active_group_value() {
             Some(group) => {
@@ -1495,13 +1516,39 @@ impl ServersView {
             .into_iter()
             .nth(self.connect_strategy.get());
         self.connect_button.set_sensitive(visible > 0);
+        let pool_active = {
+            let connection = self.last_connection.borrow();
+            let active_pool_count = connection
+                .profiles
+                .values()
+                .filter(|profiles| profiles.in_pool.iter().any(|p| p == GROUP_CONNECT_SESSION))
+                .count();
+            visible > 0
+                && active_pool_count == visible
+                && visible_ids.iter().all(|id| {
+                    connection.profiles.get(id).is_some_and(|profiles| {
+                        profiles.in_pool.iter().any(|p| p == GROUP_CONNECT_SESSION)
+                    })
+                })
+        };
         let selected_profile = self.selected_profile.borrow().clone();
-        self.connect_button
-            .set_tooltip_text(Some(&connect_button_tooltip(
-                visible,
-                choice.as_ref(),
-                &selected_profile,
-            )));
+        if pool_active {
+            self.connect_button.set_label("Disconnect");
+            self.connect_button.remove_css_class("suggested-action");
+            self.connect_button.add_css_class("destructive-action");
+            self.connect_button
+                .set_tooltip_text(Some("Stop the running group connection"));
+        } else {
+            self.connect_button.set_label("Connect");
+            self.connect_button.remove_css_class("destructive-action");
+            self.connect_button.add_css_class("suggested-action");
+            self.connect_button
+                .set_tooltip_text(Some(&connect_button_tooltip(
+                    visible,
+                    choice.as_ref(),
+                    &selected_profile,
+                )));
+        }
         match connect_bar_session_note(&selected_profile) {
             Some(note) => {
                 self.connect_session.set_label(&note);
@@ -2749,6 +2796,8 @@ impl ServersView {
     /// Reflect the connection on every card in one pass: a `connecting` server
     /// wins, otherwise `active` decides Connected/Elsewhere/Disconnected.
     pub fn set_connection(&self, connection: &CardConnection) {
+        *self.last_connection.borrow_mut() = connection.clone();
+        self.sync_connect_bar();
         for (id, card) in self.cards.borrow().iter() {
             let state = match (&connection.connecting, &connection.failed) {
                 // An attempt in flight outranks everything: no other card may
@@ -2985,13 +3034,9 @@ impl ServersView {
                     .position(|id| id == &block.id)
                     .unwrap_or(usize::MAX)
             });
-            // `content` also holds the chip row and the connect bar above the
-            // blocks and the "no matches" page below them. Re-seating starts
-            // after the connect bar by name rather than at `first_child`, so
-            // the first block cannot slip in front of it.
-            let mut previous = Some(self.connect_bar.clone().upcast::<gtk::Widget>());
+            let mut previous: Option<gtk::Widget> = None;
             for block in blocks.iter() {
-                self.content
+                self.servers_area
                     .reorder_child_after(&block.root, previous.as_ref());
                 previous = Some(block.root.clone());
             }

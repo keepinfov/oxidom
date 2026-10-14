@@ -63,12 +63,18 @@ pub fn generate(
                 vec![json!({ "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" })],
                 Some(json!({ "type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG })),
             );
+            let strategy = import_strategy(balancers, balancer_tag);
+            let needs_observatory = burst_observatory.is_some()
+                || matches!(
+                    strategy.get("type").and_then(Value::as_str),
+                    Some("leastPing" | "leastLoad")
+                );
             config["routing"]["balancers"] = json!([{
                 "tag": BALANCER_TAG,
                 "selector": [SELECTABLE_TAG_PREFIX],
-                "strategy": import_strategy(balancers, balancer_tag)
+                "strategy": strategy
             }]);
-            if burst_observatory.is_some() {
+            if needs_observatory {
                 // Keep the observatory the leastPing/leastLoad strategies need,
                 // but not the provider's `pingConfig.destination`: that is a URL
                 // the core would fetch on a timer, i.e. a beacon from the host.
@@ -262,11 +268,24 @@ fn install_rules(
     built_in: Vec<Value>,
     balancer: Option<Value>,
 ) {
-    let (profile_rules, rest) = core
+    let (mut profile_rules, rest) = core
         .routing
         .as_ref()
         .map(crate::xray::routing::parts)
         .unwrap_or_default();
+    if balancer.is_some() {
+        for rule in &mut profile_rules {
+            if let Some(obj) = rule.as_object_mut()
+                && obj.get("outboundTag").and_then(Value::as_str) == Some("proxy")
+            {
+                obj.remove("outboundTag");
+                obj.insert(
+                    "balancerTag".to_string(),
+                    Value::String(BALANCER_TAG.to_string()),
+                );
+            }
+        }
+    }
     for (key, value) in rest {
         config["routing"][key] = value;
     }
@@ -371,7 +390,11 @@ fn dns_block(dns: &ResolvedDns) -> Value {
 /// are the same two keys on all eight protocol shapes; threading them through
 /// the match would repeat the logic once per arm and let the arms drift.
 fn apply_outbound_core(outbound: &mut Value, core: &ResolvedCore) {
-    if let Some(mux) = &core.mux {
+    let is_hysteria = outbound.get("protocol").and_then(Value::as_str) == Some("hysteria");
+    if let Some(mux) = &core.mux
+        && !is_hysteria
+        && outbound.get("mux").is_none_or(Value::is_null)
+    {
         outbound["mux"] = mux_block(mux);
     }
     if core.dialer.is_some() {
@@ -599,13 +622,30 @@ fn socks_http_server(addr: &str, port: u16, user: &Option<String>, pass: &Option
 }
 
 fn stream_settings(s: &StreamSettings) -> Value {
-    let mut v = json!({ "network": if s.network.is_empty() { "tcp" } else { &s.network } });
+    let network = match s.network.as_str() {
+        "" | "raw" => "tcp",
+        "mkcp" => "kcp",
+        other => other,
+    };
+    let mut v = json!({ "network": network });
 
     match s.network.as_str() {
         "ws" => {
             v["wsSettings"] = trim_obj(json!({
                 "path": s.path,
                 "headers": s.host.as_ref().map(|h| json!({ "Host": h }))
+            }));
+        }
+        "httpupgrade" => {
+            v["httpupgradeSettings"] = trim_obj(json!({
+                "path": s.path,
+                "host": s.host
+            }));
+        }
+        "kcp" | "mkcp" => {
+            v["kcpSettings"] = trim_obj(json!({
+                "seed": s.path,
+                "header": s.header_type.as_ref().map(|t| json!({ "type": t }))
             }));
         }
         "grpc" => {
@@ -630,13 +670,25 @@ fn stream_settings(s: &StreamSettings) -> Value {
                 "host": s.host.as_ref().map(|h| json!([h]))
             }));
         }
-        "tcp" if s.header_type.as_deref() == Some("http") => {
+        "tcp" | "raw" if s.header_type.as_deref() == Some("http") => {
             // The camouflage is the request: a path and Host were parsed for
             // exactly this arm, and a server keyed on them rejects a bare
             // `GET /`. Both are lists in Xray's request object.
+            let paths = s.path.as_ref().map(|p| {
+                p.split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>()
+            });
+            let hosts = s.host.as_ref().map(|h| {
+                h.split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>()
+            });
             let request = trim_obj(json!({
-                "path": s.path.as_ref().map(|p| json!([p])),
-                "headers": s.host.as_ref().map(|h| json!({ "Host": [h] })),
+                "path": paths,
+                "headers": hosts.map(|h| json!({ "Host": h })),
             }));
             let mut header = json!({ "type": "http" });
             if request.as_object().is_some_and(|o| !o.is_empty()) {
@@ -659,7 +711,9 @@ fn stream_settings(s: &StreamSettings) -> Value {
                 "serverName": s.sni,
                 "alpn": s.alpn,
                 "fingerprint": s.fingerprint,
-                "pinnedPeerCertSha256": s.pin_sha256
+                "pinnedPeerCertSha256": s.pin_sha256,
+                "echConfigList": s.ech,
+                "verifyPeerCertByName": s.verify_peer_cert_by_name
             }));
         }
         "reality" => {
@@ -669,7 +723,8 @@ fn stream_settings(s: &StreamSettings) -> Value {
                 "fingerprint": s.fingerprint,
                 "publicKey": s.public_key,
                 "shortId": s.short_id,
-                "spiderX": s.spider_x
+                "spiderX": s.spider_x,
+                "mldsa65Verify": s.mldsa65_verify
             }));
         }
         _ => {}
@@ -1779,6 +1834,31 @@ mod tests {
         assert_eq!(
             generated["outbounds"][0]["streamSettings"]["grpcSettings"],
             json!({ "serviceName": "connect", "authority": "edge.example", "multiMode": true })
+        );
+
+        let httpupgrade = crate::link::parse_link(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?type=httpupgrade\
+             &path=%2Fup&host=edge.example&security=tls&ech=ech-list&vcn=edge.example#UP",
+        )
+        .unwrap();
+        let generated = generate(
+            &httpupgrade,
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &ResolvedCore::default(),
+        );
+        assert_eq!(
+            generated["outbounds"][0]["streamSettings"]["httpupgradeSettings"],
+            json!({ "path": "/up", "host": "edge.example" })
+        );
+        assert_eq!(
+            generated["outbounds"][0]["streamSettings"]["tlsSettings"]["echConfigList"],
+            json!("ech-list")
+        );
+        assert_eq!(
+            generated["outbounds"][0]["streamSettings"]["tlsSettings"]["verifyPeerCertByName"],
+            json!("edge.example")
         );
     }
 

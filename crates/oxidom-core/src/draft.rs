@@ -679,7 +679,10 @@ fn stream_parameters(stream: &StreamSettings, rows: &mut Vec<Parameter>) {
         ("public_key", &stream.public_key),
         ("short_id", &stream.short_id),
         ("spider_x", &stream.spider_x),
+        ("mldsa65_verify", &stream.mldsa65_verify),
         ("pin_sha256", &stream.pin_sha256),
+        ("ech", &stream.ech),
+        ("verify_peer_cert_by_name", &stream.verify_peer_cert_by_name),
     ] {
         if let Some(value) = value {
             field(key, value.clone());

@@ -747,24 +747,33 @@ impl ServerCard {
             let on_activate = on_activate.clone();
             move |_| on_activate()
         });
-        let edit_alias = icon_button("document-edit-symbolic", "Set alias");
+        let edit_alias = icon_button("document-properties-symbolic", "Set alias");
         edit_alias.add_css_class("server-action");
         let current_alias = server.alias.clone();
         edit_alias.connect_clicked(move |button| {
             show_alias_dialog(button, current_alias.as_deref(), on_set_alias.clone());
         });
-        // The same dialog a server is created in, prefilled — the pencil
-        // next to it only ever changed one field. A composite profile has
-        // no fields to edit, so it gets no button rather than a dialog that
-        // cannot be filled.
+        // The same dialog a server is created in, prefilled. A composite
+        // profile has no fields to edit, so it gets no button rather than a
+        // dialog that cannot be filled.
         let editable = !matches!(
             server.spec,
             oxidom_core::model::OutboundSpec::XrayProfile { .. }
         );
-        let edit_button = icon_button("document-properties-symbolic", "Edit server");
+        let edit_button = icon_button("document-edit-symbolic", "Edit server");
         edit_button.add_css_class("server-action");
         edit_button.set_visible(editable);
         edit_button.connect_clicked(move |_| on_edit());
+        let details_button = icon_button("dialog-information-symbolic", "Server details");
+        details_button.add_css_class("server-action");
+        details_button.set_visible(editable);
+        {
+            let server_snapshot = server.clone();
+            let on_drop_override = on_drop_override.clone();
+            details_button.connect_clicked(move |button| {
+                show_server_details_dialog(button, &server_snapshot, on_drop_override.clone());
+            });
+        }
         // A server with no link of its own still has one to give: the
         // canonical form of its stored fields. What that link cannot
         // express — a pinned certificate, a patch, a vmess gRPC authority —
@@ -804,14 +813,18 @@ impl ServerCard {
         // button to borrow, the way every other item there does.
         let trust_button = gtk::Button::builder().visible(false).build();
         trust_button.connect_clicked(move |_| on_trust());
-        // Only ordinary TLS has a certificate to pin. REALITY authenticates by
-        // public key and presents a borrowed chain nobody should pin, and a
-        // plain protocol presents nothing — offering the item there would open
-        // a dialog that can only fail.
+        // Ordinary TLS and Hysteria2 both carry a server certificate that can
+        // be pinned. REALITY authenticates by public key and presents a
+        // borrowed chain nobody should pin, and a plain protocol presents
+        // nothing.
         let pinnable = server
             .spec
             .stream()
-            .is_some_and(|stream| stream.security == "tls");
+            .is_some_and(|stream| stream.security == "tls")
+            || matches!(
+                server.spec,
+                oxidom_core::model::OutboundSpec::Hysteria2 { .. }
+            );
         // Starring is the one way into the Favourites group, and Favourites is
         // the answer to "the four servers I actually use are somewhere in six
         // hundred".
@@ -836,8 +849,9 @@ impl ServerCard {
         let action_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         action_row.set_hexpand(true);
         action_row.append(&favourite_button);
-        action_row.append(&edit_alias);
+        action_row.append(&details_button);
         action_row.append(&edit_button);
+        action_row.append(&edit_alias);
         action_row.append(&copy_button);
         action_row.append(&ping_button);
         let action_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -868,16 +882,7 @@ impl ServerCard {
             .selectable(true)
             .css_classes(["dim-label", "server-meta"])
             .build();
-        // The rest of what happened is in the log, mixed with every other
-        // source on the machine. This is the only way to it that arrives
-        // already narrowed to the server being asked about.
-        //
-        // Icons rather than words, on the reason's own line rather than a row
-        // of their own: two labelled buttons under two lines of text made this
-        // the tallest thing on an expanded card once the recent checks stopped
-        // being it. `icon_button` gives each one a tooltip *and* an accessible
-        // label, which is what keeps an icon from being a guess.
-        let failure_logs = icon_button("view-reveal-symbolic", "Show in logs");
+        let failure_logs = icon_button("utilities-terminal-symbolic", "Show in logs");
         failure_logs.add_css_class("server-action");
         failure_logs.connect_clicked(move |_| on_show_logs());
         // The step after reading the log, in the place somebody reaches it
@@ -957,123 +962,35 @@ impl ServerCard {
         history.append(&history_chart);
         history.append(&history_failures);
 
-        // Every parameter the stored server carries, under the same JSON key
-        // names the editor uses. When a server will not connect, the first
-        // question is which transport and TLS it is actually configured
-        // with; before this block, the only way to answer it was to read the
-        // subscription body outside the application.
-        let parameters = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        let mut group_shown = "";
-        for parameter in oxidom_core::draft::parameters(server) {
-            if parameter.group != group_shown {
-                group_shown = parameter.group;
-                let heading = gtk::Label::builder()
-                    .xalign(0.0)
-                    .hexpand(true)
-                    .label(parameter.group)
-                    .ellipsize(gtk::pango::EllipsizeMode::End)
-                    .css_classes(["server-meta", "server-history-title"])
-                    .build();
-                parameters.append(&heading);
-            }
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            let key = gtk::Label::builder()
-                .label(parameter.key)
-                .xalign(0.0)
-                .width_request(110)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["dim-label", "server-meta"])
-                .build();
-            // What the user overrode reads as their decision: marked, with
-            // a way back to what the provider sends that does not wait for
-            // the next refresh.
-            if parameter.overridden {
-                key.add_css_class("server-param-overridden");
-                key.set_tooltip_text(Some("Edited here; the provider sends another value"));
-            }
-            // Credentials stay masked until revealed: a screenshot of an
-            // expanded card is exactly where one ends up pasted somewhere
-            // it should not be. The value is one toggle away for the person
-            // typing it elsewhere.
-            let shown = if parameter.secret {
-                "••••••••".to_string()
-            } else {
-                parameter.value.clone()
-            };
-            let value = gtk::Label::builder()
-                .label(shown)
+        // The expanded card states what identifies a server and any trust or
+        // override marks on it; the complete field-by-field parameter listing
+        // opens in its own dialog (`show_server_details_dialog`) so the card
+        // remains compact and never traps wheel scrolling inside the grid.
+        let trust_marks = server_trust_marks(server);
+        let metadata = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        metadata.append(&full_name);
+        metadata.append(&meta);
+        metadata.append(&alias);
+        if let Some(marks_text) = trust_marks {
+            let marks = gtk::Label::builder()
+                .label(marks_text)
                 .xalign(0.0)
                 .hexpand(true)
                 .wrap(true)
                 .wrap_mode(gtk::pango::WrapMode::WordChar)
                 .max_width_chars(1)
                 .selectable(true)
-                .css_classes(["server-meta"])
+                .css_classes(["dim-label", "server-meta"])
                 .build();
-            row.append(&key);
-            row.append(&value);
-            if parameter.overridden
-                && let Some(field) =
-                    oxidom_core::draft::override_key(parameter.group, parameter.key)
-            {
-                let take_back = icon_button("edit-clear-symbolic", "Use the provider's value");
-                take_back.add_css_class("server-action");
-                let on_drop_override = on_drop_override.clone();
-                take_back.connect_clicked(move |_| on_drop_override(field.clone()));
-                row.append(&take_back);
-            }
-            if parameter.secret {
-                let secret = parameter.value.clone();
-                let value = value.clone();
-                let reveal = gtk::ToggleButton::builder()
-                    .icon_name("view-reveal-symbolic")
-                    .tooltip_text("Reveal")
-                    .valign(gtk::Align::Center)
-                    .css_classes(["flat", "server-action"])
-                    .build();
-                reveal.update_property(&[gtk::accessible::Property::Label("Reveal")]);
-                reveal.connect_toggled(move |button| {
-                    if button.is_active() {
-                        value.set_text(&secret);
-                        button.set_tooltip_text(Some("Hide"));
-                        button.update_property(&[gtk::accessible::Property::Label("Hide")]);
-                    } else {
-                        value.set_text("••••••••");
-                        button.set_tooltip_text(Some("Reveal"));
-                        button.update_property(&[gtk::accessible::Property::Label("Reveal")]);
-                    }
-                });
-                row.append(&reveal);
-            }
-            parameters.append(&row);
+            metadata.append(&marks);
         }
-
-        let metadata = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        metadata.append(&full_name);
-        metadata.append(&meta);
-        metadata.append(&alias);
-        metadata.append(&parameters);
-        // The record first, the newest failure under it. Both are about checks
-        // and they used to sit either side of the chart, which put the count of
-        // failures at the bottom of one block and the reason for the newest at
-        // the top of another. Together they read as one statement: three of ten
-        // failed this way, and the last of them was tried like this, just now.
         metadata.append(&history);
         metadata.append(&failure);
-        let metadata_scroller = gtk::ScrolledWindow::builder()
-            .child(&metadata)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .propagate_natural_height(true)
-            .vexpand(true)
-            .build();
 
-        // Long selectable metadata scrolls inside the fixed shell. Actions stay
-        // pinned to its bottom, so connect/disconnect is never clipped.
         let detail = gtk::Box::new(gtk::Orientation::Vertical, 6);
         detail.set_css_classes(&["server-card-detail"]);
         detail.set_vexpand(true);
-        detail.append(&metadata_scroller);
+        detail.append(&metadata);
         detail.append(&action_row);
 
         let detail_region = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1089,26 +1006,6 @@ impl ServerCard {
         shell.append(&header);
         shell.append(&detail_region);
 
-        // Right-click used to be a second way to expand the card, which made it
-        // the only pointer gesture in the app that did nothing a left click did
-        // not already do. The actions it now offers are the buttons above,
-        // driven by `emit_clicked` rather than re-implemented: a menu that
-        // copied their logic would be a second place for it to drift, and this
-        // way each item inherits its source button's sensitivity for free.
-        //
-        // The gesture sits on `shell` rather than on `header`. `header` is a
-        // button fixed at `COMPACT_CARD_HEIGHT` and is `detail_region`'s
-        // sibling, so it is never on the event path for a press that lands in
-        // the detail region — and the menu carries actions that exist nowhere
-        // else while the card is open. `shell` is the parent of both, so it is
-        // on the path for the whole card at either height.
-        //
-        // Bubble, not capture: the seven metadata labels below are selectable
-        // and install GTK's own text menu, which is the one that must win over
-        // text. They are selectable so an address or a failure reason can be
-        // copied out, and a card menu that took the press first would remove
-        // the only way to do it. Bubble runs target to root, so text keeps its
-        // menu and everything else gets the card's.
         let context_menu: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
         let secondary_click = gtk::GestureClick::new();
         secondary_click.set_button(gtk::gdk::BUTTON_SECONDARY);
@@ -1118,6 +1015,8 @@ impl ServerCard {
             let shell = shell.clone();
             let connect_button = connect_button.clone();
             let favourite_button = favourite_button.clone();
+            let details_button = details_button.clone();
+            let edit_button = edit_button.clone();
             let edit_alias = edit_alias.clone();
             let copy_button = copy_button.clone();
             let ping_button = ping_button.clone();
@@ -1127,33 +1026,23 @@ impl ServerCard {
                 {
                     return;
                 }
+                let buttons = ContextButtons {
+                    connect: &connect_button,
+                    favourite: favourite_button.upcast_ref(),
+                    details: editable.then_some(&details_button),
+                    edit: editable.then_some(&edit_button),
+                    alias: &edit_alias,
+                    copy: &copy_button,
+                    ping: &ping_button,
+                    trust: pinnable.then_some(&trust_button),
+                };
                 let mut slot = context_menu.borrow_mut();
                 let popover = slot.get_or_insert_with(|| {
-                    // Built on first use: a card is recreated on every rebuild,
-                    // and a subscription of six hundred servers should not pay
-                    // for six hundred popovers nobody opens.
-                    let popover = context_popover(&items(
-                        &connect_button,
-                        favourite_button.upcast_ref(),
-                        &edit_alias,
-                        &copy_button,
-                        &ping_button,
-                        pinnable.then_some(&trust_button),
-                    ));
+                    let popover = context_popover(&items(&buttons));
                     popover.set_parent(&shell);
                     popover
                 });
-                sync_context_labels(
-                    popover,
-                    &items(
-                        &connect_button,
-                        favourite_button.upcast_ref(),
-                        &edit_alias,
-                        &copy_button,
-                        &ping_button,
-                        pinnable.then_some(&trust_button),
-                    ),
-                );
+                sync_context_labels(popover, &items(&buttons));
                 popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
                 popover.popup();
             }
@@ -1904,39 +1793,171 @@ pub fn alias_validation(alias: &str) -> Option<&'static str> {
     (!oxidom_core::alias::is_valid(alias)).then_some(ALIAS_ERROR)
 }
 
+fn server_trust_marks(server: &Server) -> Option<String> {
+    let mut marks = Vec::new();
+    if server.spec.pin_sha256().is_some() {
+        marks.push("certificate pinned");
+    }
+    let allow_insecure = match &server.spec {
+        oxidom_core::model::OutboundSpec::Hysteria2 { settings, .. } => settings.allow_insecure,
+        _ => server
+            .spec
+            .stream()
+            .is_some_and(|stream| stream.allow_insecure),
+    };
+    if allow_insecure {
+        marks.push("allowInsecure requested");
+    }
+    if server
+        .overrides
+        .as_ref()
+        .is_some_and(|overrides| !overrides.values.is_empty())
+    {
+        marks.push("edited locally");
+    }
+    (!marks.is_empty()).then(|| marks.join("  ·  "))
+}
+
+fn show_server_details_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    server: &Server,
+    on_drop_override: Rc<dyn Fn(String)>,
+) {
+    let window = adw::Window::builder()
+        .title(oxidom_core::model::name_without_flag(&server.name))
+        .modal(true)
+        .default_width(500)
+        .default_height(560)
+        .build();
+    set_transient_parent(&window, parent);
+
+    let header = adw::HeaderBar::new();
+    let close = gtk::Button::with_label("Close");
+    header.pack_end(&close);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+
+    let mut current_group: Option<(&'static str, adw::PreferencesGroup)> = None;
+    for parameter in oxidom_core::draft::parameters(server) {
+        if current_group
+            .as_ref()
+            .is_none_or(|(name, _)| *name != parameter.group)
+        {
+            if let Some((_, group)) = current_group.take() {
+                content.append(&group);
+            }
+            let group = adw::PreferencesGroup::builder()
+                .title(parameter.group)
+                .build();
+            current_group = Some((parameter.group, group));
+        }
+        let shown = if parameter.secret {
+            "••••••••".to_string()
+        } else {
+            parameter.value.clone()
+        };
+        let row = adw::ActionRow::builder()
+            .title(parameter.key)
+            .subtitle(&*glib::markup_escape_text(&shown))
+            .subtitle_selectable(true)
+            .css_classes(["property"])
+            .build();
+        if parameter.overridden {
+            row.set_tooltip_text(Some("Edited here; the provider sends another value"));
+            if let Some(field) = oxidom_core::draft::override_key(parameter.group, parameter.key) {
+                let take_back = icon_button("edit-undo-symbolic", "Use the provider's value");
+                take_back.set_valign(gtk::Align::Center);
+                let on_drop_override = on_drop_override.clone();
+                let window_for_drop = window.clone();
+                take_back.connect_clicked(move |_| {
+                    on_drop_override(field.clone());
+                    window_for_drop.close();
+                });
+                row.add_suffix(&take_back);
+            }
+        }
+        if parameter.secret {
+            let secret = parameter.value.clone();
+            let row_for_reveal = row.clone();
+            let reveal = gtk::ToggleButton::builder()
+                .icon_name("view-reveal-symbolic")
+                .tooltip_text("Reveal")
+                .valign(gtk::Align::Center)
+                .css_classes(["flat", "circular"])
+                .build();
+            reveal.update_property(&[gtk::accessible::Property::Label("Reveal")]);
+            reveal.connect_toggled(move |button| {
+                if button.is_active() {
+                    row_for_reveal.set_subtitle(&glib::markup_escape_text(&secret));
+                    button.set_tooltip_text(Some("Hide"));
+                    button.update_property(&[gtk::accessible::Property::Label("Hide")]);
+                } else {
+                    row_for_reveal.set_subtitle("••••••••");
+                    button.set_tooltip_text(Some("Reveal"));
+                    button.update_property(&[gtk::accessible::Property::Label("Reveal")]);
+                }
+            });
+            row.add_suffix(&reveal);
+        }
+        if let Some((_, group)) = current_group.as_ref() {
+            group.add(&row);
+        }
+    }
+    if let Some((_, group)) = current_group.take() {
+        content.append(&group);
+    }
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&content)
+        .build();
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.append(&header);
+    page.append(&scroller);
+    window.set_content(Some(&page));
+
+    let window_for_close = window.clone();
+    close.connect_clicked(move |_| window_for_close.close());
+    window.present();
+}
+
 /// A source button, and the wording its menu item should carry.
-///
-/// `None` takes the wording from the button itself, which is what dynamic items
-/// need: Connect becomes Disconnect, the star becomes an unstar. A fixed label
-/// is for buttons whose tooltip explains a *refusal* rather than naming the
-/// action — a disabled menu row must still say what it would have done.
 type ContextItem<'a> = (&'a gtk::Button, Option<&'static str>);
 
-/// One menu item per source button, activating that very button.
-///
-/// The items carry no behaviour of their own: a context menu that re-implemented
-/// Connect or Copy would be a second copy of rules that already live on the card
-/// — including which of them are available at all, which the items inherit by
-/// mirroring `sensitive`.
-/// The menu's contents, in one place: it is built on first use and its labels
-/// are re-synced on every open, and the two lists drifting apart would show one
-/// item and act on another.
-fn items<'a>(
+struct ContextButtons<'a> {
     connect: &'a gtk::Button,
     favourite: &'a gtk::Button,
+    details: Option<&'a gtk::Button>,
+    edit: Option<&'a gtk::Button>,
     alias: &'a gtk::Button,
     copy: &'a gtk::Button,
     ping: &'a gtk::Button,
     trust: Option<&'a gtk::Button>,
-) -> Vec<ContextItem<'a>> {
-    let mut items = vec![
-        (connect, None),
-        (favourite, None),
-        (alias, None),
-        (copy, Some("Copy share-link")),
-        (ping, None),
-    ];
-    items.extend(trust.map(|trust| (trust, Some("Trust certificate…"))));
+}
+
+fn items<'a>(buttons: &ContextButtons<'a>) -> Vec<ContextItem<'a>> {
+    let mut items = vec![(buttons.connect, None), (buttons.favourite, None)];
+    items.extend(
+        buttons
+            .details
+            .map(|details| (details, Some("Server details…"))),
+    );
+    items.extend(buttons.edit.map(|edit| (edit, Some("Edit server…"))));
+    items.extend([
+        (buttons.alias, None),
+        (buttons.copy, Some("Copy share-link")),
+        (buttons.ping, None),
+    ]);
+    items.extend(
+        buttons
+            .trust
+            .map(|trust| (trust, Some("Trust certificate…"))),
+    );
     items
 }
 

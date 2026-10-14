@@ -727,6 +727,10 @@ pub fn show_profile_dialog(
         let update_validation = update_validation.clone();
         move |_| update_validation()
     });
+    core_exit.connect_selected_notify({
+        let update_validation = update_validation.clone();
+        move |_| update_validation()
+    });
     interface_enable.connect_active_notify({
         let update_validation = update_validation.clone();
         move |_| update_validation()

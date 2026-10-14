@@ -12,6 +12,15 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
+## [Unreleased]
+
+### Fixed
+- **Switching or reconnecting a profile no longer drops an `oxidom run` command onto the ordinary route or leaves it unmarked on a second run.** The bound cgroup is blocked across interface re-plans, failed starts, core exits under `on_core_exit = "hold"`, and failed reconnect confirmations; `mark_cgroup` re-applies the nftables rule on every new scope so a recreated slice inode is always matched; and IPv6 packets from a marked cgroup are refused rather than routed around the IPv4 tunnel.
+- **Switching servers under `routes = "default"` while a tunnel is dead or holding no longer hangs on DNS resolution.** The old interface is stopped (while keeping any bound `oxidom run` cgroup blocked) before resolving the new server's hostname, and all resolved IPv4 addresses (including every outbound of a composite `XrayProfile`) receive host bypass routes.
+- **Share-link and subscription imports preserve transport and TLS options through to the generated Xray configuration.** Added `httpupgrade` (`httpupgradeSettings`), `kcp`/`mkcp` (`kcpSettings`), `raw` TCP HTTP camouflage, TLS `ech` (`echConfigList`), `vcn` (`verifyPeerCertByName`), `pcs` (`pinnedPeerCertSha256`), and REALITY `pqv` (`mldsa65Verify`); fixed Clash `xhttp-opts` and VLESS `encryption`, Sing-box `transport.host` and `certificate_sha256`, Xray JSON `httpSettings.host` arrays and `tcpSettings` paths, VMess URL and XHTTP/gRPC fields, plaintext Trojan (`security=none`), and Hysteria2 `hop_interval` durations and certificate pinning.
+- **Editing a server or changing Geo URLs in Settings now saves every field.** Wired the Geo preset and URL signals on the Settings page, preserved unmodeled transport/TLS/Hysteria2 fields in the server edit dialog, updated `share_link` after edits, and kept hand-made server IDs stable across daemon restarts.
+- **Expanded server cards stay compact and open full parameters in a dedicated details dialog.** Moved the full field-by-field parameter listing out of the inline card into a modal dialog, fixed subscription block reordering on the Servers page, updated the group Connect button to show `Disconnect` while active, and corrected action icons on server cards and the sidebar.
+
 ## [0.4.0] - 2026-09-04
 
 ### Added

@@ -66,6 +66,11 @@ fn stream_from_query(q: &HashMap<String, String>) -> StreamSettings {
     let network = get("type").unwrap_or_else(|| "tcp".to_string());
     let security = get("security").unwrap_or_else(|| "none".to_string());
     let mode = get("mode");
+    let path = if matches!(network.as_str(), "kcp" | "mkcp") {
+        get("path").or_else(|| get("seed"))
+    } else {
+        get("path")
+    };
     StreamSettings {
         xhttp_mode: matches!(network.as_str(), "xhttp" | "splithttp")
             .then(|| mode.clone())
@@ -78,25 +83,32 @@ fn stream_from_query(q: &HashMap<String, String>) -> StreamSettings {
         grpc_multi_mode: network == "grpc" && mode.as_deref() == Some("multi"),
         network,
         security,
-        sni: get("sni").or_else(|| get("peer")),
+        sni: get("sni")
+            .or_else(|| get("peer"))
+            .or_else(|| get("server_name")),
         alpn: get("alpn").map(|a| a.split(',').map(|s| s.trim().to_string()).collect()),
         fingerprint: get("fp"),
         allow_insecure: q
             .get("allowInsecure")
-            .map(|v| v == "1" || v == "true")
+            .or_else(|| q.get("insecure"))
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
         pin_sha256: get("pinSHA256")
             .or_else(|| get("pinsha256"))
+            .or_else(|| get("pcs"))
             .as_deref()
             .and_then(normalize_pin_sha256),
         public_key: get("pbk"),
         short_id: get("sid"),
         spider_x: get("spx"),
-        path: get("path"),
+        path,
         host: get("host"),
         service_name: get("serviceName"),
         header_type: get("headerType"),
         flow: get("flow"),
+        ech: get("ech"),
+        verify_peer_cert_by_name: get("vcn"),
+        mldsa65_verify: get("pqv"),
     }
 }
 
@@ -226,8 +238,9 @@ fn parse_trojan(link: &str) -> Option<Server> {
     let port = url.port()?;
     let q = query_map(&url);
     let mut stream = stream_from_query(&q);
-    // Trojan is TLS by default.
-    if stream.security == "none" {
+    // Trojan is TLS by default when the link omits `security`, while an
+    // explicit `security=none` is preserved.
+    if !q.contains_key("security") && stream.security == "none" {
         stream.security = "tls".to_string();
     }
     let name = {
@@ -238,16 +251,68 @@ fn parse_trojan(link: &str) -> Option<Server> {
     Some(finish(link, name, Protocol::Trojan, host, port, spec))
 }
 
+fn parse_vmess_url(link: &str) -> Option<Server> {
+    let url = Url::parse(link).ok()?;
+    let uuid = percent_decode_str(url.username())
+        .decode_utf8_lossy()
+        .into_owned();
+    if uuid.is_empty() {
+        return None;
+    }
+    let host = host_of(&url)?;
+    let port = url.port()?;
+    let q = query_map(&url);
+    let stream = stream_from_query(&q);
+    let name = {
+        let f = decode_fragment(&url);
+        if f.is_empty() { host.clone() } else { f }
+    };
+    let security = q
+        .get("encryption")
+        .or_else(|| q.get("scy"))
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "auto".to_string());
+    let alter_id = q.get("alterId").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let spec = OutboundSpec::Vmess {
+        uuid,
+        alter_id,
+        security,
+        stream,
+    };
+    Some(finish(link, name, Protocol::Vmess, host, port, spec))
+}
+
 fn parse_vmess(link: &str) -> Option<Server> {
     let payload = link.strip_prefix("vmess://")?;
-    let bytes = b64_decode(payload)?;
-    let json: Value = serde_json::from_slice(&bytes).ok()?;
+    let Some(bytes) = b64_decode(payload) else {
+        return parse_vmess_url(link);
+    };
+    let Ok(json) = serde_json::from_slice::<Value>(&bytes) else {
+        return parse_vmess_url(link);
+    };
 
-    let s = |k: &str| json.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let s = |k: &str| {
+        json.get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     let num = |k: &str| -> Option<u64> {
         json.get(k).and_then(|v| {
             v.as_u64()
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+    };
+    let flag = |k: &str| -> Option<bool> {
+        json.get(k).and_then(|v| {
+            v.as_bool()
+                .or_else(|| v.as_u64().map(|n| n == 1))
+                .or_else(|| {
+                    v.as_str()
+                        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                })
         })
     };
 
@@ -266,9 +331,11 @@ fn parse_vmess(link: &str) -> Option<Server> {
     let net = s("net").unwrap_or_else(|| "tcp".to_string());
     let tls = s("tls").unwrap_or_default();
     let name = s("ps").unwrap_or_else(|| host.clone());
+    let vmess_type = s("type");
+    let is_xhttp = matches!(net.as_str(), "xhttp" | "splithttp");
 
     let stream = StreamSettings {
-        network: net,
+        network: net.clone(),
         security: if tls.is_empty() {
             "none".to_string()
         } else {
@@ -277,20 +344,46 @@ fn parse_vmess(link: &str) -> Option<Server> {
         sni: s("sni").or_else(|| s("host")),
         alpn: s("alpn").map(|a| a.split(',').map(|x| x.trim().to_string()).collect()),
         fingerprint: s("fp"),
-        allow_insecure: false,
-        pin_sha256: None,
-        public_key: None,
-        short_id: None,
-        spider_x: None,
+        allow_insecure: flag("allowInsecure")
+            .or_else(|| flag("insecure"))
+            .unwrap_or(false),
+        pin_sha256: s("pinSHA256")
+            .or_else(|| s("pinsha256"))
+            .or_else(|| s("pcs"))
+            .as_deref()
+            .and_then(normalize_pin_sha256),
+        public_key: s("pbk"),
+        short_id: s("sid"),
+        spider_x: s("spx"),
         path: s("path"),
         host: s("host"),
-        service_name: s("path"),
-        xhttp_mode: None,
-        xhttp_extra: None,
-        grpc_authority: None,
-        grpc_multi_mode: false,
-        header_type: s("type"),
-        flow: None,
+        service_name: s("serviceName").or_else(|| s("path")),
+        xhttp_mode: is_xhttp
+            .then(|| {
+                s("mode")
+                    .or_else(|| vmess_type.clone())
+                    .filter(|m| m != "none")
+            })
+            .flatten(),
+        xhttp_extra: is_xhttp
+            .then(|| {
+                json.get("extra").and_then(|v| {
+                    if v.is_object() {
+                        Some(v.clone())
+                    } else {
+                        v.as_str().and_then(|raw| xhttp_extra(raw.to_string()))
+                    }
+                })
+            })
+            .flatten(),
+        grpc_authority: (net == "grpc").then(|| s("authority")).flatten(),
+        grpc_multi_mode: net == "grpc"
+            && (vmess_type.as_deref() == Some("multi") || s("mode").as_deref() == Some("multi")),
+        header_type: (!is_xhttp && net != "grpc").then_some(vmess_type).flatten(),
+        flow: s("flow"),
+        ech: s("ech"),
+        verify_peer_cert_by_name: s("vcn"),
+        mldsa65_verify: s("pqv"),
     };
     let spec = OutboundSpec::Vmess {
         uuid,
@@ -428,7 +521,7 @@ fn parse_hysteria2(link: &str) -> Option<Server> {
     // Port hopping also travels as a query parameter in some exporters.
     for key in ["mport", "ports"] {
         if let Some(value) = get(key) {
-            port_hop.extend(value.split(',').filter_map(PortRange::parse));
+            port_hop.extend(value.split([',', '/']).filter_map(PortRange::parse));
         }
     }
 
@@ -438,12 +531,18 @@ fn parse_hysteria2(link: &str) -> Option<Server> {
     });
 
     let settings = Hysteria2Settings {
-        sni: get("sni").or_else(|| get("peer")),
+        sni: get("sni")
+            .or_else(|| get("peer"))
+            .or_else(|| get("server_name")),
         alpn: get("alpn").map(|a| a.split(',').map(|s| s.trim().to_string()).collect()),
         allow_insecure: get("insecure")
             .or_else(|| get("allowInsecure"))
-            .is_some_and(|v| v == "1" || v == "true"),
-        pin_sha256: get("pinSHA256").as_deref().and_then(normalize_pin_sha256),
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+        pin_sha256: get("pinSHA256")
+            .or_else(|| get("pinsha256"))
+            .or_else(|| get("pcs"))
+            .as_deref()
+            .and_then(normalize_pin_sha256),
         obfs,
         up_mbps: get("up")
             .or_else(|| get("upmbps"))
@@ -454,7 +553,9 @@ fn parse_hysteria2(link: &str) -> Option<Server> {
             .as_deref()
             .and_then(parse_bandwidth_mbps),
         port_hop,
-        hop_interval_secs: get("hopInterval").and_then(|v| v.parse().ok()),
+        hop_interval_secs: get("hopInterval")
+            .or_else(|| get("hop_interval"))
+            .and_then(|v| v.trim().trim_end_matches('s').parse().ok()),
         congestion: get("congestion"),
         udp_idle_timeout_secs: None,
     };
@@ -1022,5 +1123,69 @@ mod tests {
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].protocol, Protocol::Socks);
         assert_eq!(servers[1].protocol, Protocol::Vless);
+    }
+
+    #[test]
+    fn trojan_explicit_security_none_is_preserved() {
+        let plain = parse_link("trojan://pw@example.com:443?type=tcp&security=none#Plain").unwrap();
+        assert_eq!(stream_of(&plain).security, "none");
+    }
+
+    #[test]
+    fn vless_reads_ech_vcn_pqv_pcs_and_kcp_seed() {
+        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let link = format!(
+            "vless://{UUID}@example.com:443?type=kcp&seed=kcp-secret&headerType=wechat-video\
+             &security=tls&server_name=sni.example&pcs={digest}&ech=ech-cfg&vcn=cert.example\
+             &pqv=mldsa-key#KCP"
+        );
+        let server = parse_link(&link).unwrap();
+        let stream = stream_of(&server);
+        assert_eq!(stream.network, "kcp");
+        assert_eq!(stream.path.as_deref(), Some("kcp-secret"));
+        assert_eq!(stream.header_type.as_deref(), Some("wechat-video"));
+        assert_eq!(stream.sni.as_deref(), Some("sni.example"));
+        assert_eq!(stream.pin_sha256.as_deref(), Some(digest));
+        assert_eq!(stream.ech.as_deref(), Some("ech-cfg"));
+        assert_eq!(
+            stream.verify_peer_cert_by_name.as_deref(),
+            Some("cert.example")
+        );
+        assert_eq!(stream.mldsa65_verify.as_deref(), Some("mldsa-key"));
+    }
+
+    #[test]
+    fn vmess_carries_xhttp_grpc_and_url_format_settings() {
+        let payload = serde_json::json!({
+            "add": "example.com", "port": "443", "id": UUID, "aid": "0",
+            "scy": "auto", "net": "xhttp", "type": "packet-up", "tls": "tls",
+            "allowInsecure": 1, "path": "/x", "extra": {"xPaddingBytes": "100-200"}
+        })
+        .to_string();
+        let server = parse_link(&vmess_link(&payload)).unwrap();
+        let stream = stream_of(&server);
+        assert!(stream.allow_insecure);
+        assert_eq!(stream.xhttp_mode.as_deref(), Some("packet-up"));
+        assert_eq!(
+            stream.xhttp_extra,
+            Some(serde_json::json!({"xPaddingBytes": "100-200"}))
+        );
+
+        let url_vmess = parse_link(&format!(
+            "vmess://{UUID}@example.com:443?type=ws&security=tls&sni=vm.example&path=%2Fws#URL"
+        ))
+        .unwrap();
+        assert_eq!(url_vmess.protocol, Protocol::Vmess);
+        assert_eq!(stream_of(&url_vmess).sni.as_deref(), Some("vm.example"));
+    }
+
+    #[test]
+    fn hysteria2_accepts_snake_case_hop_interval_and_duration_suffix() {
+        let server =
+            parse_link("hysteria2://pw@h.example:443/?hop_interval=30s&mport=5000-6000/7000")
+                .unwrap();
+        let s = hy2_settings(&server);
+        assert_eq!(s.hop_interval_secs, Some(30));
+        assert_eq!(s.port_hop.len(), 2);
     }
 }

@@ -107,7 +107,7 @@ impl Sidebar {
             (Page::Profiles, "network-vpn-symbolic", "Profiles"),
             (
                 Page::Subscriptions,
-                "x-office-address-book-symbolic",
+                "folder-download-symbolic",
                 "Subscriptions",
             ),
             (Page::Settings, "preferences-system-symbolic", "Settings"),

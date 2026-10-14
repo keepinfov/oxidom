@@ -23,14 +23,10 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   says it will stop something and then cannot is worse than the second press being ignored.
  - **Server card** (custom widget): country **flag**, server **name**, protocol **subtitle**
    (`transport_label`, e.g. "vless + xhttp + reality"), optional **latency badge** (green when
-   low). The **expanded** card additionally lists every parameter the stored server carries,
-   under the JSON key names and group titles the server dialog uses (`draft::parameters` is the
-   one spelling of the list); credentials are masked with a per-row reveal toggle, values are
-   selectable text, and only fields the server actually carries are listed — a composite Xray
-   profile has no fields of its own and is not listed. Under the listing the expanded card
-   draws the recent checks as a chart, with the range on
-   its heading and the failures under it, and says beneath that why the last check produced no
-   number —
+   low). The **expanded** card shows the server's identity, any trust or local-edit marks, the
+   recent checks as a chart with the range on its heading and the failures under it, and why the
+   last check produced no number, while the complete parameter listing (`draft::parameters`) opens
+   in its own details dialog from the card's action row or context menu.
   `docs/spec/latency.md` governs both, and the record is fetched per server rather than polled
   with the grid. Whole card is a click target →
   selects that server. Every server carried by a connected profile is visually marked; the

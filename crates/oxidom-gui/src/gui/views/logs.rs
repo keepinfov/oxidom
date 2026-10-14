@@ -666,7 +666,13 @@ impl LogsView {
     /// about one server does — would otherwise read the log it had just asked
     /// to leave behind.
     pub fn show_only(&self, needle: &str) {
+        {
+            let mut filter = self.filter.borrow_mut();
+            filter.source = None;
+            filter.severity = Severity::Debug;
+        }
         if self.search.text() == needle {
+            self.redraw();
             return;
         }
         self.search.set_text(needle);

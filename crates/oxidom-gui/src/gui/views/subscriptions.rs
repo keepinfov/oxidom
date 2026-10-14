@@ -822,12 +822,32 @@ fn show_subscription_details(
     page.append(&content);
     window.set_content(Some(&page));
 
+    let initial_ua = subscription.user_agent.clone().unwrap_or_default();
+    let flush_ua = {
+        let user_agent = user_agent.clone();
+        let ua_id = ua_id.clone();
+        let ua_callback = ua_callback.clone();
+        let last_saved = Rc::new(RefCell::new(initial_ua));
+        move || {
+            let current = user_agent.text().to_string();
+            if *last_saved.borrow() != current {
+                *last_saved.borrow_mut() = current.clone();
+                ua_callback(ua_id.clone(), current);
+            }
+        }
+    };
     let window_for_close = window.clone();
-    close.connect_clicked(move |_| window_for_close.close());
+    let flush_for_close = flush_ua.clone();
+    close.connect_clicked(move |_| {
+        flush_for_close();
+        window_for_close.close();
+    });
     let refresh_id = subscription.id.clone();
     let refresh = callbacks.refresh.clone();
     let window_for_update = window.clone();
+    let flush_for_update = flush_ua;
     update.connect_clicked(move |_| {
+        flush_for_update();
         refresh(refresh_id.clone());
         window_for_update.close();
     });

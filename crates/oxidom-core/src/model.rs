@@ -162,6 +162,15 @@ pub struct StreamSettings {
     pub header_type: Option<String>,
     /// vless flow, e.g. xtls-rprx-vision
     pub flow: Option<String>,
+    /// TLS Encrypted Client Hello config list (`ech` / `echConfigList`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ech: Option<String>,
+    /// TLS certificate name verification override (`vcn` / `verifyPeerCertByName`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_peer_cert_by_name: Option<String>,
+    /// Post-quantum REALITY ML-DSA-65 verification key (`pqv` / `mldsa65Verify`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mldsa65_verify: Option<String>,
 }
 
 /// Everything needed to emit an Xray outbound for one server.
@@ -232,8 +241,47 @@ impl OutboundSpec {
             if let Some(stream) = spec.stream_mut() {
                 stream.pin_sha256 = None;
             }
+            if let OutboundSpec::Hysteria2 { settings, .. } = spec {
+                settings.pin_sha256 = None;
+            }
         }
         left == right
+    }
+
+    /// TLS SNI carried by the outbound, whether in `StreamSettings` or `Hysteria2Settings`.
+    pub fn tls_sni(&self) -> Option<&str> {
+        match self {
+            OutboundSpec::Hysteria2 { settings, .. } => settings.sni.as_deref(),
+            _ => self.stream().and_then(|stream| stream.sni.as_deref()),
+        }
+    }
+
+    /// Certificate SHA-256 pin carried by the outbound, whether in `StreamSettings` or `Hysteria2Settings`.
+    pub fn pin_sha256(&self) -> Option<&str> {
+        match self {
+            OutboundSpec::Hysteria2 { settings, .. } => settings.pin_sha256.as_deref(),
+            _ => self
+                .stream()
+                .and_then(|stream| stream.pin_sha256.as_deref()),
+        }
+    }
+
+    /// Write a certificate SHA-256 pin onto any TLS-capable outbound (`StreamSettings` or `Hysteria2Settings`).
+    pub fn set_pin_sha256(&mut self, pin: Option<String>) -> bool {
+        match self {
+            OutboundSpec::Hysteria2 { settings, .. } => {
+                settings.pin_sha256 = pin;
+                true
+            }
+            _ => {
+                if let Some(stream) = self.stream_mut() {
+                    stream.pin_sha256 = pin;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     /// The same block, to write to. Only one thing writes to it — pinning a
