@@ -490,6 +490,9 @@ impl log::Log for Tee {
 /// `RUST_LOG=debug` run otherwise fills the Logs view with zbus and rustls
 /// chatter, and the view exists to explain oxidom.
 fn accepted_by_book(metadata: &log::Metadata<'_>) -> bool {
+    if metadata.target().starts_with("netlink_packet_route") {
+        return false;
+    }
     metadata.level() <= log::Level::Info || metadata.target().starts_with("oxidom")
 }
 
