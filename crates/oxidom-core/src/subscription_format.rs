@@ -201,6 +201,7 @@ fn not_taken_from(value: &Value) -> NotTaken {
 }
 
 fn decode_body(body: &str) -> String {
+    let body = body.trim_start_matches('\u{feff}');
     let looks_b64 = body.chars().all(|c| {
         c.is_ascii_alphanumeric()
             || matches!(c, '+' | '/' | '=' | '-' | '_')
@@ -321,7 +322,10 @@ fn xray_profile_server(
     balancer_tag: String,
 ) -> Option<Server> {
     let first = server_from_xray_outbound(name, proxy_outbounds.first()?)?;
-    let burst_observatory = config.get("burstObservatory").cloned();
+    let burst_observatory = config
+        .get("burstObservatory")
+        .or_else(|| config.get("observatory"))
+        .cloned();
     let count = proxy_outbounds.len();
     let mut server = Server {
         id: String::new(),
@@ -356,8 +360,13 @@ fn server_from_xray_outbound(name: &str, outbound: &Value) -> Option<Server> {
     match protocol {
         Protocol::Hysteria2 => unreachable!("handled above"),
         Protocol::Vless | Protocol::Vmess => {
-            let endpoint = outbound.pointer("/settings/vnext/0")?;
-            let user = endpoint.pointer("/users/0")?;
+            let (endpoint, user) = match outbound.pointer("/settings/vnext/0") {
+                Some(endpoint) => (endpoint, endpoint.pointer("/users/0")?),
+                None => {
+                    let settings = outbound.get("settings")?;
+                    (settings, settings)
+                }
+            };
             stream.flow = string(user, "flow");
             let address = string(endpoint, "address")?;
             let port = u16_value(endpoint.get("port")?)?;
@@ -436,7 +445,11 @@ fn stream_from_xray(value: Option<&Value>) -> StreamSettings {
         "grpc" => value.get("grpcSettings"),
         "xhttp" | "splithttp" => value.get("xhttpSettings"),
         "h2" | "http" => value.get("httpSettings"),
-        "tcp" => value.get("tcpSettings"),
+        "httpupgrade" => value.get("httpupgradeSettings"),
+        "kcp" | "mkcp" => value.get("kcpSettings"),
+        "tcp" | "raw" => value
+            .get("tcpSettings")
+            .or_else(|| value.get("rawSettings")),
         _ => None,
     }
     .unwrap_or(&Value::Null);
@@ -456,16 +469,29 @@ fn stream_from_xray(value: Option<&Value>) -> StreamSettings {
             })
             .as_deref()
             .and_then(normalize_pin_sha256),
-        public_key: string(tls, "publicKey"),
+        public_key: string(tls, "publicKey").or_else(|| string(tls, "password")),
         short_id: string(tls, "shortId"),
         spider_x: string(tls, "spiderX"),
-        path: string(network_settings, "path"),
-        host: string(network_settings, "host").or_else(|| {
-            network_settings
-                .pointer("/headers/Host")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        }),
+        path: string(network_settings, "path")
+            .or_else(|| network_settings.get("path").and_then(first_string))
+            .or_else(|| {
+                network_settings
+                    .pointer("/header/request/path")
+                    .and_then(first_string)
+            })
+            .or_else(|| string(network_settings, "seed")),
+        host: string(network_settings, "host")
+            .or_else(|| network_settings.get("host").and_then(first_string))
+            .or_else(|| {
+                network_settings
+                    .pointer("/headers/Host")
+                    .and_then(first_string)
+            })
+            .or_else(|| {
+                network_settings
+                    .pointer("/header/request/headers/Host")
+                    .and_then(first_string)
+            }),
         service_name: string(network_settings, "serviceName"),
         xhttp_mode: string(network_settings, "mode"),
         xhttp_extra: network_settings
@@ -479,6 +505,9 @@ fn stream_from_xray(value: Option<&Value>) -> StreamSettings {
             .and_then(Value::as_str)
             .map(str::to_string),
         flow: None,
+        ech: string(tls, "echConfigList"),
+        verify_peer_cert_by_name: string(tls, "verifyPeerCertByName"),
+        mldsa65_verify: string(tls, "mldsa65Verify"),
     }
 }
 
@@ -557,16 +586,18 @@ fn stream_from_sing_box(outbound: &Value) -> StreamSettings {
             .and_then(Value::as_str)
             .map(str::to_string),
         allow_insecure: bool_value(tls.get("insecure")).unwrap_or(false),
-        // sing-box pins whole PEM certificates, not digests — nothing to map.
-        pin_sha256: None,
+        pin_sha256: string(tls, "certificate_sha256")
+            .or_else(|| tls.get("certificate_sha256").and_then(first_string))
+            .as_deref()
+            .and_then(normalize_pin_sha256),
         public_key: string(reality, "public_key"),
         short_id: string(reality, "short_id"),
         spider_x: None,
         path: string(transport, "path"),
         host: transport
-            .pointer("/headers/Host")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .get("host")
+            .and_then(first_string)
+            .or_else(|| transport.pointer("/headers/Host").and_then(first_string)),
         service_name: string(transport, "service_name"),
         xhttp_mode: string(transport, "mode"),
         xhttp_extra: transport
@@ -577,6 +608,9 @@ fn stream_from_sing_box(outbound: &Value) -> StreamSettings {
         grpc_multi_mode: bool_value(transport.get("multi_mode")).unwrap_or(false),
         header_type: None,
         flow: string(outbound, "flow"),
+        ech: None,
+        verify_peer_cert_by_name: None,
+        mldsa65_verify: None,
     }
 }
 
@@ -604,7 +638,9 @@ fn server_from_clash(proxy: &Value) -> Option<Server> {
         Protocol::Hysteria2 => unreachable!("handled above"),
         Protocol::Vless => OutboundSpec::Vless {
             uuid: string(proxy, "uuid")?,
-            encryption: "none".to_string(),
+            encryption: string(proxy, "encryption")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "none".to_string()),
             stream: stream.clone(),
         },
         Protocol::Vmess => OutboundSpec::Vmess {
@@ -655,6 +691,9 @@ fn stream_from_clash(proxy: &Value) -> StreamSettings {
     // host list under `h2-opts.host` rather than in a headers map.
     let (network, header_type) = match requested.as_str() {
         "http" => ("tcp".to_string(), Some("http".to_string())),
+        "ws" if bool_value(proxy.pointer("/ws-opts/v2ray-http-upgrade")) == Some(true) => {
+            ("httpupgrade".to_string(), None)
+        }
         _ => (requested.clone(), None),
     };
     let network_options = match requested.as_str() {
@@ -662,6 +701,7 @@ fn stream_from_clash(proxy: &Value) -> StreamSettings {
         "grpc" => proxy.get("grpc-opts"),
         "h2" => proxy.get("h2-opts"),
         "http" => proxy.get("http-opts"),
+        "xhttp" | "splithttp" => proxy.get("xhttp-opts"),
         _ => None,
     }
     .unwrap_or(&Value::Null);
@@ -672,7 +712,7 @@ fn stream_from_clash(proxy: &Value) -> StreamSettings {
                 .pointer("/headers/Host")
                 .and_then(first_string),
         ),
-        "h2" => (
+        "h2" | "xhttp" | "splithttp" => (
             string(network_options, "path"),
             network_options
                 .get("host")
@@ -687,8 +727,7 @@ fn stream_from_clash(proxy: &Value) -> StreamSettings {
             string(network_options, "path"),
             network_options
                 .pointer("/headers/Host")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+                .and_then(first_string),
         ),
     };
     StreamSettings {
@@ -724,6 +763,9 @@ fn stream_from_clash(proxy: &Value) -> StreamSettings {
         grpc_multi_mode: bool_value(network_options.get("grpc-multi-mode")).unwrap_or(false),
         header_type,
         flow: string(proxy, "flow"),
+        ech: None,
+        verify_peer_cert_by_name: None,
+        mldsa65_verify: None,
     }
 }
 
@@ -755,10 +797,21 @@ fn finish_server(
 }
 
 /// The share link a stored server can be handed over as — its own link when
-/// it arrived as one, otherwise the canonical form of its stored fields.
-/// `None` only for a composite profile, which no single link can express.
+/// it arrived as one and still describes the server's current fields, otherwise
+/// the canonical form of its stored fields. `None` only for a composite
+/// profile, which no single link can express.
 pub fn share_link(server: &Server) -> Option<String> {
-    server.link.clone().or_else(|| canonical_share_link(server))
+    if server
+        .overrides
+        .as_ref()
+        .is_none_or(|overrides| overrides.values.is_empty())
+        && let Some(link) = &server.link
+        && crate::link::parse_link(link)
+            .is_some_and(|parsed| parsed.name == server.name && parsed.same_connection_as(server))
+    {
+        return Some(link.clone());
+    }
+    canonical_share_link(server).or_else(|| server.link.clone())
 }
 
 /// What a share link for this server would not carry, as draft field names
@@ -919,6 +972,9 @@ fn add_stream_query(url: &mut Url, stream: &StreamSettings) {
         ("serviceName", stream.service_name.as_deref()),
         ("headerType", stream.header_type.as_deref()),
         ("flow", stream.flow.as_deref()),
+        ("ech", stream.ech.as_deref()),
+        ("vcn", stream.verify_peer_cert_by_name.as_deref()),
+        ("pqv", stream.mldsa65_verify.as_deref()),
     ] {
         if let Some(value) = value {
             pairs.append_pair(key, value);
@@ -1003,7 +1059,7 @@ fn port_ranges(raw: Option<&Value>) -> Vec<PortRange> {
     string_vec(raw)
         .unwrap_or_default()
         .iter()
-        .flat_map(|item| item.split(','))
+        .flat_map(|item| item.split([',', '/']))
         .filter_map(PortRange::parse)
         .collect()
 }
@@ -1018,6 +1074,16 @@ fn hysteria2_from_xray(name: &str, outbound: &Value) -> Option<Server> {
     let mask = outbound
         .pointer("/streamSettings/finalmask")
         .unwrap_or(&Value::Null);
+
+    let mut port_hop = port_ranges(hy.pointer("/udpHop/ports"));
+    if port_hop.first()
+        == Some(&PortRange {
+            start: port,
+            end: port,
+        })
+    {
+        port_hop.remove(0);
+    }
 
     let settings = Hysteria2Settings {
         sni: string(tls, "serverName"),
@@ -1036,7 +1102,7 @@ fn hysteria2_from_xray(name: &str, outbound: &Value) -> Option<Server> {
         }),
         up_mbps: bandwidth_value(hy.get("up")),
         down_mbps: bandwidth_value(hy.get("down")),
-        port_hop: port_ranges(hy.pointer("/udpHop/ports")),
+        port_hop,
         hop_interval_secs: seconds_value(hy.pointer("/udpHop/interval")),
         congestion: string(hy, "congestion"),
         udp_idle_timeout_secs: u32_value(hy.get("udpIdleTimeout")),
@@ -1072,7 +1138,10 @@ fn hysteria2_from_sing_box(name: &str, address: String, outbound: &Value) -> Opt
         sni: string(tls, "server_name"),
         alpn: string_vec(tls.get("alpn")),
         allow_insecure: bool_value(tls.get("insecure")).unwrap_or(false),
-        pin_sha256: None,
+        pin_sha256: string(tls, "certificate_sha256")
+            .or_else(|| tls.get("certificate_sha256").and_then(first_string))
+            .as_deref()
+            .and_then(normalize_pin_sha256),
         obfs,
         up_mbps: bandwidth_value(outbound.get("up_mbps").or_else(|| outbound.get("up"))),
         down_mbps: bandwidth_value(outbound.get("down_mbps").or_else(|| outbound.get("down"))),
@@ -2086,6 +2155,49 @@ proxies:
                 link,
                 "vless://test-id@example.com:443?encryption=none&type=tcp&security=none#Kept"
             );
+        }
+
+        #[test]
+        fn an_edited_server_updates_its_share_link() {
+            let mut server = crate::link::parse_link(
+                "vless://test-id@example.com:443?encryption=none&type=tcp&security=none#Kept",
+            )
+            .expect("parses");
+            server.port = 8443;
+            let link = share_link(&server).expect("expressible");
+            assert!(link.contains(":8443"), "{link}");
+        }
+
+        #[test]
+        fn clash_xhttp_and_vless_encryption_survive_import() {
+            let yaml = r#"
+proxies:
+  - name: "XHTTP"
+    type: vless
+    server: x.example
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+    encryption: "mlkem768x25519plus.native.0rtt"
+    tls: true
+    servername: x.example
+    network: xhttp
+    xhttp-opts:
+      path: /xhttp
+      host: cdn.example
+      mode: packet-up
+"#;
+            let (servers, _) = parse(yaml).unwrap();
+            let OutboundSpec::Vless {
+                encryption, stream, ..
+            } = &servers[0].spec
+            else {
+                panic!("expected vless");
+            };
+            assert_eq!(encryption, "mlkem768x25519plus.native.0rtt");
+            assert_eq!(stream.network, "xhttp");
+            assert_eq!(stream.path.as_deref(), Some("/xhttp"));
+            assert_eq!(stream.host.as_deref(), Some("cdn.example"));
+            assert_eq!(stream.xhttp_mode.as_deref(), Some("packet-up"));
         }
     }
 }

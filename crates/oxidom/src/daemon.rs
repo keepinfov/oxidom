@@ -1494,10 +1494,7 @@ impl Shared {
                 if current {
                     if let Err(error) = engine.start_interface(&profile) {
                         let reason = format!("could not bring up the profile interface: {error:#}");
-                        if let Some(session) = engine.sessions.get(&profile) {
-                            session.core.note(&reason);
-                        }
-                        engine.stop_session(&profile);
+                        engine.confirmation_failed(&profile, &reason);
                         if origin == ConnectionOrigin::Explicit {
                             oxidom_core::sync::lock(&shared.override_status).insert(
                                 profile.clone(),
@@ -1510,6 +1507,7 @@ impl Shared {
                         let _ = confirmed.send(false);
                         return;
                     }
+                    engine.confirm_traffic(&profile);
                     if engine.registry.config.system_proxy
                         && let Err(error) = engine.sessions.claim_system_proxy(&profile)
                     {
@@ -1546,12 +1544,7 @@ impl Shared {
                     && session.status() == Status::Connected
             });
             if still_active {
-                // Leave the reason in the log buffer too: the tunnel is
-                // torn down below, so the core's own status is lost.
-                if let Some(session) = engine.sessions.get(&profile) {
-                    session.core.note(&reason);
-                }
-                engine.stop_session(&profile);
+                engine.confirmation_failed(&profile, &reason);
                 if origin == ConnectionOrigin::Explicit {
                     oxidom_core::sync::lock(&shared.override_status).insert(
                         profile.clone(),
@@ -2186,7 +2179,15 @@ fn pool_membership_stale(
     selection: Option<&SessionSelection>,
     subscriptions: &[oxidom_core::model::Subscription],
 ) -> bool {
-    let (Some(query), Some(SessionSelection::Pool { fingerprint, .. })) = (query, selection) else {
+    let (
+        Some(query),
+        Some(SessionSelection::Pool {
+            members: active_members,
+            fingerprint,
+            ..
+        }),
+    ) = (query, selection)
+    else {
         // A running session deliberately survives its profile file or a later
         // switch to single-server selection.
         return false;
@@ -2197,7 +2198,23 @@ fn pool_membership_stale(
                 .iter()
                 .map(|server| server.id.clone())
                 .collect::<Vec<_>>();
-            pool_fingerprint(&ids) != *fingerprint
+            if pool_fingerprint(&ids) == *fingerprint {
+                return false;
+            }
+            if !query.members.is_empty() {
+                return true;
+            }
+            let candidate_set: HashSet<&str> =
+                members.iter().map(|server| server.id.as_str()).collect();
+            let expected_len = if query.max == 0 {
+                members.len()
+            } else {
+                query.max.min(members.len())
+            };
+            active_members.len() != expected_len
+                || !active_members
+                    .iter()
+                    .all(|id| candidate_set.contains(id.as_str()))
         })
         // An empty current result differs from the non-empty membership that
         // was accepted at `up`, even though `resolve` reports it as an error.
@@ -2376,8 +2393,8 @@ impl Service {
                 .ok_or_else(|| failed("server not found"))?;
             let sni = server
                 .spec
-                .stream()
-                .and_then(|stream| stream.sni.clone())
+                .tls_sni()
+                .map(str::to_string)
                 .filter(|sni| !sni.is_empty());
             (server.address.clone(), server.port, sni)
         };
@@ -2409,11 +2426,11 @@ impl Service {
             .flat_map(|subscription| subscription.servers.iter_mut())
             .find(|server| server.id == server_id)
             .ok_or_else(|| failed("server not found"))?;
-        let stream = server
-            .spec
-            .stream_mut()
-            .ok_or_else(|| failed("this server has no TLS settings to pin a certificate on"))?;
-        stream.pin_sha256 = Some(pin);
+        if !server.spec.set_pin_sha256(Some(pin)) {
+            return Err(failed(
+                "this server has no TLS settings to pin a certificate on",
+            ));
+        }
         engine.save().map_err(failed)
     }
 
@@ -2506,17 +2523,14 @@ impl Service {
         // same order as `connect_pool` and `up_profile`: burning the generation
         // or the override on an attempt that then fails to start would cancel a
         // pending automatic reconnect and leave the session in Error for good.
-        self.shared.clear_override("default");
         let generation = self.shared.next_connect_generation("default");
+        self.shared.clear_override("default");
         let result = self.shared.start_connection(
             "default",
             &server_id,
             generation,
             ConnectionOrigin::Explicit,
         );
-        // A death noticed just before this explicit operation may have queued
-        // its reconnect override. The user's action owns the visible state.
-        self.shared.clear_override("default");
         result.map(|_| ()).map_err(failed)
     }
 
@@ -2591,17 +2605,14 @@ impl Service {
             target
         };
 
-        self.shared.clear_override("default");
         let generation = self.shared.next_connect_generation("default");
+        self.shared.clear_override("default");
         let result = self.shared.start_connection_target(
             "default",
             &target,
             generation,
             ConnectionOrigin::Explicit,
         );
-        // A death noticed just before this explicit operation may have queued
-        // its reconnect override. The user's action owns the visible state.
-        self.shared.clear_override("default");
         result.map_err(failed)?;
         Ok("default".to_string())
     }
@@ -2766,15 +2777,14 @@ impl Service {
             (target, up_server, ignored_ports)
         };
 
-        self.shared.clear_override(&name);
         let generation = self.shared.next_connect_generation(&name);
+        self.shared.clear_override(&name);
         let confirmation = self.shared.start_connection_target(
             &name,
             &target,
             generation,
             ConnectionOrigin::Explicit,
         );
-        self.shared.clear_override(&name);
         let confirmation = confirmation.map_err(failed)?;
         if profile.interface.enable
             && !confirmation.is_some_and(|confirmation| confirmation.recv().unwrap_or(false))
@@ -2935,6 +2945,15 @@ impl Service {
         if raw.get("reconnect").is_none() {
             config.reconnect = engine.registry.config.reconnect;
         }
+        if raw.get("on_core_exit").is_none() {
+            config.on_core_exit = engine.registry.config.on_core_exit;
+        }
+        if raw.get("geoip_url").is_none() {
+            config.geoip_url = engine.registry.config.geoip_url.clone();
+        }
+        if raw.get("geosite_url").is_none() {
+            config.geosite_url = engine.registry.config.geosite_url.clone();
+        }
         // Same, for the whole `[core]` section. A client that edits it always
         // sends the key, empty section included; one that does not know the
         // section omits it, and overwriting from that absence would erase a
@@ -3012,7 +3031,7 @@ impl Service {
         let http_port = engine.registry.config.http_port;
         let xray_binary = engine.registry.config.xray_binary.clone();
         engine.set_default_ports(socks_port, http_port);
-        if let Some(session) = engine.default_session_mut() {
+        if let Some(session) = engine.sessions.get_mut("default") {
             session.core.xray_binary = xray_binary;
         }
         engine.save().map_err(failed)?;

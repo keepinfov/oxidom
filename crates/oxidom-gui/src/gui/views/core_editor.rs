@@ -630,6 +630,7 @@ impl CoreEditor {
             &widgets.mux,
             &widgets.fragment,
             &widgets.dns,
+            &widgets.pool,
         ] {
             row.connect_enable_expansion_notify({
                 let notify = notify.clone();

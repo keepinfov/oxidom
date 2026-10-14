@@ -248,14 +248,10 @@ fn preserve_server_identity(previous: &[Server], refreshed: &mut [Server]) {
         // A pinned certificate is the user's decision about *this* server, not
         // something the provider sends; a refresh that dropped it would make
         // the server unreachable again and ask the question a second time.
-        if let Some(pin) = previous[index]
-            .spec
-            .stream()
-            .and_then(|stream| stream.pin_sha256.clone())
-            && let Some(stream) = server.spec.stream_mut()
-            && stream.pin_sha256.is_none()
+        if let Some(pin) = previous[index].spec.pin_sha256().map(str::to_string)
+            && server.spec.pin_sha256().is_none()
         {
-            stream.pin_sha256 = Some(pin);
+            server.spec.set_pin_sha256(Some(pin));
         }
         // The user's field-level decisions ride across the same way. The
         // provider base is restamped from the entry as this refresh brought

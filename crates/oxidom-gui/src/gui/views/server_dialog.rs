@@ -36,7 +36,16 @@ const PROTOCOLS: [(Protocol, &str); 5] = [
     (Protocol::Hysteria2, "hysteria2"),
 ];
 
-const NETWORKS: [&str; 6] = ["tcp", "ws", "grpc", "xhttp", "splithttp", "h2"];
+const NETWORKS: [&str; 8] = [
+    "tcp",
+    "ws",
+    "grpc",
+    "xhttp",
+    "splithttp",
+    "h2",
+    "httpupgrade",
+    "kcp",
+];
 const SECURITIES: [&str; 3] = ["none", "tls", "reality"];
 
 /// Everything the widgets hold, as plain data, so assembling and validating a
@@ -72,6 +81,7 @@ pub struct DialogValues {
     pub h2_up: String,
     pub h2_down: String,
     pub patch: String,
+    pub base_draft: Option<ServerDraft>,
 }
 
 impl DialogValues {
@@ -110,6 +120,7 @@ fn combo_index(options: &[&str], value: &str) -> usize {
 /// not a placeholder.
 pub fn values_from_server(server: &Server) -> DialogValues {
     let draft = oxidom_core::draft::draft_from_server(server);
+    let base_draft = Some(draft.clone());
     let stream = draft.stream.unwrap_or_default();
     let hysteria2 = draft.hysteria2.unwrap_or_default();
     let option = |value: &Option<String>| value.clone().unwrap_or_default();
@@ -167,6 +178,7 @@ pub fn values_from_server(server: &Server) -> DialogValues {
             .as_ref()
             .map(|patch| serde_json::to_string_pretty(patch).unwrap_or_default())
             .unwrap_or_default(),
+        base_draft,
     }
 }
 
@@ -181,6 +193,21 @@ pub fn draft_from_values(values: &DialogValues) -> Result<ServerDraft, String> {
         ),
     };
     let protocol = values.protocol();
+    let base_stream = values
+        .base_draft
+        .as_ref()
+        .and_then(|draft| draft.stream.clone())
+        .unwrap_or_default();
+    let base_hysteria2 = values
+        .base_draft
+        .as_ref()
+        .and_then(|draft| draft.hysteria2.clone())
+        .unwrap_or_default();
+    let obfs_kind = base_hysteria2
+        .obfs
+        .as_ref()
+        .map(|obfs| obfs.kind.clone())
+        .unwrap_or_else(|| "salamander".to_string());
     let stream = matches!(
         protocol,
         Protocol::Vless | Protocol::Vmess | Protocol::Trojan
@@ -199,31 +226,26 @@ pub fn draft_from_values(values: &DialogValues) -> Result<ServerDraft, String> {
         sni: opt(&values.sni),
         alpn: alpn_list(&values.alpn),
         fingerprint: opt(&values.fingerprint),
-        allow_insecure: false,
-        pin_sha256: None,
         public_key: opt(&values.public_key),
         short_id: opt(&values.short_id),
         spider_x: opt(&values.spider_x),
         path: opt(&values.path),
         host: opt(&values.host),
         service_name: opt(&values.service_name),
-        xhttp_mode: None,
-        xhttp_extra: None,
-        grpc_authority: None,
-        grpc_multi_mode: false,
         header_type: opt(&values.header_type),
         flow: opt(&values.flow),
+        ..base_stream
     });
     let hysteria2 = matches!(protocol, Protocol::Hysteria2).then(|| Hysteria2Settings {
         sni: opt(&values.h2_sni),
         alpn: alpn_list(&values.h2_alpn),
         obfs: opt(&values.h2_obfs_password).map(|password| Hysteria2Obfs {
-            kind: "salamander".to_string(),
+            kind: obfs_kind,
             password,
         }),
         up_mbps: opt(&values.h2_up).and_then(|raw| parse_bandwidth_mbps(&raw)),
         down_mbps: opt(&values.h2_down).and_then(|raw| parse_bandwidth_mbps(&raw)),
-        ..Hysteria2Settings::default()
+        ..base_hysteria2
     });
     Ok(ServerDraft {
         name: values.name.trim().to_string(),
@@ -231,12 +253,18 @@ pub fn draft_from_values(values: &DialogValues) -> Result<ServerDraft, String> {
         address: values.address.trim().to_string(),
         port: values.port,
         uuid: opt(&values.uuid),
-        encryption: None,
+        encryption: values
+            .base_draft
+            .as_ref()
+            .and_then(|draft| draft.encryption.clone()),
         alter_id: Some(values.alter_id),
         security: opt(&values.vmess_security),
         method: opt(&values.method),
         password: opt(&values.password),
-        username: None,
+        username: values
+            .base_draft
+            .as_ref()
+            .and_then(|draft| draft.username.clone()),
         auth: opt(&values.auth),
         stream,
         hysteria2,
@@ -462,6 +490,7 @@ fn build_dialog(
         ..DialogValues::default()
     }));
 
+    let base_draft_for_collect = prefill.as_ref().and_then(|p| p.base_draft.clone());
     if let Some(prefill) = prefill {
         // The rows carry the server as it stands, not a blank form: the
         // protocol is a fact about the server being edited, and for a
@@ -595,6 +624,7 @@ fn build_dialog(
                 h2_up: h2_up.text().to_string(),
                 h2_down: h2_down.text().to_string(),
                 patch: patch_buffer.text(&start, &end, false).to_string(),
+                base_draft: base_draft_for_collect.clone(),
             };
             *values.borrow_mut() = collected;
         }
@@ -788,5 +818,28 @@ mod tests {
         );
         assert_eq!(settings.up_mbps, Some(100));
         assert!(draft.stream.is_none(), "no stream block for hysteria2");
+    }
+
+    #[test]
+    fn editing_a_server_preserves_unmodeled_fields() {
+        let pin = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let link = format!(
+            "vless://11111111-2222-3333-4444-555555555555@server.example.invalid:443\
+             ?encryption=mlkem768&type=xhttp&mode=packet-up&security=tls&sni=cover.example.invalid\
+             &pinSHA256={pin}&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%7D#Original"
+        );
+        let server = oxidom_core::link::parse_link(&link).expect("parses");
+        let mut values = values_from_server(&server);
+        values.port = 8443;
+        let edited = draft_from_values(&values).expect("assembles");
+        assert_eq!(edited.port, 8443);
+        assert_eq!(edited.encryption.as_deref(), Some("mlkem768"));
+        let stream = edited.stream.expect("stream");
+        assert_eq!(stream.pin_sha256.as_deref(), Some(pin));
+        assert_eq!(stream.xhttp_mode.as_deref(), Some("packet-up"));
+        assert_eq!(
+            stream.xhttp_extra,
+            Some(serde_json::json!({"xPaddingBytes": "100-200"}))
+        );
     }
 }

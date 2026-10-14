@@ -12,7 +12,9 @@ use crate::model::{Server, Subscription};
 use crate::nft::Nft;
 use crate::profile::{ProfileInterface, RouteMode};
 use crate::run::CgroupSlice;
-use crate::state::{self, InterfaceState, RouteRecord, SessionState, State, store};
+use crate::state::{
+    self, InterfaceState, RouteRecord, RunCgroupRecord, SessionState, State, store,
+};
 use crate::tun::core::Tun2socks;
 use crate::tun::plan::{Cidr, PlanInput, RoutePlan, Via, plan_routes};
 use crate::xray::api::BalancerInfo;
@@ -69,7 +71,12 @@ impl Registry {
             let mut migrated = Vec::with_capacity(subscription.servers.len());
             for mut server in std::mem::take(&mut subscription.servers) {
                 let old_id = server.id.clone();
-                let new_id = Server::stable_id(&server.identity_string());
+                let new_id =
+                    if subscription.id == LOCAL_ID && server.link.is_none() && !old_id.is_empty() {
+                        old_id.clone()
+                    } else {
+                        Server::stable_id(&server.identity_string())
+                    };
                 if old_id != new_id {
                     server_ids
                         .entry(old_id.clone())
@@ -475,6 +482,29 @@ impl Registry {
     }
 }
 
+/// What a profile's nftables chain is currently doing, if anything.
+///
+/// `Mark` is a tunnel carrying the cgroup; `Block` is the same chain turned
+/// into a drop while no tunnel does, which is what keeps a switch, a failed
+/// start or a `down` from releasing an `oxidom run` command onto the ordinary
+/// default route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainState {
+    /// No chain of ours is installed, or one was planned and never applied.
+    Off,
+    Mark,
+    Block,
+}
+
+/// What a teardown does with a profile's bound `oxidom run` cgroup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Verdict {
+    /// There is no binding worth keeping, or the policy is to let it go.
+    Release,
+    /// Leave — or put back — a chain that drops this cgroup's traffic.
+    Block(CgroupSlice),
+}
+
 /// Runtime half of a profile interface. Its plan remains available while the
 /// interface is stopped so an opted-in reconnect can restore the same routing
 /// domain after the new SOCKS inbound has proved ready.
@@ -490,7 +520,7 @@ pub struct Interface {
     pub tun2socks: Tun2socks,
     pub nft_binary: String,
     pub cgroup: Option<CgroupSlice>,
-    nft_active: bool,
+    chain: ChainState,
     pub plan: RoutePlan,
     pub up: bool,
     fresh: bool,
@@ -516,7 +546,11 @@ impl Interface {
             // Like routes, the rule is recorded as planned before it is
             // applied. Idempotent netlink cleanup makes that the safe side.
             rule: true,
-            nft_rule: self.cgroup.is_some(),
+            // A binding is enough to have a chain to clean up: it is planned
+            // before nftables is asked for it, and the chain it names may be a
+            // mark, a block, or never installed at all. Removal is idempotent,
+            // an unrecorded chain that did get installed is not.
+            nft_rule: self.cgroup.is_some() || self.chain != ChainState::Off,
         }
     }
 
@@ -656,10 +690,10 @@ impl Session {
         self.core
             .connect(server, self.address, &self.profile, &self.core_options)?;
         self.selection = Some(SessionSelection::Server(server.id.clone()));
-        // A core is carrying traffic again, so the session is no longer holding
-        // it. Cleared here rather than by whoever reconnected, because this is
-        // the one place both a first connect and a reconnect pass through.
-        self.holding_traffic = false;
+        // The hold is deliberately *not* cleared here. A core that started and
+        // then failed its confirmation never carried anything, and the window
+        // between the two is exactly the one the hold covers; it ends in
+        // [`Engine::confirm_traffic`], once a confirmation has succeeded.
         self.api_port = 0;
         self.pool_name.clear();
         self.pool_expected = 0;
@@ -691,7 +725,7 @@ impl Session {
             members.iter().map(|server| server.id.clone()).collect(),
             pool.strategy.to_string(),
         ));
-        self.holding_traffic = false;
+        // As in `Session::connect`: only a confirmation ends a hold.
         self.api_port = pool.api_port;
         self.pool_name = pool.name.to_string();
         self.pool_expected = pool.expected;
@@ -725,7 +759,31 @@ impl Session {
     }
 
     pub fn is_alive(&mut self) -> bool {
-        self.core.is_alive()
+        if !self.core.is_alive() {
+            return false;
+        }
+        let proxy = self.socks_endpoint();
+        if let Some(interface) = self.interface.as_mut()
+            && interface.up
+            && !interface.tun2socks.is_alive()
+            && interface.tun2socks.child_pid().is_some()
+        {
+            log::warn!(
+                "tun2socks for profile {:?} exited while Xray was still running; restarting it",
+                self.profile
+            );
+            if let Err(error) = interface
+                .tun2socks
+                .start(&interface.device, proxy, interface.mtu)
+            {
+                log::warn!(
+                    "could not restart tun2socks for profile {:?}: {error:#}",
+                    self.profile
+                );
+                return false;
+            }
+        }
+        true
     }
 
     /// See [`XrayCore::current_run_logs`] — for diagnosing this attempt, not
@@ -939,13 +997,22 @@ impl Engine {
 
     /// Undo each resource a crashed previous instance could have left behind.
     fn recover(&mut self) {
+        // The chains come first. A recorded `oxidom run` cgroup is the one
+        // resource here whose owner may still be running: its block has to be
+        // in place before the routes it used to rely on are taken away.
+        let chains_changed = self.recover_run_cgroups();
         let stale_sessions = self.state.sessions.clone();
         if stale_sessions.is_empty() {
+            if chains_changed {
+                let _ = self.state.save();
+            }
             return;
         }
         let mut cleaned_profiles = Vec::new();
         let mut state_changed = false;
         for saved in &stale_sessions {
+            // A chain this pass already rebuilt is not an orphan to remove.
+            let chain_handled = self.run_cgroup(&saved.profile).is_some();
             let adopted_pool = saved.xray_pid.filter(|pid| {
                 !saved.pool_members.is_empty()
                     && saved.api_port != 0
@@ -989,8 +1056,12 @@ impl Engine {
                     }
                 });
             let interface_clean = saved.interface.as_ref().is_none_or(|interface| {
-                match recover_interface(&saved.profile, interface, &self.registry.config.nft_binary)
-                {
+                match recover_interface(
+                    &saved.profile,
+                    interface,
+                    &self.registry.config.nft_binary,
+                    chain_handled,
+                ) {
                     Ok(()) => true,
                     Err(error) => {
                         log::warn!(
@@ -1027,6 +1098,9 @@ impl Engine {
             }
         }
         if cleaned_profiles.is_empty() && !state_changed {
+            if chains_changed && let Err(error) = self.state.save() {
+                log::warn!("could not persist the recovered cgroup bindings: {error:#}");
+            }
             return;
         }
         // A session is a running profile, not a remembered connection. Once
@@ -1044,6 +1118,36 @@ impl Engine {
         if state_changed && let Err(error) = self.state.save() {
             log::warn!("could not persist recovered session state: {error:#}");
         }
+    }
+
+    /// Put every recorded `oxidom run` cgroup back under the protection it had.
+    fn recover_run_cgroups(&mut self) -> bool {
+        let recorded = self.state.run_cgroups.clone();
+        let mut kept = Vec::with_capacity(recorded.len());
+        let mut dropped = false;
+        for record in recorded {
+            let slice = record.slice();
+            let nft = Nft::new(self.registry.config.nft_binary.clone());
+            if crate::paths::cgroup_dir(&slice.path).exists() {
+                if let Err(error) = nft.block(&record.profile, &slice) {
+                    log::warn!(
+                        "could not restore the block for profile {:?}: {error:#}",
+                        record.profile
+                    );
+                }
+                kept.push(record);
+            } else {
+                if let Err(error) = nft.remove(&record.profile) {
+                    log::warn!(
+                        "could not remove the chain for profile {:?}: {error:#}",
+                        record.profile
+                    );
+                }
+                dropped = true;
+            }
+        }
+        self.state.run_cgroups = kept;
+        dropped
     }
 
     pub fn save(&self) -> Result<()> {
@@ -1237,7 +1341,8 @@ impl Engine {
             .get(profile)
             .is_some_and(|session| session.holds_traffic);
         if !holds {
-            if let Err(error) = self.stop_interface(profile) {
+            let verdict = self.teardown_verdict(profile);
+            if let Err(error) = self.stop_interface_with(profile, verdict) {
                 log::warn!(
                     "could not clean the interface after profile {profile:?}'s core exited: \
                      {error:#}"
@@ -1253,6 +1358,39 @@ impl Engine {
             "profile {profile:?} lost its core and is holding its routes: traffic for this \
              tunnel is dropped, not sent out unprotected"
         );
+        true
+    }
+
+    /// The core has been confirmed to carry traffic, so a session that was
+    /// holding its routes is no longer holding them.
+    pub fn confirm_traffic(&mut self, profile: &str) {
+        let Some(session) = self.sessions.get_mut(profile) else {
+            return;
+        };
+        session.holding_traffic = false;
+    }
+
+    /// A confirmation failed for a session whose core reported `Connected`.
+    pub fn confirmation_failed(&mut self, profile: &str, reason: &str) -> bool {
+        let holds = self.sessions.get(profile).is_some_and(|session| {
+            session.holds_traffic
+                && session
+                    .interface
+                    .as_ref()
+                    .is_some_and(|interface| interface.up)
+        });
+        if !holds {
+            if let Some(session) = self.sessions.get_mut(profile) {
+                session.core.note(reason);
+            }
+            self.stop_session(profile);
+            return false;
+        }
+        if let Some(session) = self.sessions.get_mut(profile) {
+            session.core.disconnect();
+            session.core.fail(reason);
+        }
+        self.note_core_exit(profile);
         true
     }
 
@@ -1310,6 +1448,32 @@ impl Engine {
             .iter()
             .map(|entry| entry.parse::<Cidr>())
             .collect::<Result<Vec<_>>>()?;
+        let previous_created = self
+            .sessions
+            .get(profile)
+            .and_then(|session| session.interface.as_ref())
+            .is_some_and(|interface| interface.device == device && interface.created);
+        if self
+            .sessions
+            .get(profile)
+            .and_then(|session| session.interface.as_ref())
+            .is_some()
+        {
+            // Stop the old interface BEFORE resolving DNS for the new server
+            // under `routes = "default"`: if the old full-tunnel session was
+            // dead or holding traffic, table 254 would otherwise blackhole the
+            // DNS lookup for the new server's hostname into the dead TUN.
+            // Meanwhile, any bound `oxidom run` cgroup is turned into a block
+            // so scoped commands never leak over the direct route during the
+            // switch.
+            let verdict = match self.run_cgroup(profile) {
+                Some(slice) if crate::paths::cgroup_dir(&slice.path).exists() => {
+                    Verdict::Block(slice)
+                }
+                _ => Verdict::Release,
+            };
+            self.stop_interface_with(profile, verdict)?;
+        }
         // Copied LAN routes are a convenience for marked processes, so a box
         // with no default route at this moment still gets its interface. Only
         // `routes = "default"` genuinely cannot be planned without a gateway.
@@ -1345,19 +1509,14 @@ impl Engine {
             self.registry.config.tun2socks_binary.clone(),
         );
         tun2socks.resolve_binary()?;
-        let previous_created = self
-            .sessions
-            .get(profile)
-            .and_then(|session| session.interface.as_ref())
-            .is_some_and(|interface| interface.device == device && interface.created);
-        if self
-            .sessions
-            .get(profile)
-            .and_then(|session| session.interface.as_ref())
-            .is_some()
-        {
-            self.stop_interface(profile)?;
-        }
+        let cgroup = match self.run_cgroup(profile) {
+            Some(slice) if crate::paths::cgroup_dir(&slice.path).exists() => Some(slice),
+            Some(_) => {
+                let _ = self.unbind_run_cgroup(profile);
+                None
+            }
+            None => None,
+        };
         let interface = Interface {
             profile: profile.to_string(),
             device: device.clone(),
@@ -1369,8 +1528,8 @@ impl Engine {
             created: previous_created || !crate::tun::device::exists(&device),
             tun2socks,
             nft_binary: self.registry.config.nft_binary.clone(),
-            cgroup: None,
-            nft_active: false,
+            cgroup,
+            chain: ChainState::Off,
             plan,
             up: false,
             fresh: false,
@@ -1418,14 +1577,20 @@ impl Engine {
                 existing_path
             );
         }
-        if interface.cgroup.as_ref() == Some(&slice) && interface.nft_active {
+        // Always re-apply `Nft::install` when a scope calls `mark_cgroup`: if
+        // an earlier `oxidom run` scope finished, `systemd --user` removed the
+        // empty slice directory and created a new one with a new kernel inode
+        // for this scope. Since `nft` resolves `socket cgroupv2` to an inode at
+        // rule parse time, flushing and re-adding the rule ensures the kernel
+        // matches the current scope's inode.
+        interface.cgroup = Some(slice.clone());
+        if let Err(error) = self.bind_run_cgroup(profile, &slice) {
             self.sessions
                 .get_mut(profile)
                 .expect("the session existed above")
                 .interface = Some(interface);
-            return Ok(slice);
+            return Err(error);
         }
-        interface.cgroup = Some(slice.clone());
         if let Err(error) = self.persist_interface_state(profile, &interface) {
             self.sessions
                 .get_mut(profile)
@@ -1435,13 +1600,78 @@ impl Engine {
         }
         let result =
             Nft::new(interface.nft_binary.clone()).install(profile, &slice, interface.mark);
-        interface.nft_active = result.is_ok();
+        if result.is_ok() {
+            interface.chain = ChainState::Mark;
+        } else {
+            interface.chain = ChainState::Off;
+            interface.cgroup = None;
+            let _ = self.unbind_run_cgroup(profile);
+            let _ = self.persist_interface_state(profile, &interface);
+        }
         self.sessions
             .get_mut(profile)
             .expect("the session existed above")
             .interface = Some(interface);
         result?;
         Ok(slice)
+    }
+
+    /// The `oxidom run` cgroup this profile is bound to, if any.
+    fn run_cgroup(&self, profile: &str) -> Option<CgroupSlice> {
+        self.state
+            .run_cgroups
+            .iter()
+            .find(|record| record.profile == profile)
+            .map(RunCgroupRecord::slice)
+    }
+
+    /// Record that this profile's `oxidom run` cgroup must not reach the
+    /// ordinary path while no tunnel carries it.
+    fn bind_run_cgroup(&mut self, profile: &str, slice: &CgroupSlice) -> Result<()> {
+        let record = RunCgroupRecord {
+            profile: profile.to_string(),
+            path: slice.path.clone(),
+            level: slice.level,
+        };
+        if let Some(existing) = self
+            .state
+            .run_cgroups
+            .iter_mut()
+            .find(|record| record.profile == profile)
+        {
+            *existing = record;
+        } else {
+            self.state.run_cgroups.push(record);
+        }
+        self.state.save()
+    }
+
+    /// Forget a binding whose cgroup is no longer protected.
+    fn unbind_run_cgroup(&mut self, profile: &str) -> Result<()> {
+        let before = self.state.run_cgroups.len();
+        self.state
+            .run_cgroups
+            .retain(|record| record.profile != profile);
+        if self.state.run_cgroups.len() == before {
+            return Ok(());
+        }
+        self.state.save()
+    }
+
+    /// What a teardown does with this profile's bound `oxidom run` cgroup.
+    fn teardown_verdict(&self, profile: &str) -> Verdict {
+        let Some(slice) = self.run_cgroup(profile) else {
+            return Verdict::Release;
+        };
+        let holds = self
+            .sessions
+            .get(profile)
+            .is_some_and(|session| session.holds_traffic);
+        if holds && crate::paths::cgroup_dir(&slice.path).exists() {
+            Verdict::Block(slice)
+        } else {
+            Verdict::Release
+        }
     }
 
     /// Test seam: plant a minimal `oxidom run` cgroup on a session's interface
@@ -1467,7 +1697,7 @@ impl Engine {
             tun2socks: Tun2socks::new(profile.to_string(), String::new()),
             nft_binary: String::new(),
             cgroup: Some(slice),
-            nft_active: false,
+            chain: ChainState::Off,
             plan: RoutePlan {
                 private: Vec::new(),
                 system: Vec::new(),
@@ -1566,7 +1796,8 @@ impl Engine {
         });
         if let Err(error) = result {
             let delete_fresh_device = interface.fresh;
-            let rollback = cleanup_live_interface(&mut interface, delete_fresh_device);
+            let verdict = self.teardown_verdict(profile);
+            let rollback = cleanup_live_interface(&mut interface, delete_fresh_device, &verdict);
             self.sessions
                 .get_mut(profile)
                 .expect("the session existed above")
@@ -1592,6 +1823,11 @@ impl Engine {
     /// Stop routing through the interface but keep its persistent device and
     /// plan so reconnect can reuse hand-written routes and the same identity.
     pub fn stop_interface(&mut self, profile: &str) -> Result<()> {
+        let verdict = self.teardown_verdict(profile);
+        self.stop_interface_with(profile, verdict)
+    }
+
+    fn stop_interface_with(&mut self, profile: &str, verdict: Verdict) -> Result<()> {
         let Some(mut interface) = self
             .sessions
             .get_mut(profile)
@@ -1599,13 +1835,24 @@ impl Engine {
         else {
             return Ok(());
         };
-        let result = cleanup_live_interface(&mut interface, false);
+        let result = cleanup_live_interface(&mut interface, false, &verdict);
+        if result.is_ok() {
+            match &verdict {
+                Verdict::Block(slice) => interface.cgroup = Some(slice.clone()),
+                Verdict::Release => interface.cgroup = None,
+            }
+        }
         self.sessions
             .get_mut(profile)
             .expect("the session existed above")
             .interface = Some(interface);
         self.sync_session(profile);
+        let unbound = match (result.is_ok(), verdict) {
+            (true, Verdict::Release) => self.unbind_run_cgroup(profile),
+            _ => Ok(()),
+        };
         self.state.save()?;
+        unbound?;
         result
     }
 
@@ -1619,7 +1866,8 @@ impl Engine {
         else {
             return Ok(false);
         };
-        if let Err(error) = cleanup_live_interface(&mut interface, true) {
+        let verdict = self.teardown_verdict(profile);
+        if let Err(error) = cleanup_live_interface(&mut interface, true, &verdict) {
             self.sessions
                 .get_mut(profile)
                 .expect("the session existed above")
@@ -1628,6 +1876,9 @@ impl Engine {
         }
         self.sync_session(profile);
         self.state.save()?;
+        if let Verdict::Release = verdict {
+            self.unbind_run_cgroup(profile)?;
+        }
         Ok(true)
     }
 
@@ -1695,9 +1946,17 @@ impl Engine {
             .sessions
             .iter()
             .filter_map(
-                |(profile, session)| match (session.server_id(), session.status()) {
-                    (Some(id), Status::Connected | Status::Connecting | Status::Error(_))
-                        if covers(id, &self.registry.subscriptions) =>
+                |(profile, session)| match (&session.selection, session.status()) {
+                    (
+                        Some(SessionSelection::Server(id)),
+                        Status::Connected | Status::Connecting | Status::Error(_),
+                    ) if covers(id, &self.registry.subscriptions) => Some(profile.to_string()),
+                    (
+                        Some(SessionSelection::Pool { members, .. }),
+                        Status::Connected | Status::Connecting | Status::Error(_),
+                    ) if members
+                        .iter()
+                        .any(|id| covers(id, &self.registry.subscriptions)) =>
                     {
                         Some(profile.to_string())
                     }
@@ -1883,23 +2142,58 @@ impl Engine {
     }
 }
 
-fn resolve_server_ipv4(server: &Server) -> Result<Ipv4Addr> {
-    if let Ok(address) = server.address.parse::<Ipv4Addr>() {
-        return Ok(address);
+fn resolve_endpoint_ipv4(address: &str, port: u16) -> Result<Vec<Ipv4Addr>> {
+    if let Ok(ip) = address.parse::<Ipv4Addr>() {
+        return Ok(vec![ip]);
     }
-    (server.address.as_str(), server.port)
-        .to_socket_addrs()
-        .with_context(|| {
-            format!(
-                "resolving server endpoint {}:{} for routes = \"default\"",
-                server.address, server.port
-            )
-        })?
-        .find_map(|address| match address.ip() {
-            std::net::IpAddr::V4(address) => Some(address),
-            std::net::IpAddr::V6(_) => None,
-        })
-        .context("routes = \"default\" requires the server IPv4 address")
+    let mut resolved = Vec::new();
+    for addr in (address, port).to_socket_addrs().with_context(|| {
+        format!("resolving server endpoint {address}:{port} for routes = \"default\"")
+    })? {
+        if let std::net::IpAddr::V4(ip) = addr.ip()
+            && !resolved.contains(&ip)
+        {
+            resolved.push(ip);
+        }
+    }
+    if resolved.is_empty() {
+        bail!("routes = \"default\" requires the server IPv4 address");
+    }
+    Ok(resolved)
+}
+
+fn resolve_server_ipv4_all(server: &Server) -> Result<Vec<Ipv4Addr>> {
+    if let crate::model::OutboundSpec::XrayProfile {
+        proxy_outbounds, ..
+    } = &server.spec
+    {
+        let mut all = Vec::new();
+        for outbound in proxy_outbounds {
+            let endpoint = outbound
+                .pointer("/settings/vnext/0")
+                .or_else(|| outbound.pointer("/settings/servers/0"))
+                .or_else(|| outbound.get("settings"));
+            if let Some(addr) = endpoint
+                .and_then(|e| e.get("address"))
+                .and_then(|v| v.as_str())
+            {
+                let port = endpoint
+                    .and_then(|e| e.get("port"))
+                    .and_then(|v| v.as_u64())
+                    .and_then(|p| u16::try_from(p).ok())
+                    .unwrap_or(server.port);
+                for ip in resolve_endpoint_ipv4(addr, port)? {
+                    if !all.contains(&ip) {
+                        all.push(ip);
+                    }
+                }
+            }
+        }
+        if !all.is_empty() {
+            return Ok(all);
+        }
+    }
+    resolve_endpoint_ipv4(&server.address, server.port)
 }
 
 /// Ask the OS for a port on this session address, then release it for Xray.
@@ -1921,18 +2215,22 @@ pub fn free_port(bind: Ipv4Addr, excluded: &[u16]) -> Result<u16> {
 }
 
 fn resolve_servers_ipv4(servers: &[Server]) -> Result<Vec<Ipv4Addr>> {
-    servers
-        .iter()
-        .map(|server| {
-            resolve_server_ipv4(server).with_context(|| {
-                format!(
-                    "pool member {:?} ({}) needs a host route to avoid a full-tunnel loop",
-                    server.name,
-                    server.alias.as_deref().unwrap_or(&server.id)
-                )
-            })
-        })
-        .collect()
+    let mut addresses = Vec::new();
+    for server in servers {
+        let resolved = resolve_server_ipv4_all(server).with_context(|| {
+            format!(
+                "pool member {:?} ({}) needs a host route to avoid a full-tunnel loop",
+                server.name,
+                server.alias.as_deref().unwrap_or(&server.id)
+            )
+        })?;
+        for ip in resolved {
+            if !addresses.contains(&ip) {
+                addresses.push(ip);
+            }
+        }
+    }
+    Ok(addresses)
 }
 
 fn start_interface_steps(
@@ -1952,7 +2250,15 @@ fn start_interface_steps(
 
     let net = crate::tun::net::Net::new()?;
     let index = net.link_index(&interface.device)?;
+    net.set_mtu(index, u32::from(interface.mtu))?;
     net.address_add(index, interface.address, 32)?;
+    // Enable `src_valid_mark` and loose `rp_filter` on the TUN device so the
+    // kernel's reverse-path check honors the fwmark restored by nftables in
+    // `prerouting` for `oxidom run` packets.
+    let sysctl_dir =
+        std::path::PathBuf::from(format!("/proc/sys/net/ipv4/conf/{}", interface.device));
+    let _ = std::fs::write(sysctl_dir.join("src_valid_mark"), b"1\n");
+    let _ = std::fs::write(sysctl_dir.join("rp_filter"), b"2\n");
     interface
         .tun2socks
         .start(&interface.device, proxy, interface.mtu)?;
@@ -1976,34 +2282,63 @@ fn start_interface_steps(
     for route in &interface.plan.system {
         net.route_add(route, index)?;
     }
-    if let Some(slice) = interface.cgroup.as_ref() {
-        Nft::new(interface.nft_binary.clone()).install(
-            &interface.profile,
-            slice,
-            interface.mark,
-        )?;
-        interface.nft_active = true;
+    if let Some(slice) = interface.cgroup.clone() {
+        if crate::paths::cgroup_dir(&slice.path).exists() {
+            Nft::new(interface.nft_binary.clone()).install(
+                &interface.profile,
+                &slice,
+                interface.mark,
+            )?;
+            interface.chain = ChainState::Mark;
+        } else {
+            let _ = Nft::new(interface.nft_binary.clone()).remove(&interface.profile);
+            interface.cgroup = None;
+            interface.chain = ChainState::Off;
+        }
     }
     interface.up = true;
     interface.fresh = false;
     Ok(())
 }
 
-fn cleanup_live_interface(interface: &mut Interface, delete_device: bool) -> Result<()> {
-    // Stop assigning the mark before removing its rule/table routes. If nft
-    // cannot do that atomically, leave the routing domain intact rather than
-    // silently releasing marked traffic onto the ordinary default route.
-    if interface.cgroup.is_some() {
-        let removed = Nft::new(interface.nft_binary.clone()).remove(&interface.profile);
-        // Refusing teardown only makes sense while a mark rule is actually
-        // assigning traffic. A profile whose install failed has no rule to
-        // release, and treating that as fatal strands its device: the removal
-        // fails again on every `down`, so nothing can ever bring it back.
-        if interface.nft_active {
-            removed?;
+/// Install, keep or remove the profile's chain according to `verdict`.
+fn set_chain(
+    profile: &str,
+    nft_binary: &str,
+    installed: ChainState,
+    verdict: &Verdict,
+) -> Result<ChainState> {
+    match verdict {
+        Verdict::Block(slice) => {
+            Nft::new(nft_binary.to_string()).block(profile, slice)?;
+            Ok(ChainState::Block)
         }
-        interface.nft_active = false;
+        Verdict::Release => {
+            if installed == ChainState::Off {
+                return Ok(ChainState::Off);
+            }
+            let removed = Nft::new(nft_binary.to_string()).remove(profile);
+            if installed == ChainState::Mark {
+                removed?;
+            } else if let Err(error) = removed {
+                log::warn!("could not remove the blocked chain for profile {profile:?}: {error:#}");
+            }
+            Ok(ChainState::Off)
+        }
     }
+}
+
+fn cleanup_live_interface(
+    interface: &mut Interface,
+    delete_device: bool,
+    verdict: &Verdict,
+) -> Result<()> {
+    interface.chain = set_chain(
+        &interface.profile,
+        &interface.nft_binary,
+        interface.chain,
+        verdict,
+    )?;
     interface.tun2socks.stop();
     interface.up = false;
     let device_exists = crate::tun::device::exists(&interface.device);
@@ -2033,17 +2368,20 @@ fn cleanup_live_interface(interface: &mut Interface, delete_device: bool) -> Res
                 errors.push(format!("{error:#}"));
             }
         }
+        if !delete_device && let Some(index) = index {
+            if let Err(error) = net.address_del(index, interface.address, 32) {
+                errors.push(format!("{error:#}"));
+            }
+            if let Err(error) = net.link_down(index) {
+                errors.push(format!("{error:#}"));
+            }
+        }
         Ok(())
     }) {
         Ok(()) => {}
         Err(error) => errors.push(format!("{error:#}")),
     }
     if delete_device && device_exists {
-        // `created` only knows about this session. A persistent device outlives
-        // its session by design, and `down` drops the record that remembered
-        // making it, so after the first reconnect the kernel's own notion of
-        // ownership is the only one left. Refusing is still a real outcome and
-        // is reported rather than passed off as a removal.
         let ours = interface.created
             || crate::tun::device::owned_by(
                 &interface.device,
@@ -2066,8 +2404,13 @@ fn cleanup_live_interface(interface: &mut Interface, delete_device: bool) -> Res
     }
 }
 
-fn recover_interface(profile: &str, interface: &InterfaceState, nft_binary: &str) -> Result<()> {
-    if interface.nft_rule {
+fn recover_interface(
+    profile: &str,
+    interface: &InterfaceState,
+    nft_binary: &str,
+    chain_handled: bool,
+) -> Result<()> {
+    if interface.nft_rule && !chain_handled {
         Nft::new(nft_binary.to_string()).remove(profile)?;
     }
     if let Some(pid) = interface.tun2socks_pid
@@ -2104,7 +2447,7 @@ fn recover_interface(profile: &str, interface: &InterfaceState, nft_binary: &str
         .filter(|route| route.table == interface.table)
     {
         let route = route.to_spec();
-        if matches!(route.via, Via::Interface(_)) || index.is_some() {
+        if matches!(route.via, Via::Gateway(_) | Via::Interface(_)) || index.is_some() {
             net.route_del(&route, index.unwrap_or(0))?;
         }
     }
@@ -2203,8 +2546,11 @@ mod tests {
 
     use anyhow::{Context, Result, anyhow};
 
-    use super::{Engine, Interface, LOCAL_ID, PoolSession, Session, Sessions};
+    use super::{
+        ChainState, Engine, Interface, LOCAL_ID, PoolSession, Session, Sessions, Verdict, set_chain,
+    };
     use crate::bind;
+    use crate::config::OnCoreExit;
     use crate::link::parse_link;
     use crate::model::{Server, Subscription};
     use crate::profile::RouteMode;
@@ -2364,6 +2710,7 @@ mod tests {
         let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("recover-all-sessions")?;
         State {
+            run_cgroups: Vec::new(),
             sessions: vec![
                 saved_profile_session("home", Some(4_000_000)),
                 saved_profile_session("work", Some(4_000_001)),
@@ -2413,6 +2760,7 @@ mod tests {
             },
         )?;
         State {
+            run_cgroups: Vec::new(),
             sessions: vec![saved],
         }
         .save()?;
@@ -2451,7 +2799,7 @@ mod tests {
             tun2socks: Tun2socks::new("work".to_string(), String::new()),
             nft_binary: String::new(),
             cgroup: Some(crate::run::user_slice("work", 1000)?),
-            nft_active: false,
+            chain: ChainState::Off,
             plan: RoutePlan {
                 private: vec![
                     RouteSpec {
@@ -2518,6 +2866,7 @@ mod tests {
         assert!(interface.nft_rule);
         saved.interface = Some(interface.clone());
         State {
+            run_cgroups: Vec::new(),
             sessions: vec![saved],
         }
         .save()?;
@@ -2559,7 +2908,7 @@ mod tests {
             tun2socks: Tun2socks::new("work".to_string(), String::new()),
             nft_binary: String::new(),
             cgroup: None,
-            nft_active: false,
+            chain: ChainState::Off,
             plan: RoutePlan {
                 private: Vec::new(),
                 system: Vec::new(),
@@ -2617,7 +2966,7 @@ mod tests {
             tun2socks: Tun2socks::new(profile.to_string(), String::new()),
             nft_binary: String::new(),
             cgroup: None,
-            nft_active: false,
+            chain: ChainState::Off,
             plan: RoutePlan {
                 private: Vec::new(),
                 system: Vec::new(),
@@ -2666,8 +3015,8 @@ mod tests {
 
         let session = engine.sessions.get("work").context("session")?;
         assert!(
-            !session.holding_traffic,
-            "a core is carrying traffic again, so the hold is over"
+            session.holding_traffic,
+            "a started core is not a confirmed one: the hold outlives the reconnect"
         );
         let interface = session
             .interface
@@ -2677,6 +3026,14 @@ mod tests {
             interface.up,
             "the routes and the rule survived the reconnect instead of being \
              removed while the retry ran"
+        );
+        engine.confirm_traffic("work");
+        assert!(
+            !engine
+                .sessions
+                .get("work")
+                .context("session")?
+                .holding_traffic
         );
         engine.stop_session("work");
         Ok(())
@@ -2721,8 +3078,8 @@ mod tests {
 
         let session = engine.sessions.get("work").context("session")?;
         assert!(
-            !session.holding_traffic,
-            "a core is carrying traffic again, so the hold is over"
+            session.holding_traffic,
+            "a started core is not a confirmed one: the hold outlives the reconnect"
         );
         let interface = session
             .interface
@@ -2733,7 +3090,194 @@ mod tests {
             "the routes and the rule survived the reconnect instead of being \
              removed while the retry ran"
         );
+        engine.confirm_traffic("work");
+        assert!(
+            !engine
+                .sessions
+                .get("work")
+                .context("session")?
+                .holding_traffic
+        );
         engine.stop_session("work");
+        Ok(())
+    }
+
+    fn recording_nft_binary(root: &std::path::Path) -> Result<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join("fake-nft");
+        let log = root.join("nft.log");
+        std::fs::write(&path, format!("#!/bin/sh\ncat > \"{}\"\n", log.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        Ok(path.display().to_string())
+    }
+
+    fn recorded_ruleset(root: &std::path::Path) -> Result<String> {
+        std::fs::read_to_string(root.join("nft.log"))
+            .with_context(|| format!("no ruleset was recorded under {}", root.display()))
+    }
+
+    fn engine_bound_to_run_cgroup(
+        root: &std::path::Path,
+        scope_lives: bool,
+    ) -> Result<(Engine, crate::run::CgroupSlice)> {
+        let mut engine = Engine::load();
+        engine.registry.config.nft_binary = recording_nft_binary(root)?;
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 15, 1), 12280, 12281)?;
+        engine.configure_hold_traffic("work", None);
+        let slice = crate::run::user_slice("work", 1000)?;
+        if scope_lives {
+            std::fs::create_dir_all(crate::paths::cgroup_dir(&slice.path))?;
+        }
+        engine.bind_run_cgroup("work", &slice)?;
+        Ok((engine, slice))
+    }
+
+    #[test]
+    fn a_failed_confirmation_leaves_a_held_tunnel_holding() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("failed-confirmation-holds")?;
+        let (mut engine, slice) = engine_bound_to_run_cgroup(&root.path, true)?;
+        let mut interface = held_interface("work");
+        interface.cgroup = Some(slice.clone());
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(interface);
+        assert!(engine.note_core_exit("work"), "the default is to hold");
+
+        assert!(
+            engine.confirmation_failed("work", "the check never answered"),
+            "a session that was holding keeps holding"
+        );
+
+        let session = engine.sessions.get("work").context("session")?;
+        assert!(
+            session.holding_traffic,
+            "the session is holding its traffic"
+        );
+        let interface = session.interface.as_ref().context("interface")?;
+        assert!(
+            interface.up,
+            "the routes and the rule the hold is made of are still installed"
+        );
+        assert_eq!(engine.teardown_verdict("work"), Verdict::Block(slice));
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_confirmation_still_stops_a_session_that_does_not_hold() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("failed-confirmation-releases")?;
+        let (mut engine, _slice) = engine_bound_to_run_cgroup(&root.path, true)?;
+        engine.configure_hold_traffic("work", Some(OnCoreExit::Release));
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(held_interface("work"));
+
+        assert!(
+            !engine.confirmation_failed("work", "the check never answered"),
+            "a session set to release is not held"
+        );
+
+        let session = engine.sessions.get("work").context("session")?;
+        assert!(!session.holding_traffic);
+        assert!(
+            !session
+                .interface
+                .as_ref()
+                .is_some_and(|interface| interface.up),
+            "a released session is taken down, as it was before"
+        );
+        assert_eq!(engine.teardown_verdict("work"), Verdict::Release);
+        Ok(())
+    }
+
+    #[test]
+    fn a_replanned_interface_blocks_the_cgroup_it_stops_serving() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("replan-blocks-cgroup")?;
+        let slice = crate::run::user_slice("work", 1000)?;
+
+        let chain = set_chain(
+            "work",
+            &recording_nft_binary(&root.path)?,
+            ChainState::Mark,
+            &Verdict::Block(slice.clone()),
+        )?;
+
+        assert_eq!(chain, ChainState::Block, "the chain now drops, not marks");
+        let ruleset = recorded_ruleset(&root.path)?;
+        assert!(
+            ruleset.contains(&format!(
+                "socket cgroupv2 level {} \"{}\"",
+                slice.level, slice.path
+            )),
+            "the bound cgroup is no longer matched once its interface stops: {ruleset}"
+        );
+        assert!(
+            ruleset.contains("counter drop"),
+            "the bound cgroup was released onto the ordinary path: {ruleset}"
+        );
+        assert!(
+            !ruleset.contains("destroy chain"),
+            "the chain was removed instead of turned into a block: {ruleset}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_mark_cgroup_reinstalls_the_rule_for_the_new_scope_inode() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("second-mark-cgroup")?;
+        let nft_stub = recording_nft_binary(&root.path)?;
+        let mut engine = Engine::load();
+        engine.registry.config.nft_binary = nft_stub.clone();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 15, 2), 12380, 12381)?;
+        let mut interface = held_interface("work");
+        interface.nft_binary = nft_stub;
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(interface);
+        engine.sync_session("work");
+
+        engine.mark_cgroup("work", 1000)?;
+        std::fs::remove_file(root.path.join("nft.log"))?;
+
+        // A second `oxidom run` command starts a fresh scope with a new inode;
+        // `mark_cgroup` must invoke `nft` again rather than short-circuiting.
+        engine.mark_cgroup("work", 1000)?;
+        let ruleset = recorded_ruleset(&root.path)?;
+        assert!(
+            ruleset.contains("meta mark set 0x6f21"),
+            "the second scope did not reinstall the mark rule: {ruleset}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_edited_hand_made_server_keeps_its_id_across_a_reload() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("edited-hand-made-reload")?;
+        let stored_id = {
+            let mut engine = Engine::load();
+            let stored = engine.add_server(crate::draft::resolve(&typed_draft())?)?;
+            let mut edited = typed_draft();
+            edited.password = Some("changed-password".to_string());
+            let updated = engine.update_server(&stored.id, &edited)?;
+            assert_eq!(updated.id, stored.id);
+            stored.id
+        };
+
+        let reloaded = Engine::load();
+        assert!(
+            reloaded.all_servers().any(|server| server.id == stored_id),
+            "reloading the daemon changed the edited hand-made server's id"
+        );
         Ok(())
     }
 
@@ -2774,7 +3318,11 @@ mod tests {
             waiters.push(std::thread::spawn(move || child.wait()));
             saved.push(saved_profile_session(profile, Some(pid)));
         }
-        State { sessions: saved }.save()?;
+        State {
+            sessions: saved,
+            run_cgroups: Vec::new(),
+        }
+        .save()?;
 
         let engine = Engine::load();
 
@@ -2822,6 +3370,7 @@ mod tests {
         // Exactly what `Engine::drop` leaves behind for a plain proxy
         // session: the PID cleared, no interface ever created.
         State {
+            run_cgroups: Vec::new(),
             sessions: vec![saved_profile_session("work", None)],
         }
         .save()?;
@@ -2848,6 +3397,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()?;
         State {
+            run_cgroups: Vec::new(),
             sessions: vec![saved_profile_session("work", Some(child.id()))],
         }
         .save()?;
@@ -3175,6 +3725,7 @@ mod tests {
         let mut session = saved_session(Some(old_active));
         session.xray_pid = Some(child.id());
         State {
+            run_cgroups: Vec::new(),
             sessions: vec![session],
         }
         .save()?;
@@ -3249,6 +3800,7 @@ mod tests {
         let mut session = saved_session(Some("different-old-id".to_string()));
         session.xray_pid = Some(child.id());
         State {
+            run_cgroups: Vec::new(),
             sessions: vec![session],
         }
         .save()?;

@@ -1108,6 +1108,7 @@ fn refuse(submitted: &SettingsValues, effective: &SettingsValues, draft: &mut Se
         http_port,
         system_proxy,
         reconnect,
+        hold_traffic,
         latency_method,
         latency_test_url,
         subscription_user_agent,
@@ -1227,6 +1228,46 @@ fn connect_draft_signals(
         move |_| update()
     });
     widgets.user_agent.connect_changed({
+        let widgets = widgets.clone();
+        let update = update.clone();
+        move |_| {
+            sync_preset(&widgets);
+            update();
+        }
+    });
+    widgets.geo_preset.connect_selected_notify({
+        let geoip_url = widgets.geoip_url.clone();
+        let geosite_url = widgets.geosite_url.clone();
+        move |row| {
+            if let Some(preset) = GEO_PRESETS.get(row.selected().wrapping_sub(1) as usize) {
+                let target_geoip = if row.selected() == 1 {
+                    ""
+                } else {
+                    preset.geoip
+                };
+                let target_geosite = if row.selected() == 1 {
+                    ""
+                } else {
+                    preset.geosite
+                };
+                if geoip_url.text() != target_geoip {
+                    geoip_url.set_text(target_geoip);
+                }
+                if geosite_url.text() != target_geosite {
+                    geosite_url.set_text(target_geosite);
+                }
+            }
+        }
+    });
+    widgets.geoip_url.connect_changed({
+        let widgets = widgets.clone();
+        let update = update.clone();
+        move |_| {
+            sync_preset(&widgets);
+            update();
+        }
+    });
+    widgets.geosite_url.connect_changed({
         let widgets = widgets.clone();
         move |_| {
             sync_preset(&widgets);

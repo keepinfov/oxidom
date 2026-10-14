@@ -1516,6 +1516,8 @@ impl Controller {
             let weak = Rc::downgrade(self);
             move || {
                 if let Some(controller) = weak.upgrade() {
+                    oxidom_core::logbook::global().clear();
+                    controller.bump_epoch();
                     let client = controller.state.borrow().client.clone();
                     std::thread::spawn(move || {
                         let _ = client.clear_logs();
@@ -3182,7 +3184,9 @@ impl Controller {
                     let mut state = self.state.borrow_mut();
                     if let Some(server_id) = &server_id {
                         state.selected_id = Some(server_id.clone());
-                        state.ui.connected_id = Some(server_id.clone());
+                        if name == "default" {
+                            state.ui.connected_id = Some(server_id.clone());
+                        }
                     } else if name == "default" {
                         // A pool has no active member. Keeping the previous
                         // default server here would light up its card and put
@@ -3199,12 +3203,16 @@ impl Controller {
                 }
                 self.bump_epoch();
                 if let Some(server_id) = server_id {
-                    self.set_cards_connection(CardConnection {
-                        active: Some(server_id.clone()),
-                        profiles: self.state.borrow().ui.connected_profiles.clone(),
-                        connecting: Some(server_id.clone()),
-                        failed: None,
-                    });
+                    if name == "default" {
+                        self.set_cards_connection(CardConnection {
+                            active: Some(server_id.clone()),
+                            profiles: self.state.borrow().ui.connected_profiles.clone(),
+                            connecting: Some(server_id.clone()),
+                            failed: None,
+                        });
+                    } else {
+                        self.sync_connection_cards();
+                    }
                     self.servers.set_selected(Some(&server_id));
                 } else {
                     self.sync_connection_cards();
@@ -3264,11 +3272,19 @@ impl Controller {
                             state
                                 .ui
                                 .pin_status(&pinned_name, Status::Disconnected, Instant::now());
-                            state.ui.connected_id = None;
-                            state.ui.failed_id = None;
+                            if pinned_name == "default" {
+                                state.ui.connected_id = None;
+                                state.ui.failed_id = None;
+                            } else {
+                                state.ui.connected_profiles.retain(|_, profiles| {
+                                    profiles.connected.retain(|p| p != &pinned_name);
+                                    profiles.in_pool.retain(|p| p != &pinned_name);
+                                    !profiles.connected.is_empty() || !profiles.in_pool.is_empty()
+                                });
+                            }
                         }
                         controller.bump_epoch();
-                        controller.set_cards_connection(CardConnection::default());
+                        controller.sync_connection_cards();
                         controller.rebuild_sessions();
                         controller.refresh_status();
                         controller.reconcile_system_proxy();
@@ -4511,8 +4527,7 @@ impl Controller {
                 .iter()
                 .flat_map(|subscription| subscription.servers.iter())
                 .find(|server| server.id == server_id)
-                .and_then(|server| server.spec.stream())
-                .is_none_or(|stream| stream.pin_sha256.is_none())
+                .is_none_or(|server| server.spec.pin_sha256().is_none())
         };
         if action == ipc::ErrorAction::TrustCertificate
             && let Some(server_id) = self.state.borrow().ui.failed_id.clone()
@@ -4988,7 +5003,21 @@ impl Controller {
                         // `up` on a live profile refuses rather than redialling
                         // — which would report the pin as not having helped.
                         AfterTrust::Reconnect(profile) => {
-                            controller.reconnect_profile(profile.clone())
+                            let bare_default = profile == "default"
+                                && controller
+                                    .state
+                                    .borrow()
+                                    .profiles
+                                    .iter()
+                                    .find(|entry| entry.name == "default")
+                                    .is_none_or(|entry| {
+                                        entry.server.is_empty() && entry.pool.is_none()
+                                    });
+                            if bare_default {
+                                controller.connect_server(server_id.clone());
+                            } else {
+                                controller.reconnect_profile(profile.clone());
+                            }
                         }
                         AfterTrust::Measure => controller.probe_one(server_id.clone(), false),
                     }
