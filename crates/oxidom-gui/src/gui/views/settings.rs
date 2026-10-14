@@ -31,11 +31,15 @@ const SYSTEM_PROXY_SUBTITLE: &str =
 const HOLD_TRAFFIC_SUBTITLE: &str = "Traffic is dropped until the tunnel reconnects. Turned off, apps fall back to your \
      ordinary connection — with your own address — until it does";
 
+const STANDBY_PROXY_SUBTITLE: &str = "Keep the SOCKS and HTTP ports answering with a direct connection when disconnected \
+     (never used while a crashed tunnel is holding traffic)";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsValues {
     pub socks_port: u16,
     pub http_port: u16,
     pub system_proxy: bool,
+    pub standby_proxy: bool,
     pub reconnect: bool,
     /// What a session does with its routes when its core exits by itself. The
     /// machine's answer; a profile may override it.
@@ -65,6 +69,7 @@ impl From<&Config> for SettingsValues {
             socks_port: config.socks_port,
             http_port: config.http_port,
             system_proxy: config.system_proxy,
+            standby_proxy: config.standby_proxy,
             reconnect: config.reconnect,
             hold_traffic: config.on_core_exit == OnCoreExit::Hold,
             latency_method: config.latency_method,
@@ -146,6 +151,7 @@ struct SettingsWidgets {
     socks: adw::SpinRow,
     http: adw::SpinRow,
     system_proxy: adw::SwitchRow,
+    standby_proxy: adw::SwitchRow,
     reconnect: adw::SwitchRow,
     hold_traffic: adw::SwitchRow,
     method: adw::ComboRow,
@@ -197,6 +203,7 @@ impl SettingsWidgets {
             socks_port: self.socks.value() as u16,
             http_port: self.http.value() as u16,
             system_proxy: self.system_proxy.is_active(),
+            standby_proxy: self.standby_proxy.is_active(),
             reconnect: self.reconnect.is_active(),
             hold_traffic: self.hold_traffic.is_active(),
             latency_method: match self.method.selected() {
@@ -222,6 +229,7 @@ impl SettingsWidgets {
         self.socks.set_value(f64::from(values.socks_port));
         self.http.set_value(f64::from(values.http_port));
         self.system_proxy.set_active(values.system_proxy);
+        self.standby_proxy.set_active(values.standby_proxy);
         self.reconnect.set_active(values.reconnect);
         self.hold_traffic.set_active(values.hold_traffic);
         self.method.set_selected(match values.latency_method {
@@ -281,6 +289,12 @@ impl SettingsView {
             .title("System proxy")
             .subtitle(SYSTEM_PROXY_SUBTITLE)
             .active(applied.system_proxy)
+            .build();
+        let standby_proxy = adw::SwitchRow::builder()
+            .title("Answer on local ports while disconnected")
+            .subtitle(STANDBY_PROXY_SUBTITLE)
+            .subtitle_lines(2)
+            .active(applied.standby_proxy)
             .build();
         let reconnect = adw::SwitchRow::builder()
             .title("Reconnect automatically")
@@ -412,6 +426,7 @@ impl SettingsView {
         proxy_group.add(&http);
         proxy_group.add(&ports_error);
         proxy_group.add(&system_proxy);
+        proxy_group.add(&standby_proxy);
         proxy_group.add(&reconnect);
         proxy_group.add(&hold_traffic);
         let xray_group = adw::PreferencesGroup::builder()
@@ -587,6 +602,7 @@ impl SettingsView {
             socks,
             http,
             system_proxy,
+            standby_proxy,
             reconnect,
             hold_traffic,
             method,
@@ -1107,6 +1123,7 @@ fn refuse(submitted: &SettingsValues, effective: &SettingsValues, draft: &mut Se
         socks_port,
         http_port,
         system_proxy,
+        standby_proxy,
         reconnect,
         hold_traffic,
         latency_method,
@@ -1186,6 +1203,10 @@ fn connect_draft_signals(
         move |_| update()
     });
     widgets.system_proxy.connect_active_notify({
+        let update = update.clone();
+        move |_| update()
+    });
+    widgets.standby_proxy.connect_active_notify({
         let update = update.clone();
         move |_| update()
     });
@@ -1373,6 +1394,7 @@ mod tests {
             socks_port: 10808,
             http_port: 10809,
             system_proxy: false,
+            standby_proxy: false,
             reconnect: false,
             hold_traffic: true,
             latency_method: LatencyMethod::HttpGet,

@@ -66,6 +66,7 @@ moved aside (see [File handling](#file-handling)) and defaults are used.
 socks_port = 10808
 http_port  = 10809
 system_proxy = false
+standby_proxy = false
 reconnect = false
 on_core_exit = "hold"
 latency_method = "http_get"
@@ -83,6 +84,7 @@ nft_binary = ""
 | `socks_port` | `u16` | `10808` | Local SOCKS5 inbound port. Must be non-zero and differ from `http_port`. |
 | `http_port` | `u16` | `10809` | Local HTTP inbound port. |
 | `system_proxy` | bool | `false` | Whether a connected session takes over the GNOME system proxy. See [routing.md](routing.md#gnome-system-proxy). |
+| `standby_proxy` | bool | `false` | Opt in to direct SOCKS/HTTP on `127.0.0.1` at the configured ports only while no profile session is connected, connecting or holding traffic. See [Direct standby](#direct-standby). |
 | `reconnect` | bool | `false` | Redial when the core exits **unexpectedly** — never after you asked for `down`. Opt-in on purpose: a tunnel that silently comes back is a tunnel you cannot turn off. |
 | `on_core_exit` | `"hold"` \| `"release"` | `"hold"` | What happens to a session's routes when its core exits by itself. `hold` keeps them, so traffic for that tunnel is **dropped** until it reconnects or you stop it. `release` removes them immediately, and your apps fall back to the ordinary connection with your own address. A profile's own `on_core_exit` wins. An explicit `down` always releases. |
 | `latency_method` | enum | `"http_get"` | One of `icmp`, `tcp`, `http_head`, `http_get`. |
@@ -96,6 +98,27 @@ nft_binary = ""
 
 Ports must be between 1 and 65535, and the SOCKS and HTTP inbounds cannot share
 one.
+
+### Direct standby
+
+With `standby_proxy = true`, applications already pointed at the local SOCKS or
+HTTP proxy can keep using the machine's **ordinary, unprotected connection**
+while disconnected. In the GUI this is **Answer on local ports while
+disconnected**. It is off by default, listens only on `127.0.0.1` at `socks_port`
+and `http_port`, and does not open standby listeners on named profiles' addresses.
+
+It runs only while **every** profile session is neither connected nor connecting
+and none is holding traffic. Before any session starts, oxidom closes both the
+standby listeners and accepted direct connections, so an old connection cannot
+keep bypassing the new tunnel. Standby does not automatically take over the
+GNOME system proxy, even when `system_proxy = true`.
+
+The GUI explicitly reports **Direct proxy** and `oxidom status` / `oxidom list
+sessions` show `direct` while it is serving, even if a failed default session is
+still recorded. Direct does not mean connected or protected. In contrast,
+`on_core_exit = "hold"` keeps routes and **drops traffic** after a crash; standby
+stays off until that hold is released, for any profile. Merely enabling standby
+does not override this fail-closed policy.
 
 ### Where the geo data comes from
 

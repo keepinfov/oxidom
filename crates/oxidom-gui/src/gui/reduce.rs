@@ -105,6 +105,9 @@ pub(super) struct SnapshotState {
     pending_since: Instant,
     /// Latest status reported by the daemon.
     pub daemon_status: Status,
+    /// True while the daemon is serving a direct standby proxy on `default`'s
+    /// ports because nothing is connected.
+    pub standby_proxy: bool,
     /// The server whose connection attempt failed, while that failure is still
     /// what the UI is reporting. Separate from `connected_id`, which means
     /// "the tunnel is running for this one" and drives the system proxy.
@@ -210,6 +213,7 @@ impl SnapshotState {
             pending_profile: "default".to_string(),
             pending_since: Instant::now(),
             daemon_status: status.to_status(),
+            standby_proxy: status.standby_proxy,
             failed_id: None,
             route_target: route_target(status),
             // Left unset on purpose: a GUI opening onto an already-broken
@@ -416,6 +420,7 @@ pub(super) fn reduce(
     let mut toast_not_run = false;
     let mut new_error: Option<String> = None;
     state.daemon_status = snapshot.status.to_status();
+    state.standby_proxy = snapshot.status.standby_proxy;
     state.active_profile = snapshot.status.active_profile.clone();
     state.sessions.clone_from(&snapshot.status.sessions);
     state.connected_profiles = connected_profiles(&snapshot.status);
@@ -887,6 +892,11 @@ pub(super) fn describe_rule(query: &PoolQuery) -> String {
     if !query.subscriptions.is_empty() {
         parts.push(format!("{} subscription(s)", query.subscriptions.len()));
     }
+    if let Some(ceiling) = query.max_latency_ms {
+        parts.push(format!("under {ceiling} ms"));
+    } else if query.alive_only {
+        parts.push("alive".to_string());
+    }
     if !query.exclude.is_empty() {
         parts.push(format!("except {}", query.exclude.len()));
     }
@@ -1097,6 +1107,26 @@ pub(super) fn filtered_ids(query: &PoolQuery, groups: &[Subscription]) -> Vec<St
         .collect()
 }
 
+/// Stable ids selected by a pool query, applying any `alive_only` or
+/// `max_latency_ms` filter against `latencies` (`Some(Some(ms))` = reachable).
+pub(super) fn filtered_ids_with_latencies(
+    query: &PoolQuery,
+    groups: &[Subscription],
+    latencies: &HashMap<String, Option<u32>>,
+) -> Vec<String> {
+    filtered_ids(query, groups)
+        .into_iter()
+        .filter(|id| {
+            let known = match latencies.get(id).copied() {
+                Some(Some(ms)) => oxidom_core::pool::Known::Reachable(ms),
+                Some(None) => oxidom_core::pool::Known::Unreachable,
+                None => oxidom_core::pool::Known::Unmeasured,
+            };
+            query.matches_known(known)
+        })
+        .collect()
+}
+
 fn normalized(values: &[String], lowercase: bool) -> Vec<String> {
     let mut normalized = values
         .iter()
@@ -1113,6 +1143,94 @@ fn normalized(values: &[String], lowercase: bool) -> Vec<String> {
     normalized.sort_by_key(|value| value.to_ascii_lowercase());
     normalized.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     normalized
+}
+
+pub(super) fn direct_latencies(
+    readings: &HashMap<String, LatencyReading>,
+) -> HashMap<String, Option<u32>> {
+    readings
+        .iter()
+        .filter(|(_, reading)| reading.route == ProbeRoute::Direct)
+        .map(|(id, reading)| (id.clone(), reading.value))
+        .collect()
+}
+
+/// Freeze search into the query without losing empty-list intent. Callers keep
+/// `kind` beside the query: the core's wire format infers kind from members.
+pub(super) fn selection_query(
+    mut query: PoolQuery,
+    kind: PoolKind,
+    groups: &[Subscription],
+    texts: &HashMap<String, String>,
+    search: &str,
+) -> PoolQuery {
+    let search = search.trim().to_lowercase();
+    if kind == PoolKind::List {
+        if !query.members.is_empty() {
+            query.members = filtered_ids(&query, groups)
+                .into_iter()
+                .filter(|id| {
+                    search.is_empty() || texts.get(id).is_some_and(|text| text.contains(&search))
+                })
+                .collect();
+        }
+    } else if !search.is_empty() {
+        query.exclude.extend(
+            filtered_ids(&query, groups)
+                .into_iter()
+                .filter(|id| !texts.get(id).is_some_and(|text| text.contains(&search))),
+        );
+    }
+    query
+}
+
+pub(super) fn selection_ids(
+    query: &PoolQuery,
+    kind: PoolKind,
+    groups: &[Subscription],
+    latencies: &HashMap<String, Option<u32>>,
+) -> Vec<String> {
+    if kind == PoolKind::List && query.members.is_empty() {
+        return Vec::new();
+    }
+    filtered_ids_with_latencies(query, groups, latencies)
+}
+
+pub(super) fn profile_selection(query: &PoolQuery, kind: PoolKind) -> Option<PoolQuery> {
+    // The profile's wire format cannot carry the separate empty-list kind.
+    (!(kind == PoolKind::List && query.members.is_empty())).then(|| query.clone())
+}
+
+pub(super) fn replace_picker_selection(
+    selected: &mut Vec<String>,
+    values: &[String],
+    ids: &[String],
+) -> Vec<bool> {
+    *selected = values.to_vec();
+    ids.iter().map(|id| selected.contains(id)).collect()
+}
+
+pub(super) fn proxy_status_label(status: &Status, standby: bool, label: &str) -> String {
+    match (standby, status) {
+        (true, Status::Disconnected) => "Direct proxy".into(),
+        (true, _) => format!("Direct proxy · {label}"),
+        (false, _) => label.into(),
+    }
+}
+
+pub(super) fn compact_status_visible(status: &Status, standby: bool, compact: bool) -> bool {
+    compact && (standby || !matches!(status, Status::Disconnected))
+}
+
+pub(super) fn rotation_options(available: usize) -> Vec<usize> {
+    [2, 4, 6, 8, 12, 0]
+        .into_iter()
+        .filter(|value| *value == 0 || *value < available)
+        .collect()
+}
+
+pub(super) fn preview_height(heights: &[i32]) -> i32 {
+    (heights.iter().take(10).sum::<i32>() + 2).max(480)
 }
 
 fn pool_servers(groups: &[Subscription]) -> impl Iterator<Item = &oxidom_core::model::Server> {
@@ -1772,10 +1890,10 @@ pub(super) const GROUP_CONNECT_SESSION: &str = "default";
 /// The tooltip used to say "without saving anything" and name no session, on
 /// the strength of a comment claiming no profile is touched. No profile *file*
 /// is written, which is what that was reaching for — but the session is the
-/// daemon's `default`, and `default.toml`'s ports, its interface, its `[core]`
-/// and its routing block are the ones that apply. Which session runs decides
-/// which ports open and which routing holds, so it is not a detail the button
-/// may leave out.
+/// selected profile's (defaulting to `default`), and `<session>.toml`'s ports,
+/// its interface, its `[core]` and its routing block are the ones that apply.
+/// Which session runs decides which ports open and which routing holds, so it
+/// is not a detail the button may leave out.
 pub(super) fn connect_button_tooltip(
     visible: usize,
     choice: Option<&ConnectChoice>,
@@ -1784,13 +1902,15 @@ pub(super) fn connect_button_tooltip(
     if visible == 0 {
         return "Nothing to connect: this selection shows no servers.".to_string();
     }
+    let session = if selected_profile.is_empty() {
+        GROUP_CONNECT_SESSION
+    } else {
+        selected_profile
+    };
     let mut text = format!(
-        "Run these {visible} servers now, in the {GROUP_CONNECT_SESSION} session. \
+        "Run these {visible} servers now, in the {session} session. \
          No profile is saved or changed."
     );
-    if selected_profile != GROUP_CONNECT_SESSION {
-        text.push_str(&format!(" “{selected_profile}” is not used."));
-    }
     // The strategy's own sentence ends in a full stop; the one before it has to
     // as well, or the two run together into a line with no punctuation between
     // them.
@@ -1800,18 +1920,11 @@ pub(super) fn connect_button_tooltip(
     text
 }
 
-/// The line under the bar's title, present only when the header names a profile
-/// this button will not touch.
-///
-/// When the header already says `default` the tooltip has said everything and a
-/// second line would be noise. When it does not, the header is showing a
-/// selected profile with a `Profile: <name>` tooltip beside a button that will
-/// ignore it, and the contradiction belongs where it is caused rather than in a
-/// tooltip nobody hovers.
+/// The line under the bar's title, naming the session when a non-default
+/// profile is selected in the header.
 pub(super) fn connect_bar_session_note(selected_profile: &str) -> Option<String> {
-    (selected_profile != GROUP_CONNECT_SESSION).then(|| {
-        format!("Runs in the {GROUP_CONNECT_SESSION} session, not in “{selected_profile}”")
-    })
+    (selected_profile != GROUP_CONNECT_SESSION)
+        .then(|| format!("Runs in the “{selected_profile}” session"))
 }
 
 /// Decide what connecting a group does. Nothing here writes anything.
@@ -1820,8 +1933,11 @@ pub(super) fn connect_bar_session_note(selected_profile: &str) -> Option<String>
 /// matches right now. Comparing those rather than the query is what makes the
 /// button honest: a saved group and the same servers arrived at by hand are the
 /// same session, and a session started from one is stopped by the other.
+///
+/// #127: the selected session alone owns this action. Other profiles can carry
+/// the same members without being stopped by a Connect in this one.
 pub(super) fn pool_action(state: &SnapshotState, members: &[String]) -> PoolAction {
-    let running = state.sessions.iter().find(|session| {
+    let matches = |session: &&SessionInfo| {
         session.selection.kind == "pool"
             && same_members(&session.selection, members)
             // The daemon keeps a stopped or failed session inspectable with
@@ -1831,7 +1947,16 @@ pub(super) fn pool_action(state: &SnapshotState, members: &[String]) -> PoolActi
             // must stay reachable.
             && (matches!(session.state.as_str(), "connected" | "connecting")
                 || session.holding_traffic)
-    });
+    };
+    let selected = if state.selected_profile.is_empty() {
+        GROUP_CONNECT_SESSION
+    } else {
+        &state.selected_profile
+    };
+    let running = state
+        .sessions
+        .iter()
+        .find(|session| session.profile == selected && matches(session));
     match running {
         Some(session) => PoolAction::Stop(session.profile.clone()),
         None => PoolAction::ConnectSelection,
@@ -3114,6 +3239,36 @@ mod tests {
                 },
             ]
         );
+
+        let latencies = HashMap::from([
+            ("alpine".to_string(), Some(80_u32)),
+            ("zurich".to_string(), Some(260_u32)),
+            ("berlin".to_string(), None),
+        ]);
+        let alive_rule = PoolQuery {
+            countries: vec!["ch".to_string(), "de".to_string()],
+            alive_only: true,
+            ..PoolQuery::default()
+        };
+        assert_eq!(
+            filtered_ids_with_latencies(&alive_rule, &groups, &latencies),
+            ["alpine", "zurich"],
+            "alive_only drops unreachable and unmeasured servers"
+        );
+        assert_eq!(describe_rule(&alive_rule), "CH, DE · alive");
+
+        let ceiling_rule = PoolQuery {
+            countries: vec!["ch".to_string(), "de".to_string()],
+            alive_only: true,
+            max_latency_ms: Some(200),
+            ..PoolQuery::default()
+        };
+        assert_eq!(
+            filtered_ids_with_latencies(&ceiling_rule, &groups, &latencies),
+            ["alpine"],
+            "max_latency_ms keeps only reachable servers at or below the ceiling"
+        );
+        assert_eq!(describe_rule(&ceiling_rule), "CH, DE · under 200 ms");
     }
 
     fn group(id: &str, kind: GroupKind, query: PoolQuery) -> ServerGroup {
@@ -3124,6 +3279,253 @@ mod tests {
             kind,
             query,
         }
+    }
+
+    #[test]
+    fn health_selection_composes_filters_using_only_latest_direct_readings() {
+        let groups = vec![
+            filter_group(
+                "main",
+                "Main",
+                &[
+                    (
+                        "edge",
+                        "trojan://invented@edge.example:443#Edge",
+                        Some("de"),
+                    ),
+                    (
+                        "slow",
+                        "trojan://invented@slow.example:443#Slow",
+                        Some("de"),
+                    ),
+                    (
+                        "failed",
+                        "trojan://invented@failed.example:443#Failed",
+                        Some("de"),
+                    ),
+                    (
+                        "unknown",
+                        "trojan://invented@unknown.example:443#Unknown",
+                        Some("de"),
+                    ),
+                    (
+                        "tunnel",
+                        "trojan://invented@tunnel.example:443#Tunnel",
+                        Some("de"),
+                    ),
+                    (
+                        "excluded",
+                        "trojan://invented@excluded.example:443#Excluded",
+                        Some("de"),
+                    ),
+                    (
+                        "country",
+                        "trojan://invented@country.example:443#Country",
+                        Some("nl"),
+                    ),
+                    (
+                        "protocol",
+                        "vless://00000000-0000-0000-0000-000000000001@protocol.example:443#Protocol",
+                        Some("de"),
+                    ),
+                ],
+            ),
+            filter_group(
+                "backup",
+                "Backup",
+                &[(
+                    "other",
+                    "trojan://invented@other.example:443#Other",
+                    Some("de"),
+                )],
+            ),
+        ];
+        let mut readings = HashMap::from([
+            ("edge".into(), reading(Some(200))),
+            ("slow".into(), reading(Some(201))),
+            ("failed".into(), reading(None)),
+            ("tunnel".into(), proxied(1, NOW_MS)),
+            ("excluded".into(), reading(Some(1))),
+            ("country".into(), reading(Some(1))),
+            ("protocol".into(), reading(Some(1))),
+            ("other".into(), reading(Some(1))),
+        ]);
+        let query = PoolQuery {
+            countries: vec!["de".into()],
+            protocols: vec!["trojan".into()],
+            subscriptions: vec!["main".into()],
+            exclude: vec!["excluded".into()],
+            alive_only: true,
+            max_latency_ms: Some(200),
+            ..PoolQuery::default()
+        };
+        assert_eq!(
+            filtered_ids_with_latencies(&query, &groups, &direct_latencies(&readings)),
+            ["edge"]
+        );
+        readings.insert("edge".into(), reading(None));
+        assert!(
+            filtered_ids_with_latencies(&query, &groups, &direct_latencies(&readings)).is_empty()
+        );
+        readings.insert("slow".into(), reading(Some(200)));
+        assert_eq!(
+            filtered_ids_with_latencies(&query, &groups, &direct_latencies(&readings)),
+            ["slow"]
+        );
+    }
+
+    #[test]
+    fn empty_and_search_narrowed_lists_never_become_universal_rules() {
+        let groups = vec![filter_group(
+            "main",
+            "Main",
+            &[(
+                "edge",
+                "trojan://invented@edge.example:443#Edge",
+                Some("de"),
+            )],
+        )];
+        for members in [vec![], vec!["gone".into()], vec!["edge".into()]] {
+            let query = selection_query(
+                PoolQuery {
+                    members,
+                    ..PoolQuery::default()
+                },
+                PoolKind::List,
+                &groups,
+                &HashMap::new(),
+                "no match",
+            );
+            assert!(selection_ids(&query, PoolKind::List, &groups, &HashMap::new()).is_empty());
+        }
+        let query = selection_query(
+            PoolQuery::default(),
+            PoolKind::Rule,
+            &groups,
+            &HashMap::new(),
+            "",
+        );
+        assert_eq!(filtered_ids(&query, &groups), ["edge"]);
+    }
+
+    #[test]
+    fn an_empty_frozen_selection_cannot_become_a_universal_profile() {
+        let groups = vec![filter_group(
+            "main",
+            "Main",
+            &[("a", "trojan://invented@a.example:443#A", Some("de"))],
+        )];
+        for members in [vec![], vec!["gone".into()], vec!["a".into()]] {
+            let query = selection_query(
+                PoolQuery {
+                    members,
+                    ..PoolQuery::default()
+                },
+                PoolKind::List,
+                &groups,
+                &HashMap::new(),
+                "no match",
+            );
+            assert!(profile_selection(&query, PoolKind::List).is_none());
+        }
+        let all = PoolQuery::default();
+        assert_eq!(profile_selection(&all, PoolKind::Rule), Some(all));
+        let list = PoolQuery {
+            name: "Frozen".into(),
+            members: vec!["a".into()],
+            ..PoolQuery::default()
+        };
+        assert_eq!(profile_selection(&list, PoolKind::List), Some(list));
+    }
+
+    #[test]
+    fn replacing_a_draft_replaces_nested_selection_vectors_and_filled_checks() {
+        let ids = vec!["a".into(), "b".into(), "c".into()];
+        let mut only = Vec::new();
+        let mut except = vec!["a".into()];
+        assert_eq!(
+            replace_picker_selection(&mut only, &["a".into()], &ids),
+            [true, false, false]
+        );
+        only.push("b".into());
+        assert_eq!(only, ["a", "b"], "adding B must keep the loaded A");
+        assert_eq!(
+            replace_picker_selection(&mut except, &["c".into()], &ids),
+            [false, false, true]
+        );
+        except.push("b".into());
+        assert_eq!(except, ["c", "b"]);
+        for selection in [&mut only, &mut except] {
+            assert_eq!(replace_picker_selection(selection, &[], &ids), [false; 3]);
+            assert!(
+                selection.is_empty(),
+                "Reset must clear even already-filled pages"
+            );
+        }
+        let mut lazy = vec!["a".into()];
+        assert!(replace_picker_selection(&mut lazy, &["b".into()], &[]).is_empty());
+        assert_eq!(
+            lazy,
+            ["b"],
+            "replacement also applies before a page is filled"
+        );
+    }
+
+    #[test]
+    fn standby_is_visible_for_other_profiles_and_preserves_error_text() {
+        for profile in ["default", "work", ""] {
+            let mut state = state();
+            state.selected_profile = profile.into();
+            state.standby_proxy = true;
+            state.daemon_status = Status::Disconnected;
+            assert_eq!(
+                proxy_status_label(
+                    &selected_status(&state),
+                    state.standby_proxy,
+                    "Disconnected"
+                ),
+                "Direct proxy"
+            );
+            assert_eq!(
+                proxy_status_label(&Status::Error("failure".into()), true, "Error: failure"),
+                "Direct proxy · Error: failure"
+            );
+            assert_eq!(
+                proxy_status_label(&Status::Connected, false, "Connected"),
+                "Connected"
+            );
+        }
+    }
+
+    #[test]
+    fn the_compact_chip_remains_visible_for_a_direct_proxy_without_a_tunnel() {
+        assert!(compact_status_visible(&Status::Disconnected, true, true));
+        assert!(compact_status_visible(
+            &Status::Error("failure".into()),
+            true,
+            true
+        ));
+        assert!(!compact_status_visible(&Status::Disconnected, false, true));
+        assert!(!compact_status_visible(&Status::Disconnected, true, false));
+    }
+
+    #[test]
+    fn rotation_options_never_exceed_the_available_members() {
+        for available in 0..20 {
+            let options = rotation_options(available);
+            assert_eq!(options.iter().filter(|value| **value == 0).count(), 1);
+            assert!(
+                options
+                    .iter()
+                    .all(|value| *value == 0 || *value < available)
+            );
+        }
+    }
+
+    #[test]
+    fn the_preview_pays_for_the_first_ten_measured_rows() {
+        assert_eq!(preview_height(&[56; 12]), 562);
+        assert!(preview_height(&[40; 10]) >= 402);
     }
 
     #[test]
@@ -3297,10 +3699,10 @@ mod tests {
         );
     }
 
-    /// Started from the bar, stopped from the bar — whichever session is
-    /// carrying it, and whatever profile happens to be selected now.
+    /// #127: a group action owns only the selected session, never a matching
+    /// pool in another profile. An empty selection names the default session.
     #[test]
-    fn a_running_selection_is_stopped_by_the_button_that_started_it() {
+    fn a_running_selection_is_stopped_only_in_the_selected_session() {
         let members = vec!["berlin".to_string(), "munich".to_string()];
         let mut state = state();
         state.selected_profile = "home".to_string();
@@ -3322,6 +3724,9 @@ mod tests {
         };
         state.sessions = vec![running];
 
+        assert_eq!(pool_action(&state, &members), PoolAction::ConnectSelection);
+        state.selected_profile.clear();
+
         // Order is the ranking the pool started with, and it moves with every
         // latency check. Counting it would make the button flip to Connect for
         // a session that is plainly running.
@@ -3338,6 +3743,14 @@ mod tests {
             "hamburg".to_string(),
         ];
         assert_eq!(pool_action(&state, &wider), PoolAction::ConnectSelection);
+        state.selected_profile = "home".into();
+        let mut home = state.sessions[0].clone();
+        home.profile = "home".into();
+        state.sessions.push(home);
+        assert_eq!(
+            pool_action(&state, &members),
+            PoolAction::Stop("home".into())
+        );
     }
 
     /// The daemon keeps a stopped or failed session inspectable, selection
@@ -4630,10 +5043,8 @@ mod tests {
         );
     }
 
-    /// The bar promised "without saving anything" and named no session, while
-    /// the header could be showing a profile the button would not use. Which
-    /// session runs decides which ports open and which routing applies, so it
-    /// is not a detail a button may leave out.
+    /// The bar names the session it will use, which is the selected profile's
+    /// session (`default` unless the header switcher chose another).
     #[test]
     fn the_connect_bar_names_the_session_it_will_run_in() {
         let tooltip = connect_button_tooltip(4, None, "default");
@@ -4641,16 +5052,11 @@ mod tests {
             tooltip.contains("in the default session"),
             "the session is unnamed: {tooltip}"
         );
-        assert!(
-            !tooltip.contains("is not used"),
-            "the header already says default; there is nothing to contradict: {tooltip}"
-        );
 
         let elsewhere = connect_button_tooltip(4, None, "work");
         assert!(
-            elsewhere.contains("in the default session")
-                && elsewhere.contains("“work” is not used"),
-            "the selected profile is not named as the one being ignored: {elsewhere}"
+            elsewhere.contains("in the work session"),
+            "the selected profile is not named as the session: {elsewhere}"
         );
     }
 
@@ -4670,14 +5076,13 @@ mod tests {
         );
     }
 
-    /// The note belongs on the bar rather than only in a tooltip, and only when
-    /// there is a contradiction to resolve.
+    /// The note belongs on the bar when the header names a non-default profile.
     #[test]
     fn the_bar_says_so_only_when_the_header_names_another_profile() {
         assert_eq!(connect_bar_session_note("default"), None);
         assert_eq!(
             connect_bar_session_note("work").as_deref(),
-            Some("Runs in the default session, not in “work”")
+            Some("Runs in the “work” session")
         );
     }
 

@@ -46,6 +46,11 @@ pub struct StatusInfo {
     /// first session when `default` is absent, because existing GUIs still
     /// consume only that single-session shape.
     pub sessions: Vec<SessionInfo>,
+    /// True while the local SOCKS and HTTP ports are answering in direct
+    /// standby mode (`standby_proxy = true` and no tunnel is up or holding
+    /// traffic on any profile).
+    #[serde(default)]
+    pub standby_proxy: bool,
 }
 
 impl StatusInfo {
@@ -63,6 +68,7 @@ impl StatusInfo {
             active_profile: None,
             error_id: None,
             sessions: Vec::new(),
+            standby_proxy: false,
         }
     }
 
@@ -906,6 +912,10 @@ mod tests {
         let info: StatusInfo = serde_json::from_str(r#"{"state":"connected"}"#).unwrap();
         assert!(matches!(info.to_status(), Status::Connected));
         assert_eq!(info.active_id, None);
+        assert!(
+            !info.standby_proxy,
+            "older daemons do not report direct standby"
+        );
 
         let empty: StatusInfo = serde_json::from_str("{}").unwrap();
         assert!(matches!(empty.to_status(), Status::Disconnected));

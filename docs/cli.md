@@ -122,6 +122,17 @@ None of these will start a daemon; if none is running they exit 4.
 With no `PROFILE`, lists every session — identical to `oxidom list sessions`.
 With one, prints that session.
 
+When [direct standby](configuration.md#direct-standby) is actually serving, the
+unscoped listing explicitly shows `default` as `direct` on `127.0.0.1` at the
+configured ports, even if a failed default session remains recorded. That means
+ordinary, unprotected traffic, not a connected tunnel. A session holding traffic
+prevents standby in every profile and is reported as `holding` instead.
+
+`oxidom status default` also reports this as `direct`, naming both local ports. Any previous
+default-session failure remains in the JSON `error` field and is printed as `previous error`
+in the single-session text output. Direct standby does not satisfy the connected-tunnel
+requirement of `ip`, `env` or `run`.
+
 ```
 connected  ch-trojan  Zurich 01  socks 127.0.0.1:10808  84 ms
 ```
@@ -186,6 +197,11 @@ its traffic is being dropped rather than sent out unprotected. See
 `holding_traffic` field, which is what a script checking whether the machine is
 exposed should read — `state` still says `error`, because the core is still gone.
 
+`STATE` reads `direct` for active standby service on the configured local ports.
+It has no remote server, tunnel latency or interface, and does not own the system
+proxy. An enabled setting alone does not make a `direct` row: the daemon must
+actually be serving, with no connected, connecting or holding session anywhere.
+
 ### `oxidom tun [PROFILE] [--down]`
 
 Inspect or remove a session's persistent TUN device. `PROFILE` defaults to
@@ -214,6 +230,15 @@ The daemon does the measuring; `ping` asks for it and then polls for up to 30
 seconds. Because a request is only queued, not started, that budget covers the
 wait for a free slot as well as the measurement — on a busy queue a probe can
 still be running when the command gives up.
+
+Direct HTTP checks and the initial connection confirmation each allow **6 seconds**
+for the cold request, including DNS, TCP and TLS/REALITY handshakes. The temporary
+core's startup has a separate readiness wait; periodic checks through an established
+session retain a **3-second** request budget. Confirmation uses HTTP through SOCKS
+even if the configured direct method is ICMP or TCP. A passing host ping or TCP
+connect does not prove the proxy outbound carries requests; a failure reports a
+recognised core cause (handshake timeout, reset, refusal or DNS failure), otherwise
+the measured timeout, closed connection or local failure.
 
 Failures are distinguished, because "the server is down" and "this laptop has no
 network" deserve different reactions. Everything below goes to stderr, and every
@@ -479,6 +504,13 @@ deliberately excluded from every one of them.
 "interface":{"device":"oxi-work","address":"198.18.9.7","mtu":1500,
 "routes":"manual","table":28449,"mark":28449,"up":true}}]
 ```
+
+While standby is active, the array includes a `default` entry with `state` equal
+to `"direct"`, address `"127.0.0.1"` and the configured ports. `server_id`,
+`server_alias`, `server_name`, `latency_ms` and `interface` are `null`;
+`owns_system_proxy` and `holding_traffic` are `false`, and `selection` is absent.
+This service remains reported even when a failed default session is inspectable;
+it is not an additional connected tunnel.
 
 **`list servers --json`** — `id`, `alias`, `name`, `protocol`, `address`, `port`,
 `country`, `subscription_id`, `subscription`.

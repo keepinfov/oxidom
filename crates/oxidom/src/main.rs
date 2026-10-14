@@ -241,6 +241,20 @@ fn status(profile: Option<&str>, json: bool) -> CliResult {
     let Some(profile) = profile else {
         return print_sessions(&client, json);
     };
+    if profile == "default" {
+        let status = client.status().map_err(Failure::error)?;
+        if status.standby_proxy {
+            let settings = client.settings().map_err(Failure::error)?;
+            if let Some(session) = standby_session(&status, &settings) {
+                let output = StatusOutput::new(&session, None, None);
+                return if json {
+                    print_json(&output)
+                } else {
+                    print_line(direct_status(&output))
+                };
+            }
+        }
+    }
     let session = connected_session(&client, profile)?;
     let probes = client.probe_state().map_err(Failure::error)?;
     if session.selection.kind == "pool" {
@@ -410,16 +424,39 @@ fn list(target: ListTarget, json: bool) -> CliResult {
 fn print_sessions(client: &DaemonClient, json: bool) -> CliResult {
     let sessions = client.list_sessions().map_err(Failure::error)?;
     let probes = client.probe_state().map_err(Failure::error)?;
-    let outputs = sessions
+    let standby = client
+        .status()
+        .ok()
+        .filter(|status| status.standby_proxy)
+        .and_then(|status| {
+            client
+                .settings()
+                .ok()
+                .and_then(|settings| standby_session(&status, &settings))
+        });
+    let outputs = session_outputs(&sessions, &probes, standby.as_ref());
+    if json {
+        print_json(&outputs)
+    } else {
+        print_text(session_table(&outputs))
+    }
+}
+
+fn session_outputs(
+    sessions: &[SessionInfo],
+    probes: &ProbeState,
+    standby: Option<&SessionInfo>,
+) -> Vec<SessionOutput> {
+    let mut outputs = sessions
         .iter()
         .map(|session| {
             let latency = (session.state == "connected")
                 .then(|| {
                     if session.selection.kind == "pool" {
-                        current_pool_latency(&probes, &session.profile)
+                        current_pool_latency(probes, &session.profile)
                     } else {
                         session.server_id.as_deref().and_then(|server_id| {
-                            current_latency(&probes, &session.profile, server_id)
+                            current_latency(probes, &session.profile, server_id)
                         })
                     }
                 })
@@ -427,11 +464,45 @@ fn print_sessions(client: &DaemonClient, json: bool) -> CliResult {
             SessionOutput::new(session, latency)
         })
         .collect::<Vec<_>>();
-    if json {
-        print_json(&outputs)
-    } else {
-        print_text(session_table(&outputs))
+    if let Some(session) = standby {
+        outputs.retain(|output| output.profile != "default");
+        outputs.insert(0, SessionOutput::new(session, None));
     }
+    outputs
+}
+
+fn standby_session(
+    status: &oxidom_core::ipc::StatusInfo,
+    settings: &oxidom_core::config::Config,
+) -> Option<SessionInfo> {
+    if !status.standby_proxy {
+        return None;
+    }
+    Some(SessionInfo {
+        profile: "default".to_string(),
+        state: "direct".to_string(),
+        address: "127.0.0.1".to_string(),
+        socks_port: settings.socks_port,
+        http_port: settings.http_port,
+        error: status
+            .sessions
+            .iter()
+            .find(|session| session.profile == "default")
+            .and_then(|session| session.error.clone())
+            .or_else(|| status.error.clone()),
+        ..SessionInfo::default()
+    })
+}
+
+fn direct_status(output: &StatusOutput) -> String {
+    let mut text = format!(
+        "direct  standby  socks {}:{}  http {}:{}",
+        output.address, output.socks_port, output.address, output.http_port
+    );
+    if let Some(error) = &output.error {
+        text.push_str(&format!("  previous error: {error}"));
+    }
+    text
 }
 
 fn session_table(sessions: &[SessionOutput]) -> String {
@@ -1226,6 +1297,63 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn direct_standby_is_visible_even_with_a_failed_default_session() {
+        let status = oxidom_core::ipc::StatusInfo {
+            standby_proxy: true,
+            sessions: vec![SessionInfo {
+                profile: "default".into(),
+                state: "error".into(),
+                error: Some("the core refused the config".into()),
+                server_id: Some("failed-server".into()),
+                ..SessionInfo::default()
+            }],
+            ..Default::default()
+        };
+        let settings = oxidom_core::config::Config::default();
+        let direct = standby_session(&status, &settings).expect("standby is active");
+        assert_eq!(direct.state, "direct");
+        assert_eq!(direct.error.as_deref(), Some("the core refused the config"));
+        assert!(direct.server_id.is_none());
+        assert!(direct.selection.kind.is_empty());
+        let mut sessions = status.sessions.clone();
+        sessions.push(SessionInfo {
+            profile: "work".into(),
+            state: "error".into(),
+            error: Some("a named failure".into()),
+            ..Default::default()
+        });
+        let outputs = session_outputs(&sessions, &ProbeState::default(), Some(&direct));
+        assert_eq!(
+            outputs.len(),
+            2,
+            "standby replaces, rather than duplicates or hides behind, the failed default"
+        );
+        assert_eq!(outputs[0].profile, "default");
+        assert_eq!(outputs[1].error.as_deref(), Some("a named failure"));
+        let output = &outputs[0];
+        let json = serde_json::to_value(output).unwrap();
+        assert_eq!(json["state"], "direct");
+        assert_eq!(json["error"], "the core refused the config");
+        assert_eq!(json["server_id"], serde_json::Value::Null);
+        assert!(session_table(&outputs).contains("default  direct"));
+        assert_eq!(
+            session_outputs(&sessions, &ProbeState::default(), None)[0].state,
+            "error"
+        );
+        let output = StatusOutput::new(&direct, None, None);
+        assert!(direct_status(&output).starts_with("direct  standby  socks 127.0.0.1:"));
+        assert!(direct_status(&output).contains("previous error: the core refused the config"));
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["state"], "direct");
+        assert_eq!(json["server"], serde_json::Value::Null);
+        assert_eq!(json["error"], "the core refused the config");
+        assert!(
+            require_connected(direct).is_err(),
+            "direct is not a tunnel for env/ip/run"
+        );
+    }
 
     #[test]
     fn the_not_up_reply_exits_3_like_env_and_ip() {

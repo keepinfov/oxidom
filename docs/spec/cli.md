@@ -52,7 +52,24 @@ Data goes only to stdout; warnings, errors, and ambiguous-handle candidates go t
 uses the fixed DTOs in `oxidom-core/src/cli_json.rs`. `SessionOutput` carries `holding_traffic`
 beside `state`: a session whose core exited while it kept its routes is in `error` and dropping
 traffic, which is a different claim from `error` alone, and the sessions table prints its `STATE`
-as `holding`. Exit codes are binding:
+as `holding`.
+
+`status` (without a profile) and `list sessions`, including their JSON forms, report active
+standby service as a `default` row with `state = "direct"`, address `127.0.0.1`, and the daemon's
+configured SOCKS/HTTP ports. This is direct service, not a tunnel or a new persisted session.
+It must remain visible even if a failed default session is still recorded. Its server fields,
+latency and interface are null, `owns_system_proxy` and `holding_traffic` are false, and no pool
+selection is attached. A session holding routes instead remains `error` with
+`holding_traffic = true` in JSON and `holding` in the table; direct standby is forbidden while
+any session holds traffic, connects or is connected. The D-Bus status flag underlying this
+presentation is specified in [storage.md](storage.md#standby-over-d-bus-binding).
+
+`status default` reports the same direct service using the single-session `StatusOutput` shape,
+with no selected server or latency. The `error` field retains any previous default-session
+failure; text output appends it as `previous error`. In the unscoped listing the direct row
+replaces the failed default row and preserves that error in JSON, without hiding other profiles.
+
+Exit codes are binding:
 
 | Code | Meaning |
 |---:|---|

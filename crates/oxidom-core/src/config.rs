@@ -10,6 +10,13 @@ pub struct Config {
     pub socks_port: u16,
     pub http_port: u16,
     pub system_proxy: bool,
+    /// Keep the local SOCKS and HTTP ports answering while no session is up,
+    /// passing connections straight out over the machine's ordinary route.
+    /// Off by default: a proxy that silently stops proxying must be opted into,
+    /// and a session holding traffic after an unexpected core exit never falls
+    /// back to this.
+    #[serde(default)]
+    pub standby_proxy: bool,
     /// Bring the tunnel back up by ourselves when the core dies unexpectedly.
     /// Off by default: a client that silently redials is a client that hides a
     /// server going bad, and the user asked for explicit modes throughout.
@@ -96,6 +103,7 @@ impl Default for Config {
             socks_port: 10808,
             http_port: 10809,
             system_proxy: false,
+            standby_proxy: false,
             reconnect: false,
             on_core_exit: OnCoreExit::default(),
             latency_method: LatencyMethod::HttpGet,
@@ -153,6 +161,18 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_disabled_standby_setting_is_explicit_in_json() {
+        let json = serde_json::to_string(&Config::default()).expect("serializes");
+        assert!(
+            json.contains(r#""standby_proxy":false"#),
+            "absence means preserve the daemon's opt-in: {json}"
+        );
+        let older: Config = serde_json::from_str(r#"{"socks_port":10808,"http_port":10809}"#)
+            .expect("old settings still parse");
+        assert!(!older.standby_proxy);
+    }
 
     #[test]
     fn reconnect_off_by_default() {

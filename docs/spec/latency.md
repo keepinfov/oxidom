@@ -8,8 +8,18 @@ travels under.
 - `http_head` — HEAD `latency_test_url` **through the active SOCKS inbound**.
 - `http_get` — GET `latency_test_url` through SOCKS (Happ-style; expect 204).
 
-List view may use a cheap method across servers concurrently (bounded thread pool); the active
-connection uses the configured method.
+Direct HTTP checks use a throwaway core per server; `Direct` means independent of the running
+session, not an HTTP request around the server. Direct ICMP/TCP checks test the host/port only.
+Session confirmation and periodic session checks always use HTTP through the session's SOCKS
+inbound: HEAD when configured, GET otherwise, including when the direct method is ICMP or TCP.
+Both successful and failed readings record the method actually attempted.
+
+The first HTTP request in a direct probe or connection confirmation gets a **6-second**
+`REAL_DELAY_TIMEOUT` budget for DNS, TCP and TLS/REALITY setup. A direct probe core's readiness
+wait is separate (up to 4 seconds). Periodic requests through an established session keep their
+**3-second** budget; they do not receive the cold-start allowance on every tick. Pool
+confirmation retains its bounded confirmation window, using the cold-start request budget
+within it rather than treating an unready balancer as a successful connection.
 
 ## Probe outcomes (binding)
 
@@ -60,7 +70,17 @@ as `ipc::LatencyReading { value, measured_at_unix_ms, route, method, failure }` 
 - **`route`** is `Direct` or `Proxied`. Only the server the tunnel is *currently* carrying may be
   measured `Proxied` (`daemon::Shared::probe_target`), and only a `Proxied` reading may be shown
   as the connection's latency. A reading whose route no longer applies is `Superseded` on the
-  card — shown as `—`, never as a number.
+  card — shown as `—`, never as a number. The initial confirmation after a connect uses
+  `REAL_DELAY_TIMEOUT` (6 s) over the local SOCKS inbound rather than the 3 s periodic budget,
+  because a newly started session pays for DNS, TCP and TLS/REALITY handshakes on its first
+  request just as a direct `real_delay` probe does. A recognised core complaint takes priority
+  in a failed confirmation: certificate/config/geo-data errors, TLS/REALITY handshake timeout,
+  reset, refusal or DNS failure. Otherwise report the measured timeout, closed connection,
+  no-network or local-failure verdict, not a bare "did not pass its latency check" when the
+  cause is known. The failed path allows the core's pipe reader to publish its diagnostic before
+  deciding there is none. If ICMP/TCP passed but HTTP confirmation failed, explain that host/port
+  reachability is not proof the proxy outbound carries traffic. Never substitute a successful
+  direct ping for failed tunnel confirmation.
 - **`failure.is_some()` ⟺ `value.is_none()`**, upheld by `LatencyReading::ok`/`failed`. Build them
   through those constructors.
 - **Every direct id that leaves `running ∪ queued` leaves a `readings` entry behind**, including
@@ -79,6 +99,10 @@ as `ipc::LatencyReading { value, measured_at_unix_ms, route, method, failure }` 
 - `ProbeState.readings` contains direct measurements keyed by server id.
   `ProbeState.proxied` contains connection measurements keyed by profile; two profiles on one
   server must never overwrite each other. Readings are pruned with their server or session.
+- **Health filters use direct readings only.** `alive_only` and `max_latency_ms` on a pool query
+  consult `readings`, not `proxied` or the badge currently displayed. Either constraint drops
+  unknown and failed readings; a ceiling accepts a successful value equal to its maximum.
+  The picker preview and daemon activation obey the same rule.
 - **`ProbeState` carries the newest reading and nothing older.** It is polled every 500 ms for
   every server a client knows about, so anything added to it is a standing broadcast. That is why
   the history below is a second payload and not a field here — and why `PROBE_STATE_VERSION` does

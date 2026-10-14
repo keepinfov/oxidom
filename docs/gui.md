@@ -39,15 +39,27 @@ lists. Its head is the `Filter` pill; the rest are your saved groups plus
 
 ### Filters and groups
 
-There is one dialog behind all of them, and a name is the only difference between
-a filter and a group.
+There is one connection picker behind all of them: a window with room for a
+matching-server list, not a small popover. Open it from `Filter`, the header
+menu's **Pick connection…**, **Ctrl+K**, or **Pick connection…** in the tray.
+`New group` and `⋮ → Edit…` use the same picker, with different starting values.
 
 It holds an optional **Name** and **Icon**, then **Country**, **Protocol** and
 **Subscription** expanders with a checkbox per choice, then **Except** for
 excluding individual servers (a search, because a provider may have two hundred
-nodes), then a list for picking servers by hand. `Apply` shows the selection
-without saving it; `Save` needs a name. The `Filter` pill, `New group` and
-`⋮ → Edit…` all open this dialog — they differ only in what it opens with.
+nodes), then a list for picking servers by hand. Saved groups can be loaded here
+too. **Alive only** requires a successful direct check; **Latency ceiling** keeps
+successful direct readings **at or below** the maximum. Unknown and failed
+readings are left out when either is enabled. A reading through a running tunnel
+does not qualify. Country, protocol, subscription and health filters combine, so
+choosing one does not silently replace another.
+
+The preview and count describe the same query **Connect** will run, without
+applying a hidden search from the Servers page. New direct readings can change
+which nodes match the next connect. **Apply** shows the selection without saving
+it; **Save** needs a name and keeps a group chip. To write a profile for the CLI
+or systemd, apply the selection and choose **New profile from this…** in the
+selection menu. Connect itself saves neither.
 
 You are never asked whether you are making a list or a rule. Servers picked by
 hand are frozen, because picking them is what freezing means; a selection made
@@ -55,9 +67,8 @@ only of filters keeps matching, because that is all a filter can do. The line at
 the bottom of the dialog says which one you have made and what it will do next
 week.
 
-A **group is a saved filter**. That is the whole idea: connecting to a group writes
-the filter straight into a profile's [pool](profiles-and-pools.md#pools), so the
-daemon never learns a second concept.
+A **group is a saved filter**. Connecting to one runs that query as a
+[pool](profiles-and-pools.md#pools) without writing it into a profile file.
 
 The `⋮` menu always acts on **the selection currently on screen**, not on some
 previously selected group. `New profile from this…` lives there and works on an
@@ -72,27 +83,31 @@ profile, asks nothing, and needs none selected — "connect me to one of these" 
 what the page is for, and it used to cost a profile write plus a dialog about
 profiles, or a trip to another page when none was selected.
 
-**It runs in the `default` session**, whatever profile the header is showing,
-and the bar says so. Writing no profile is not the same as touching none:
-`default.toml`'s ports, its interface, its `[core]` and its routing block are the
-ones that apply. Where the header names something else, the bar says that too —
-that profile is not the one used, and it goes on reporting its own status,
-because that status is still true. A card click on the same page is the other
-way round: it does honour the selected profile, and offers to repoint it.
+**It runs in the selected profile's session** (`default` unless you picked
+another in the header), and the bar says so. Writing no profile is not the same
+as touching none: that profile's interface, `[core]` and routing block apply,
+along with its ports for a named session (`default` uses the daemon's configured
+ports), while its `.toml` file on disk is left untouched. Two pools in two
+sessions can therefore run at once without colliding on ports. A card click on
+the same page offers to repoint the selected profile's
+saved server.
 
-Pressing it again stops the session running that selection. Which session that
-is, is decided by the servers rather than by the name, so a saved group and the
-same servers picked by hand are the same run.
+Pressing it again stops only the **selected session** if its pool has the same
+resolved servers, regardless of the group name. A matching pool in another
+session is left alone; select that profile in the header to stop it.
 
-**Save as group** keeps the selection as a chip. **New profile from this…** in
-the bar's menu makes a profile out of it — for a systemd unit, or the CLI, or an
-interface of its own. Both are deliberate acts, and neither happens by
-connecting. Connecting a *profile*, from the Profiles page, still repoints and
-still asks first.
+**Save** in the picker keeps the selection as a group chip. **New profile from this…**
+in the selection menu makes a profile out of it for a systemd unit, the CLI, or
+an interface of its own. An empty frozen list cannot be saved as a profile.
+Both are deliberate acts, and
+neither happens by connecting. Connecting a *profile*, from the Profiles page,
+still repoints and still asks first.
 
 The Connect bar carries a rotation width — how many of a group's servers stay in
 rotation at once, default 6. It is deliberately not stored on the group: a group answers
-*which* servers, the width answers *how many at once, this run*.
+*which* servers, the width answers *how many at once, this run*. Choose 2, 4, 6,
+8 or 12, or explicitly **All**. A width larger than the pool uses all its members,
+not extra nodes, and does not change the saved profile.
 
 Per-subscription latency checks and sorting live on this page too.
 
@@ -117,6 +132,15 @@ rather than the red one — see [spec/latency.md](spec/latency.md).
 The tooltip on a number also names the method actually used, which is not always
 the one configured: a TCP check of a Hysteria2 server falls back to ICMP, because
 Hysteria2 is QUIC over UDP and has no TCP port to open.
+
+The first HTTP request after connecting gets a **6-second cold-start budget** for
+DNS, TCP and TLS/REALITY setup, just like a direct HTTP check using a throwaway
+core. Periodic checks through an established session keep their **3-second**
+budget. Confirmation always goes through SOCKS using HTTP, even when Settings
+chooses ICMP or TCP: a host answering ping or accepting TCP does not prove its
+proxy carries traffic. Failed confirmation reports a recognised outbound cause,
+such as a handshake timeout, reset or DNS failure, or the measured timeout/local
+failure when no more specific cause is available.
 
 **An expanded card says more than the badge can.** The badge has a glyph and a
 tooltip to work with, and "the server did not answer" covers a refused handshake,
@@ -337,6 +361,7 @@ repointing it.
 |---|---|
 | **Appearance** | Follow the system, Light, or Dark. Applies as you pick it — there is nothing to Apply, because it belongs to this window rather than to the daemon. A choice other than "follow the system" overrides the desktop, which is the point on a desktop that offers no such setting. Stored in `gui_prefs.toml`. |
 | **Local proxy** — SOCKS and HTTP ports | Locked, with an explanation, when the daemon's unit pinned them. |
+| **Answer on local ports while disconnected** | Off by default. Serve a **direct**, unprotected connection on `127.0.0.1` at the configured SOCKS/HTTP ports only while no profile session is connected, connecting or holding traffic. Starting any session closes the standby listeners and existing direct connections first. |
 | **System proxy** | "Send the whole desktop's traffic through oxidom while connected (GNOME)". See [routing.md](routing.md#gnome-system-proxy). |
 | **Reconnect automatically** | "Reconnect only when Xray exits unexpectedly, never after Disconnect". |
 | **Hold traffic if Xray exits** | On by default. The routes stay when the core dies, so the tunnel's traffic is dropped until it comes back rather than falling back to your ordinary connection with your own address. A profile can answer for itself, in the profile editor under Interface. See [when the core dies](routing.md#when-the-core-dies). |
@@ -349,6 +374,12 @@ repointing it.
 | **Geo data** | Whether the core can load `geoip.dat` and `geosite.dat`. Decided by asking the core, not by looking for the files — which is also how a corrupt list is told from a missing one. Silent until the daemon has an answer, so a daemon older than the check accuses nothing. |
 | **Where the geo data comes from** | Which lists to fetch. Three sources by name — v2fly (the default), Loyalsoldier, runetfreedom — or any address you type. The lists differ in what they cover, and for some countries a regional one is the difference between routing that works and routing that does not. The two are chosen separately. Only `https` is accepted, and each file is checked against the `.sha256sum` published beside it; a source that publishes none is refused rather than installed unverified. |
 | **Install the geo data** | Shown only when the core cannot load them. Looks for a copy already on this machine first and offers to use it; otherwise offers a download, behind a confirmation naming both URLs and both destination paths. A progress bar reports the transfer and **Cancel** stops it. Where the daemon is too old to install anything, the row carries the manual commands instead of a button that could not help. |
+
+While standby is serving, status explicitly says **Direct proxy**, even when a
+failed default session is still listed. This is not a connected tunnel and does
+not automatically enable the GNOME system proxy. **Holding traffic** means the
+opposite: routes are kept and traffic is dropped, with no direct standby fallback
+until the hold is released. See [configuration.md](configuration.md#direct-standby).
 
 ## Logs
 
@@ -414,6 +445,9 @@ Raise what oxidom reports about itself with `RUST_LOG`, or `oxidom-gui --debug`.
 The tray icon needs a **StatusNotifierItem host** on the session bus. On stock
 GNOME that means an AppIndicator extension; without one, the window still works
 normally — there is simply no icon.
+
+**Pick connection…** opens the same picker as **Ctrl+K** in the window, including
+when the main window was hidden.
 
 `--background` starts the GUI hidden so the tray and the session daemon exist
 before you open a window. Activating the application again presents it. On NixOS:

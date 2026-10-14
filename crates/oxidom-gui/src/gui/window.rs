@@ -25,10 +25,10 @@ use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbePhase, ProbeWait, SessionRowState,
     SnapshotState, SwitcherItem, about_comments, active_latency_for, card_action,
-    check_can_be_stopped, geo_download_prompt, history_chart, human_bytes, latency_states,
-    missing_core_message, other_profiles_message, pool_action, pool_short_label, press_stops,
-    reduce, selected_status, session_for, session_rows, stop_report, switcher_items,
-    switcher_visible,
+    check_can_be_stopped, compact_status_visible, geo_download_prompt, history_chart, human_bytes,
+    latency_states, missing_core_message, other_profiles_message, pool_action, pool_short_label,
+    press_stops, proxy_status_label, reduce, selected_status, session_for, session_rows,
+    stop_report, switcher_items, switcher_visible,
 };
 use super::server_card::{self, LatencyState};
 use super::sidebar::{Page, Sidebar};
@@ -813,6 +813,9 @@ fn build(
     // page: everything else in the header appears and disappears with the
     // view. It carries the two things that are true wherever the user is.
     let primary_menu = gtk::gio::Menu::new();
+    let pick_section = gtk::gio::Menu::new();
+    pick_section.append(Some("_Pick connection…"), Some("win.pick-connection"));
+    primary_menu.append_section(None, &pick_section);
     let window_section = gtk::gio::Menu::new();
     window_section.append(Some("_Quit"), Some("win.quit"));
     primary_menu.append_section(None, &window_section);
@@ -1210,6 +1213,14 @@ impl Controller {
             "search",
             &["<Control>f"],
             Box::new(|controller| controller.focus_search()),
+        );
+        add(
+            "pick-connection",
+            &["<Control>k"],
+            Box::new(|controller| {
+                controller.navigate_to(Page::Servers);
+                controller.servers.open_connection_picker();
+            }),
         );
         add(
             "refresh",
@@ -2197,6 +2208,22 @@ impl Controller {
                     }
                 })
             },
+            connect_selection: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move |query| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.connect_selection(query);
+                    }
+                })
+            },
+            clear_search: {
+                let weak = Rc::downgrade(self);
+                Rc::new(move || {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.clear_search();
+                    }
+                })
+            },
         };
         self.servers.rebuild(
             &subscriptions,
@@ -2206,6 +2233,8 @@ impl Controller {
             &latency_states,
             callbacks,
         );
+        let readings = self.state.borrow().ui.readings.clone();
+        self.servers.set_direct_readings(&readings);
         // The cards are new widgets and carry nothing yet; a card that was
         // open across the rebuild still owes an answer for having no number.
         self.refresh_failure_report();
@@ -2442,24 +2471,16 @@ impl Controller {
 
     /// Run the visible selection, writing nothing.
     ///
-    /// The session is the daemon's `default`, the same one a card click uses —
-    /// so this is the pool counterpart of connecting a single server, and like
-    /// that one it modifies no profile file. Saving a selection is a separate,
-    /// deliberate act: **Save as a profile** on the same bar.
-    ///
-    /// "Writing nothing" is not "touching nothing", and the difference is what
-    /// the bar now says out loud. `default.toml`'s ports, its interface, its
-    /// `[core]` and its routing block are the ones that apply, whatever profile
-    /// the header happens to be showing — and which session runs decides which
-    /// ports are opened and which routing holds.
+    /// Only the selected session is toggled. Its ports and routing apply, but
+    /// no profile file is rewritten. The picker's always-labelled Connect uses
+    /// `connect_selection` directly rather than this bar's toggle action.
     fn connect_pool(self: &Rc<Self>, query: PoolQuery, members: Vec<String>) {
         let action = {
             let state = self.state.borrow();
             pool_action(&state.ui, &members)
         };
         match action {
-            // Started from here, stopped from here — whichever page it was
-            // started on, and whatever profile happens to be selected now.
+            // A matching pool elsewhere belongs to that profile's controls.
             PoolAction::Stop(profile) => {
                 if profile == "default" {
                     self.disconnect();
@@ -2471,14 +2492,18 @@ impl Controller {
         }
     }
 
-    fn connect_selection(self: &Rc<Self>, query: PoolQuery) {
+    fn connect_selection(self: &Rc<Self>, mut query: PoolQuery) {
+        let profile = self.state.borrow().ui.selected_profile.clone();
+        if query.session.is_empty() {
+            query.session.clone_from(&profile);
+        }
         let label = if query.name.is_empty() {
             "the selection".to_string()
         } else {
             format!("“{}”", query.name)
         };
         self.client_job(
-            UiOperation::new(UiOperationKind::UpProfile),
+            UiOperation::for_profile(UiOperationKind::UpProfile, &query.session),
             move |client| client.connect_pool(&query).map(|_| ()),
             move |controller, result| match result {
                 Ok(()) => controller.refresh_status(),
@@ -3546,6 +3571,7 @@ impl Controller {
             socks_port: values.socks_port,
             http_port: values.http_port,
             system_proxy: values.system_proxy,
+            standby_proxy: values.standby_proxy,
             reconnect: values.reconnect,
             on_core_exit: if values.hold_traffic {
                 oxidom_core::config::OnCoreExit::Hold
@@ -3867,6 +3893,8 @@ impl Controller {
         let Some(effects) = effects else {
             return;
         };
+        let readings = self.state.borrow().ui.readings.clone();
+        self.servers.set_direct_readings(&readings);
         self.update_profiles_banner(&snapshot.status.sessions);
         // Collected rather than issued inline: `probe_one` borrows the state the
         // effects were just produced from.
@@ -4115,6 +4143,11 @@ impl Controller {
         while let Ok(command) = self.tray_commands.try_recv() {
             match command {
                 TrayCommand::ShowWindow => self.window.present(),
+                TrayCommand::PickConnection => {
+                    self.window.present();
+                    self.navigate_to(Page::Servers);
+                    self.servers.open_connection_picker();
+                }
                 TrayCommand::Toggle(profile) => {
                     // The same rule the page's switch follows, so a checkmark
                     // and a switch for one profile can never disagree.
@@ -4182,7 +4215,7 @@ impl Controller {
         };
         let text = {
             let state = self.state.borrow();
-            match status {
+            let label = match status {
                 Status::Disconnected => "Disconnected".to_string(),
                 Status::Connecting => "Connecting…".to_string(),
                 Status::Connected => {
@@ -4195,7 +4228,8 @@ impl Controller {
                     }
                 }
                 Status::Error(error) => format!("Error: {error}"),
-            }
+            };
+            proxy_status_label(status, state.ui.standby_proxy, &label)
         };
         let sessions = self.tray_sessions();
         // Any session in error, not just the selected profile's: the icon is
@@ -4289,10 +4323,10 @@ impl Controller {
         self.header_status_label.set_visible(false);
         self.header_status_label.remove_css_class("latency-stale");
         set_status_tone(&self.header_status, StatusTone::Neutral);
-        self.header_status
-            .set_visible(self.compact.get() && !matches!(status, Status::Disconnected));
-
         let state = self.state.borrow();
+        let standby = state.ui.standby_proxy;
+        self.header_status
+            .set_visible(compact_status_visible(status, standby, self.compact.get()));
         let pool_name = self.active_pool_name(&state);
         let display = self.active_server_display(&state);
         drop(state);
@@ -4352,6 +4386,25 @@ impl Controller {
                     .set_tooltip_text(Some("Connection error — show connections"));
             }
         }
+        if standby {
+            let summary = match status {
+                Status::Disconnected => "Disconnected",
+                Status::Connecting => "Connecting",
+                Status::Connected => "Connected",
+                Status::Error(_) => "Connection error",
+            };
+            let label = proxy_status_label(status, true, summary);
+            self.header_status_label.set_label(&label);
+            self.header_status_label.set_visible(true);
+            let detail = match status {
+                Status::Error(error) => format!("Error: {error}"),
+                _ => summary.into(),
+            };
+            self.header_status.set_tooltip_text(Some(&format!(
+                "{} — show connections",
+                proxy_status_label(status, true, &detail)
+            )));
+        }
     }
 
     fn update_sidebar_connection_status(&self, state: &AppState) {
@@ -4367,8 +4420,9 @@ impl Controller {
                 set_status_tone(&self.sidebar_status, StatusTone::Neutral);
                 self.sidebar_status_icon
                     .set_icon_name(Some("network-vpn-symbolic"));
-                self.sidebar_status_label.set_label("Disconnected");
-                "Disconnected".to_string()
+                let label = "Disconnected";
+                self.sidebar_status_label.set_label(label);
+                label.to_string()
             }
             Status::Connecting => {
                 set_status_tone(&self.sidebar_status, StatusTone::Working);
@@ -4402,6 +4456,8 @@ impl Controller {
                 "Connection error".to_string()
             }
         };
+        let summary = proxy_status_label(&status, state.ui.standby_proxy, &summary);
+        self.sidebar_status_label.set_label(&summary);
         // Names the destination, not the state, because that is what the click
         // does. The state is already the label an inch to the left.
         self.sidebar_status

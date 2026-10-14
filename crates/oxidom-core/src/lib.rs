@@ -24,6 +24,7 @@ pub mod profile;
 pub mod redact;
 pub mod resolve;
 pub mod run;
+pub mod standby;
 pub mod state;
 pub mod subscription;
 pub mod subscription_format;
