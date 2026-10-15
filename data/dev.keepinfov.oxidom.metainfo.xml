@@ -43,6 +43,23 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.5.1" date="2026-10-14">
+      <description>
+        <p>
+          Pick a connection in one window from the header, Filter or system
+          tray. Combine saved groups, country, protocol, subscription and
+          direct-latency filters, preview the matching servers, and connect
+          without changing a profile. Pools run independently in named sessions.
+        </p>
+        <p>
+          An optional direct standby proxy keeps local SOCKS and HTTP ports
+          answering while every tunnel is idle. Its state is shown explicitly,
+          existing direct connections close before a tunnel starts, and held
+          traffic never falls back to direct service. Connection confirmation
+          allows for cold-start handshakes and explains failures more clearly.
+        </p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-10-14">
       <description>
         <p>

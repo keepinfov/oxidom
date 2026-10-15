@@ -12,7 +12,7 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
-## [Unreleased]
+## [0.5.1] - 2026-10-14
 
 ### Added
 - **A pool can be raised in a named session.** `ConnectPool` now carries the target session name (defaulting to `default` for older clients), so the group Connect bar runs in the profile selected in the header and two pools in two sessions can run at once without colliding on ports.
