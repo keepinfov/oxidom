@@ -4237,15 +4237,14 @@ impl Controller {
             }
             return false;
         }
-        if let Some(marker) = gui_proxy_marker() {
-            if let Err(error) = std::fs::remove_file(marker)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                proxy.endpoint = None;
-                self.system_proxy.set(proxy);
-                log::warn!("could not retire the desktop proxy recovery record");
-                return false;
-            }
+        if let Some(marker) = gui_proxy_marker()
+            && let Err(error) = std::fs::remove_file(marker)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            proxy.endpoint = None;
+            self.system_proxy.set(proxy);
+            log::warn!("could not retire the desktop proxy recovery record");
+            return false;
         }
         proxy.cleared(true);
         self.system_proxy.set(proxy);

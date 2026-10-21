@@ -1925,10 +1925,9 @@ impl Shared {
                         if session.reported_status() == Status::Connected
                             && session.is_alive()
                             && (reconnect_all || session_has_run_cgroup(session))
+                            && let Some(attempt) = shared.watchdog_attempt(&engine, &profile)
                         {
-                            if let Some(attempt) = shared.watchdog_attempt(&engine, &profile) {
-                                watched.push((profile, attempt));
-                            }
+                            watched.push((profile, attempt));
                         }
                     }
                     (mode, watched)
@@ -4543,7 +4542,7 @@ mod tests {
         let shared = &service.shared;
 
         let generation = watchdog_test_attempt(shared, WatchdogMode::Aggressive)?;
-        let note = |outcome| {
+        let note = |outcome: Option<&probe::ProbeOutcome>| {
             shared.note_tunnel_probe("default", generation, WatchdogMode::Aggressive, outcome)
         };
         // One short of the threshold never fires.
@@ -4570,7 +4569,7 @@ mod tests {
         let service = for_test();
         let shared = &service.shared;
         let generation = watchdog_test_attempt(shared, WatchdogMode::Aggressive)?;
-        let note = |outcome| {
+        let note = |outcome: Option<&probe::ProbeOutcome>| {
             shared.note_tunnel_probe("default", generation, WatchdogMode::Aggressive, outcome)
         };
 
