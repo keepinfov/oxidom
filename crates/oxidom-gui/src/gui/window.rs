@@ -24,7 +24,7 @@ use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbePhase, ProbeWait, SessionRowState,
-    SnapshotState, SwitcherItem, about_comments, active_latency_for, card_action,
+    SnapshotState, SwitcherItem, SystemProxyState, about_comments, active_latency_for, card_action,
     check_can_be_stopped, compact_status_visible, geo_download_prompt, history_chart, human_bytes,
     latency_states, missing_core_message, other_profiles_message, pool_action, pool_short_label,
     press_stops, proxy_status_label, reduce, selected_status, session_for, session_rows,
@@ -131,6 +131,7 @@ struct TrayState {
 
 type SettingsCallback = Rc<dyn Fn(SettingsValues)>;
 type ShortcutHandler = Box<dyn Fn(&Rc<Controller>)>;
+type PollResult = (u64, Result<PolledSnapshot, String>);
 
 const SIDEBAR_BREAKPOINT_WIDTH: u32 = 700;
 
@@ -322,12 +323,10 @@ struct Controller {
     tray_commands: mpsc::Receiver<TrayCommand>,
     /// Last state pushed to the tray, to skip no-op updates.
     tray_pushed: RefCell<TrayState>,
-    /// True while this GUI holds the GNOME system proxy applied.
-    proxy_applied: Cell<bool>,
     /// Endpoint the applied GNOME proxy points at. `None` with
-    /// `proxy_applied == true` means it came from a crash marker and must be
+    /// `applied == true` means it came from a crash marker and must be
     /// reconciled even if a connection is already up.
-    applied_proxy_endpoint: Cell<Option<(std::net::Ipv4Addr, u16, u16)>>,
+    system_proxy: Cell<SystemProxyState>,
     /// Why the desktop proxy could not be installed, as last reported.
     /// `reconcile_system_proxy` runs on every poll tick, so the message is kept
     /// here to say it once instead of twice a second.
@@ -339,7 +338,7 @@ struct Controller {
     /// O(cards) pass on every poll tick.
     applied_connection: RefCell<CardConnection>,
     poll_in_flight: Arc<AtomicBool>,
-    poll_snapshot: Arc<Mutex<Option<PolledSnapshot>>>,
+    poll_snapshot: Arc<Mutex<Option<PollResult>>>,
     /// A history fetch is out on a worker thread, and whether a reading landed
     /// while it was. The history is the one card fact that costs a D-Bus call
     /// of its own, and every finished check in a 600-server sweep asks for it:
@@ -352,6 +351,8 @@ struct Controller {
     /// Merges the daemon's log with this process's own, and remembers how far
     /// each has been read. See [`LogFeed`].
     log_feed: RefCell<LogFeed>,
+    /// Replaying the last slice drains local logs without inventing a remote book.
+    last_remote_logs: RefCell<Option<LogSlice>>,
 }
 
 /// How often the main loop looks in on the connection thread.
@@ -605,8 +606,14 @@ fn build(
     let fetched_subscriptions = client.subscriptions().ok();
     let subscriptions_snapshot = fetched_subscriptions.clone().unwrap_or_default();
     let profiles_snapshot = client.list_profiles().unwrap_or_default();
-    let initial_status = client.status().unwrap_or_default();
-    let initial_config = client.settings().unwrap_or_default();
+    let initial_status = client.status();
+    let initial_poll_error = initial_status
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
+    let initial_status = initial_status.unwrap_or_default();
+    let (initial_config, watchdog_supported) =
+        client.settings_with_watchdog_support().unwrap_or_default();
     // A daemon older than RuntimeInfo answers UnknownMethod; `None` just
     // leaves the settings rows unlocked and the effective path unknown.
     let initial_runtime = client.runtime_info().ok();
@@ -624,12 +631,16 @@ fn build(
     let probe_cancel_supported = client.supports_probe_cancel();
     let selected_id = initial_status.active_id.clone();
     let servers = ServersView::new(fetched_subscriptions.as_deref());
+    let mut ui = SnapshotState::new(&initial_status);
+    if let Some(error) = initial_poll_error {
+        ui.poll_failed(0, error);
+    }
     let state = Rc::new(RefCell::new(AppState {
         client,
         subscriptions: subscriptions_snapshot,
         profiles: profiles_snapshot,
         selected_id,
-        ui: SnapshotState::new(&initial_status),
+        ui,
     }));
 
     let sessions = SessionsView::new();
@@ -661,6 +672,7 @@ fn build(
         }
     });
     settings.set_daemon_capabilities(daemon_source, geo_download_supported);
+    settings.set_watchdog_supported(watchdog_supported);
     servers.set_probe_cancel_supported(probe_cancel_supported);
     settings.set_runtime_info(initial_runtime.as_ref());
 
@@ -958,10 +970,13 @@ fn build(
         tray: RefCell::new(tray_handle),
         tray_commands,
         tray_pushed: RefCell::new(TrayState::default()),
-        proxy_applied: Cell::new(gui_proxy_marker_exists()),
+        system_proxy: Cell::new(SystemProxyState {
+            applied: gui_proxy_marker_exists(),
+            endpoint: None,
+            marker_only: false,
+        }),
         system_proxy_failure: RefCell::new(None),
         status_action: Cell::new(None),
-        applied_proxy_endpoint: Cell::new(None),
         applied_connection: RefCell::new(CardConnection::default()),
         poll_in_flight: Arc::new(AtomicBool::new(false)),
         history_in_flight: Cell::new(false),
@@ -969,6 +984,7 @@ fn build(
         sweep_tick: Cell::new(0),
         poll_snapshot: Arc::new(Mutex::new(None)),
         log_feed: RefCell::new(LogFeed::new()),
+        last_remote_logs: RefCell::new(None),
     });
     *controller_holder.borrow_mut() = Rc::downgrade(&controller);
 
@@ -991,6 +1007,7 @@ fn build(
         controller.poll_geo_progress();
     }
     controller.rebuild_views();
+    controller.update_profiles_banner(&initial_status.sessions);
     controller.refresh_status();
     controller.add_breakpoint();
     controller.start_timer();
@@ -3573,6 +3590,7 @@ impl Controller {
             system_proxy: values.system_proxy,
             standby_proxy: values.standby_proxy,
             reconnect: values.reconnect,
+            watchdog: values.watchdog,
             on_core_exit: if values.hold_traffic {
                 oxidom_core::config::OnCoreExit::Hold
             } else {
@@ -3770,7 +3788,7 @@ impl Controller {
                             snapshot.epoch = epoch;
                             controller.apply_snapshot(snapshot);
                         }
-                        Err(_) => controller.refresh_status(),
+                        Err(error) => controller.apply_poll_failure(epoch, format!("{error:#}")),
                     }
                     glib::ControlFlow::Break
                 }
@@ -3826,8 +3844,12 @@ impl Controller {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_millis(500), move || {
             controller.drain_tray_commands();
-            if let Some(snapshot) = oxidom_core::sync::lock(&controller.poll_snapshot).take() {
-                controller.apply_snapshot(snapshot);
+            if let Some((epoch, result)) = oxidom_core::sync::lock(&controller.poll_snapshot).take()
+            {
+                match result {
+                    Ok(snapshot) => controller.apply_snapshot(snapshot),
+                    Err(error) => controller.apply_poll_failure(epoch, error),
+                }
             }
             let tick = controller.sweep_tick.get().wrapping_add(1);
             controller.sweep_tick.set(tick % AGE_SWEEP_TICKS);
@@ -3855,9 +3877,8 @@ impl Controller {
                             epoch,
                         })
                     })();
-                    if let Ok(snapshot) = snapshot {
-                        *oxidom_core::sync::lock(&slot) = Some(snapshot);
-                    }
+                    *oxidom_core::sync::lock(&slot) =
+                        Some((epoch, snapshot.map_err(|error| format!("{error:#}"))));
                     in_flight.store(false, Ordering::SeqCst);
                 });
             }
@@ -3942,6 +3963,27 @@ impl Controller {
         self.refresh_status();
     }
 
+    fn apply_poll_failure(self: &Rc<Self>, epoch: u64, error: String) {
+        if self.state.borrow_mut().ui.poll_failed(epoch, error) {
+            // Do not put arbitrary D-Bus error text (which may carry secrets) in logs.
+            log::warn!("daemon polling failed; tunnel state is unknown");
+        }
+        let state = self.state.borrow();
+        if state.ui.poll_error.is_none() {
+            return;
+        }
+        self.update_profiles_banner(&state.ui.sessions);
+        drop(state);
+        self.sync_session_rows();
+        self.sync_profile_switcher();
+        self.sync_connection_cards();
+        self.refresh_status();
+        let remote = self.last_remote_logs.borrow().clone();
+        if let Some(remote) = remote {
+            self.absorb_logs(remote);
+        }
+    }
+
     /// Fold one round of the daemon's log into the view, together with whatever
     /// this process has logged about itself since the last round.
     ///
@@ -3949,6 +3991,7 @@ impl Controller {
     /// in this process: there is nothing to wait for, and reading it beside the
     /// daemon's keeps both streams entering the reorder window together.
     fn absorb_logs(&self, remote: LogSlice) {
+        *self.last_remote_logs.borrow_mut() = Some(remote.clone());
         let local = logbook::global().since(
             self.log_feed.borrow().local_cursor(),
             LOG_FETCH_LIMIT as usize,
@@ -3965,6 +4008,15 @@ impl Controller {
     /// rows it points at are already on screen, and the button leads where the
     /// user already is.
     fn update_profiles_banner(&self, sessions: &[ipc::SessionInfo]) {
+        if let Some(error) = &self.state.borrow().ui.poll_error {
+            self.profiles_banner.set_title(
+                "Daemon unavailable - tunnel state unknown. Retrying; last known sessions are preserved.",
+            );
+            self.profiles_banner.set_tooltip_text(Some(error));
+            self.profiles_banner.set_revealed(true);
+            return;
+        }
+        self.profiles_banner.set_tooltip_text(None);
         let selected_profile = self.state.borrow().ui.selected_profile.clone();
         let elsewhere =
             self.stack.visible_child_name().as_deref() != Some(Page::Profiles.stack_name());
@@ -4014,6 +4066,14 @@ impl Controller {
     /// Push the current connection onto the cards, skipping the O(cards)
     /// pass when nothing changed.
     fn sync_connection_cards(&self) {
+        let unavailable = self.state.borrow().ui.poll_error.is_some();
+        self.servers.root.set_sensitive(!unavailable);
+        if unavailable {
+            if *self.applied_connection.borrow() != CardConnection::default() {
+                self.set_cards_connection(CardConnection::default());
+            }
+            return;
+        }
         let (active, profiles, failed, status) = {
             let state = self.state.borrow();
             (
@@ -4064,6 +4124,10 @@ impl Controller {
     /// daemon, which may run as a system service) applies and clears it. A
     /// marker file survives crashes so the next start can undo a stale proxy.
     fn reconcile_system_proxy(self: &Rc<Self>) {
+        // Losing contact is not evidence that the owning inbound or held routes died.
+        if self.state.borrow().ui.poll_error.is_some() {
+            return;
+        }
         let applied_settings = self.settings.applied();
         let desired = {
             let state = self.state.borrow();
@@ -4077,32 +4141,57 @@ impl Controller {
         };
         if let Some((address, socks_port, http_port)) = desired {
             let endpoint = (address, socks_port, http_port);
-            if self.proxy_applied.get() && self.applied_proxy_endpoint.get() != Some(endpoint) {
-                // Never leave the previous owner's dead inbound installed if
-                // replacing it fails partway through.
-                self.clear_system_proxy();
+            let applied = self.system_proxy.get();
+            if applied.applied && applied.endpoint == Some(endpoint) {
+                return;
             }
-            if !self.proxy_applied.get() {
+            let intent = gui_proxy_marker()
+                .ok_or_else(|| anyhow::anyhow!("desktop proxy recovery path is unavailable"))
+                .and_then(|marker| oxidom_core::fsutil::write_private_atomic(&marker, b"1"));
+            if let Err(error) = intent {
+                let mut pending = self.system_proxy.get();
+                pending.intent_failed();
+                self.system_proxy.set(pending);
+                if pending.marker_only {
+                    self.clear_system_proxy();
+                }
+                self.report_system_proxy(Some(format!(
+                    "Could not record desktop proxy recovery: {error:#}"
+                )));
+                return;
+            }
+            self.system_proxy.set(SystemProxyState {
+                applied: true,
+                endpoint: None,
+                marker_only: false,
+            });
+            {
                 // The one setting that could be on and doing nothing: this ran
                 // twice a second and dropped the error every time, so a session
                 // without `gsettings` left the switch looking applied.
-                match sysproxy::apply(address, socks_port, http_port) {
+                let result = if applied.applied {
+                    sysproxy::replace(address, socks_port, http_port)
+                } else {
+                    sysproxy::apply(address, socks_port, http_port)
+                };
+                match result {
                     Ok(()) => {
-                        self.proxy_applied.set(true);
-                        self.applied_proxy_endpoint.set(Some(endpoint));
-                        if let Some(marker) = gui_proxy_marker() {
-                            let _ = std::fs::write(marker, b"1");
-                        }
+                        self.system_proxy.set(SystemProxyState {
+                            applied: true,
+                            endpoint: Some(endpoint),
+                            marker_only: false,
+                        });
                         self.report_system_proxy(None);
                     }
                     Err(error) => self.report_system_proxy(Some(format!("{error:#}"))),
                 }
             }
         } else {
-            self.clear_system_proxy();
             // Turning it off, or disconnecting, makes any earlier complaint
             // moot — the row should not keep accusing a switch that is idle.
-            self.report_system_proxy(None);
+            if self.clear_system_proxy() {
+                self.report_system_proxy(None);
+            }
         }
     }
 
@@ -4127,16 +4216,40 @@ impl Controller {
 
     /// Point the session back at a direct connection. Idempotent, and safe to
     /// call from a signal handler.
-    fn clear_system_proxy(&self) {
-        if !self.proxy_applied.get() {
-            return;
+    fn clear_system_proxy(&self) -> bool {
+        let mut proxy = self.system_proxy.get();
+        if !proxy.applied && !proxy.marker_only {
+            return true;
         }
-        let _ = sysproxy::clear();
-        self.proxy_applied.set(false);
-        self.applied_proxy_endpoint.set(None);
+        let result = if proxy.applied {
+            sysproxy::clear()
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            let failure = format!("Could not clear the desktop proxy: {error:#}");
+            if self.system_proxy_failure.borrow().as_ref() != Some(&failure) {
+                log::warn!("could not clear the desktop proxy; retaining its recovery record");
+                self.settings.set_system_proxy_failure(Some(
+                    "Could not be cleared - the previous desktop proxy may still be active",
+                ));
+                *self.system_proxy_failure.borrow_mut() = Some(failure);
+            }
+            return false;
+        }
         if let Some(marker) = gui_proxy_marker() {
-            let _ = std::fs::remove_file(marker);
+            if let Err(error) = std::fs::remove_file(marker)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                proxy.endpoint = None;
+                self.system_proxy.set(proxy);
+                log::warn!("could not retire the desktop proxy recovery record");
+                return false;
+            }
         }
+        proxy.cleared(true);
+        self.system_proxy.set(proxy);
+        true
     }
 
     fn drain_tray_commands(self: &Rc<Self>) {
@@ -4202,6 +4315,9 @@ impl Controller {
     /// from the window.
     fn tray_sessions(&self) -> Vec<(String, bool)> {
         let state = self.state.borrow();
+        if state.ui.poll_error.is_some() {
+            return Vec::new();
+        }
         session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
             .into_iter()
             .map(|row| (row.profile, row.toggle_on))
@@ -4229,13 +4345,18 @@ impl Controller {
                 }
                 Status::Error(error) => format!("Error: {error}"),
             };
-            proxy_status_label(status, state.ui.standby_proxy, &label)
+            if state.ui.poll_error.is_some() {
+                "Daemon unavailable - tunnel state unknown".into()
+            } else {
+                proxy_status_label(status, state.ui.standby_proxy, &label)
+            }
         };
         let sessions = self.tray_sessions();
         // Any session in error, not just the selected profile's: the icon is
         // the only channel a hidden window has, and "one of your tunnels is
         // down" is worth an attention state whichever one it is.
-        let failed = matches!(status, Status::Error(_))
+        let failed = self.state.borrow().ui.poll_error.is_some()
+            || matches!(status, Status::Error(_))
             || self
                 .state
                 .borrow()
@@ -4324,6 +4445,18 @@ impl Controller {
         self.header_status_label.remove_css_class("latency-stale");
         set_status_tone(&self.header_status, StatusTone::Neutral);
         let state = self.state.borrow();
+        if state.ui.poll_error.is_some() {
+            self.header_status.set_visible(self.compact.get());
+            set_status_tone(&self.header_status, StatusTone::Error);
+            self.header_status_icon
+                .set_icon_name(Some("dialog-warning-symbolic"));
+            self.header_status_icon.set_visible(true);
+            self.header_status_label.set_label("State unknown");
+            self.header_status_label.set_visible(true);
+            self.header_status
+                .set_tooltip_text(Some("Daemon unavailable - tunnel state unknown"));
+            return;
+        }
         let standby = state.ui.standby_proxy;
         self.header_status
             .set_visible(compact_status_visible(status, standby, self.compact.get()));
@@ -4408,6 +4541,17 @@ impl Controller {
     }
 
     fn update_sidebar_connection_status(&self, state: &AppState) {
+        if state.ui.poll_error.is_some() {
+            set_status_tone(&self.sidebar_status, StatusTone::Error);
+            self.sidebar_status_icon
+                .set_icon_name(Some("dialog-warning-symbolic"));
+            self.sidebar_status_label.remove_css_class("latency-stale");
+            self.sidebar_status_label.set_label("State unknown");
+            self.sidebar_status
+                .set_tooltip_text(Some("Daemon unavailable - tunnel state unknown"));
+            self.set_status_action(None);
+            return;
+        }
         let status = selected_status(&state.ui);
         let (active_latency, latency_stale) = active_latency_for(&state.ui);
         self.sidebar_status_label.remove_css_class("latency-stale");
@@ -5167,7 +5311,11 @@ fn desired_system_proxy_endpoint(
     }
     sessions
         .iter()
-        .find(|session| session.owns_system_proxy && session.state == "connected")
+        .find(|session| {
+            session.owns_system_proxy
+                && (matches!(session.state.as_str(), "connected" | "connecting")
+                    || session.holding_traffic)
+        })
         .and_then(|session| {
             session
                 .address
@@ -5562,6 +5710,49 @@ mod tests {
         drop(sender);
         assert!(matches!(poll_worker(&receiver), WorkerPoll::Ready(3)));
         assert!(matches!(poll_worker(&receiver), WorkerPoll::Lost));
+    }
+
+    #[test]
+    fn system_proxy_keeps_its_owner_while_traffic_is_held() {
+        let mut owner = SessionInfo {
+            profile: "home".into(),
+            state: "error".into(),
+            address: "127.31.8.1".into(),
+            socks_port: 10808,
+            http_port: 10809,
+            owns_system_proxy: true,
+            holding_traffic: true,
+            ..SessionInfo::default()
+        };
+        let desired = |enabled, owner: &SessionInfo| {
+            desired_system_proxy_endpoint(
+                enabled,
+                &Status::Error("core stopped".into()),
+                std::slice::from_ref(owner),
+                1,
+                2,
+            )
+        };
+        assert_eq!(
+            desired(true, &owner),
+            Some(("127.31.8.1".parse().unwrap(), 10808, 10809))
+        );
+        assert_eq!(desired(false, &owner), None);
+        owner.holding_traffic = false;
+        assert_eq!(desired(true, &owner), None);
+        owner.state = "connecting".into();
+        assert_eq!(
+            desired(true, &owner),
+            Some(("127.31.8.1".parse().unwrap(), 10808, 10809))
+        );
+        owner.state = "error".into();
+        owner.holding_traffic = true;
+        owner.owns_system_proxy = false;
+        assert_eq!(desired(true, &owner), None);
+        owner.holding_traffic = false;
+        owner.owns_system_proxy = true;
+        owner.state = "stopped".into();
+        assert_eq!(desired(true, &owner), None);
     }
 
     #[test]

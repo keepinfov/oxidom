@@ -23,6 +23,10 @@ missing files (treat as defaults/empty).
   the scope keeps running — and a restart rebuilds the block from them. A record whose cgroup no
   longer exists is dropped, with its chain, on the next start or teardown.
 - `~/.local/share/oxidom/hwid` — random per-install id (only generated/used if a sub opts in).
+- `~/.local/share/oxidom/store.lock` — the daemon's exclusive store lock, held from before
+  loading or recovering state until exit. The file is private and must never be unlinked to
+  release the lock: every contender must lock the same inode. A second owner fails without
+  running recovery, regardless of which bus it intended to serve.
 - `~/.local/share/oxidom/oxidom-gui.log` — the graphical client's own log, `0600`, rotated at 2MB
   with one `.log.1` kept. Written only by the GUI, which detaches and sends stderr to `/dev/null`
   and so has no journal; the daemon writes no file because its stderr already reaches one.
@@ -40,6 +44,14 @@ missing files (treat as defaults/empty).
   profile and server id.
 
 ## Which daemon owns the store (binding)
+
+State and configuration replacements use a unique, exclusively created `0600` temporary file
+in the destination directory. Write, permission and file-sync errors are returned before rename;
+only that writer's temporary file is cleaned on failure. Rename is followed by directory fsync.
+New `0700` directory components and their entries in their parents are also synchronized.
+A failure after rename means the replacement may already be visible but its durability was not
+confirmed; it must not be reported as a successful save. This is per-file durability, not a
+transaction across the store's separate files.
 
 A system daemon run from the NixOS module keeps all of the above in its `StateDirectory`
 (`/var/lib/oxidom`) instead of the user's XDG dirs, so **the choice of daemon is the choice of
@@ -79,6 +91,7 @@ http_port  = 10809            # local HTTP inbound
 system_proxy = false          # toggle GNOME/env system proxy on connect
 standby_proxy = false         # direct SOCKS/HTTP only when every session is idle and none holds traffic
 reconnect = false             # reconnect after an unexpected core exit; explicit opt-in
+watchdog = "conservative"     # off | conservative | aggressive; independent of process supervision
 on_core_exit = "hold"         # hold | release — a core that exits by itself keeps its routes,
                               # so traffic is dropped rather than released; a profile overrides
 latency_method = "http_get"   # one of: icmp | tcp | http_head | http_get
@@ -110,6 +123,34 @@ that carries none gains no key.
 Every `[core]` key is optional at both levels, and an untouched section is not written to the file
 at all. See [Advanced core settings](xray-config.md#advanced-core-settings-binding) for what each
 one generates.
+
+### Tunnel watchdog and settings compatibility (binding)
+
+`watchdog` defaults to `conservative` in old on-disk files. It controls synthetic checks for
+resilient sessions (`reconnect = true` or a bound `oxidom run` cgroup), not process-exit
+supervision. Budgets and recovery semantics are specified in [latency.md](latency.md).
+`GetSettings` and `SetSettings` retain their signatures. Omitting `watchdog` from a settings
+payload preserves the current daemon value; a valid explicit value replaces it. A policy
+change invalidates in-flight checks as well as stored failure streaks.
+
+Absence of the key in a **daemon response** is different from an old file: that daemon implements
+the previous aggressive policy and cannot configure it. Clients must mark the control unsupported
+rather than claiming the new conservative default is active.
+
+### Geo source and update ownership (binding)
+
+Only the user's `geoip_url` and `geosite_url` settings choose download sources. Subscription
+rules, geo URLs and remote rule-set URLs are reported as not applied; importing or refreshing a
+subscription grants no permission to fetch or adopt them. Accepting provider rules and accepting
+a provider's data source are separate trust decisions, neither implicitly enables the other.
+
+The daemon alone writes its private `assets` copies, on explicit install/adopt requests. It
+checks HTTPS and the published sidecar digest for downloads. Distribution-provided assets remain
+owned by their package; adoption copies them rather than updating them in place. There is no
+scheduled updater or Xray `geodata` block on the pinned 26.3.27 core, and no second writer is
+started as a fallback. Updating private copies requires an explicit action and reconnection to
+load them. A future scheduler or hot reload requires a new ownership and compatibility contract;
+an old daemon/core must continue to report manual updates, never claim unsupported hot reload.
 
 ### Direct standby (binding)
 

@@ -1,5 +1,6 @@
 mod cli;
 mod daemon;
+mod store_lock;
 
 use std::fs::OpenOptions;
 use std::io::Write;

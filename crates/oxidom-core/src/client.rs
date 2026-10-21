@@ -628,8 +628,24 @@ impl DaemonClient {
     }
 
     pub fn settings(&self) -> Result<Config> {
+        self.settings_with_watchdog_support()
+            .map(|(config, _)| config)
+    }
+
+    /// Old daemons implement aggressive checks, not the new on-disk default.
+    pub fn settings_with_watchdog_support(&self) -> Result<(Config, bool)> {
         let json: String = self.proxy.call("GetSettings", &()).map_err(friendly)?;
-        Ok(serde_json::from_str(&json)?)
+        Self::decode_settings(&json)
+    }
+
+    fn decode_settings(json: &str) -> Result<(Config, bool)> {
+        let value: serde_json::Value = serde_json::from_str(json)?;
+        let supported = value.get("watchdog").is_some();
+        let mut config: Config = serde_json::from_value(value)?;
+        if !supported {
+            config.watchdog = crate::config::WatchdogMode::Aggressive;
+        }
+        Ok((config, supported))
     }
 
     pub fn apply_settings(&self, config: &Config) -> Result<ApplySettingsResult> {
@@ -703,6 +719,19 @@ fn is_unknown_method(error: &zbus::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_older_daemon_does_not_claim_to_support_conservative_checks() {
+        use crate::config::WatchdogMode;
+
+        let (old, supported) =
+            super::DaemonClient::decode_settings(r#"{"reconnect":true}"#).unwrap();
+        assert!(!supported);
+        assert_eq!(old.watchdog, WatchdogMode::Aggressive);
+        let (new, supported) =
+            super::DaemonClient::decode_settings(r#"{"watchdog":"off"}"#).unwrap();
+        assert!(supported);
+        assert_eq!(new.watchdog, WatchdogMode::Off);
+    }
     use super::{BUS_NAME, daemon_binary, policy_installed};
 
     #[test]

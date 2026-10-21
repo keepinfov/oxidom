@@ -136,6 +136,22 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   selected profile's session (`default` initially). It shows its live status (Connecting/Connected/Error) and
   active latency. If other sessions run, a persistent banner reports their count and points to
   `oxidom status`.
+- **Unavailable daemon snapshot (binding):** a current poll failure marks tunnel state unknown,
+  not disconnected. The window, session rows, profile switcher and tray stop claiming a fresh
+  connected state; last-known sessions and proxy ownership are retained. Repeated identical
+  failures are not logged on every tick. A stale success or failure cannot change a newer UI
+  epoch, and a current success clears the warning. Polling retries the existing client and store;
+  it must not rediscover another daemon/database as recovery. Local log lines continue draining
+  using the last remote book when one has been obtained.
+- **Desktop proxy recovery (binding):** an owner that is holding traffic, or replacing its core
+  while `connecting`, retains its endpoint. Replacing or reconciling an owned proxy never switches
+  to direct mode on failure. Private recovery intent is written before changing desktop settings;
+  a failed clear or marker removal retains the recovery record for retry. An unreadable daemon
+  snapshot is not permission to clear the proxy. Explicit stop/release still relinquishes it.
+- **Tunnel watchdog:** Settings offers Off, Conservative and Aggressive, behind Apply/Reset.
+  Conservative is the default and reports failed synthetic checks without killing a live core.
+  Against a daemon whose settings omit the key, the control is disabled and says the daemon must
+  be upgraded/restarted rather than claiming the new policy works.
 - **Subscriptions view:** add (URL + optional name), update-now, delete; per-sub **"send HWID"**
   switch (default OFF) with a privacy hint.
   **An import says what it did not take (binding).** The parser reads outbounds and nothing

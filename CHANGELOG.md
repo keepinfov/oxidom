@@ -12,6 +12,18 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
+## [Unreleased]
+
+### Added
+- **Tunnel checks have an explicit policy.** `watchdog = "conservative"` is the default: repeated failed checks are reported without stopping a live Xray core. `aggressive` retains live-core restart after three negative checks; `off` disables these checks without disabling process-exit supervision. The policy is selectable in Settings.
+
+### Fixed
+- **Connecting is not reported as connected before confirmation.** Status, session lists and the GUI wait for a successful request through SOCKS and completion of any requested interface setup; internal process supervision continues during confirmation.
+- **A failed daemon poll no longer leaves the GUI indefinitely presenting its last snapshot as current.** The window and tray say that tunnel state is unknown, preserve the last known sessions and desktop proxy, and recover on the next current snapshot without switching stores.
+- **Desktop proxy ownership survives holding and replacement.** Replacing an owned endpoint does not switch to direct mode, and failed cleanup retains its recovery record for retry.
+- **Watchdog results belong to the core they measured.** Explicit replacements, automatic retries and policy changes invalidate old results and their failure streaks. A local outage or an unmeasurable check breaks the streak rather than joining unrelated failures.
+- **Only one daemon can recover a store at a time.** An exclusive private lock is acquired before loading state or recovering resources. State writes use exclusively created temporary files and report synchronization errors, including directory synchronization after publication.
+
 ## [0.5.1] - 2026-10-14
 
 ### Added

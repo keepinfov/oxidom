@@ -13,7 +13,7 @@ use nix::sys::signal::{SigSet, Signal};
 use zbus::fdo;
 
 use oxidom_core::alias;
-use oxidom_core::config::{Config, LatencyMethod};
+use oxidom_core::config::{Config, LatencyMethod, WatchdogMode};
 use oxidom_core::engine::{Engine, PoolSession, SessionSelection, pool_fingerprint};
 use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
@@ -54,11 +54,20 @@ const POOL_CONFIRM_WINDOW: Duration = Duration::from_secs(20);
 const POOL_CONFIRM_RETRY_GAP: Duration = Duration::from_secs(2);
 const CORE_EXITED_MESSAGE: &str = "Xray exited unexpectedly";
 const RECONNECTING_MESSAGE: &str = "Xray exited unexpectedly — reconnecting";
-/// Consecutive failed liveness probes before a still-running tunnel is declared
-/// dead and revived. At `ACTIVE_PROBE_INTERVAL` this is ~90s of unbroken
-/// failure — long enough that one slow round, or a server merely slower than
-/// the probe budget, never trips it, since any reachable answer resets the run.
+/// The legacy, explicitly aggressive live-core restart threshold.
 const TUNNEL_DEATH_STRIKES: u32 = 3;
+
+fn watchdog_policy(mode: WatchdogMode) -> Option<(Duration, Duration, u32)> {
+    match mode {
+        WatchdogMode::Off => None,
+        WatchdogMode::Conservative => Some((Duration::from_secs(60), Duration::from_secs(8), 5)),
+        WatchdogMode::Aggressive => Some((
+            ACTIVE_PROBE_INTERVAL,
+            Duration::from_secs(3),
+            TUNNEL_DEATH_STRIKES,
+        )),
+    }
+}
 
 fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_secs((1_u64 << attempt.min(5)).min(30))
@@ -338,6 +347,19 @@ pub struct DaemonOptions {
     pub http_port: Option<u16>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WatchdogAttempt {
+    generation: u64,
+    spawn_seq: u64,
+    policy_epoch: u64,
+}
+
+struct TunnelStreak {
+    attempt: WatchdogAttempt,
+    mode: WatchdogMode,
+    count: u32,
+}
+
 #[derive(Clone)]
 pub(crate) struct Shared {
     engine: Arc<Mutex<Engine>>,
@@ -353,11 +375,9 @@ pub(crate) struct Shared {
     /// Layered over the core status, e.g. when the confirming probe after a
     /// connect fails and the daemon shuts the tunnel back down.
     override_status: Arc<Mutex<HashMap<String, ErrorOverride>>>,
-    /// Consecutive dead-tunnel probes per profile, for the watchdog that revives
-    /// a resilient session whose server stops answering while its core keeps
-    /// running (so `note_core_deaths` never sees it). Reset by any reachable
-    /// probe, when a session leaves `Connected`, and on prune.
-    tunnel_failures: Arc<Mutex<HashMap<String, u32>>>,
+    /// A failure streak belongs to one attempt and policy, never its replacement.
+    tunnel_failures: Arc<Mutex<HashMap<String, TunnelStreak>>>,
+    watchdog_epoch: Arc<AtomicU64>,
     /// Generates attempt ids; `current_generations` keeps one cancellation
     /// domain per profile so bringing `work` up cannot invalidate `default`'s
     /// in-flight confirmation.
@@ -440,6 +460,7 @@ impl Shared {
             probes: Arc::new(Mutex::new(ProbeQueue::default())),
             override_status: Arc::new(Mutex::new(HashMap::new())),
             tunnel_failures: Arc::new(Mutex::new(HashMap::new())),
+            watchdog_epoch: Arc::new(AtomicU64::new(0)),
             // An adopted pool core is already a live attempt. Giving it a
             // generation makes its first post-recovery death reconnectable
             // while retaining the same cancellation rules as a fresh `up`.
@@ -768,8 +789,11 @@ impl Shared {
             StatusInfo::from_status(&failure.status, None)
                 .with_error_id(failure.selection.server_id().map(str::to_string))
         } else {
-            StatusInfo::from_status(&session.status(), session.server_id().map(str::to_string))
-                .with_active_profile(session.selection.as_ref().map(|_| profile.to_string()))
+            StatusInfo::from_status(
+                &session.reported_status(),
+                session.server_id().map(str::to_string),
+            )
+            .with_active_profile(session.selection.as_ref().map(|_| profile.to_string()))
         };
         status.sessions = sessions;
         status.standby_proxy = oxidom_core::sync::lock(&self.standby).is_some();
@@ -1247,10 +1271,6 @@ impl Shared {
     /// server, and even a single-server session configured for `icmp` or `tcp`
     /// confirms over HTTP through its SOCKS inbound. `None` means there was
     /// nothing to measure.
-    fn session_probe_outcome(&self, profile: &str) -> Option<(probe::ProbeOutcome, LatencyMethod)> {
-        self.session_probe_outcome_with_timeout(profile, Duration::from_secs(3))
-    }
-
     fn session_probe_outcome_with_timeout(
         &self,
         profile: &str,
@@ -1733,32 +1753,59 @@ impl Shared {
         oxidom_core::sync::lock(&self.probes).retain_alive(&alive_servers, &alive_profiles);
     }
 
-    /// Fold one liveness probe of a running tunnel into its failure streak and
-    /// report whether the tunnel should now be considered dead.
-    ///
-    /// Only the server's own silence advances the count. A `Reachable` answer —
-    /// however slow — wipes the streak, so a server merely slower than the probe
-    /// budget never trips this. `NoNetwork` is this machine losing its uplink,
-    /// not the server dropping, and a reconnect cannot mend it; `Internal`/`None`
-    /// are our own failure to measure. None of those touch the count.
-    fn note_tunnel_probe(&self, profile: &str, outcome: Option<&probe::ProbeOutcome>) -> bool {
+    fn watchdog_attempt(&self, engine: &Engine, profile: &str) -> Option<WatchdogAttempt> {
+        Some(WatchdogAttempt {
+            generation: self.current_generation(profile)?,
+            spawn_seq: engine.sessions.get(profile)?.core.spawn_seq(),
+            policy_epoch: self.watchdog_epoch.load(Ordering::SeqCst),
+        })
+    }
+
+    /// Report a streak of attributable negative probes. Missing measurements and
+    /// local outages break the streak; neither proves the server is dead.
+    fn note_tunnel_probe(
+        &self,
+        profile: &str,
+        attempt: WatchdogAttempt,
+        mode: WatchdogMode,
+        outcome: Option<&probe::ProbeOutcome>,
+    ) -> bool {
+        let Some((_, _, threshold)) = watchdog_policy(mode) else {
+            return false;
+        };
+        let engine = oxidom_core::sync::lock(&self.engine);
+        if self.watchdog_attempt(&engine, profile) != Some(attempt)
+            || engine.registry.config.watchdog != mode
+        {
+            return false;
+        }
         let mut failures = oxidom_core::sync::lock(&self.tunnel_failures);
         match outcome {
             Some(probe::ProbeOutcome::Timeout | probe::ProbeOutcome::Unreachable) => {
-                let count = failures.entry(profile.to_string()).or_insert(0);
-                *count += 1;
-                if *count >= TUNNEL_DEATH_STRIKES {
+                let streak = failures.entry(profile.to_string()).or_insert(TunnelStreak {
+                    attempt,
+                    mode,
+                    count: 0,
+                });
+                if (streak.attempt, streak.mode) != (attempt, mode) {
+                    *streak = TunnelStreak {
+                        attempt,
+                        mode,
+                        count: 0,
+                    };
+                }
+                streak.count = streak.count.saturating_add(1);
+                if streak.count >= threshold {
                     failures.remove(profile);
                     true
                 } else {
                     false
                 }
             }
-            Some(probe::ProbeOutcome::Reachable(_)) => {
+            _ => {
                 failures.remove(profile);
                 false
             }
-            _ => false,
         }
     }
 
@@ -1770,15 +1817,24 @@ impl Shared {
     /// the wedged core, mark it failed, and hold or release its routes according
     /// to the session's own setting — then hands off to the ordinary reconnect
     /// loop, which retries with backoff until the server is back.
-    fn recover_dead_tunnel(&self, profile: &str) {
+    fn recover_dead_tunnel(
+        &self,
+        profile: &str,
+        attempt: WatchdogAttempt,
+    ) -> Option<ConnectionTarget> {
         let target = {
             let mut engine = oxidom_core::sync::lock(&self.engine);
-            let Some(session) = engine.sessions.get_mut(profile) else {
-                return;
-            };
-            let Some(target) = reconnect_target(session) else {
-                return;
-            };
+            if self.watchdog_attempt(&engine, profile) != Some(attempt)
+                || engine.registry.config.watchdog != WatchdogMode::Aggressive
+                || !resilient(&engine, profile)
+            {
+                return None;
+            }
+            let session = engine.sessions.get_mut(profile)?;
+            if session.reported_status() != Status::Connected {
+                return None;
+            }
+            let target = reconnect_target(session)?;
             // The core still holds the profile's SOCKS port; a reconnect rebinds
             // the same port and `ensure_ports_free` refuses while the old inbound
             // lingers. Kill it before failing so the port is free, and so
@@ -1793,9 +1849,7 @@ impl Shared {
             engine.note_core_exit(profile);
             target
         };
-        if let Some(generation) = self.current_generation(profile) {
-            self.begin_reconnect(profile.to_string(), target, generation);
-        }
+        Some(target)
     }
 
     /// Periodic re-probe of the active server; keeps the latency reading
@@ -1836,17 +1890,27 @@ impl Shared {
         });
     }
 
-    /// Counterpart to `spawn_active_probe_loop`: it refuses to tear a connection
-    /// down, this one does — but only for a resilient session (an `oxidom run`
-    /// cgroup, or the global `reconnect`), and only after `TUNNEL_DEATH_STRIKES`
-    /// unbroken failures prove the server is gone rather than slow.
+    /// Conservative checks diagnose silence without treating one synthetic
+    /// destination as proof that a live core must be killed.
     fn spawn_tunnel_watchdog(&self) {
         let shared = self.clone();
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(ACTIVE_PROBE_INTERVAL);
-                let watched = {
+                let mode = oxidom_core::sync::lock(&shared.engine)
+                    .registry
+                    .config
+                    .watchdog;
+                let interval = watchdog_policy(mode)
+                    .map(|(interval, _, _)| interval)
+                    .unwrap_or(Duration::from_secs(60));
+                std::thread::sleep(interval);
+                let (mode, watched) = {
                     let mut engine = oxidom_core::sync::lock(&shared.engine);
+                    let mode = engine.registry.config.watchdog;
+                    if mode == WatchdogMode::Off {
+                        oxidom_core::sync::lock(&shared.tunnel_failures).clear();
+                        continue;
+                    }
                     let reconnect_all = engine.registry.config.reconnect;
                     let profiles = engine
                         .sessions
@@ -1858,25 +1922,40 @@ impl Shared {
                         let Some(session) = engine.sessions.get_mut(&profile) else {
                             continue;
                         };
-                        if session.status() == Status::Connected
+                        if session.reported_status() == Status::Connected
                             && session.is_alive()
                             && (reconnect_all || session_has_run_cgroup(session))
                         {
-                            watched.push(profile);
+                            if let Some(attempt) = shared.watchdog_attempt(&engine, &profile) {
+                                watched.push((profile, attempt));
+                            }
                         }
                     }
-                    watched
+                    (mode, watched)
                 };
-                for profile in watched {
+                let Some((_, timeout, _)) = watchdog_policy(mode) else {
+                    continue;
+                };
+                for (profile, attempt) in watched {
                     let outcome = shared
-                        .session_probe_outcome(&profile)
+                        .session_probe_outcome_with_timeout(&profile, timeout)
                         .map(|(outcome, _)| outcome);
-                    if shared.note_tunnel_probe(&profile, outcome.as_ref()) {
-                        log::warn!(
-                            "profile {profile:?} stopped answering while its core is alive; \
-                             reviving it"
-                        );
-                        shared.recover_dead_tunnel(&profile);
+                    if shared.note_tunnel_probe(&profile, attempt, mode, outcome.as_ref()) {
+                        if mode == WatchdogMode::Aggressive {
+                            if let Some(target) = shared.recover_dead_tunnel(&profile, attempt) {
+                                log::warn!(
+                                    "profile {profile:?} failed aggressive tunnel checks; reviving it"
+                                );
+                                shared.begin_reconnect(profile, target, attempt.generation);
+                            }
+                        } else if shared
+                            .watchdog_attempt(&oxidom_core::sync::lock(&shared.engine), &profile)
+                            == Some(attempt)
+                        {
+                            log::warn!(
+                                "profile {profile:?} failed conservative tunnel checks; keeping its live core"
+                            );
+                        }
                     }
                 }
             }
@@ -2165,7 +2244,7 @@ fn session_info(
     let (status, selection) = match override_status {
         Some(failure) => (&failure.status, Some(failure.selection.clone())),
         None => {
-            let status = session.status();
+            let status = session.reported_status();
             return session_info_with_status(engine, profile, session, &status, None);
         }
     };
@@ -3111,6 +3190,9 @@ impl Service {
         if raw.get("reconnect").is_none() {
             config.reconnect = engine.registry.config.reconnect;
         }
+        if raw.get("watchdog").is_none() {
+            config.watchdog = engine.registry.config.watchdog;
+        }
         if raw.get("on_core_exit").is_none() {
             config.on_core_exit = engine.registry.config.on_core_exit;
         }
@@ -3191,6 +3273,10 @@ impl Service {
             }
         } else if let Some(owner) = engine.sessions.owner_of_system_proxy().map(str::to_string) {
             engine.sessions.release_system_proxy(&owner);
+        }
+        if config.watchdog != engine.registry.config.watchdog {
+            self.shared.watchdog_epoch.fetch_add(1, Ordering::SeqCst);
+            oxidom_core::sync::lock(&self.shared.tunnel_failures).clear();
         }
         engine.registry.config = config;
         let socks_port = engine.registry.config.socks_port;
@@ -3419,6 +3505,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
     stop.add(Signal::SIGTERM);
     stop.thread_block()?;
 
+    let _store_lock = crate::store_lock::StoreLock::acquire(&oxidom_core::paths::data_dir()?)?;
     let mut engine = Engine::load();
     for warning in engine.registry.load_warnings.drain(..) {
         log::warn!("{warning}");
@@ -4334,6 +4421,7 @@ mod tests {
             let mut engine = oxidom_core::sync::lock(&service.shared.engine);
             engine.registry.config.reconnect = true;
             engine.registry.config.tun2socks_binary = "/configured/tun2socks".to_string();
+            engine.registry.config.watchdog = WatchdogMode::Off;
             engine.registry.config.nft_binary = "/configured/nft".to_string();
         }
         let mut raw = serde_json::to_value(Config::default())?;
@@ -4341,6 +4429,7 @@ mod tests {
             .as_object_mut()
             .context("serialized config is not an object")?;
         object.remove("reconnect");
+        object.remove("watchdog");
         object.remove("tun2socks_binary");
         object.remove("nft_binary");
 
@@ -4348,6 +4437,7 @@ mod tests {
 
         let engine = oxidom_core::sync::lock(&service.shared.engine);
         assert!(engine.registry.config.reconnect);
+        assert_eq!(engine.registry.config.watchdog, WatchdogMode::Off);
         assert_eq!(
             engine.registry.config.tun2socks_binary,
             "/configured/tun2socks"
@@ -4431,6 +4521,20 @@ mod tests {
         })
     }
 
+    fn watchdog_test_attempt(shared: &Shared, mode: WatchdogMode) -> Result<WatchdogAttempt> {
+        if shared.current_generation("default").is_none() {
+            shared.next_connect_generation("default");
+        }
+        let mut engine = oxidom_core::sync::lock(&shared.engine);
+        engine.registry.config.watchdog = mode;
+        if engine.sessions.get("default").is_none() {
+            mark_active(&mut engine, "default", "test-server")?;
+        }
+        shared
+            .watchdog_attempt(&engine, "default")
+            .context("watchdog attempt")
+    }
+
     #[test]
     fn a_dead_tunnel_is_declared_only_after_an_unbroken_run_of_failures() -> Result<()> {
         let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
@@ -4438,20 +4542,24 @@ mod tests {
         let service = for_test();
         let shared = &service.shared;
 
+        let generation = watchdog_test_attempt(shared, WatchdogMode::Aggressive)?;
+        let note = |outcome| {
+            shared.note_tunnel_probe("default", generation, WatchdogMode::Aggressive, outcome)
+        };
         // One short of the threshold never fires.
         for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
-            assert!(!shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::Timeout)));
+            assert!(!note(Some(&probe::ProbeOutcome::Timeout)));
         }
         // A single reachable answer — however slow — wipes the streak, so the
         // count has to start over from scratch.
-        assert!(!shared.note_tunnel_probe("default", Some(&reachable())));
+        assert!(!note(Some(&reachable())));
         for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
-            assert!(!shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::Unreachable)));
+            assert!(!note(Some(&probe::ProbeOutcome::Unreachable)));
         }
         // The strike that reaches the threshold is the one that declares it dead.
-        assert!(shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::Unreachable)));
+        assert!(note(Some(&probe::ProbeOutcome::Unreachable)));
         // And the counter is cleared on the way out, so the next run starts fresh.
-        assert!(!shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::Timeout)));
+        assert!(!note(Some(&probe::ProbeOutcome::Timeout)));
         Ok(())
     }
 
@@ -4461,20 +4569,35 @@ mod tests {
         let _root = TestRoot::install("tunnel-not-the-server")?;
         let service = for_test();
         let shared = &service.shared;
+        let generation = watchdog_test_attempt(shared, WatchdogMode::Aggressive)?;
+        let note = |outcome| {
+            shared.note_tunnel_probe("default", generation, WatchdogMode::Aggressive, outcome)
+        };
 
         // A machine with no uplink, our own inability to measure, and a vanished
         // session are none of them the server going quiet: a reconnect cannot
         // mend them, so they must never advance toward a teardown, even repeated
         // well past the threshold.
         for _ in 0..TUNNEL_DEATH_STRIKES + 2 {
-            assert!(!shared.note_tunnel_probe("default", Some(&probe::ProbeOutcome::NoNetwork)));
-            assert!(!shared.note_tunnel_probe(
-                "default",
-                Some(&probe::ProbeOutcome::Internal(
-                    oxidom_core::ipc::ProbeDetail::NoCore
-                ))
-            ));
-            assert!(!shared.note_tunnel_probe("default", None));
+            assert!(!note(Some(&probe::ProbeOutcome::NoNetwork)));
+            assert!(!note(Some(&probe::ProbeOutcome::Internal(
+                oxidom_core::ipc::ProbeDetail::NoCore
+            ))));
+            assert!(!note(None));
+        }
+        for interruption in [
+            None,
+            Some(probe::ProbeOutcome::NoNetwork),
+            Some(probe::ProbeOutcome::Internal(ProbeDetail::Other)),
+        ] {
+            for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
+                assert!(!note(Some(&probe::ProbeOutcome::Timeout)));
+            }
+            assert!(!note(interruption.as_ref()));
+            for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
+                assert!(!note(Some(&probe::ProbeOutcome::Timeout)));
+            }
+            assert!(note(Some(&probe::ProbeOutcome::Timeout)));
         }
         Ok(())
     }
@@ -4504,21 +4627,281 @@ mod tests {
     }
 
     #[test]
+    fn only_aggressive_checks_may_restart_a_live_core() -> Result<()> {
+        assert_eq!(watchdog_policy(WatchdogMode::Off), None);
+        assert_eq!(
+            watchdog_policy(WatchdogMode::Conservative),
+            Some((Duration::from_secs(60), Duration::from_secs(8), 5))
+        );
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("conservative-watchdog")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.config.reconnect = true;
+            mark_active(&mut engine, "default", "one")?;
+            *oxidom_core::sync::lock(
+                &engine
+                    .sessions
+                    .get("default")
+                    .context("session")?
+                    .core
+                    .status,
+            ) = Status::Connected;
+        }
+        let generation = watchdog_test_attempt(&service.shared, WatchdogMode::Conservative)?;
+        for _ in 0..4 {
+            assert!(!service.shared.note_tunnel_probe(
+                "default",
+                generation,
+                WatchdogMode::Conservative,
+                Some(&probe::ProbeOutcome::Timeout)
+            ));
+        }
+        assert!(service.shared.note_tunnel_probe(
+            "default",
+            generation,
+            WatchdogMode::Conservative,
+            Some(&probe::ProbeOutcome::Timeout)
+        ));
+        for mode in [WatchdogMode::Conservative, WatchdogMode::Off] {
+            oxidom_core::sync::lock(&service.shared.engine)
+                .registry
+                .config
+                .watchdog = mode;
+            assert!(
+                service
+                    .shared
+                    .recover_dead_tunnel("default", generation)
+                    .is_none()
+            );
+            assert_eq!(
+                oxidom_core::sync::lock(&service.shared.engine)
+                    .sessions
+                    .get("default")
+                    .context("session")?
+                    .status(),
+                Status::Connected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_watchdog_result_cannot_stop_or_add_strikes_to_a_replacement() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("stale-watchdog")?;
+        let service = for_test();
+        let shared = &service.shared;
+        {
+            let mut engine = oxidom_core::sync::lock(&shared.engine);
+            engine.registry.config.reconnect = true;
+            engine.registry.config.watchdog = WatchdogMode::Aggressive;
+            mark_active(&mut engine, "default", "one")?;
+            *oxidom_core::sync::lock(
+                &engine
+                    .sessions
+                    .get("default")
+                    .context("session")?
+                    .core
+                    .status,
+            ) = Status::Connected;
+        }
+        let stale = watchdog_test_attempt(shared, WatchdogMode::Aggressive)?;
+        for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
+            assert!(!shared.note_tunnel_probe(
+                "default",
+                stale,
+                WatchdogMode::Aggressive,
+                Some(&probe::ProbeOutcome::Timeout)
+            ));
+        }
+        shared.next_connect_generation("default");
+        let current = watchdog_test_attempt(shared, WatchdogMode::Aggressive)?;
+        assert!(!shared.note_tunnel_probe(
+            "default",
+            stale,
+            WatchdogMode::Aggressive,
+            Some(&probe::ProbeOutcome::Timeout)
+        ));
+        assert!(shared.recover_dead_tunnel("default", stale).is_none());
+        assert_eq!(
+            oxidom_core::sync::lock(&shared.engine)
+                .sessions
+                .get("default")
+                .context("replacement")?
+                .status(),
+            Status::Connected
+        );
+        for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
+            assert!(!shared.note_tunnel_probe(
+                "default",
+                current,
+                WatchdogMode::Aggressive,
+                Some(&probe::ProbeOutcome::Timeout)
+            ));
+        }
+        assert!(shared.note_tunnel_probe(
+            "default",
+            current,
+            WatchdogMode::Aggressive,
+            Some(&probe::ProbeOutcome::Timeout)
+        ));
+        shared.invalidate_generation("default");
+        assert!(shared.recover_dead_tunnel("default", current).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn changing_watchdog_policy_does_not_inherit_another_policys_strikes() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("watchdog-policy-streak")?;
+        let service = for_test();
+        let shared = &service.shared;
+        let generation = watchdog_test_attempt(shared, WatchdogMode::Conservative)?;
+        for _ in 0..4 {
+            assert!(!shared.note_tunnel_probe(
+                "default",
+                generation,
+                WatchdogMode::Conservative,
+                Some(&probe::ProbeOutcome::Timeout)
+            ));
+        }
+        let current = watchdog_test_attempt(shared, WatchdogMode::Aggressive)?;
+        for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
+            assert!(!shared.note_tunnel_probe(
+                "default",
+                current,
+                WatchdogMode::Aggressive,
+                Some(&probe::ProbeOutcome::Timeout)
+            ));
+        }
+        assert!(shared.note_tunnel_probe(
+            "default",
+            current,
+            WatchdogMode::Aggressive,
+            Some(&probe::ProbeOutcome::Timeout)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn disabling_and_reenabling_watchdog_invalidates_in_flight_checks() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("watchdog-settings-epoch")?;
+        let service = for_test();
+        let shared = &service.shared;
+        let stale = watchdog_test_attempt(shared, WatchdogMode::Aggressive)?;
+        for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
+            assert!(!shared.note_tunnel_probe(
+                "default",
+                stale,
+                WatchdogMode::Aggressive,
+                Some(&probe::ProbeOutcome::Timeout)
+            ));
+        }
+        for mode in [WatchdogMode::Off, WatchdogMode::Aggressive] {
+            service.set_settings(serde_json::to_string(&Config {
+                watchdog: mode,
+                ..Config::default()
+            })?)?;
+        }
+        assert!(!shared.note_tunnel_probe(
+            "default",
+            stale,
+            WatchdogMode::Aggressive,
+            Some(&probe::ProbeOutcome::Timeout)
+        ));
+        assert!(shared.recover_dead_tunnel("default", stale).is_none());
+        let current = watchdog_test_attempt(shared, WatchdogMode::Aggressive)?;
+        assert_ne!(current.policy_epoch, stale.policy_epoch);
+        for _ in 0..TUNNEL_DEATH_STRIKES - 1 {
+            assert!(!shared.note_tunnel_probe(
+                "default",
+                current,
+                WatchdogMode::Aggressive,
+                Some(&probe::ProbeOutcome::Timeout)
+            ));
+        }
+        assert!(shared.note_tunnel_probe(
+            "default",
+            current,
+            WatchdogMode::Aggressive,
+            Some(&probe::ProbeOutcome::Timeout)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_retries_cannot_inherit_checks_of_the_previous_core() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("watchdog-core-incarnation")?;
+        let service = for_test();
+        configure_fake_core(&service, &root)?;
+        let id = {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            let id = engine.all_servers().next().context("server")?.id.clone();
+            let socks = engine.registry.config.socks_port;
+            let http = engine.registry.config.http_port;
+            engine.prepare_session("default", Ipv4Addr::LOCALHOST, socks, http)?;
+            engine.connect_session("default", &id)?;
+            engine.confirm_traffic("default");
+            id
+        };
+        let stale = watchdog_test_attempt(&service.shared, WatchdogMode::Aggressive)?;
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.connect_session("default", &id)?;
+            engine.confirm_traffic("default");
+        }
+        let current = watchdog_test_attempt(&service.shared, WatchdogMode::Aggressive)?;
+        assert_eq!(current.generation, stale.generation);
+        assert_ne!(current.spawn_seq, stale.spawn_seq);
+        assert!(!service.shared.note_tunnel_probe(
+            "default",
+            stale,
+            WatchdogMode::Aggressive,
+            Some(&probe::ProbeOutcome::Timeout)
+        ));
+        assert!(
+            service
+                .shared
+                .recover_dead_tunnel("default", stale)
+                .is_none()
+        );
+        assert_eq!(
+            oxidom_core::sync::lock(&service.shared.engine)
+                .sessions
+                .get("default")
+                .context("session")?
+                .reported_status(),
+            Status::Connected
+        );
+        Ok(())
+    }
+
+    #[test]
     fn reviving_a_live_but_dead_tunnel_fails_the_core_and_keeps_the_selection() -> Result<()> {
         let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("revive-live-tunnel")?;
         let service = for_test();
         {
             let mut engine = oxidom_core::sync::lock(&service.shared.engine);
-            // reconnect off and no cgroup, so the handoff to begin_reconnect is a
-            // no-op and the test stays hermetic — we assert only the local half.
-            engine.registry.config.reconnect = false;
+            // Recovery returns its target; only the watchdog starts the retry.
+            engine.registry.config.reconnect = true;
+            engine.registry.config.watchdog = WatchdogMode::Aggressive;
             mark_active(&mut engine, "default", "silent-server")?;
             let session = engine.default_session_mut().context("default session")?;
             *oxidom_core::sync::lock(&session.core.status) = Status::Connected;
         }
 
-        service.shared.recover_dead_tunnel("default");
+        let generation = watchdog_test_attempt(&service.shared, WatchdogMode::Aggressive)?;
+        assert!(
+            service
+                .shared
+                .recover_dead_tunnel("default", generation)
+                .is_some()
+        );
 
         let engine = oxidom_core::sync::lock(&service.shared.engine);
         let session = engine.sessions.get("default").context("default session")?;
@@ -4738,14 +5121,21 @@ mod tests {
         let service = for_test();
         {
             let mut engine = oxidom_core::sync::lock(&service.shared.engine);
-            engine.registry.config.reconnect = false;
+            engine.registry.config.reconnect = true;
+            engine.registry.config.watchdog = WatchdogMode::Aggressive;
             mark_active(&mut engine, "default", "silent-server")?;
             let session = engine.default_session_mut().context("default session")?;
             *oxidom_core::sync::lock(&session.core.status) = Status::Connected;
             engine.sessions.claim_system_proxy("default")?;
         }
 
-        service.shared.recover_dead_tunnel("default");
+        let generation = watchdog_test_attempt(&service.shared, WatchdogMode::Aggressive)?;
+        assert!(
+            service
+                .shared
+                .recover_dead_tunnel("default", generation)
+                .is_some()
+        );
 
         let engine = oxidom_core::sync::lock(&service.shared.engine);
         assert_eq!(engine.sessions.owner_of_system_proxy(), Some("default"));
@@ -5123,6 +5513,52 @@ mod tests {
         assert_eq!(status.active_profile.as_deref(), Some("home"));
         assert_eq!(status.active_id.as_deref(), Some("home-server"));
         assert_eq!(status.sessions.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn every_status_surface_waits_for_traffic_confirmation() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("public-confirmation-status")?;
+        let service = for_test();
+        configure_fake_core(&service, &root)?;
+        let id = {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            let id = engine
+                .all_servers()
+                .next()
+                .context("test server")?
+                .id
+                .clone();
+            let socks_port = engine.registry.config.socks_port;
+            let http_port = engine.registry.config.http_port;
+            engine.prepare_session("default", Ipv4Addr::LOCALHOST, socks_port, http_port)?;
+            engine.connect_session("default", &id)?;
+            id
+        };
+        service.shared.next_connect_generation("default");
+        let status: StatusInfo = serde_json::from_str(&service.status()?)?;
+        assert_eq!(status.state, "connecting");
+        assert_eq!(status.active_id.as_deref(), Some(id.as_str()));
+        assert_eq!(status.sessions[0].state, "connecting");
+        let sessions: Vec<SessionInfo> = serde_json::from_str(&service.list_sessions()?)?;
+        assert_eq!(sessions[0].state, "connecting");
+        let session: SessionInfo =
+            serde_json::from_str(&service.session_status("default".into())?)?;
+        assert_eq!(session.state, "connecting");
+
+        confirm_live_session(&service, "default")?;
+        let status: StatusInfo = serde_json::from_str(&service.status()?)?;
+        assert_eq!(status.state, "connected");
+        assert_eq!(status.sessions[0].state, "connected");
+        assert_eq!(
+            service
+                .shared
+                .session_info("default")
+                .context("session")?
+                .state,
+            "connected"
+        );
         Ok(())
     }
 
