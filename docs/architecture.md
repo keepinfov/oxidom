@@ -95,10 +95,14 @@ Before spawning, oxidom **resolves the binary first and then checks the ports** 
 in that order, so a busy port can never mask a missing core. Stopping is SIGTERM,
 a 2-second grace, then SIGKILL.
 
-Connecting is optimistic but *verified*: the session goes to `connected`, and then
-a confirmation step proves the tunnel actually carries traffic. If it does not, the
-session is torn back down and the reason is reported. This is why failures name a
-specific cause rather than leaving a connected-looking session that does nothing.
+Connecting remains `connecting` in public status until confirmation proves the SOCKS path
+carries traffic and the requested interface is ready. The internal process state is available
+to probes and supervision throughout. Failed confirmation reports its cause rather than
+publishing an unverified connection as connected.
+
+Synthetic tunnel checks are conservative by default: they warn without killing a live core.
+Aggressive live-core recovery is explicit; process-exit supervision is independent. Results
+belong to one core incarnation and policy epoch, not merely a profile name.
 
 **Crash recovery.** The daemon records what it did before doing it, so a crash can
 be cleaned up: orphaned Xray children, a stuck GNOME system proxy, leftover routes,
@@ -106,6 +110,8 @@ rules and TUN devices are all repaired on the next start. A recovered process is
 adopted only after checking it is really ours — the cmdline must name our config
 file, and a recovered tun2socks must name our device. The binary is
 user-configurable, so its name proves nothing.
+An exclusive store lock is acquired before loading or recovering anything, so another daemon
+cannot enter recovery against a live owner's store.
 
 The system unit deliberately uses `KillMode=process`: the cores, not the daemon,
 carry the traffic, so a daemon crash should not drop every tunnel with it. A clean

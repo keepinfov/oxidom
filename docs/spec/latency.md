@@ -16,10 +16,41 @@ Both successful and failed readings record the method actually attempted.
 
 The first HTTP request in a direct probe or connection confirmation gets a **6-second**
 `REAL_DELAY_TIMEOUT` budget for DNS, TCP and TLS/REALITY setup. A direct probe core's readiness
-wait is separate (up to 4 seconds). Periodic requests through an established session keep their
-**3-second** budget; they do not receive the cold-start allowance on every tick. Pool
+wait is separate (up to 4 seconds). Periodic latency-display requests through an established
+session keep their **3-second** budget. Separate watchdog requests use the policy below. Pool
 confirmation retains its bounded confirmation window, using the cold-start request budget
 within it rather than treating an unready balancer as a successful connection.
+
+All public status surfaces report `connecting` until the SOCKS-path confirmation succeeds and
+the requested interface has started. Starting a process or binding its listener is insufficient.
+An adopted running pool is not a fresh attempt. Internal process status remains usable by probes
+and exit supervision while confirmation is pending; terminal errors are not masked by the pending
+flag. Confirmation success is applied only to its current generation.
+
+## Tunnel watchdog (binding)
+
+This is distinct from the periodic latency display and the one-second process-exit supervisor.
+Only resilient sessions are checked, and initial confirmation is allowed to finish first.
+
+| Policy | Gap between sweeps | Request budget | Negative checks | Action |
+|---|---|---|---|---|
+| `off` | No requests | None | None | No synthetic recovery |
+| `conservative` (default) | 60 s | 8 s | 5 | Warn; retain the live core |
+| `aggressive` | 30 s | 3 s | 3 | Stop the current core and hand off to reconnect |
+
+Requests are sequential per sweep, so these gaps are not fixed per-session schedules. HEAD is
+used when configured, GET otherwise. Any HTTP response proves reachability. `Timeout` and
+`Unreachable` advance a streak; `Reachable`, `NoNetwork`, `Internal` and missing outcomes clear
+it. A timeout is not proof that a server slower than the budget is dead, which is why the default
+policy never kills a live core on this evidence alone. A local listening socket alone is not
+evidence that the outbound works either.
+
+Results and streaks belong to the profile's cancellation generation, core spawn watermark and
+watchdog policy epoch. A replacement core within the same automatic retry generation is a new
+measurement subject. Policy changes, including off-and-on between sweeps, invalidate old checks.
+Before destructive recovery, identity, current aggressive policy, resilience and confirmed state
+are checked again under the engine lock. Recovery preserves the selected server/pool and applies
+the session's existing hold/release policy. This does not add automatic single-node failover.
 
 ## Probe outcomes (binding)
 

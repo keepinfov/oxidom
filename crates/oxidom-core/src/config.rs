@@ -21,6 +21,9 @@ pub struct Config {
     /// Off by default: a client that silently redials is a client that hides a
     /// server going bad, and the user asked for explicit modes throughout.
     pub reconnect: bool,
+    /// Synthetic tunnel checks never restart a live core unless explicitly
+    /// configured as aggressive. Process-exit supervision is independent.
+    pub watchdog: WatchdogMode,
     /// What happens to a session's routes when its core exits by itself.
     /// A profile's own setting wins where it has one.
     pub on_core_exit: OnCoreExit,
@@ -87,6 +90,15 @@ pub enum OnCoreExit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum WatchdogMode {
+    Off,
+    #[default]
+    Conservative,
+    Aggressive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LatencyMethod {
     Icmp,
     Tcp,
@@ -105,6 +117,7 @@ impl Default for Config {
             system_proxy: false,
             standby_proxy: false,
             reconnect: false,
+            watchdog: WatchdogMode::default(),
             on_core_exit: OnCoreExit::default(),
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".to_string(),
@@ -177,6 +190,21 @@ mod tests {
     #[test]
     fn reconnect_off_by_default() {
         assert!(!Config::default().reconnect);
+    }
+
+    #[test]
+    fn old_settings_use_conservative_checks_and_modes_round_trip_as_literal_bytes() {
+        let older: Config = toml::from_str("reconnect = true").expect("old config parses");
+        assert_eq!(older.watchdog, WatchdogMode::Conservative);
+        for (text, mode) in [
+            (r#""off""#, WatchdogMode::Off),
+            (r#""conservative""#, WatchdogMode::Conservative),
+            (r#""aggressive""#, WatchdogMode::Aggressive),
+        ] {
+            assert_eq!(serde_json::from_str::<WatchdogMode>(text).unwrap(), mode);
+            assert_eq!(serde_json::to_string(&mode).unwrap(), text);
+        }
+        assert!(toml::from_str::<Config>("watchdog = 'unknown'").is_err());
     }
 
     /// Empty means the built-in default rather than "no source at all", which

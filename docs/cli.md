@@ -191,6 +191,9 @@ Text output is tab-separated, except `sessions`, which is a padded table with
 columns `PROFILE STATE SERVER ADDRESS [DEVICE] LATENCY`. `DEVICE` appears only
 when at least one session has an interface; missing values render as `—`.
 
+`connecting` includes verification: the process must carry an HTTP request through SOCKS,
+and any requested interface must be ready, before status becomes `connected`.
+
 `STATE` reads `holding` for a session whose core exited while it kept its routes:
 its traffic is being dropped rather than sent out unprotected. See
 [when the core dies](routing.md#when-the-core-dies). In `--json` that is the

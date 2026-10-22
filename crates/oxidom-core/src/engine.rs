@@ -620,6 +620,8 @@ pub struct Session {
     /// Name of the profile that started this session. This is the runtime key.
     pub profile: String,
     pub core: XrayCore,
+    /// Runtime-only: a newly started core has not yet proved it carries traffic.
+    pub confirmation_pending: bool,
     pub address: Ipv4Addr,
     pub socks_port: u16,
     pub http_port: u16,
@@ -664,6 +666,7 @@ impl Session {
     ) -> Self {
         Self {
             core: XrayCore::new(profile.clone(), socks_port, http_port, xray_binary),
+            confirmation_pending: false,
             profile,
             address,
             socks_port,
@@ -687,6 +690,7 @@ impl Session {
         self.selection = None;
         self.api_port = 0;
         self.balancer_info = None;
+        self.confirmation_pending = true;
         self.core
             .connect(server, self.address, &self.profile, &self.core_options)?;
         self.selection = Some(SessionSelection::Server(server.id.clone()));
@@ -709,6 +713,7 @@ impl Session {
         self.api_port = 0;
         self.balancer_info = None;
         let member_refs = members.iter().collect::<Vec<_>>();
+        self.confirmation_pending = true;
         self.core.connect_pool(
             &crate::xray::config::PoolSpec {
                 members: &member_refs,
@@ -738,6 +743,7 @@ impl Session {
 
     pub fn disconnect(&mut self) {
         self.core.disconnect();
+        self.confirmation_pending = false;
         self.selection = None;
         self.api_port = 0;
         self.pool_name.clear();
@@ -756,6 +762,14 @@ impl Session {
 
     pub fn status(&self) -> Status {
         self.core.status()
+    }
+
+    /// Client-facing status; internal probes and supervision use [`Self::status`].
+    pub fn reported_status(&self) -> Status {
+        match self.status() {
+            Status::Connected if self.confirmation_pending => Status::Connecting,
+            status => status,
+        }
     }
 
     pub fn is_alive(&mut self) -> bool {
@@ -1361,12 +1375,13 @@ impl Engine {
         true
     }
 
-    /// The core has been confirmed to carry traffic, so a session that was
-    /// holding its routes is no longer holding them.
+    /// The core has been confirmed to carry traffic, ending pending confirmation
+    /// and any hold on its routes.
     pub fn confirm_traffic(&mut self, profile: &str) {
         let Some(session) = self.sessions.get_mut(profile) else {
             return;
         };
+        session.confirmation_pending = false;
         session.holding_traffic = false;
     }
 
@@ -2776,6 +2791,11 @@ mod tests {
                 if members == &["one".to_string(), "two".to_string()]
         ));
         assert_eq!(session.status(), crate::xray::core::Status::Connected);
+        assert!(!session.confirmation_pending);
+        assert_eq!(
+            session.reported_status(),
+            crate::xray::core::Status::Connected
+        );
 
         drop(engine);
         child.wait()?;
@@ -2947,6 +2967,142 @@ mod tests {
         )?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
         Ok(path.display().to_string())
+    }
+
+    #[test]
+    fn a_started_single_session_is_connecting_until_its_own_traffic_is_confirmed() -> Result<()> {
+        use crate::xray::core::Status;
+
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("single-confirmation-pending")?;
+        let mut engine = Engine::load();
+        engine.registry.config.xray_binary = fake_core_binary(&root.path)?;
+        let server = parse_link("trojan://invented@one.example:443#One").context("test server")?;
+        for (profile, octet) in [("work", 1), ("home", 2)] {
+            engine.prepare_session(profile, Ipv4Addr::new(127, 72, 16, octet), 12380, 12381)?;
+            let session = engine
+                .sessions
+                .get_mut(profile)
+                .context("prepared session")?;
+            assert!(!session.confirmation_pending);
+            session.connect(&server)?;
+        }
+
+        for profile in ["work", "home"] {
+            let session = engine.sessions.get(profile).context("started session")?;
+            assert!(session.child_pid().is_some());
+            assert!(session.confirmation_pending);
+            assert_eq!(session.status(), Status::Connected);
+            assert_eq!(session.reported_status(), Status::Connecting);
+        }
+
+        engine.confirm_traffic("missing");
+        engine.confirm_traffic("work");
+        assert_eq!(
+            engine
+                .sessions
+                .get("work")
+                .context("work session")?
+                .reported_status(),
+            Status::Connected
+        );
+        assert_eq!(
+            engine
+                .sessions
+                .get("home")
+                .context("home session")?
+                .reported_status(),
+            Status::Connecting
+        );
+        let session = engine
+            .sessions
+            .get_mut("work")
+            .context("confirmed session")?;
+        assert!(!session.confirmation_pending);
+        session.connect(&server)?;
+        assert!(session.confirmation_pending);
+        assert_eq!(session.reported_status(), Status::Connecting);
+
+        let session = engine
+            .sessions
+            .get_mut("home")
+            .context("unconfirmed session")?;
+        session.disconnect();
+        assert!(!session.confirmation_pending);
+        assert_eq!(session.reported_status(), Status::Disconnected);
+        Ok(())
+    }
+
+    #[test]
+    fn a_started_pool_session_is_connecting_until_traffic_is_confirmed() -> Result<()> {
+        use crate::xray::core::Status;
+
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("pool-confirmation-pending")?;
+        let mut engine = Engine::load();
+        engine.registry.config.xray_binary = fake_core_binary(&root.path)?;
+        engine.prepare_session("spread", Ipv4Addr::new(127, 72, 16, 3), 12380, 12381)?;
+        let members = [
+            parse_link("trojan://invented-one@one.example:443#One").context("first member")?,
+            parse_link("trojan://invented-two@two.example:443#Two").context("second member")?,
+        ];
+        engine
+            .sessions
+            .get_mut("spread")
+            .context("prepared session")?
+            .connect_pool(
+                &members,
+                &PoolSession {
+                    name: "pool",
+                    strategy: "random",
+                    expected: members.len(),
+                    probe_interval: "10s",
+                    api_port: 12382,
+                },
+            )?;
+
+        let session = engine.sessions.get("spread").context("started pool")?;
+        assert!(session.child_pid().is_some());
+        assert!(session.confirmation_pending);
+        assert_eq!(session.status(), Status::Connected);
+        assert_eq!(session.reported_status(), Status::Connecting);
+
+        engine.confirm_traffic("spread");
+        let session = engine.sessions.get("spread").context("confirmed pool")?;
+        assert!(!session.confirmation_pending);
+        assert_eq!(session.status(), Status::Connected);
+        assert_eq!(session.reported_status(), Status::Connected);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_confirmation_only_masks_a_raw_connected_status() {
+        use crate::xray::core::Status;
+
+        let mut session = Session::new(
+            "work".to_string(),
+            Ipv4Addr::LOCALHOST,
+            12380,
+            12381,
+            String::new(),
+            ResolvedCore::default(),
+        );
+        for (raw, pending) in [
+            (Status::Disconnected, Status::Disconnected),
+            (Status::Connecting, Status::Connecting),
+            (Status::Connected, Status::Connecting),
+            (
+                Status::Error("core exited".to_string()),
+                Status::Error("core exited".to_string()),
+            ),
+        ] {
+            *crate::sync::lock(&session.core.status) = raw.clone();
+            session.confirmation_pending = false;
+            assert_eq!(session.reported_status(), raw);
+            session.confirmation_pending = true;
+            assert_eq!(session.reported_status(), pending);
+            assert_eq!(session.status(), raw);
+        }
     }
 
     /// The state a live interface is in, hand-built because planning one

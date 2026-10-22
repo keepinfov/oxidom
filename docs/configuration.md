@@ -68,6 +68,7 @@ http_port  = 10809
 system_proxy = false
 standby_proxy = false
 reconnect = false
+watchdog = "conservative"
 on_core_exit = "hold"
 latency_method = "http_get"
 latency_test_url = "https://www.gstatic.com/generate_204"
@@ -86,6 +87,7 @@ nft_binary = ""
 | `system_proxy` | bool | `false` | Whether a connected session takes over the GNOME system proxy. See [routing.md](routing.md#gnome-system-proxy). |
 | `standby_proxy` | bool | `false` | Opt in to direct SOCKS/HTTP on `127.0.0.1` at the configured ports only while no profile session is connected, connecting or holding traffic. See [Direct standby](#direct-standby). |
 | `reconnect` | bool | `false` | Redial when the core exits **unexpectedly** — never after you asked for `down`. Opt-in on purpose: a tunnel that silently comes back is a tunnel you cannot turn off. |
+| `watchdog` | `"off"` \| `"conservative"` \| `"aggressive"` | `"conservative"` | Synthetic checks for automatically recovered sessions. Conservative warns after five failed checks (8 s request budget, 60 s between sweeps) but keeps a live core. Aggressive restarts after three failures (3 s, 30 s between sweeps). Off disables these checks, not process-exit supervision. Also selectable in Settings. |
 | `on_core_exit` | `"hold"` \| `"release"` | `"hold"` | What happens to a session's routes when its core exits by itself. `hold` keeps them, so traffic for that tunnel is **dropped** until it reconnects or you stop it. `release` removes them immediately, and your apps fall back to the ordinary connection with your own address. A profile's own `on_core_exit` wins. An explicit `down` always releases. |
 | `latency_method` | enum | `"http_get"` | One of `icmp`, `tcp`, `http_head`, `http_get`. |
 | `latency_test_url` | string | `https://www.gstatic.com/generate_204` | Target for the HTTP probe methods. |
@@ -411,8 +413,9 @@ files in your home directory. A session daemon installs into
 
 ## File handling
 
-- Every write is **atomic** — a temp file and a rename, so a crash mid-write cannot
-  truncate your subscriptions.
+- Every replacement uses an exclusively created private temporary file, file fsync, rename
+  and directory fsync. Newly created directory entries are synchronized too. Errors are
+  reported; a post-rename sync failure means publication happened but durability is unconfirmed.
 - Files are created `0600` and their parent directories `0700`. Generated Xray
   configs contain credentials and are no exception.
 - A file that cannot be parsed is **never overwritten**. It is renamed to
@@ -421,6 +424,9 @@ files in your home directory. A session daemon installs into
 - `config.toml` and `state.toml` are **owned by the daemon**. Hand-editing them
   while a daemon is running will be overwritten; stop it first, or go through the
   GUI or `oxidom profile edit`.
+- The daemon holds `store.lock` before reading or recovering its data directory. A second
+  daemon targeting that directory refuses to start. Do not delete the lock file to unlock it;
+  the operating system releases the lock when its owner exits.
 
 ---
 

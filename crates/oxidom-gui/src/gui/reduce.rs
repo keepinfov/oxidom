@@ -105,6 +105,8 @@ pub(super) struct SnapshotState {
     pending_since: Instant,
     /// Latest status reported by the daemon.
     pub daemon_status: Status,
+    /// A failed poll says nothing about whether the last known tunnels survived.
+    pub poll_error: Option<String>,
     /// True while the daemon is serving a direct standby proxy on `default`'s
     /// ports because nothing is connected.
     pub standby_proxy: bool,
@@ -213,6 +215,7 @@ impl SnapshotState {
             pending_profile: "default".to_string(),
             pending_since: Instant::now(),
             daemon_status: status.to_status(),
+            poll_error: None,
             standby_proxy: status.standby_proxy,
             failed_id: None,
             route_target: route_target(status),
@@ -336,6 +339,38 @@ impl SnapshotState {
     pub fn clear_pin(&mut self) {
         self.pending_status = None;
     }
+
+    /// Return true only for a new, current polling failure.
+    pub fn poll_failed(&mut self, epoch: u64, error: String) -> bool {
+        if epoch < self.state_epoch || self.poll_error.as_ref() == Some(&error) {
+            return false;
+        }
+        self.poll_error = Some(error);
+        true
+    }
+}
+
+/// The recovery record must outlive a failed desktop-proxy clear.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct SystemProxyState {
+    pub applied: bool,
+    pub endpoint: Option<(std::net::Ipv4Addr, u16, u16)>,
+    /// A failed intent write may have published a marker without touching GNOME.
+    pub marker_only: bool,
+}
+
+impl SystemProxyState {
+    pub fn intent_failed(&mut self) {
+        if !self.applied {
+            self.marker_only = true;
+        }
+    }
+
+    pub fn cleared(&mut self, succeeded: bool) {
+        if succeeded {
+            *self = Self::default();
+        }
+    }
 }
 
 /// How long a pinned status may outrank the daemon. Long enough that a slow
@@ -414,6 +449,7 @@ pub(super) fn reduce(
     if snapshot.epoch < state.state_epoch {
         return None;
     }
+    state.poll_error = None;
     let mut effects = Vec::new();
     let mut toast_unreachable = false;
     let mut toast_no_network = false;
@@ -1390,7 +1426,7 @@ pub(super) enum SessionRowState {
     Connecting,
     Connected,
     Error,
-    /// A state string this build does not know. Kept apart from `Stopped`
+    /// An unreadable state or an unavailable daemon. Kept apart from `Stopped`
     /// because it is a different claim: "stopped" with the switch off is a
     /// definite answer, and a newer daemon would have been given it wrongly.
     Unknown,
@@ -1704,7 +1740,7 @@ pub(super) fn session_rows(
                 details.push(SessionDetail::new("Description", entry.description.clone()));
             }
 
-            SessionRow {
+            let mut row = SessionRow {
                 profile: entry.name.clone(),
                 state: row_state,
                 headline: session_headline(row_state, &selection, session),
@@ -1718,7 +1754,19 @@ pub(super) fn session_rows(
                 ),
                 busy: in_flight.is_some(),
                 error: session.and_then(|session| session.error.clone()),
+            };
+            if state.poll_error.is_some() {
+                row.state = SessionRowState::Unknown;
+                row.headline = "Tunnel state unknown - daemon polling failed".into();
+                row.latency = None;
+                row.warning = None;
+                row.busy = true;
+                row.details.insert(
+                    0,
+                    SessionDetail::new("Status", "Last known daemon snapshot"),
+                );
             }
+            row
         })
         .collect()
 }
@@ -1747,7 +1795,11 @@ pub(super) fn switcher_items(
         .iter()
         .map(|entry| SwitcherItem {
             profile: entry.name.clone(),
-            state: session_row_state(session_for(state, &entry.name)),
+            state: if state.poll_error.is_some() {
+                SessionRowState::Unknown
+            } else {
+                session_row_state(session_for(state, &entry.name))
+            },
             selected: entry.name == state.selected_profile,
         })
         .collect()
@@ -2954,6 +3006,79 @@ mod tests {
 
     fn state() -> SnapshotState {
         SnapshotState::new(&StatusInfo::default())
+    }
+
+    #[test]
+    fn a_failed_poll_marks_state_unknown_without_forgetting_sessions_and_recovers() {
+        let status = StatusInfo {
+            state: "connected".into(),
+            active_id: Some("node".into()),
+            sessions: vec![SessionInfo {
+                owns_system_proxy: true,
+                ..session("work", "connected", "node")
+            }],
+            ..StatusInfo::default()
+        };
+        let mut state = SnapshotState::new(&status);
+        state.selected_profile = "work".into();
+        state.state_epoch = 2;
+        assert!(state.poll_failed(2, "daemon unavailable".into()));
+        assert_eq!(state.poll_error.as_deref(), Some("daemon unavailable"));
+        assert!(!state.poll_failed(2, "daemon unavailable".into()));
+        assert!(!state.poll_failed(1, "obsolete failure".into()));
+        assert_eq!(state.poll_error.as_deref(), Some("daemon unavailable"));
+        assert_eq!(state.connected_id.as_deref(), Some("node"));
+        assert_eq!(state.sessions, status.sessions);
+        assert_eq!(selected_status(&state), Status::Connected);
+        let rows = session_rows(&[profile("work", "node")], &state, NOW_MS);
+        assert_eq!(rows[0].state, SessionRowState::Unknown);
+        assert!(rows[0].busy);
+        assert!(rows[0].toggle_on, "unknown must not imply stopped");
+        assert!(rows[0].headline.contains("unknown"));
+        assert_eq!(rows[0].latency, None);
+
+        let mut fresh = snapshot(status, probe(&[], &[]));
+        assert!(reduce(&mut state, &fresh, Instant::now(), NOW_MS, true).is_none());
+        assert!(
+            state.poll_error.is_some(),
+            "a stale success is not recovery"
+        );
+        assert!(state.poll_failed(2, "another polling error".into()));
+        fresh.epoch = 2;
+        fold(&mut state, &fresh, Instant::now(), true);
+        assert_eq!(state.poll_error, None);
+        let rows = session_rows(&[profile("work", "node")], &state, NOW_MS);
+        assert_eq!(rows[0].state, SessionRowState::Connected);
+        assert!(!rows[0].busy);
+        assert!(state.poll_failed(2, "daemon unavailable".into()));
+    }
+
+    #[test]
+    fn a_failed_proxy_clear_keeps_its_recovery_record_until_success() {
+        let mut state = SystemProxyState {
+            applied: true,
+            endpoint: Some(("127.31.8.1".parse().unwrap(), 10808, 10809)),
+            marker_only: false,
+        };
+        let applied = state;
+        state.cleared(false);
+        assert_eq!(state, applied);
+        state.cleared(true);
+        assert_eq!(state, SystemProxyState::default());
+        state.applied = true;
+        state.cleared(false);
+        assert!(state.applied, "a recovered crash marker must survive too");
+        state.cleared(true);
+        state.intent_failed();
+        assert!(
+            !state.applied,
+            "failed intent is not permission to clear GNOME"
+        );
+        assert!(state.marker_only);
+        state.cleared(false);
+        assert!(state.marker_only);
+        state.cleared(true);
+        assert_eq!(state, SystemProxyState::default());
     }
 
     fn profile(name: &str, server: &str) -> ProfileEntry {
