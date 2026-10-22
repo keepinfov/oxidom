@@ -32,6 +32,7 @@ use super::reduce::{
 };
 use super::server_card::{self, LatencyState};
 use super::sidebar::{Page, Sidebar};
+use super::startup::{self, InitialData};
 use super::tray::{OxidomTray, TrayCommand};
 use super::views::logs::LogsView;
 use super::views::profile_dialog::{
@@ -434,8 +435,8 @@ impl Splash {
         }
     }
 
-    fn set_stage(&self, stage: ConnectStage) {
-        self.stage.set_label(stage_text(stage));
+    fn set_stage(&self, stage: &str) {
+        self.stage.set_label(stage);
     }
 
     /// Take the splash down because the connection finished, not because the
@@ -455,7 +456,7 @@ fn stage_text(stage: ConnectStage) -> &'static str {
     }
 }
 
-/// Reach the daemon off the main loop, then build the window with it.
+/// Reach the daemon and load its initial state off the main loop, then build.
 ///
 /// `on_ready` receives the window, or `None` when the daemon could not be
 /// reached at all (the error is already on screen by then). Splitting this out
@@ -492,14 +493,25 @@ pub fn start(
     let splash = RefCell::new((!background).then(|| Splash::new(app, cancelled.clone())));
 
     let (stage_sender, stage_receiver) = mpsc::channel();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let client = DaemonClient::connect_any(|stage| {
-            log::info!("daemon connection: {}", stage_text(stage));
-            let _ = stage_sender.send(stage);
-        });
-        let _ = sender.send(client.map_err(|error| format!("{error:#}")));
-    });
+    let receiver = startup::spawn(
+        {
+            let stage_sender = stage_sender.clone();
+            move || {
+                DaemonClient::connect_any(|stage| {
+                    let text = stage_text(stage);
+                    log::info!("daemon connection: {text}");
+                    let _ = stage_sender.send(text);
+                })
+                .map_err(|error| format!("{error:#}"))
+            }
+        },
+        move |client| {
+            let text = "Loading daemon state...";
+            log::info!("daemon connection: {text}");
+            let _ = stage_sender.send(text);
+            InitialData::load(client)
+        },
+    );
 
     let app = app.clone();
     let on_ready = Rc::new(on_ready);
@@ -523,13 +535,13 @@ pub fn start(
             }
         };
         match outcome {
-            Ok(client) => {
+            Ok((client, initial)) => {
                 // Built and presented *before* the splash comes down. Taking
                 // the splash away first leaves the application with no window
                 // at all for a moment, and a desktop that follows a launch by
                 // watching for its window sees the launch abandoned rather
                 // than finished — which is a busy cursor that never clears.
-                let window = build(&app, background, client, startup_id.take());
+                let window = build(&app, background, client, initial, startup_id.take());
                 if let Some(splash) = splash.borrow_mut().take() {
                     splash.dismiss();
                 }
@@ -592,6 +604,7 @@ fn build(
     app: &adw::Application,
     background: bool,
     client: DaemonClient,
+    initial: InitialData,
     startup_id: Option<String>,
 ) -> adw::ApplicationWindow {
     if client.source() != DaemonSource::System {
@@ -600,44 +613,23 @@ fn build(
             client.source()
         );
     }
-    // `ok()` rather than a default: GuiPrefs::load must know whether the list
-    // was read or the call failed, or a daemon restarting right now would let
-    // the prune erase the saved subscription order.
-    let fetched_subscriptions = client.subscriptions().ok();
-    let subscriptions_snapshot = fetched_subscriptions.clone().unwrap_or_default();
-    let profiles_snapshot = client.list_profiles().unwrap_or_default();
-    let initial_status = client.status();
-    let initial_poll_error = initial_status
-        .as_ref()
-        .err()
-        .map(|error| format!("{error:#}"));
-    let initial_status = initial_status.unwrap_or_default();
-    let (initial_config, watchdog_supported) =
-        client.settings_with_watchdog_support().unwrap_or_default();
-    // A daemon older than RuntimeInfo answers UnknownMethod; `None` just
-    // leaves the settings rows unlocked and the effective path unknown.
-    let initial_runtime = client.runtime_info().ok();
-    // Asked once, here: whether this daemon can install geo data, and which
-    // daemon it is. Together they decide whether the Settings page may offer a
-    // button at all — a system service too old to know the method cannot be
-    // helped by anything this process downloads into the user's home.
+    let InitialData {
+        subscriptions: fetched_subscriptions,
+        profiles: profiles_snapshot,
+        status: initial_status,
+        ui,
+        config: initial_config,
+        watchdog_supported,
+        runtime: initial_runtime,
+        geo_download_supported,
+        probe_cancel_supported,
+    } = initial;
     let daemon_source = client.source();
-    let geo_download_supported = client.supports_geo_download();
-    // Asked once, here, because the answer decides whether the latency controls
-    // may offer a stop at all. A session daemon left running from an older
-    // version is the realistic case: the packages pin the daemon to the same
-    // version as the interface, but a running process is not upgraded by an
-    // install.
-    let probe_cancel_supported = client.supports_probe_cancel();
     let selected_id = initial_status.active_id.clone();
     let servers = ServersView::new(fetched_subscriptions.as_deref());
-    let mut ui = SnapshotState::new(&initial_status);
-    if let Some(error) = initial_poll_error {
-        ui.poll_failed(0, error);
-    }
     let state = Rc::new(RefCell::new(AppState {
         client,
-        subscriptions: subscriptions_snapshot,
+        subscriptions: fetched_subscriptions.unwrap_or_default(),
         profiles: profiles_snapshot,
         selected_id,
         ui,

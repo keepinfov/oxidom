@@ -67,6 +67,29 @@ database**. The GUI must not make that choice by accident:
   logged, and the connection runs off the main loop behind a startup window that says which step
   it is on. Never make the user stare at nothing while a daemon is being reached.
 
+Discovery uses monotonic phase deadlines covering transport setup, authentication/Hello, proxy
+construction and the readiness `Status` call, not merely the wait for a method reply:
+
+- `connect_any`: the whole system phase has 10 seconds, including its first attempt and any
+  installed-policy grace retries; the existing session phase has 2 seconds; starting and reaching
+  a session daemon has 6 seconds. Quick confirmed absence or access denial advances immediately
+  unless installed-system grace applies. Retries and sleeps share their phase's remaining budget.
+- `connect_existing`: at most 2 seconds per bus, without installed-system grace or an explicit
+  session-daemon spawn. Ordinary D-Bus system-service activation is still possible.
+- A timeout, `NoReply`, or other indeterminate readiness failure returns an error. It is not
+  evidence that the system name is unowned and must not select another database. Confirmed
+  absence, a missing/refusing bus socket, or access denial can permit fallback.
+- Check the spawned child's exit while waiting. After exit, allow up to 2 seconds of same-session
+  readiness within the original 6-second budget: another starter may have won the store lock.
+  If no daemon answers, report the original exit status. Never kill a daemon on discovery timeout.
+
+These are cooperative I/O deadlines, not hard real-time limits on synchronous callbacks,
+filesystem lookup or process spawning. On expiry, drop pending async setup; zbus's Unix connect
+can already be running as uncancellable blocking work, so the persistent discovery runtime caps
+such blocking work at one thread. Normal RPCs retain a separate 300-second per-reply limit, not
+an aggregate startup, hydration or subscription-update deadline. No mutating request is retried
+because of a client timeout.
+
 ## Reading the log over D-Bus (binding)
 
 `LogsSince(after_seq: u64, limit: u32) -> String` returns a JSON `LogSlice`: the records following

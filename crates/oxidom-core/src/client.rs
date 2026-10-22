@@ -1,10 +1,13 @@
 //! Blocking D-Bus client for the oxidom daemon. All calls can block for the
 //! duration of a daemon operation — never call these on the GTK main thread.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::ipc::{
@@ -15,20 +18,20 @@ use crate::model::Subscription;
 use crate::profile::Profile;
 use crate::run::CgroupSlice;
 
-/// Ceiling on any single daemon call. zbus waits forever by default, and a
-/// daemon that stops replying — wedged on its engine lock, killed mid-call —
-/// would otherwise pin the UI's operation slot for the rest of the session,
-/// refusing every later action with "another operation is still running".
-/// Sized past the slowest legitimate call: `RefreshAll` fetches each
-/// subscription in turn, each with its own 30s HTTP cap.
+/// Ordinary per-reply limit, separate from discovery's end-to-end budgets.
+/// This is not a total operation deadline: RefreshAll can queue and fetch many
+/// subscriptions sequentially, and even sending a call precedes its reply timer.
 const METHOD_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// How long an installed-but-silent system daemon is waited for before the GUI
-/// gives up and runs one of its own. The window it covers is the seconds
-/// between a desktop session autostarting the GUI and the systemd unit claiming
-/// its bus name; a daemon that is genuinely broken is not worth more than this.
+/// Discovery includes connection, authentication, Hello, proxy setup and Status.
+/// An unanswered attempt is indeterminate, never permission to switch databases.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// The entire patient system phase, including its first attempt and retries.
 const SYSTEM_DAEMON_GRACE: Duration = Duration::from_secs(10);
 const SYSTEM_DAEMON_RETRY: Duration = Duration::from_millis(250);
+const SESSION_STARTUP: Duration = Duration::from_secs(6);
+const SESSION_RETRY: Duration = Duration::from_millis(150);
+const SESSION_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// Where a D-Bus system policy file for the daemon would be installed. Its
 /// presence is what tells "no system daemon on this machine" (nothing to wait
@@ -134,26 +137,208 @@ fn name_unowned(error: &zbus::Error) -> bool {
             name.as_str(),
             "org.freedesktop.DBus.Error.ServiceUnknown"
                 | "org.freedesktop.DBus.Error.NameHasNoOwner"
-                | "org.freedesktop.DBus.Error.NoReply"
                 | "org.freedesktop.DBus.Error.Spawn.ChildSignaled"
                 | "org.freedesktop.DBus.Error.Spawn.ChildExited"
+        ),
+        zbus::Error::FDO(error) => matches!(
+            error.as_ref(),
+            zbus::fdo::Error::ServiceUnknown(_)
+                | zbus::fdo::Error::NameHasNoOwner(_)
+                | zbus::fdo::Error::SpawnChildSignaled(_)
+                | zbus::fdo::Error::SpawnChildExited(_)
         ),
         _ => false,
     }
 }
 
-impl DaemonClient {
-    fn try_bus(system: bool, source: DaemonSource) -> zbus::Result<Self> {
-        let builder = if system {
-            zbus::blocking::connection::Builder::system()?
+fn bus_unavailable(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(name, ..) => {
+            name.as_str() == "org.freedesktop.DBus.Error.AccessDenied"
+        }
+        zbus::Error::FDO(error) => matches!(error.as_ref(), zbus::fdo::Error::AccessDenied(_)),
+        zbus::Error::InputOutput(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::PermissionDenied
+        ),
+        _ => false,
+    }
+}
+
+fn block_discovery<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    // Connections retain reactor tasks after discovery returns. A temporary
+    // runtime would strand them; avoid relying on zbus's hidden block_on API.
+    static RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                // zbus 5.18 uses a blocking Unix connect that may outlive our
+                // cancelled future (e.g. a full socket backlog). Its Task drop
+                // aborts queued work, but cannot stop a running connect. Bound
+                // those uncancellable connects to one on this persistent runtime.
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+        })
+        .as_ref()
+        .map_err(|_| anyhow!("could not create the daemon discovery runtime"))?
+        .block_on(future)
+}
+
+async fn before_deadline<T>(
+    deadline: Instant,
+    future: impl Future<Output = zbus::Result<T>>,
+) -> zbus::Result<T> {
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => {
+            Err(zbus::fdo::Error::TimedOut("daemon discovery deadline expired".into()).into())
+        }
+        result = future, if Instant::now() < deadline => result,
+    }
+}
+
+async fn find_existing<T, F, Fut>(
+    progress: &impl Fn(ConnectStage),
+    patient: bool,
+    installed: bool,
+    attempt: &mut F,
+) -> Result<Option<(T, DaemonSource)>>
+where
+    F: FnMut(DaemonSource) -> Fut,
+    Fut: Future<Output = zbus::Result<T>>,
+{
+    let deadline = Instant::now()
+        + if patient {
+            SYSTEM_DAEMON_GRACE
         } else {
-            zbus::blocking::connection::Builder::session()?
+            DISCOVERY_TIMEOUT
         };
-        let connection = builder.method_timeout(METHOD_TIMEOUT).build()?;
-        let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE)?;
+    progress(ConnectStage::System);
+    let mut waiting = false;
+    loop {
+        if Instant::now() >= deadline {
+            if !waiting {
+                bail!("system daemon discovery timed out; refusing to switch databases");
+            }
+            // A pending attempt expires as an error below. Only confirmed
+            // absence permits fallback at the end of installed grace.
+            log::warn!(
+                "the installed system daemon remained absent through its startup grace; \
+                 falling back to a session daemon, which keeps its own subscriptions"
+            );
+            break;
+        }
+        match before_deadline(deadline, attempt(DaemonSource::System)).await {
+            Ok(client) => return Ok(Some((client, DaemonSource::System))),
+            Err(error) if name_unowned(&error) => {
+                if !patient || !installed {
+                    break;
+                }
+                if !waiting {
+                    waiting = true;
+                    progress(ConnectStage::WaitingForSystem);
+                }
+                let now = Instant::now();
+                if now < deadline {
+                    tokio::time::sleep_until((now + SYSTEM_DAEMON_RETRY).min(deadline)).await;
+                }
+            }
+            Err(error) if bus_unavailable(&error) => break,
+            Err(error) => {
+                return Err(anyhow!(error).context(
+                    "could not determine system daemon readiness; refusing to switch databases",
+                ));
+            }
+        }
+    }
+    progress(ConnectStage::Session);
+    match before_deadline(
+        Instant::now() + DISCOVERY_TIMEOUT,
+        attempt(DaemonSource::Session),
+    )
+    .await
+    {
+        Ok(client) => Ok(Some((client, DaemonSource::Session))),
+        Err(error) if name_unowned(&error) || bus_unavailable(&error) => Ok(None),
+        Err(error) => Err(anyhow!(error).context("could not determine session daemon readiness")),
+    }
+}
+
+async fn wait_spawned<T, F, Fut>(
+    deadline: Instant,
+    attempt: &mut F,
+    mut check_child: impl FnMut() -> Result<()>,
+) -> Result<T>
+where
+    F: FnMut(DaemonSource) -> Fut,
+    Fut: Future<Output = zbus::Result<T>>,
+{
+    let readiness = async {
+        loop {
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for the session daemon to become ready");
+            }
+            match before_deadline(deadline, attempt(DaemonSource::Spawned)).await {
+                Ok(client) => return Ok(client),
+                Err(error) if name_unowned(&error) => {}
+                Err(error) => {
+                    return Err(
+                        anyhow!(error).context("could not reach the started session daemon")
+                    );
+                }
+            }
+            let now = Instant::now();
+            if now < deadline {
+                tokio::time::sleep_until((now + SESSION_RETRY).min(deadline)).await;
+            }
+        }
+    };
+    let child_exit = async {
+        loop {
+            if let Err(error) = check_child() {
+                return error;
+            }
+            if Instant::now() >= deadline {
+                return anyhow!("timed out waiting for the session daemon to become ready");
+            }
+            let now = Instant::now();
+            if now < deadline {
+                tokio::time::sleep_until((now + SESSION_RETRY).min(deadline)).await;
+            }
+        }
+    };
+    tokio::pin!(readiness);
+    let exit_error = tokio::select! {
+        biased;
+        error = child_exit => error,
+        result = &mut readiness => return result,
+    };
+    // Another client may have won the store lock. Keep the in-flight readiness
+    // and absence retries on this same session bus, without spawning again.
+    let final_deadline = deadline.min(Instant::now() + SESSION_EXIT_GRACE);
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(final_deadline) => Err(exit_error),
+        result = readiness, if Instant::now() < final_deadline => result.or(Err(exit_error)),
+    }
+}
+
+impl DaemonClient {
+    async fn try_bus(source: DaemonSource) -> zbus::Result<zbus::Proxy<'static>> {
+        let builder = if source == DaemonSource::System {
+            zbus::connection::Builder::system()?
+        } else {
+            zbus::connection::Builder::session()?
+        };
+        let connection = builder.method_timeout(METHOD_TIMEOUT).build().await?;
+        let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
         // Reject name owners that don't answer: a real daemon replies fast.
-        let _: String = proxy.call("Status", &())?;
-        Ok(DaemonClient { proxy, source })
+        let _: String = proxy.call("Status", &()).await?;
+        Ok(proxy)
     }
 
     /// Which daemon this client is driving.
@@ -175,63 +360,52 @@ impl DaemonClient {
     /// `progress` is called on the calling thread before each step, so a caller
     /// that runs this off the main loop can report what it is waiting on.
     pub fn connect_any(progress: impl Fn(ConnectStage)) -> Result<Self> {
-        if let Some(client) = Self::find_existing(&progress, true) {
-            return Ok(client);
-        }
-
-        progress(ConnectStage::Starting);
-        let executable = daemon_binary();
-        std::process::Command::new(&executable)
-            .arg("daemon")
-            .spawn()
-            .with_context(|| format!("spawning a session daemon with {}", executable.display()))?;
-        for _ in 0..40 {
-            std::thread::sleep(Duration::from_millis(150));
-            if let Ok(client) = Self::try_bus(false, DaemonSource::Spawned) {
+        let (proxy, source) = block_discovery(async {
+            if let Some(client) = find_existing(
+                &progress,
+                true,
+                system_daemon_installed(),
+                &mut Self::try_bus,
+            )
+            .await?
+            {
                 return Ok(client);
             }
-        }
-        bail!("could not reach or start the oxidom daemon")
+
+            progress(ConnectStage::Starting);
+            let deadline = Instant::now() + SESSION_STARTUP;
+            let executable = daemon_binary();
+            let mut child = std::process::Command::new(&executable)
+                .arg("daemon")
+                .spawn()
+                .context("spawning a session daemon")?;
+            let proxy = wait_spawned(deadline, &mut Self::try_bus, || {
+                if let Some(status) = child.try_wait().context("checking the session daemon")? {
+                    bail!("the session daemon exited before becoming ready ({status})");
+                }
+                Ok(())
+            })
+            .await?;
+            // Dropping Child does not kill it, including on discovery timeout.
+            Ok((proxy, DaemonSource::Spawned))
+        })?;
+        Ok(Self {
+            proxy: proxy.into(),
+            source,
+        })
     }
 
     /// Reach an already running daemon without starting a private session
     /// daemon. Read-only CLI commands use this so a status check never changes
     /// machine state merely by asking.
     pub fn connect_existing() -> Result<Self> {
-        Self::find_existing(&|_| {}, false)
-            .ok_or_else(|| anyhow::anyhow!("the oxidom daemon is not available"))
-    }
-
-    /// `patient` decides whether an installed-but-silent system daemon is worth
-    /// waiting [`SYSTEM_DAEMON_GRACE`] for. Only a caller that would otherwise
-    /// start a daemon of its own has that race to lose; a read-only CLI command
-    /// must answer "nothing is running" now, not in ten seconds.
-    fn find_existing(progress: &impl Fn(ConnectStage), patient: bool) -> Option<DaemonClient> {
-        progress(ConnectStage::System);
-        match Self::try_bus(true, DaemonSource::System) {
-            Ok(client) => return Some(client),
-            Err(error) if patient && name_unowned(&error) && system_daemon_installed() => {
-                progress(ConnectStage::WaitingForSystem);
-                let deadline = Instant::now() + SYSTEM_DAEMON_GRACE;
-                while Instant::now() < deadline {
-                    std::thread::sleep(SYSTEM_DAEMON_RETRY);
-                    if let Ok(client) = Self::try_bus(true, DaemonSource::System) {
-                        return Some(client);
-                    }
-                }
-                log::warn!(
-                    "the system daemon is installed but did not answer within {}s; \
-                     falling back to a session daemon, which keeps its own subscriptions",
-                    SYSTEM_DAEMON_GRACE.as_secs()
-                );
-            }
-            Err(error) if patient => {
-                log::info!("no daemon on the system bus ({error})");
-            }
-            Err(_) => {}
-        }
-        progress(ConnectStage::Session);
-        Self::try_bus(false, DaemonSource::Session).ok()
+        let (proxy, source) =
+            block_discovery(find_existing(&|_| {}, false, false, &mut Self::try_bus))?
+                .ok_or_else(|| anyhow!("the oxidom daemon is not available"))?;
+        Ok(Self {
+            proxy: proxy.into(),
+            source,
+        })
     }
 
     pub fn subscriptions(&self) -> Result<Vec<Subscription>> {
@@ -719,6 +893,421 @@ fn is_unknown_method(error: &zbus::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unanswered_status_does_not_authorize_database_fallback() {
+        let call = zbus::Message::method_call(super::OBJECT_PATH, "Status")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let error = zbus::Message::error(&call.header(), "org.freedesktop.DBus.Error.NoReply")
+            .unwrap()
+            .build(&"invented unanswered daemon")
+            .unwrap()
+            .into();
+        assert!(!super::name_unowned(&error));
+    }
+
+    use std::cell::{Cell, RefCell};
+    use std::future::{pending, ready};
+
+    use super::{
+        ConnectStage, DISCOVERY_TIMEOUT, DaemonSource, SESSION_EXIT_GRACE, SESSION_RETRY,
+        SESSION_STARTUP, SYSTEM_DAEMON_GRACE, before_deadline, find_existing, name_unowned,
+        wait_spawned,
+    };
+    use tokio::time::Instant;
+
+    fn absent() -> zbus::Error {
+        zbus::fdo::Error::ServiceUnknown("invented missing daemon".into()).into()
+    }
+
+    fn method_error(name: &str) -> zbus::Error {
+        let call = zbus::Message::method_call(super::OBJECT_PATH, "Status")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        zbus::Message::error(&call.header(), name)
+            .unwrap()
+            .build(&"invented discovery error")
+            .unwrap()
+            .into()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_outer_deadline_drops_a_pending_async_setup_future() {
+        struct OnDrop<'a>(&'a Cell<bool>);
+        impl Drop for OnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = Cell::new(false);
+        let start = Instant::now();
+        let guard = OnDrop(&dropped);
+        let result = before_deadline(start + DISCOVERY_TIMEOUT, async move {
+            let _guard = guard;
+            pending::<zbus::Result<()>>().await
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(dropped.get());
+        assert_eq!(start.elapsed(), DISCOVERY_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_deadline_never_polls_another_setup_future() {
+        let polled = Cell::new(false);
+        let result = before_deadline(Instant::now(), async {
+            polled.set(true);
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!polled.get());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn system_retries_share_the_grace_with_the_first_attempt() {
+        let start = Instant::now();
+        let calls = Cell::new(0);
+        let stages = RefCell::new(Vec::new());
+        let result = find_existing(
+            &|stage| stages.borrow_mut().push(stage),
+            true,
+            true,
+            &mut |source| {
+                let call = calls.get();
+                calls.set(call + 1);
+                async move {
+                    if source == DaemonSource::Session {
+                        return Ok(());
+                    }
+                    assert!(Instant::now() < start + SYSTEM_DAEMON_GRACE);
+                    if call == 0 {
+                        tokio::time::advance(std::time::Duration::from_secs(7)).await;
+                    }
+                    Err(absent())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Some(((), DaemonSource::Session)));
+        assert_eq!(start.elapsed(), SYSTEM_DAEMON_GRACE);
+        assert_eq!(calls.get(), 13);
+        assert_eq!(
+            *stages.borrow(),
+            [
+                ConnectStage::System,
+                ConnectStage::WaitingForSystem,
+                ConnectStage::Session
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_last_system_attempt_that_times_out_never_selects_another_database() {
+        let calls = Cell::new(0);
+        let start = Instant::now();
+        let result = find_existing(&|_| {}, true, true, &mut |source| {
+            assert_eq!(source, DaemonSource::System);
+            let call = calls.get();
+            calls.set(call + 1);
+            async move {
+                if call == 0 {
+                    Err(absent())
+                } else {
+                    pending::<zbus::Result<()>>().await
+                }
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 2);
+        assert_eq!(start.elapsed(), SYSTEM_DAEMON_GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_reply_and_bus_timeouts_are_not_evidence_of_absence() {
+        let errors: [zbus::Error; 5] = [
+            method_error("org.freedesktop.DBus.Error.NoReply"),
+            zbus::fdo::Error::NoReply("invented timeout".into()).into(),
+            zbus::fdo::Error::Timeout("invented timeout".into()).into(),
+            zbus::fdo::Error::TimedOut("invented timeout".into()).into(),
+            std::io::Error::from(std::io::ErrorKind::TimedOut).into(),
+        ];
+        for error in errors {
+            assert!(!name_unowned(&error));
+            let result = find_existing(&|_| {}, true, true, &mut |source| {
+                assert_eq!(source, DaemonSource::System);
+                ready(Err::<(), _>(error.clone()))
+            })
+            .await;
+            assert!(result.is_err());
+
+            let result = find_existing(&|_| {}, false, false, &mut |source| {
+                ready(Err::<(), _>(if source == DaemonSource::System {
+                    absent()
+                } else {
+                    error.clone()
+                }))
+            })
+            .await;
+            assert!(result.is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_only_discovery_bounds_each_bus_without_entering_the_spawn_phase() {
+        let start = Instant::now();
+        let stages = RefCell::new(Vec::new());
+        let result = find_existing(
+            &|stage| stages.borrow_mut().push(stage),
+            false,
+            true,
+            &mut |_| pending::<zbus::Result<()>>(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(start.elapsed(), DISCOVERY_TIMEOUT);
+        assert_eq!(*stages.borrow(), [ConnectStage::System]);
+
+        let start = Instant::now();
+        let result = find_existing(&|_| {}, false, true, &mut |source| async move {
+            if source == DaemonSource::System {
+                Err(absent())
+            } else {
+                pending::<zbus::Result<()>>().await
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(start.elapsed(), DISCOVERY_TIMEOUT);
+
+        let result = find_existing(
+            &|stage| assert_ne!(stage, ConnectStage::Starting),
+            false,
+            true,
+            &mut |_| ready(Err::<(), _>(absent())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_responsive_system_daemon_is_always_preferred() {
+        let result = find_existing(&|_| {}, true, true, &mut |source| {
+            assert_eq!(source, DaemonSource::System);
+            ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, Some(((), DaemonSource::System)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn access_denied_and_an_absent_bus_allow_session_fallback_without_grace() {
+        let errors: [zbus::Error; 4] = [
+            method_error("org.freedesktop.DBus.Error.AccessDenied"),
+            zbus::fdo::Error::AccessDenied("invented denial".into()).into(),
+            std::io::Error::from(std::io::ErrorKind::NotFound).into(),
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into(),
+        ];
+        for error in errors {
+            let start = Instant::now();
+            let result = find_existing(&|_| {}, true, true, &mut |source| {
+                ready(if source == DaemonSource::System {
+                    Err(error.clone())
+                } else {
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(result, Some(((), DaemonSource::Session)));
+            assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_child_failures_can_recover_within_installed_system_grace() {
+        let errors: [zbus::Error; 6] = [
+            method_error("org.freedesktop.DBus.Error.ServiceUnknown"),
+            method_error("org.freedesktop.DBus.Error.NameHasNoOwner"),
+            method_error("org.freedesktop.DBus.Error.Spawn.ChildExited"),
+            method_error("org.freedesktop.DBus.Error.Spawn.ChildSignaled"),
+            zbus::fdo::Error::SpawnChildExited("invented exit".into()).into(),
+            zbus::fdo::Error::SpawnChildSignaled("invented signal".into()).into(),
+        ];
+        for error in errors {
+            let calls = Cell::new(0);
+            let result = find_existing(&|_| {}, true, true, &mut |source| {
+                assert_eq!(source, DaemonSource::System);
+                calls.set(calls.get() + 1);
+                ready(if calls.get() == 1 {
+                    Err(error.clone())
+                } else {
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(result, Some(((), DaemonSource::System)));
+            assert_eq!(calls.get(), 2);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawned_session_retries_never_start_at_or_after_the_startup_deadline() {
+        let start = Instant::now();
+        let calls = Cell::new(0);
+        let result = wait_spawned(
+            start + SESSION_STARTUP,
+            &mut |source| {
+                assert_eq!(source, DaemonSource::Spawned);
+                assert!(Instant::now() < start + SESSION_STARTUP);
+                calls.set(calls.get() + 1);
+                ready(Err::<(), _>(absent()))
+            },
+            || Ok(()),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(start.elapsed(), SESSION_STARTUP);
+        assert_eq!(calls.get(), 40);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_spawned_session_setup_expires_within_the_startup_budget() {
+        let start = Instant::now();
+        let result = wait_spawned(
+            start + SESSION_STARTUP,
+            &mut |_| pending::<zbus::Result<()>>(),
+            || Ok(()),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(start.elapsed(), SESSION_STARTUP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_spawned_child_exit_is_reported_after_a_short_same_bus_readiness_grace() {
+        let start = Instant::now();
+        let checks = Cell::new(0);
+        let result = wait_spawned(
+            start + SESSION_STARTUP,
+            &mut |_| pending::<zbus::Result<()>>(),
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    anyhow::bail!(
+                        "the session daemon exited before becoming ready (exit status: 23)"
+                    );
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("exit status: 23"));
+        assert_eq!(checks.get(), 2);
+        assert_eq!(start.elapsed(), SESSION_RETRY + SESSION_EXIT_GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_losing_child_exit_does_not_override_pending_winner_readiness() {
+        let start = Instant::now();
+        let checks = Cell::new(0);
+        let attempts = Cell::new(0);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut sender = Some(sender);
+        let mut receiver = Some(receiver);
+        let result = wait_spawned(
+            start + SESSION_STARTUP,
+            &mut |source| {
+                assert_eq!(source, DaemonSource::Spawned);
+                attempts.set(attempts.get() + 1);
+                let receiver = receiver.take().unwrap();
+                async move {
+                    receiver.await.unwrap();
+                    Ok(())
+                }
+            },
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    sender.take().unwrap().send(()).unwrap();
+                    anyhow::bail!("the losing session daemon exited (exit status: 23)");
+                }
+                Ok(())
+            },
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(checks.get(), 2);
+        assert_eq!(start.elapsed(), SESSION_RETRY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_losing_child_keeps_retrying_the_same_session_bus_for_the_winner() {
+        let start = Instant::now();
+        let attempts = Cell::new(0);
+        let result = wait_spawned(
+            start + SESSION_STARTUP,
+            &mut |source| {
+                assert_eq!(source, DaemonSource::Spawned);
+                attempts.set(attempts.get() + 1);
+                ready(if attempts.get() == 1 {
+                    Err(absent())
+                } else {
+                    Ok(())
+                })
+            },
+            || anyhow::bail!("the losing session daemon exited (exit status: 23)"),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(start.elapsed(), SESSION_RETRY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn child_exit_grace_never_extends_the_original_startup_deadline() {
+        let start = Instant::now();
+        let checks = Cell::new(0);
+        let remaining = SESSION_RETRY * 2;
+        let result = wait_spawned(
+            start + remaining,
+            &mut |_| pending::<zbus::Result<()>>(),
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    anyhow::bail!("the session daemon exited (exit status: 23)");
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("exit status: 23"));
+        assert_eq!(checks.get(), 2);
+        assert_eq!(start.elapsed(), remaining);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_during_the_last_poll_interval_keeps_its_exit_status() {
+        let deadline = Instant::now() + SESSION_STARTUP;
+        let result = wait_spawned(deadline, &mut |_| pending::<zbus::Result<()>>(), || {
+            if Instant::now() >= deadline {
+                anyhow::bail!("the session daemon exited (exit status: 23)");
+            }
+            Ok(())
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("exit status: 23"));
+        assert_eq!(Instant::now(), deadline);
+    }
+
     #[test]
     fn an_older_daemon_does_not_claim_to_support_conservative_checks() {
         use crate::config::WatchdogMode;

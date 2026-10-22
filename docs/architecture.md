@@ -82,6 +82,20 @@ Two things prevent that:
 Falling back is logged, and the GUI shows which step it is on rather than a blank
 window.
 
+Discovery deadlines cover connecting and authenticating to the bus as well as
+waiting for `Status`. GUI startup and commands that may start a daemon allow
+10 seconds for the whole system phase, 2 seconds for an existing session daemon,
+and 6 seconds for a newly started session daemon. Read/control commands that
+require an existing daemon allow 2 seconds per bus without the system grace.
+Quick absence or access denial can finish a phase sooner. A timeout or `NoReply`
+reports an error rather than silently choosing another database.
+
+A spawned daemon that exits early is reported with its exit status, after a
+short same-session readiness grace for a competing starter that won the store
+lock. Discovery failure does not kill a daemon. These are cooperative I/O
+deadlines, not guarantees against stalled filesystem or process-spawn work;
+ordinary calls and initial GUI hydration have separate timeout semantics.
+
 ## Running the core
 
 Each session writes its own `current-config-<profile>.json` (mode `0600` — it holds

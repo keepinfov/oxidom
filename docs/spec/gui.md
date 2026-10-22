@@ -6,6 +6,27 @@ adaptive.
 The GUI is an `adw::Application` (app id `dev.keepinfov.oxidom`). It wires to the core modules and
 does not reimplement parsing/Xray logic in the UI layer.
 
+## Startup (binding)
+
+Daemon discovery and the initial subscription, profile, status, settings, runtime and capability
+calls run on the same background worker, never on the GTK main thread. The startup window stays
+responsive and reports "Loading daemon state..." while that worker hydrates the initial state;
+background startup remains hidden. Discovery follows the phase deadlines in `storage.md`.
+
+Deliver the client and owned initial state together, once, before constructing the interactive
+window. Preserve the launch notification id and present the real window before dismissing the
+splash. Closing the splash abandons delivery and quits; it is not a request to stop the daemon.
+No late hydration result may overwrite an interactive action.
+
+Hydration fields fail independently. A failed subscription read is not an authoritative empty
+catalog and must not prune saved GUI ordering. A failed initial status produces unknown state,
+not proof that tunnels stopped; unavailable state must not clear a desktop proxy. Retain existing
+defaults and older-daemon degradation for other fields. Capability checks run once in their
+existing order. This does not impose a total hydration deadline or move tray/desktop-proxy work
+off the main thread.
+
+## Layout
+
 Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
 - **`adw::NavigationSplitView`** (or `OverlaySplitView`) for the adaptive sidebar.
   - **Sidebar:** app/logo area at top; a nav list — at least "Servers" (the server browser) plus

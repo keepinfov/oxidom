@@ -467,6 +467,12 @@ programs.oxidom.trayAutostart = true;
 
 ## Notes
 
+- Startup discovers the daemon and loads its initial catalog, profiles, status,
+  settings and capabilities in a worker. The startup window stays responsive and
+  says **Loading daemon state...** during loading; `--background` stays hidden.
+  There is no total loading deadline. Discovery itself has bounded phases;
+  a daemon timeout is an error, not permission to switch databases. Retry from
+  the unavailable dialog after a slow first daemon/core installation finishes.
 - The GUI runs **fully unprivileged**. TUN interfaces need the system daemon; the
   GUI can configure them, but cannot grant the privilege.
 - The GUI owns the GNOME system proxy toggle, not the daemon — it is a per-desktop

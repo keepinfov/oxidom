@@ -18,6 +18,7 @@ surface, packaging, or the CLI belongs here.
 - **Tunnel checks have an explicit policy.** `watchdog = "conservative"` is the default: repeated failed checks are reported without stopping a live Xray core. `aggressive` retains live-core restart after three negative checks; `off` disables these checks without disabling process-exit supervision. The policy is selectable in Settings.
 
 ### Fixed
+- **Initial daemon data no longer blocks GTK while the GUI opens.** Catalog, profile, status, settings and capability reads run behind the responsive startup window. Discovery budgets include bus setup and readiness, distinguish a timeout from an absent daemon, and report early daemon exit without rejecting a competing starter that became ready on the same session bus.
 - **Connecting is not reported as connected before confirmation.** Status, session lists and the GUI wait for a successful request through SOCKS and completion of any requested interface setup; internal process supervision continues during confirmation.
 - **A failed daemon poll no longer leaves the GUI indefinitely presenting its last snapshot as current.** The window and tray say that tunnel state is unknown, preserve the last known sessions and desktop proxy, and recover on the next current snapshot without switching stores.
 - **Desktop proxy ownership survives holding and replacement.** Replacing an owned endpoint does not switch to direct mode, and failed cleanup retains its recovery record for retry.
