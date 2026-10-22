@@ -720,6 +720,20 @@ fn is_unknown_method(error: &zbus::Error) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn an_unanswered_status_does_not_authorize_database_fallback() {
+        let call = zbus::Message::method_call(super::OBJECT_PATH, "Status")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let error = zbus::Message::error(&call.header(), "org.freedesktop.DBus.Error.NoReply")
+            .unwrap()
+            .build(&"invented unanswered daemon")
+            .unwrap()
+            .into();
+        assert!(!super::name_unowned(&error));
+    }
+
+    #[test]
     fn an_older_daemon_does_not_claim_to_support_conservative_checks() {
         use crate::config::WatchdogMode;
 
