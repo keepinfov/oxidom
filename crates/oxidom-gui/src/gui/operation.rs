@@ -19,6 +19,19 @@ pub enum UiOperationKind {
     InstallGeoAssets,
 }
 
+impl UiOperationKind {
+    pub fn is_subscription_fetch(self) -> bool {
+        matches!(
+            self,
+            Self::AddSubscription | Self::UpdateSubscription | Self::UpdateAllSubscriptions
+        )
+    }
+
+    pub fn permits(self, next: Self) -> bool {
+        self.is_subscription_fetch() && matches!(next, Self::Disconnect | Self::DownProfile)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiOperation {
     pub kind: UiOperationKind,

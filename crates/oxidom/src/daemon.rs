@@ -14,7 +14,10 @@ use zbus::fdo;
 
 use oxidom_core::alias;
 use oxidom_core::config::{Config, LatencyMethod, WatchdogMode};
-use oxidom_core::engine::{Engine, PoolSession, SessionSelection, pool_fingerprint};
+use oxidom_core::engine::{
+    Engine, PoolSession, SessionSelection, SubscriptionFetch, SubscriptionOperation,
+    pool_fingerprint,
+};
 use oxidom_core::handle::{self, HandleMatch};
 use oxidom_core::ipc::{
     ApplySettingsResult, BUS_NAME, InterfaceInfo, LatencyReading, OBJECT_PATH, PROBE_HISTORY_LIMIT,
@@ -363,6 +366,8 @@ struct TunnelStreak {
 #[derive(Clone)]
 pub(crate) struct Shared {
     engine: Arc<Mutex<Engine>>,
+    /// Queue network updates without occupying the engine or blocking executor threads.
+    subscription_work: Arc<tokio::sync::Mutex<()>>,
     readings: Arc<Mutex<HashMap<String, LatencyReading>>>,
     /// The last few readings per server, newest first, for the one card that
     /// is open. Kept beside `readings` rather than inside it because the two
@@ -434,6 +439,45 @@ pub(crate) struct CoreVersion {
 }
 
 impl Shared {
+    async fn update_subscriptions(
+        &self,
+        operation: SubscriptionOperation,
+        fetch: impl FnMut(
+            &SubscriptionFetch,
+            Option<&str>,
+        ) -> Result<oxidom_core::subscription::FetchResult>
+        + Send
+        + 'static,
+    ) -> Result<()> {
+        let guard = self.subscription_work.clone().lock_owned().await;
+        let shared = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let update =
+                oxidom_core::sync::lock(&shared.engine).prepare_subscription_update(operation)?;
+            let results = update.fetch(
+                |target| {
+                    oxidom_core::sync::lock(&shared.engine).validate_subscription_fetch(target)
+                },
+                fetch,
+            );
+            let result = {
+                let mut engine = oxidom_core::sync::lock(&shared.engine);
+                let (result, stopped) = engine.apply_subscription_update(results);
+                for profile in stopped {
+                    shared.invalidate_generation(&profile);
+                    shared.clear_override(&profile);
+                }
+                result
+            };
+            shared.prune_readings();
+            shared.reconcile_standby();
+            result
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("subscription worker failed"))?
+    }
+
     pub(crate) fn new(
         engine: Engine,
         socks_port_locked: bool,
@@ -454,6 +498,7 @@ impl Shared {
             .collect();
         Shared {
             engine: Arc::new(Mutex::new(engine)),
+            subscription_work: Arc::new(tokio::sync::Mutex::new(())),
             readings: Arc::new(Mutex::new(HashMap::new())),
             history: Arc::new(Mutex::new(HashMap::new())),
             proxied: Arc::new(Mutex::new(HashMap::new())),
@@ -1404,6 +1449,9 @@ impl Shared {
         origin: ConnectionOrigin,
     ) -> Result<Option<mpsc::Receiver<bool>>> {
         if !self.generation_is_current(profile, generation) {
+            if origin == ConnectionOrigin::Explicit {
+                anyhow::bail!("connection attempt was superseded before its core started");
+            }
             return Ok(None);
         }
         oxidom_core::sync::lock(&self.proxied).remove(profile);
@@ -1452,7 +1500,13 @@ impl Shared {
         match connect_result {
             None => {
                 oxidom_core::sync::lock(&self.probes).finish(probe_job.token);
-                Ok(None)
+                if origin == ConnectionOrigin::Explicit {
+                    Err(anyhow::anyhow!(
+                        "connection attempt was superseded before its core started"
+                    ))
+                } else {
+                    Ok(None)
+                }
             }
             Some(Err(error)) => {
                 // The GUI watched this id run; leaving without a reading
@@ -2041,6 +2095,13 @@ impl Shared {
     }
 }
 
+fn fetch_subscription(
+    request: &SubscriptionFetch,
+    hwid: Option<&str>,
+) -> Result<oxidom_core::subscription::FetchResult> {
+    oxidom_core::subscription::fetch(&request.url, &request.user_agent, request.send_hwid, hwid)
+}
+
 pub(crate) struct Service {
     pub(crate) shared: Shared,
 }
@@ -2454,14 +2515,24 @@ impl Service {
         json(&engine.registry.subscriptions)
     }
 
-    fn add_subscription(&self, url: String, name: String, send_hwid: bool) -> fdo::Result<()> {
+    async fn add_subscription(
+        &self,
+        url: String,
+        name: String,
+        send_hwid: bool,
+    ) -> fdo::Result<()> {
         let name = (!name.is_empty()).then_some(name);
-        let result =
-            oxidom_core::sync::lock(&self.shared.engine).add_subscription(url, name, send_hwid);
-        // After the failures too: a refresh that errors part-way through has
-        // still replaced some of the list.
-        self.shared.prune_readings();
-        result.map_err(failed)
+        self.shared
+            .update_subscriptions(
+                SubscriptionOperation::Add {
+                    url,
+                    name,
+                    send_hwid,
+                },
+                fetch_subscription,
+            )
+            .await
+            .map_err(failed)
     }
 
     fn remove_subscription(&self, subscription_id: String) -> fdo::Result<bool> {
@@ -2471,16 +2542,21 @@ impl Service {
         result.map_err(failed)
     }
 
-    fn refresh(&self, subscription_id: String) -> fdo::Result<()> {
-        let result = oxidom_core::sync::lock(&self.shared.engine).refresh(&subscription_id);
-        self.shared.prune_readings();
-        result.map_err(failed)
+    async fn refresh(&self, subscription_id: String) -> fdo::Result<()> {
+        self.shared
+            .update_subscriptions(
+                SubscriptionOperation::Refresh(subscription_id),
+                fetch_subscription,
+            )
+            .await
+            .map_err(failed)
     }
 
-    fn refresh_all(&self) -> fdo::Result<()> {
-        let result = oxidom_core::sync::lock(&self.shared.engine).refresh_all();
-        self.shared.prune_readings();
-        result.map_err(failed)
+    async fn refresh_all(&self) -> fdo::Result<()> {
+        self.shared
+            .update_subscriptions(SubscriptionOperation::RefreshAll, fetch_subscription)
+            .await
+            .map_err(failed)
     }
 
     fn import_links(&self, text: String) -> fdo::Result<(u32, u32)> {
@@ -4518,6 +4594,255 @@ mod tests {
             ms: 42,
             method: LatencyMethod::HttpGet,
         })
+    }
+
+    fn subscription_response() -> oxidom_core::subscription::FetchResult {
+        let (servers, skipped) = oxidom_core::subscription_format::parse(
+            "trojan://invented@node.example.invalid:443#Offline",
+        )
+        .unwrap();
+        oxidom_core::subscription::FetchResult {
+            servers,
+            skipped,
+            userinfo: None,
+            title: Some("Offline".into()),
+            update_interval: None,
+            not_taken: Default::default(),
+        }
+    }
+
+    fn subscription_runtime() -> Result<tokio::runtime::Runtime> {
+        Ok(tokio::runtime::Builder::new_current_thread().build()?)
+    }
+
+    #[test]
+    fn a_pending_subscription_fetch_leaves_the_engine_and_async_executor_available() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("responsive-subscription-fetch")?;
+        let service = for_test();
+        let id = {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            let mut sub = oxidom_core::model::Subscription::new(
+                "https://panel.example.invalid/sub".into(),
+                Some("Initial".into()),
+            );
+            sub.servers = subscription_response().servers;
+            let id = sub.id.clone();
+            engine.registry.subscriptions.push(sub);
+            mark_active(&mut engine, "work", "invented-server")?;
+            id
+        };
+        subscription_runtime()?.block_on(async {
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (release, blocked) = mpsc::channel();
+            let worker = service.shared.clone();
+            let probe = worker.clone();
+            let mut entered = Some(entered);
+            let operation = tokio::spawn(async move {
+                worker
+                    .update_subscriptions(SubscriptionOperation::Refresh(id), move |_, _| {
+                        assert!(
+                            probe.engine.try_lock().is_ok(),
+                            "network work must not own the engine"
+                        );
+                        let _ = entered.take().context("one fetch")?.send(());
+                        blocked.recv_timeout(Duration::from_secs(10))?;
+                        Ok(subscription_response())
+                    })
+                    .await
+            });
+            waiting.await?;
+            assert!(
+                !operation.is_finished(),
+                "reply must wait for the fetch and commit"
+            );
+            assert!(service.shared.subscription_work.try_lock().is_err());
+            let _: StatusInfo = serde_json::from_str(&service.status()?)?;
+            let _: Vec<oxidom_core::model::Subscription> =
+                serde_json::from_str(&service.list_subscriptions()?)?;
+            service.stop_profile("work")?;
+            {
+                let mut engine = service
+                    .shared
+                    .engine
+                    .try_lock()
+                    .expect("control remains available");
+                engine.registry.subscriptions[0].description = Some("edited during HTTP".into());
+            }
+            release.send(())?;
+            operation.await??;
+            assert_eq!(
+                oxidom_core::sync::lock(&service.shared.engine)
+                    .registry
+                    .subscriptions[0]
+                    .description
+                    .as_deref(),
+                Some("edited during HTTP")
+            );
+            assert!(service.shared.subscription_work.try_lock().is_ok());
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    #[test]
+    fn subscription_workers_release_their_queue_after_failure_or_panic() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("subscription-worker-failure")?;
+        let service = for_test();
+        subscription_runtime()?.block_on(async {
+            let add = || SubscriptionOperation::Add {
+                url: "https://panel.example.invalid/sub".into(),
+                name: Some("Offline".into()),
+                send_hwid: false,
+            };
+            assert!(
+                service
+                    .shared
+                    .update_subscriptions(add(), |_, _| Err(anyhow::anyhow!(
+                        "offline fetch failure"
+                    )))
+                    .await
+                    .is_err()
+            );
+            assert!(service.shared.subscription_work.try_lock().is_ok());
+            let error = service
+                .shared
+                .update_subscriptions(add(), |_, _| panic!("invented worker panic"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "subscription worker failed");
+            assert!(service.shared.subscription_work.try_lock().is_ok());
+            service
+                .shared
+                .update_subscriptions(add(), |_, _| Ok(subscription_response()))
+                .await?;
+            assert_eq!(
+                oxidom_core::sync::lock(&service.shared.engine)
+                    .registry
+                    .subscriptions
+                    .len(),
+                1
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    #[test]
+    fn queued_requests_do_not_send_hwid_after_opt_out_or_removal() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("subscription-revoked-hwid")?;
+        let service = for_test();
+        for remove in [false, true] {
+            let id = {
+                let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+                let first = oxidom_core::model::Subscription::new(
+                    "https://first.example.invalid/sub".into(),
+                    Some("First".into()),
+                );
+                let mut second = oxidom_core::model::Subscription::new(
+                    "https://second.example.invalid/sub".into(),
+                    Some("Second".into()),
+                );
+                second.send_hwid = true;
+                let id = second.id.clone();
+                engine.registry.subscriptions = vec![first, second];
+                id
+            };
+            subscription_runtime()?.block_on(async {
+                let (entered, waiting) = tokio::sync::oneshot::channel();
+                let (release, blocked) = mpsc::channel();
+                let shared = service.shared.clone();
+                let mut entered = Some(entered);
+                let operation = tokio::spawn(async move {
+                    shared
+                        .update_subscriptions(
+                            SubscriptionOperation::RefreshAll,
+                            move |request, hwid| {
+                                assert_eq!(
+                                    request.url, "https://first.example.invalid/sub",
+                                    "the revoked request must never start"
+                                );
+                                assert!(hwid.is_none());
+                                let _ = entered.take().context("first request only")?.send(());
+                                blocked.recv_timeout(Duration::from_secs(10))?;
+                                Ok(subscription_response())
+                            },
+                        )
+                        .await
+                });
+                waiting.await?;
+                if remove {
+                    service.remove_subscription(id)?;
+                } else {
+                    service.set_hwid(id, false)?;
+                }
+                release.send(())?;
+                assert!(
+                    operation.await?.is_err(),
+                    "the invalidated target is reported"
+                );
+                assert!(!oxidom_core::paths::hwid_file()?.exists());
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_teardown_invalidates_pending_confirmation_before_unlocking_the_engine() -> Result<()>
+    {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("subscription-cancels-attempt")?;
+        let service = for_test();
+        let id = {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            let mut sub = oxidom_core::model::Subscription::new(
+                "https://panel.example.invalid/sub".into(),
+                Some("Initial".into()),
+            );
+            sub.servers = subscription_response().servers;
+            let server = sub.servers[0].id.clone();
+            let id = sub.id.clone();
+            engine.registry.subscriptions.push(sub);
+            mark_active(&mut engine, "work", &server)?;
+            let session = engine.sessions.get_mut("work").context("session")?;
+            *oxidom_core::sync::lock(&session.core.status) = Status::Connecting;
+            id
+        };
+        let generation = service.shared.next_connect_generation("work");
+        subscription_runtime()?.block_on(service.shared.update_subscriptions(
+            SubscriptionOperation::Refresh(id),
+            |_, _| {
+                let mut response = subscription_response();
+                response.servers.clear();
+                Ok(response)
+            },
+        ))?;
+        assert!(!service.shared.generation_is_current("work", generation));
+        assert!(
+            oxidom_core::sync::lock(&service.shared.override_status)
+                .get("work")
+                .is_none()
+        );
+        assert!(
+            oxidom_core::sync::lock(&service.shared.engine)
+                .sessions
+                .get("work")
+                .context("session")?
+                .selection
+                .is_none()
+        );
+        let error = service
+            .shared
+            .start_connection(
+                "work",
+                "unaffected-server",
+                generation,
+                ConnectionOrigin::Explicit,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("superseded"));
+        Ok(())
     }
 
     fn watchdog_test_attempt(shared: &Shared, mode: WatchdogMode) -> Result<WatchdogAttempt> {

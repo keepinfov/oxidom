@@ -171,6 +171,23 @@ enable Advanced > Send HWID and add it again
 
 ## Refreshing
 
+Fetching and parsing do not hold up daemon status or disconnect. In the GUI, a running session
+can be stopped while Add/Update/Update All is fetching; the update keeps its own progress and
+completion. Stop ends the tunnel, not the subscription request. Other editing operations remain
+serialized in that window. The command still waits for its update result; a client-side timeout
+does not mean the daemon canceled the work.
+
+Results are merged into the catalog as it exists at completion. Concurrent aliases, pins,
+overrides, descriptions and ordering are retained. A subscription or server removed during the
+request is not silently restored. If request settings or subscription lifetime changed, the
+affected result is rejected with a retry message instead of overwriting the change. HWID consent
+is checked again before each queued target starts; a request already underway cannot be recalled.
+Refresh All keeps successful updates and reports failed or invalidated targets together.
+
+Adding the same URL again remains a fresh replacement, not an ordinary refresh. If that existing
+subscription changes while Add is fetching, the replacement is rejected rather than erasing those
+edits. Use Update when the existing per-subscription configuration should be preserved.
+
 A refresh matches servers first by id and then by connection details, so a node
 renamed upstream keeps its alias, its id, and its last latency rather than
 appearing as a new server.
