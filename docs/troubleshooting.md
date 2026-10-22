@@ -290,6 +290,23 @@ fix it, and move it back with the daemon stopped.
 
 ## Getting logs
 
+### Tunnel checks and unavailable daemon
+
+`watchdog = "conservative"` (also **Settings → Tunnel watchdog**) is the default. Five
+negative checks produce a warning but do not stop a live core: one unreachable check URL is
+not proof that the tunnel is unusable. The request budget is 8 seconds, with 60 seconds between
+sequential sweeps. Aggressive retains the old restart policy (three failures, 3-second requests,
+30-second gaps); Off disables synthetic checks, not supervision of an exited process.
+These checks run only for automatic-recovery sessions. Ordinary latency-display checks keep
+their separate 3-second budget, so their displayed failures are not live-core restart orders.
+
+If the GUI says **tunnel state unknown**, it could not obtain a current daemon snapshot.
+This does not establish that Xray or the routes stopped. Existing desktop proxy settings stay
+in place while the GUI retries the same daemon. Do not start a second daemon against the same
+store to repair it; an exclusive lock rejects a second owner before recovery.
+
+### Log locations
+
 The daemon logs to stderr, so under systemd:
 
 ```sh

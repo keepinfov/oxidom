@@ -283,7 +283,9 @@ fragment must be a JSON object, and a draft is proved to generate before anythin
   previous attempt is read as this attempt's reason, and without the source filter oxidom's own
   note about an unrecognised obfuscation type matches `UNSUPPORTED_PROTOCOL_MARKERS`.
 - Track state: `Disconnected | Connecting | Connected | Error(msg)`. Consider "Connected" once
-  the process is up and a latency probe through the SOCKS inbound succeeds.
+  the process is up, a latency probe through the SOCKS inbound succeeds, and the requested
+  interface is ready. All D-Bus status surfaces report `connecting` until then; internal process
+  supervision must still notice a core dying during confirmation.
 - Stop cleanly on disconnect/app-exit (SIGTERM, then SIGKILL after timeout). The same escalation
   applies to an orphan inherited from a crashed run (`engine::kill_stale_xray`), which verifies
   the process is gone rather than assuming SIGTERM worked.

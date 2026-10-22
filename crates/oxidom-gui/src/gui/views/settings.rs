@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use oxidom_core::config::{Config, LatencyMethod, OnCoreExit};
+use oxidom_core::config::{Config, LatencyMethod, OnCoreExit, WatchdogMode};
 use oxidom_core::core_options::CoreOptions;
 use oxidom_core::ipc::RuntimeInfo;
 // Recognized subscription client identifiers: picking one fills the editable
@@ -32,7 +32,20 @@ const HOLD_TRAFFIC_SUBTITLE: &str = "Traffic is dropped until the tunnel reconne
      ordinary connection — with your own address — until it does";
 
 const STANDBY_PROXY_SUBTITLE: &str = "Keep the SOCKS and HTTP ports answering with a direct connection when disconnected \
-     (never used while a crashed tunnel is holding traffic)";
+      (never used while a crashed tunnel is holding traffic)";
+
+const WATCHDOG_MODES: [WatchdogMode; 3] = [
+    WatchdogMode::Off,
+    WatchdogMode::Conservative,
+    WatchdogMode::Aggressive,
+];
+
+fn watchdog_position(mode: WatchdogMode) -> u32 {
+    WATCHDOG_MODES
+        .iter()
+        .position(|candidate| *candidate == mode)
+        .unwrap_or(1) as u32
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsValues {
@@ -41,6 +54,7 @@ pub struct SettingsValues {
     pub system_proxy: bool,
     pub standby_proxy: bool,
     pub reconnect: bool,
+    pub watchdog: WatchdogMode,
     /// What a session does with its routes when its core exits by itself. The
     /// machine's answer; a profile may override it.
     pub hold_traffic: bool,
@@ -71,6 +85,7 @@ impl From<&Config> for SettingsValues {
             system_proxy: config.system_proxy,
             standby_proxy: config.standby_proxy,
             reconnect: config.reconnect,
+            watchdog: config.watchdog,
             hold_traffic: config.on_core_exit == OnCoreExit::Hold,
             latency_method: config.latency_method,
             latency_test_url: config.latency_test_url.clone(),
@@ -153,6 +168,7 @@ struct SettingsWidgets {
     system_proxy: adw::SwitchRow,
     standby_proxy: adw::SwitchRow,
     reconnect: adw::SwitchRow,
+    watchdog: adw::ComboRow,
     hold_traffic: adw::SwitchRow,
     method: adw::ComboRow,
     test_url: adw::EntryRow,
@@ -205,6 +221,10 @@ impl SettingsWidgets {
             system_proxy: self.system_proxy.is_active(),
             standby_proxy: self.standby_proxy.is_active(),
             reconnect: self.reconnect.is_active(),
+            watchdog: WATCHDOG_MODES
+                .get(self.watchdog.selected() as usize)
+                .copied()
+                .unwrap_or_default(),
             hold_traffic: self.hold_traffic.is_active(),
             latency_method: match self.method.selected() {
                 0 => LatencyMethod::Icmp,
@@ -231,6 +251,8 @@ impl SettingsWidgets {
         self.system_proxy.set_active(values.system_proxy);
         self.standby_proxy.set_active(values.standby_proxy);
         self.reconnect.set_active(values.reconnect);
+        self.watchdog
+            .set_selected(watchdog_position(values.watchdog));
         self.hold_traffic.set_active(values.hold_traffic);
         self.method.set_selected(match values.latency_method {
             LatencyMethod::Icmp => 0,
@@ -300,6 +322,13 @@ impl SettingsView {
             .title("Reconnect automatically")
             .subtitle("Reconnect only when Xray exits unexpectedly, never after Disconnect")
             .active(applied.reconnect)
+            .build();
+        let watchdog = adw::ComboRow::builder()
+            .title("Tunnel watchdog")
+            .subtitle("For automatic recovery sessions. Conservative keeps a live core; aggressive may interrupt traffic")
+            .subtitle_lines(2)
+            .model(&gtk::StringList::new(&["Off", "Conservative", "Aggressive"]))
+            .selected(watchdog_position(applied.watchdog))
             .build();
         let hold_traffic = adw::SwitchRow::builder()
             .title("Hold traffic if Xray exits")
@@ -428,6 +457,7 @@ impl SettingsView {
         proxy_group.add(&system_proxy);
         proxy_group.add(&standby_proxy);
         proxy_group.add(&reconnect);
+        proxy_group.add(&watchdog);
         proxy_group.add(&hold_traffic);
         let xray_group = adw::PreferencesGroup::builder()
             .title("Xray core")
@@ -604,6 +634,7 @@ impl SettingsView {
             system_proxy,
             standby_proxy,
             reconnect,
+            watchdog,
             hold_traffic,
             method,
             test_url,
@@ -780,6 +811,15 @@ impl SettingsView {
                 row.set_subtitle(SYSTEM_PROXY_SUBTITLE);
                 row.remove_css_class("error");
             }
+        }
+    }
+
+    pub fn set_watchdog_supported(&self, supported: bool) {
+        self.widgets.watchdog.set_sensitive(supported);
+        if !supported {
+            self.widgets.watchdog.set_subtitle(
+                "This daemon cannot configure tunnel checks. Restart the upgraded daemon to enable this setting",
+            );
         }
     }
 
@@ -1125,6 +1165,7 @@ fn refuse(submitted: &SettingsValues, effective: &SettingsValues, draft: &mut Se
         system_proxy,
         standby_proxy,
         reconnect,
+        watchdog,
         hold_traffic,
         latency_method,
         latency_test_url,
@@ -1211,6 +1252,10 @@ fn connect_draft_signals(
         move |_| update()
     });
     widgets.reconnect.connect_active_notify({
+        let update = update.clone();
+        move |_| update()
+    });
+    widgets.watchdog.connect_selected_notify({
         let update = update.clone();
         move |_| update()
     });
@@ -1396,6 +1441,7 @@ mod tests {
             system_proxy: false,
             standby_proxy: false,
             reconnect: false,
+            watchdog: WatchdogMode::Conservative,
             hold_traffic: true,
             latency_method: LatencyMethod::HttpGet,
             latency_test_url: "https://www.gstatic.com/generate_204".into(),
@@ -1407,6 +1453,26 @@ mod tests {
             nft_binary: String::new(),
             core: CoreOptions::default(),
         }
+    }
+
+    #[test]
+    fn watchdog_modes_survive_settings_drafts_and_daemon_refusals() {
+        for (index, mode) in WATCHDOG_MODES.iter().enumerate() {
+            assert_eq!(watchdog_position(*mode), index as u32);
+            let config = Config {
+                watchdog: *mode,
+                ..Config::default()
+            };
+            assert_eq!(SettingsValues::from(&config).watchdog, *mode);
+        }
+        let submitted = values();
+        let mut draft = submitted.clone();
+        let effective = SettingsValues {
+            watchdog: WatchdogMode::Off,
+            ..submitted.clone()
+        };
+        refuse(&submitted, &effective, &mut draft);
+        assert_eq!(draft.watchdog, WatchdogMode::Off);
     }
 
     /// Empty is the built-in source, so it must read as that preset rather

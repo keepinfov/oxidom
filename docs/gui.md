@@ -238,6 +238,14 @@ A session whose core exited while holding its routes is marked **holding
 traffic**, and the expanded row says the routes stay until it reconnects or is
 stopped. A deliberately dead network should not be mistaken for a broken one.
 
+**Connecting** lasts until an HTTP request through the session succeeds and its requested
+interface is ready. A running Xray process alone does not make the row Connected.
+
+If the daemon snapshot cannot be read, the banner and tray report **tunnel state unknown**.
+The last-known sessions are preserved, but connected highlights and session controls no longer
+pretend the snapshot is fresh. The GUI retries the same daemon, without switching databases or
+clearing an owned desktop proxy. A successful current snapshot restores the normal display.
+
 A profile that is up is a **session**; that is the word the CLI, systemd and the
 logs use for it.
 
@@ -364,6 +372,7 @@ repointing it.
 | **Answer on local ports while disconnected** | Off by default. Serve a **direct**, unprotected connection on `127.0.0.1` at the configured SOCKS/HTTP ports only while no profile session is connected, connecting or holding traffic. Starting any session closes the standby listeners and existing direct connections first. |
 | **System proxy** | "Send the whole desktop's traffic through oxidom while connected (GNOME)". See [routing.md](routing.md#gnome-system-proxy). |
 | **Reconnect automatically** | "Reconnect only when Xray exits unexpectedly, never after Disconnect". |
+| **Tunnel watchdog** | Off, Conservative (default), or Aggressive. Conservative reports repeated failed checks without killing a live core; Aggressive may interrupt traffic to restart it. Applies to automatically recovered sessions, including `oxidom run`. Process-exit supervision remains active in every mode. Disabled against an older daemon that does not support the setting. |
 | **Hold traffic if Xray exits** | On by default. The routes stay when the core dies, so the tunnel's traffic is dropped until it comes back rather than falling back to your ordinary connection with your own address. A profile can answer for itself, in the profile editor under Interface. See [when the core dies](routing.md#when-the-core-dies). |
 | **Latency method** | `icmp`, `tcp`, `http_head`, `http_get`. |
 | **Latency check URL** | Target for the HTTP methods. |

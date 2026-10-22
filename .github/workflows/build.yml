@@ -24,6 +24,7 @@ name: build
 # and `nixfmt` and has never required this workflow. The push trigger on master
 # stays, so every merge is still built.
 on:
+  workflow_dispatch:
   push:
     branches: [master]
   pull_request:
