@@ -26,6 +26,87 @@ use crate::{alias, bind, link, probe, subscription};
 /// the identity migration must leave it alone.
 pub const LOCAL_ID: &str = "local";
 
+/// A catalog update whose network work can run without holding the engine lock.
+pub enum SubscriptionOperation {
+    Add {
+        url: String,
+        name: Option<String>,
+        send_hwid: bool,
+    },
+    Refresh(String),
+    RefreshAll,
+}
+
+/// URLs are credentials; neither this request nor its baseline should be logged.
+pub struct SubscriptionFetch {
+    pub url: String,
+    pub user_agent: String,
+    pub send_hwid: bool,
+}
+
+enum SubscriptionBaseline {
+    Add {
+        name: Option<String>,
+        existing: Option<serde_json::Value>,
+    },
+    Refresh {
+        name: String,
+        server_ids: Vec<String>,
+    },
+}
+
+pub struct SubscriptionTarget {
+    id: String,
+    epoch: u64,
+    label: String,
+    request: SubscriptionFetch,
+    baseline: SubscriptionBaseline,
+}
+
+/// An opaque request snapshot prepared while the caller holds the engine lock.
+pub struct SubscriptionUpdate {
+    targets: Vec<SubscriptionTarget>,
+    refresh_all: bool,
+}
+
+/// Raw responses and their request baselines, ready to commit under the engine lock.
+pub struct SubscriptionResults {
+    targets: Vec<(SubscriptionTarget, Result<subscription::FetchResult>)>,
+    refresh_all: bool,
+    updated_at: i64,
+}
+
+impl SubscriptionUpdate {
+    /// Run WITHOUT the engine lock. The caller serializes fetch operations;
+    /// even reading the HWID belongs here because it may create it.
+    pub fn fetch(
+        self,
+        mut validate: impl FnMut(&SubscriptionTarget) -> Result<()>,
+        mut fetch: impl FnMut(&SubscriptionFetch, Option<&str>) -> Result<subscription::FetchResult>,
+    ) -> SubscriptionResults {
+        let targets = self
+            .targets
+            .into_iter()
+            .map(|target| {
+                let result = validate(&target).and_then(|()| {
+                    let hwid = target
+                        .request
+                        .send_hwid
+                        .then(|| state::hwid().ok())
+                        .flatten();
+                    fetch(&target.request, hwid.as_deref())
+                });
+                (target, result)
+            })
+            .collect();
+        SubscriptionResults {
+            targets,
+            refresh_all: self.refresh_all,
+            updated_at: subscription::now_unix(),
+        }
+    }
+}
+
 /// Persistent configuration and server catalog shared by every session.
 pub struct Registry {
     pub config: Config,
@@ -33,6 +114,8 @@ pub struct Registry {
     /// Non-fatal problems found while loading (e.g. a quarantined corrupt
     /// subscriptions file). The GUI surfaces these once at startup.
     pub load_warnings: Vec<String>,
+    // Runtime tombstones also cancel adds whose URL is not in the store yet.
+    subscription_epochs: HashMap<String, u64>,
 }
 
 impl Registry {
@@ -43,6 +126,7 @@ impl Registry {
             subscriptions,
             config,
             load_warnings: store_warning.into_iter().collect(),
+            subscription_epochs: HashMap::new(),
         }
     }
 
@@ -258,6 +342,10 @@ impl Registry {
     }
 
     pub fn remove_subscription(&mut self, sub_id: &str) -> Result<()> {
+        *self
+            .subscription_epochs
+            .entry(sub_id.to_string())
+            .or_default() += 1;
         self.subscriptions.retain(|s| s.id != sub_id);
         store::save(&self.subscriptions)?;
         Ok(())
@@ -1178,6 +1266,208 @@ impl Engine {
         self.registry.find_server(id)
     }
 
+    /// Snapshot request settings, identity and lifetime without doing any I/O.
+    pub fn prepare_subscription_update(
+        &self,
+        operation: SubscriptionOperation,
+    ) -> Result<SubscriptionUpdate> {
+        let target = |sub: &Subscription, baseline| SubscriptionTarget {
+            id: sub.id.clone(),
+            epoch: self
+                .registry
+                .subscription_epochs
+                .get(&sub.id)
+                .copied()
+                .unwrap_or(0),
+            label: if sub.name.trim().is_empty()
+                || (!sub.url.is_empty() && sub.name.contains(&sub.url))
+            {
+                format!("subscription {}", sub.id)
+            } else {
+                sub.name.clone()
+            },
+            request: SubscriptionFetch {
+                url: sub.url.clone(),
+                user_agent: subscription::effective_user_agent(
+                    sub.user_agent
+                        .as_deref()
+                        .unwrap_or(&self.registry.config.subscription_user_agent),
+                )
+                .to_string(),
+                send_hwid: sub.send_hwid,
+            },
+            baseline,
+        };
+        let refresh = |sub: &Subscription| {
+            target(
+                sub,
+                SubscriptionBaseline::Refresh {
+                    name: sub.name.clone(),
+                    server_ids: sub.servers.iter().map(|server| server.id.clone()).collect(),
+                },
+            )
+        };
+        let refresh_all = matches!(&operation, SubscriptionOperation::RefreshAll);
+        let targets = match operation {
+            SubscriptionOperation::Add {
+                url,
+                name,
+                send_hwid,
+            } => {
+                let mut sub = Subscription::new(url, name.clone());
+                sub.send_hwid = send_hwid;
+                let existing = self
+                    .registry
+                    .subscriptions
+                    .iter()
+                    .find(|current| current.id == sub.id)
+                    .map(serde_json::to_value)
+                    .transpose()?;
+                vec![target(&sub, SubscriptionBaseline::Add { name, existing })]
+            }
+            SubscriptionOperation::Refresh(id) => {
+                let sub = self
+                    .registry
+                    .subscriptions
+                    .iter()
+                    .find(|sub| sub.id == id)
+                    .ok_or_else(|| anyhow!("subscription not found"))?;
+                vec![refresh(sub)]
+            }
+            SubscriptionOperation::RefreshAll => self
+                .registry
+                .subscriptions
+                .iter()
+                .filter(|sub| !sub.url.is_empty())
+                .map(refresh)
+                .collect(),
+        };
+        Ok(SubscriptionUpdate {
+            targets,
+            refresh_all,
+        })
+    }
+
+    /// Check immediately before each request, not only after a whole batch. An
+    /// opt-out or deletion must prevent a later queued request from sending HWID.
+    pub fn validate_subscription_fetch(&self, target: &SubscriptionTarget) -> Result<()> {
+        if self
+            .registry
+            .subscription_epochs
+            .get(&target.id)
+            .copied()
+            .unwrap_or(0)
+            != target.epoch
+        {
+            bail!("subscription was removed while fetching; retry the update");
+        }
+        let current = self
+            .registry
+            .subscriptions
+            .iter()
+            .find(|sub| sub.id == target.id);
+        match &target.baseline {
+            SubscriptionBaseline::Add { existing, .. } => {
+                if current.map(serde_json::to_value).transpose()?.as_ref() != existing.as_ref() {
+                    bail!("subscription changed while fetching; retry the add");
+                }
+                if subscription::effective_user_agent(&self.registry.config.subscription_user_agent)
+                    != target.request.user_agent
+                {
+                    bail!("subscription request settings changed while fetching; retry the add");
+                }
+            }
+            SubscriptionBaseline::Refresh { server_ids, .. } => {
+                let sub =
+                    current.ok_or_else(|| anyhow!("subscription was removed while fetching"))?;
+                let ua = subscription::effective_user_agent(
+                    sub.user_agent
+                        .as_deref()
+                        .unwrap_or(&self.registry.config.subscription_user_agent),
+                );
+                if sub.url != target.request.url
+                    || sub.send_hwid != target.request.send_hwid
+                    || ua != target.request.user_agent
+                {
+                    bail!(
+                        "subscription request settings changed while fetching; retry the refresh"
+                    );
+                }
+                if server_ids
+                    .iter()
+                    .any(|id| !sub.servers.iter().any(|server| &server.id == id))
+                {
+                    bail!("a server was removed while fetching; retry the refresh");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit against current state and reconcile even if saving fails. Returned
+    /// profiles let the daemon cancel pending work before releasing its engine lock.
+    pub fn apply_subscription_update(
+        &mut self,
+        results: SubscriptionResults,
+    ) -> (Result<()>, Vec<String>) {
+        let mut errors = Vec::new();
+        let mut changed = false;
+        for (target, fetched) in results.targets {
+            let label = target.label.clone();
+            let result = (|| -> Result<()> {
+                let mut response = fetched?;
+                self.validate_subscription_fetch(&target)?;
+                let index = self
+                    .registry
+                    .subscriptions
+                    .iter()
+                    .position(|sub| sub.id == target.id);
+                match target.baseline {
+                    SubscriptionBaseline::Add { name, .. } => {
+                        // Duplicate Add retains its shipped fresh-replacement behavior.
+                        let mut sub = Subscription::new(target.request.url, name);
+                        sub.send_hwid = target.request.send_hwid;
+                        subscription::apply_fetch(&mut sub, response, results.updated_at);
+                        if let Some(index) = index {
+                            self.registry.subscriptions[index] = sub;
+                        } else {
+                            self.registry.subscriptions.push(sub);
+                        }
+                    }
+                    SubscriptionBaseline::Refresh { name, .. } => {
+                        let index = index
+                            .ok_or_else(|| anyhow!("subscription was removed while fetching"))?;
+                        let sub = &mut self.registry.subscriptions[index];
+                        if sub.name != name {
+                            response.title = None;
+                        }
+                        subscription::apply_fetch(sub, response, results.updated_at);
+                    }
+                }
+                changed = true;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                errors.push(format!("{label}: {error:#}"));
+            }
+        }
+        let mut stopped = Vec::new();
+        if changed || results.refresh_all {
+            alias::assign(&mut self.registry.subscriptions);
+            let saved = store::save(&self.registry.subscriptions);
+            stopped = self.disconnect_if_active_gone();
+            if let Err(error) = saved {
+                return (Err(error), stopped);
+            }
+        }
+        let result = if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(errors.join("; ")))
+        };
+        (result, stopped)
+    }
+
     pub fn add_subscription(
         &mut self,
         url: String,
@@ -1929,7 +2219,7 @@ impl Engine {
     /// panel rotated its credentials, renumbered it, or dropped it entirely.
     /// Same invariant as a deletion: the tunnel must not keep running through
     /// a server the user can no longer see, select or manage.
-    fn disconnect_if_active_gone(&mut self) -> bool {
+    fn disconnect_if_active_gone(&mut self) -> Vec<String> {
         let gone = self.disconnect_if_active_within(|active_id, subs| {
             !subs
                 .iter()
@@ -1945,7 +2235,7 @@ impl Engine {
                     .note("the active server is no longer in its subscription — disconnected");
             }
         }
-        !gone.is_empty()
+        gone
     }
 
     /// Disconnect when the tunnel is running and the active server matches
@@ -2598,6 +2888,418 @@ mod tests {
             crate::paths::set_test_root(None);
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    const UPDATE_LINKS: &str =
+        "trojan://invented-one@one.example:443#One\ntrojan://invented-two@two.example:443#Two";
+
+    fn update_response(body: &str) -> crate::subscription::FetchResult {
+        let (servers, skipped) = crate::subscription_format::parse(body).unwrap();
+        crate::subscription::FetchResult {
+            servers,
+            skipped,
+            not_taken: crate::subscription_format::not_taken(body),
+            userinfo: Some(
+                serde_json::from_str(r#"{"upload":1,"download":2,"total":3,"expire":4}"#).unwrap(),
+            ),
+            title: Some("Provider title".into()),
+            update_interval: Some(12),
+        }
+    }
+
+    fn update_subscription() -> Subscription {
+        let mut sub = Subscription::new(
+            "https://panel.example/sub".into(),
+            Some("Initial title".into()),
+        );
+        sub.servers = update_response(UPDATE_LINKS).servers;
+        crate::alias::assign(std::slice::from_mut(&mut sub));
+        sub
+    }
+
+    #[test]
+    fn an_unlocked_refresh_merges_current_edits_instead_of_snapshot_edits() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("update-current-edits")?;
+        let mut engine = Engine::load();
+        let sub = update_subscription();
+        let ids: Vec<_> = sub.servers.iter().map(|server| server.id.clone()).collect();
+        engine.registry.subscriptions.push(sub.clone());
+        let mut draft = crate::draft::draft_from_server(&sub.servers[1]);
+        draft.port = 8443;
+        engine.update_server(&ids[1], &draft)?;
+        engine.registry.subscriptions[0].servers[1]
+            .spec
+            .set_pin_sha256(Some("b".repeat(64)));
+        let update = engine
+            .prepare_subscription_update(super::SubscriptionOperation::Refresh(sub.id.clone()))?;
+        engine.drop_server_override(&ids[1], "port")?;
+        let mut draft = crate::draft::draft_from_server(&sub.servers[0]);
+        draft.port = 9443;
+        engine.update_server(&ids[0], &draft)?;
+        let current = &mut engine.registry.subscriptions[0];
+        current.name = "Manual title".into();
+        current.description = Some("new description".into());
+        current.servers[0].alias = Some("latest-alias".into());
+        current.servers[0].latency_ms = Some(42);
+        current.servers[0].spec.set_pin_sha256(Some("a".repeat(64)));
+        current.servers[1].spec.set_pin_sha256(None);
+        let other = Subscription::new("https://other.example/sub".into(), Some("Other".into()));
+        engine.registry.subscriptions.insert(0, other.clone());
+        let mut results = update.fetch(|_| Ok(()), |request, hwid| {
+            assert_eq!(request.url, sub.url);
+            assert!(!request.send_hwid);
+            assert!(hwid.is_none());
+            Ok(update_response("trojan://invented-one@one.example:2053#FreshOne\ntrojan://invented-two@two.example:443#FreshTwo"))
+        });
+        results.updated_at = 123;
+        let (result, stopped) = engine.apply_subscription_update(results);
+        result?;
+        assert!(stopped.is_empty());
+        assert_eq!(engine.registry.subscriptions[0].id, other.id);
+        let current = &engine.registry.subscriptions[1];
+        assert_eq!(current.name, "Manual title");
+        assert_eq!(current.description.as_deref(), Some("new description"));
+        assert_eq!(current.updated_at, Some(123));
+        assert_eq!(current.userinfo.as_ref().unwrap().download, 2);
+        assert_eq!(current.servers[0].id, ids[0]);
+        assert_eq!(current.servers[0].alias.as_deref(), Some("latest-alias"));
+        assert_eq!(current.servers[0].latency_ms, Some(42));
+        assert_eq!(current.servers[0].port, 9443);
+        assert_eq!(
+            current.servers[0].spec.pin_sha256(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            current.servers[0].overrides.as_ref().unwrap().provider["port"],
+            serde_json::json!(2053)
+        );
+        assert_eq!(current.servers[1].port, 443);
+        assert!(current.servers[1].overrides.is_none());
+        assert!(current.servers[1].spec.pin_sha256().is_none());
+        assert_eq!(
+            serde_json::to_value(store::load().0)?,
+            serde_json::to_value(&engine.registry.subscriptions)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_subscription_invalidates_results_even_after_identical_readdition() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("update-lifetime")?;
+        let mut engine = Engine::load();
+        let sub = update_subscription();
+        engine.registry.subscriptions.push(sub.clone());
+        for add in [false, true] {
+            let operation = if add {
+                super::SubscriptionOperation::Add {
+                    url: sub.url.clone(),
+                    name: None,
+                    send_hwid: false,
+                }
+            } else {
+                super::SubscriptionOperation::Refresh(sub.id.clone())
+            };
+            let update = engine.prepare_subscription_update(operation)?;
+            engine.registry.remove_subscription(&sub.id)?;
+            engine.registry.subscriptions.push(sub.clone());
+            let (result, stopped) = engine.apply_subscription_update(
+                update.fetch(|_| Ok(()), |_, _| Ok(update_response(UPDATE_LINKS))),
+            );
+            assert!(result.is_err());
+            assert!(stopped.is_empty());
+            assert_eq!(
+                serde_json::to_value(&engine.registry.subscriptions[0])?,
+                serde_json::to_value(&sub)?
+            );
+        }
+        engine.registry.remove_subscription(&sub.id)?;
+        let update = engine.prepare_subscription_update(super::SubscriptionOperation::Add {
+            url: sub.url,
+            name: None,
+            send_hwid: false,
+        })?;
+        engine.registry.remove_subscription(&sub.id)?;
+        assert!(
+            engine
+                .apply_subscription_update(
+                    update.fetch(|_| Ok(()), |_, _| Ok(update_response(UPDATE_LINKS)))
+                )
+                .0
+                .is_err()
+        );
+        assert!(engine.registry.subscriptions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn removed_servers_and_changed_request_settings_reject_stale_refreshes() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("update-request-context")?;
+        let mut engine = Engine::load();
+        for setting in ["url", "hwid", "global-ua", "explicit-ua", "server"] {
+            let sub = update_subscription();
+            engine.registry.subscriptions = vec![sub.clone()];
+            engine.registry.config.subscription_user_agent = "initial-client".into();
+            let update = engine
+                .prepare_subscription_update(super::SubscriptionOperation::Refresh(sub.id))?;
+            match setting {
+                "url" => {
+                    engine.registry.subscriptions[0].url = "https://changed.example/sub".into()
+                }
+                "hwid" => engine.registry.subscriptions[0].send_hwid = true,
+                "global-ua" => {
+                    engine.registry.config.subscription_user_agent = "changed-client".into()
+                }
+                "explicit-ua" => {
+                    engine.registry.subscriptions[0].user_agent = Some("changed-client".into())
+                }
+                _ => {
+                    engine.registry.subscriptions[0].servers.remove(0);
+                }
+            }
+            let before = serde_json::to_value(&engine.registry.subscriptions)?;
+            let (result, stopped) = engine.apply_subscription_update(
+                update.fetch(|_| Ok(()), |_, _| Ok(update_response(UPDATE_LINKS))),
+            );
+            assert!(result.is_err(), "{setting}");
+            assert!(stopped.is_empty());
+            assert_eq!(
+                serde_json::to_value(&engine.registry.subscriptions)?,
+                before
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn effective_user_agents_ignore_irrelevant_global_changes() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("update-effective-ua")?;
+        let mut engine = Engine::load();
+        for explicit in [true, false] {
+            let mut sub = update_subscription();
+            sub.user_agent = explicit.then(|| "explicit-client".into());
+            engine.registry.subscriptions = vec![sub.clone()];
+            engine.registry.config.subscription_user_agent.clear();
+            let update = engine
+                .prepare_subscription_update(super::SubscriptionOperation::Refresh(sub.id))?;
+            engine.registry.config.subscription_user_agent = if explicit {
+                "irrelevant"
+            } else {
+                "v2rayN/6.45"
+            }
+            .into();
+            let (result, _) = engine.apply_subscription_update(update.fetch(
+                |_| Ok(()),
+                |request, _| {
+                    assert_eq!(
+                        request.user_agent,
+                        if explicit {
+                            "explicit-client"
+                        } else {
+                            "v2rayN/6.45"
+                        }
+                    );
+                    Ok(update_response(UPDATE_LINKS))
+                },
+            ));
+            result?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_add_replaces_only_its_unchanged_baseline_and_preserves_failed_targets()
+    -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("update-duplicate-add")?;
+        let mut engine = Engine::load();
+        let sub = update_subscription();
+        engine.registry.subscriptions.push(sub.clone());
+        let operation = || super::SubscriptionOperation::Add {
+            url: sub.url.clone(),
+            name: Some("Supplied title".into()),
+            send_hwid: false,
+        };
+        let update = engine.prepare_subscription_update(operation())?;
+        engine.registry.subscriptions[0].description = Some("concurrent edit".into());
+        let before = serde_json::to_value(&engine.registry.subscriptions)?;
+        assert!(
+            engine
+                .apply_subscription_update(
+                    update.fetch(|_| Ok(()), |_, _| Ok(update_response(UPDATE_LINKS)))
+                )
+                .0
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(&engine.registry.subscriptions)?,
+            before
+        );
+        engine.registry.subscriptions[0].user_agent = Some("old-client".into());
+        engine.registry.subscriptions[0].send_hwid = true;
+        let update = engine.prepare_subscription_update(operation())?;
+        engine
+            .apply_subscription_update(update.fetch(
+                |_| Ok(()),
+                |request, hwid| {
+                    assert!(!request.send_hwid);
+                    assert!(hwid.is_none());
+                    assert_ne!(request.user_agent, "old-client");
+                    let mut response = update_response(UPDATE_LINKS);
+                    response.title = None;
+                    Ok(response)
+                },
+            ))
+            .0?;
+        assert_eq!(engine.registry.subscriptions[0].name, "Supplied title");
+        assert!(engine.registry.subscriptions[0].description.is_none());
+        assert!(engine.registry.subscriptions[0].user_agent.is_none());
+        assert!(!engine.registry.subscriptions[0].send_hwid);
+        let before = serde_json::to_value(&engine.registry.subscriptions)?;
+        for operation in [
+            operation(),
+            super::SubscriptionOperation::Refresh(sub.id.clone()),
+        ] {
+            let update = engine.prepare_subscription_update(operation)?;
+            let (result, stopped) = engine.apply_subscription_update(
+                update.fetch(|_| Ok(()), |_, _| Err(anyhow!("offline failure"))),
+            );
+            assert!(result.is_err());
+            assert!(stopped.is_empty());
+            assert_eq!(
+                serde_json::to_value(&engine.registry.subscriptions)?,
+                before
+            );
+        }
+        assert!(!crate::paths::hwid_file()?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_all_skips_local_targets_saves_successes_and_reports_ordered_safe_errors()
+    -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("update-partial-success")?;
+        let mut engine = Engine::load();
+        let first = update_subscription();
+        let second = Subscription::new("https://second.example/sub".into(), None);
+        let third = Subscription::new("https://third.example/sub".into(), Some("Third".into()));
+        let mut local = Subscription::new(String::new(), Some("Local".into()));
+        local.id = LOCAL_ID.into();
+        engine.registry.subscriptions = vec![local, first.clone(), second.clone(), third.clone()];
+        let update =
+            engine.prepare_subscription_update(super::SubscriptionOperation::RefreshAll)?;
+        let mut urls = Vec::new();
+        let results = update.fetch(
+            |_| Ok(()),
+            |request, _| {
+                urls.push(request.url.clone());
+                if request.url == first.url {
+                    Ok(update_response(UPDATE_LINKS))
+                } else {
+                    Err(anyhow!("offline failure"))
+                }
+            },
+        );
+        let (result, stopped) = engine.apply_subscription_update(results);
+        let error = result.unwrap_err().to_string();
+        assert_eq!(urls, [first.url, second.url.clone(), third.url.clone()]);
+        assert!(!error.contains(&second.url));
+        assert!(!error.contains(&third.url));
+        assert!(error.find(&second.id).unwrap() < error.find("Third").unwrap());
+        assert!(stopped.is_empty());
+        assert_eq!(engine.registry.subscriptions[1].name, "Provider title");
+        assert!(engine.registry.subscriptions[2].updated_at.is_none());
+        assert_eq!(
+            serde_json::to_value(store::load().0)?,
+            serde_json::to_value(&engine.registry.subscriptions)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committing_updates_reconciles_current_sessions_even_when_saving_fails() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("update-session-reconciliation")?;
+        let mut engine = Engine::load();
+        let sub = update_subscription();
+        let members: Vec<_> = sub.servers.iter().map(|server| server.id.clone()).collect();
+        engine.registry.subscriptions = vec![sub.clone()];
+        let update = engine
+            .prepare_subscription_update(super::SubscriptionOperation::Refresh(sub.id.clone()))?;
+        for (profile, selection) in [
+            (
+                "pool",
+                super::SessionSelection::pool(members.clone(), "random".into()),
+            ),
+            (
+                "single",
+                super::SessionSelection::Server(members[1].clone()),
+            ),
+        ] {
+            let mut session = Session::new(
+                profile.into(),
+                Ipv4Addr::LOCALHOST,
+                10808,
+                10809,
+                String::new(),
+                ResolvedCore::default(),
+            );
+            session.selection = Some(selection);
+            *crate::sync::lock(&session.core.status) = crate::xray::core::Status::Connected;
+            engine.sessions.insert(session);
+        }
+        engine.apply_subscription_update(update.fetch(|_| Ok(()), |_, _| Ok(update_response(
+            "trojan://invented-one@one.example:443#One\ntrojan://invented-two@two.example:443#Two\ntrojan://invented-three@three.example:443#Three"
+        )))).0?;
+        assert!(
+            matches!(&engine.sessions.get("pool").unwrap().selection, Some(super::SessionSelection::Pool { members: live, .. }) if live == &members)
+        );
+        engine.registry.subscriptions.push(Subscription::new(
+            "https://failed.example/sub".into(),
+            Some("Failed".into()),
+        ));
+        let update =
+            engine.prepare_subscription_update(super::SubscriptionOperation::RefreshAll)?;
+        std::fs::remove_file(crate::paths::subscriptions_file()?)?;
+        std::fs::create_dir(crate::paths::subscriptions_file()?)?;
+        let (result, stopped) = engine.apply_subscription_update(update.fetch(
+            |_| Ok(()),
+            |request, _| {
+                if request.url == sub.url {
+                    Ok(update_response("trojan://invented-one@one.example:443#One"))
+                } else {
+                    Err(anyhow!("fetch failure"))
+                }
+            },
+        ));
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("writing subscriptions"));
+        assert!(!error.contains("fetch failure"));
+        assert_eq!(stopped, ["pool", "single"]);
+        assert!(engine.sessions.get("pool").unwrap().selection.is_none());
+        assert!(engine.sessions.get("single").unwrap().selection.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_refresh_all_keeps_its_save_semantics() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("update-empty-all")?;
+        let mut engine = Engine::load();
+        let update =
+            engine.prepare_subscription_update(super::SubscriptionOperation::RefreshAll)?;
+        engine
+            .apply_subscription_update(update.fetch(|_| Ok(()), |_, _| panic!("no targets")))
+            .0?;
+        assert_eq!(
+            std::fs::read_to_string(crate::paths::subscriptions_file()?)?,
+            "[]"
+        );
+        Ok(())
     }
 
     fn old_stable_id(seed: &str) -> String {

@@ -53,6 +53,38 @@ struct UserInfo { upload: u64, download: u64, total: u64, expire: Option<i64> }
 3. Body may be base64-encoded; if it decodes to text lines, use that, else use raw text.
 4. Split into lines; parse each non-empty line as a share link (below). Skip unparseable lines.
 
+### Concurrent subscription updates (binding)
+
+`AddSubscription`, `Refresh` and `RefreshAll` retain their D-Bus arguments and empty successful
+replies. A reply means fetching, parsing and catalog application have finished, not merely been
+queued. The handlers await blocking workers; waiting updates queue asynchronously before a worker
+is allocated. One fetch operation runs at a time, without retaining the engine mutex during HTTP,
+HWID access or parsing. Status, supervision and explicit stop remain able to acquire that mutex.
+
+A short locked preparation captures identity, request settings and subscription lifetime. Before
+each target starts, those values are checked again under the engine lock; an opted-out or deleted
+target waiting behind another request is skipped without sending HWID. A request already started
+cannot be recalled. The lock is released before obtaining the opted-in identifier or networking.
+
+Application uses raw provider responses against the **current** catalog. It preserves current
+server identities, aliases, pins, latency and override additions/removals, using the fresh provider
+values as override bases. Concurrent subscription rename wins over a response title; current
+description and order are retained. URL, effective User-Agent or HWID changes invalidate the
+target; an unchanged explicit User-Agent is not invalidated by an irrelevant global change.
+
+Removal advances a runtime lifetime marker, even when the ID has not been inserted yet. An old
+result cannot resurrect that target or replace an identically re-added subscription. Removal of
+a snapshotted server also rejects its subscription result. Duplicate Add retains its existing
+fresh-replacement semantics, but applies only if its complete previous subscription baseline and
+request context remain unchanged. These markers are runtime-only; no persisted schema changes.
+
+Refresh All skips the local empty-URL group, fetches sequentially, aggregates target errors in
+order, and saves accepted results once. A save error takes precedence. Sessions are reconciled
+against the final current catalog even after a persistence failure; a stopped session's pending
+confirmation/retry is invalidated under the same lock. Live pool membership is not rewritten, and
+the existing teardown when a member disappears is preserved. A superseded explicit connection
+attempt reports cancellation rather than success without starting a core.
+
 ### A server entered as fields (binding)
 
 A server can enter the store without a link: a `ServerDraft` — name, protocol, address, port,

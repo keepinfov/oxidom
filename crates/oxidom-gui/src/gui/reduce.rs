@@ -91,12 +91,13 @@ pub(super) struct SnapshotState {
     /// its card's business, not a toast's.
     pub notify_local: HashSet<String>,
     pub operation: Option<UiOperation>,
+    /// The sole exception to serialization: a Stop may overlap a provider fetch.
+    pub stop_operation: Option<UiOperation>,
     /// Optimistic status shown while a job is in flight. Written only through
     /// [`SnapshotState::pin_status`], so the deadline below always has a start.
     pending_status: Option<Status>,
-    /// The profile the optimistic status belongs to. A single operation may be
-    /// in flight, but changing the header selection must not move its status to
-    /// another session.
+    /// The profile the optimistic status belongs to. Changing the header
+    /// selection must not move a pending transition to another session.
     pending_profile: String,
     /// When `pending_status` was pinned. The pin outranks every daemon status
     /// while it stands, so a pin nobody ever retires — a daemon that restarted
@@ -211,6 +212,7 @@ impl SnapshotState {
             notify_probe: HashSet::new(),
             notify_local: HashSet::new(),
             operation: None,
+            stop_operation: None,
             pending_status: None,
             pending_profile: "default".to_string(),
             pending_since: Instant::now(),
@@ -225,6 +227,45 @@ impl SnapshotState {
             notified_outdated: false,
             state_epoch: 0,
         }
+    }
+
+    pub fn foreground_operation(&self) -> Option<&UiOperation> {
+        self.stop_operation.as_ref().or(self.operation.as_ref())
+    }
+
+    pub fn can_start(&self, kind: UiOperationKind) -> bool {
+        self.stop_operation.is_none()
+            && self
+                .operation
+                .as_ref()
+                .is_none_or(|operation| operation.kind.permits(kind))
+    }
+
+    pub fn begin_operation(&mut self, operation: UiOperation) -> bool {
+        if !self.can_start(operation.kind) {
+            return false;
+        }
+        if self.operation.is_some() {
+            self.stop_operation = Some(operation);
+        } else {
+            self.operation = Some(operation);
+        }
+        true
+    }
+
+    /// Retire only this worker. Re-stamping is allowed only without a newer action.
+    pub fn finish_operation(&mut self, operation: &UiOperation, epoch: u64, lost: bool) -> bool {
+        if self.stop_operation.as_ref() == Some(operation) {
+            self.stop_operation = None;
+        } else if self.operation.as_ref() == Some(operation) {
+            self.operation = None;
+        } else {
+            return false;
+        }
+        if lost && !operation.kind.is_subscription_fetch() {
+            self.clear_pin();
+        }
+        epoch == self.state_epoch
     }
 
     /// What the UI as a whole is showing: an optimistic transition outranks
@@ -675,7 +716,10 @@ pub(super) fn reduce(
     // The snapshot is known to be no older than the pin (it passed the epoch
     // check above), so "the daemon still says what it said before" is a
     // statement about the daemon lagging, not about a stale read.
-    if state.operation.is_none() {
+    if state
+        .foreground_operation()
+        .is_none_or(|op| op.kind.is_subscription_fetch())
+    {
         let reported_status = reported_status_for(state, &state.pending_profile);
         let contradicted = match &state.pending_status {
             None => false,
@@ -710,7 +754,9 @@ pub(super) fn reduce(
     }
     // While no optimistic transition is in flight, the daemon's view of the
     // active server wins.
-    if state.operation.is_none()
+    if state
+        .foreground_operation()
+        .is_none_or(|op| op.kind.is_subscription_fetch())
         && state.pending_status_for("default").is_none()
         && snapshot.status.active_id != state.connected_id
     {
@@ -1577,8 +1623,12 @@ fn session_headline(
 
 /// The operation currently running for `profile`, if any.
 fn operation_kind_for(state: &SnapshotState, profile: &str) -> Option<UiOperationKind> {
-    let operation = state.operation.as_ref()?;
-    (operation.profile.as_deref() == Some(profile)).then_some(operation.kind)
+    let operation = state.foreground_operation()?;
+    let target = operation
+        .profile
+        .as_deref()
+        .or_else(|| (operation.kind == UiOperationKind::Disconnect).then_some("default"));
+    (target == Some(profile)).then_some(operation.kind)
 }
 
 /// Build every row on the Profiles page without asking a widget to interpret
@@ -1598,7 +1648,9 @@ pub(super) fn session_rows(
                 // the world it described half a second ago would put the row —
                 // and its switch — back where the user just moved it away from.
                 Some(UiOperationKind::UpProfile) => SessionRowState::Connecting,
-                Some(UiOperationKind::DownProfile) => SessionRowState::Stopped,
+                Some(UiOperationKind::DownProfile | UiOperationKind::Disconnect) => {
+                    SessionRowState::Stopped
+                }
                 _ => session_row_state(session),
             };
             let running_pool = session
@@ -3006,6 +3058,138 @@ mod tests {
 
     fn state() -> SnapshotState {
         SnapshotState::new(&StatusInfo::default())
+    }
+
+    #[test]
+    fn only_one_stop_can_overlap_a_subscription_fetch() {
+        for fetch in [
+            UiOperationKind::AddSubscription,
+            UiOperationKind::UpdateSubscription,
+            UiOperationKind::UpdateAllSubscriptions,
+        ] {
+            for stop in [UiOperationKind::Disconnect, UiOperationKind::DownProfile] {
+                let mut state = state();
+                let fetch = UiOperation::new(fetch);
+                let stop = UiOperation::for_profile(stop, "work");
+                assert!(state.begin_operation(fetch.clone()));
+                for mutation in [
+                    UiOperationKind::Connect,
+                    UiOperationKind::AddSubscription,
+                    UiOperationKind::UpdateSubscription,
+                    UiOperationKind::UpdateAllSubscriptions,
+                    UiOperationKind::DeleteSubscription,
+                    UiOperationKind::ImportServers,
+                    UiOperationKind::EditServer,
+                    UiOperationKind::ApplySettings,
+                    UiOperationKind::UpProfile,
+                ] {
+                    assert!(!state.can_start(mutation), "{mutation:?}");
+                }
+                assert!(state.begin_operation(stop.clone()));
+                assert_eq!(state.operation.as_ref(), Some(&fetch));
+                assert_eq!(state.stop_operation.as_ref(), Some(&stop));
+                assert!(!state.can_start(UiOperationKind::Disconnect));
+                assert!(!state.begin_operation(stop));
+            }
+        }
+        let mut state = state();
+        assert!(state.begin_operation(UiOperation::new(UiOperationKind::Connect)));
+        assert!(!state.can_start(UiOperationKind::Disconnect));
+    }
+
+    #[test]
+    fn fetch_and_stop_completions_or_losses_retire_only_their_own_slot() {
+        for lost in [false, true] {
+            for fetch_first in [false, true] {
+                let mut state = state();
+                let fetch = UiOperation::new(UiOperationKind::UpdateAllSubscriptions);
+                let stop = UiOperation::for_profile(UiOperationKind::DownProfile, "work");
+                assert!(state.begin_operation(fetch.clone()));
+                assert!(state.begin_operation(stop.clone()));
+                state.pin_status("work", Status::Disconnected, Instant::now());
+                assert!(!state.finish_operation(
+                    &UiOperation::new(UiOperationKind::ApplySettings),
+                    0,
+                    true
+                ));
+                let (first, second) = if fetch_first {
+                    (&fetch, &stop)
+                } else {
+                    (&stop, &fetch)
+                };
+                assert!(state.finish_operation(first, 0, lost));
+                assert_eq!(state.operation.is_some(), !fetch_first);
+                assert_eq!(state.stop_operation.is_some(), fetch_first);
+                assert_eq!(state.is_pinned(), !lost || fetch_first);
+                assert!(!state.can_start(UiOperationKind::SaveProfile));
+                assert!(state.finish_operation(second, 0, lost));
+                assert!(state.operation.is_none());
+                assert!(state.stop_operation.is_none());
+                assert!(state.can_start(UiOperationKind::SaveProfile));
+            }
+        }
+    }
+
+    #[test]
+    fn a_fetch_snapshot_superseded_by_stop_cannot_become_current() {
+        for stop_first in [false, true] {
+            let mut state = state();
+            let fetch = UiOperation::new(UiOperationKind::UpdateSubscription);
+            let stop = UiOperation::new(UiOperationKind::Disconnect);
+            assert!(state.begin_operation(fetch.clone()));
+            state.state_epoch = 1;
+            let mut old = snapshot(
+                StatusInfo {
+                    state: "connected".into(),
+                    active_id: Some("old-node".into()),
+                    ..StatusInfo::default()
+                },
+                probe(&[], &[]),
+            );
+            old.epoch = 1;
+            assert!(state.begin_operation(stop.clone()));
+            state.state_epoch = 2;
+            state.pin_status("default", Status::Disconnected, Instant::now());
+            if stop_first {
+                assert!(state.finish_operation(&stop, 2, false));
+                state.state_epoch = 3;
+            }
+            assert!(!state.finish_operation(&fetch, old.epoch, false));
+            assert_eq!(state.stop_operation.is_some(), !stop_first);
+            assert!(reduce(&mut state, &old, Instant::now(), NOW_MS, true).is_none());
+            assert_eq!(state.current_status(), Status::Disconnected);
+            assert_eq!(state.connected_id, None);
+            if !stop_first {
+                assert!(state.finish_operation(&stop, 2, false));
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_stopping_profile_is_busy_during_a_fetch() {
+        for (stop, affected) in [
+            (UiOperation::new(UiOperationKind::Disconnect), "default"),
+            (
+                UiOperation::for_profile(UiOperationKind::DownProfile, "work"),
+                "work",
+            ),
+        ] {
+            let mut state = state();
+            state.sessions = vec![
+                session("default", "connected", "one"),
+                session("work", "connected", "two"),
+            ];
+            assert!(state.begin_operation(UiOperation::new(UiOperationKind::AddSubscription)));
+            assert!(state.begin_operation(stop));
+            for row in session_rows(
+                &[profile("default", "one"), profile("work", "two")],
+                &state,
+                NOW_MS,
+            ) {
+                assert_eq!(row.busy, row.profile == affected);
+                assert_eq!(row.toggle_on, row.profile != affected);
+            }
+        }
     }
 
     #[test]

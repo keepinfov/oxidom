@@ -175,6 +175,12 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   be upgraded/restarted rather than claiming the new policy works.
 - **Subscriptions view:** add (URL + optional name), update-now, delete; per-sub **"send HWID"**
   switch (default OFF) with a privacy hint.
+  **Stop remains available during fetch (binding).** One Disconnect/DownProfile may overlap a
+  subscription Add/Update/Update All. Other mutations and a second Stop remain serialized.
+  Each worker owns its completion record; finishing or losing either never clears the other's
+  spinner or Stop pin. A superseded fetch snapshot is discarded, not re-stamped as current after
+  Stop. The stopping session alone is busy; activity reports both workers while they overlap.
+  Stop does not claim to cancel the subscription request: its result still arrives normally.
   **An import says what it did not take (binding).** The parser reads outbounds and nothing
   else, so a body carrying routing — `route.rules`/`route.rule_set` in sing-box, `rules`/
   `rule-providers`/`geox-url` in Clash, `routing.rules` in a full Xray config — has all of it

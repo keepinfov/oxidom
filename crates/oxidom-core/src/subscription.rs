@@ -41,8 +41,7 @@ pub const CLIENT_PRESETS: &[(&str, &str)] = &[
 
 /// Overall cap on a subscription fetch. ureq's default agent has *no* read
 /// timeout, so a panel that completes the handshake and then goes quiet would
-/// block this thread forever — and the daemon holds its engine lock across
-/// this call, which would take the whole tunnel down with it.
+/// block a worker and prevent subsequent serialized refreshes indefinitely.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Result of fetching + parsing a subscription URL.
@@ -76,11 +75,7 @@ pub fn fetch(
     send_hwid: bool,
     hwid: Option<&str>,
 ) -> Result<FetchResult> {
-    let ua = if user_agent.trim().is_empty() {
-        DEFAULT_USER_AGENT
-    } else {
-        user_agent
-    };
+    let ua = effective_user_agent(user_agent);
     if send_hwid && hwid.is_none() {
         bail!("Send HWID is enabled, but the per-install identifier is unavailable");
     }
@@ -201,10 +196,24 @@ pub fn user_agent_override(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+pub(crate) fn effective_user_agent(user_agent: &str) -> &str {
+    if user_agent.trim().is_empty() {
+        DEFAULT_USER_AGENT
+    } else {
+        user_agent
+    }
+}
+
 /// Fetch into an existing Subscription, updating servers/userinfo/name/timestamp.
 pub fn refresh(sub: &mut Subscription, user_agent: &str, hwid: Option<&str>) -> Result<()> {
     let ua = sub.user_agent.as_deref().unwrap_or(user_agent);
-    let mut res = fetch(&sub.url, ua, sub.send_hwid, hwid)?;
+    let res = fetch(&sub.url, ua, sub.send_hwid, hwid)?;
+    apply_fetch(sub, res, now_unix());
+    Ok(())
+}
+
+/// Merge a raw provider response into the current subscription, keeping local edits.
+pub fn apply_fetch(sub: &mut Subscription, mut res: FetchResult, updated_at: i64) {
     preserve_server_identity(&sub.servers, &mut res.servers);
     sub.servers = res.servers;
     sub.skipped = res.skipped;
@@ -213,8 +222,7 @@ pub fn refresh(sub: &mut Subscription, user_agent: &str, hwid: Option<&str>) -> 
     if let Some(t) = res.title {
         sub.name = t;
     }
-    sub.updated_at = Some(now_unix());
-    Ok(())
+    sub.updated_at = Some(updated_at);
 }
 
 fn preserve_server_identity(previous: &[Server], refreshed: &mut [Server]) {
@@ -307,9 +315,12 @@ fn drift_is_only_overrides(previous: &Server, refreshed: &Server) -> bool {
         &crate::draft::draft_from_server(&base),
         &crate::draft::draft_from_server(refreshed),
     );
-    drift
-        .keys()
-        .all(|key| key == "name" || overrides.values.contains_key(key))
+    drift.keys().all(|key| {
+        key == "name"
+            || key == "stream.pin_sha256"
+            || key == "hysteria2.pin_sha256"
+            || overrides.values.contains_key(key)
+    })
 }
 
 fn decode_maybe_b64_header(raw: &str) -> String {
@@ -354,7 +365,7 @@ fn parse_userinfo(raw: &str) -> Option<UserInfo> {
     if any { Some(info) } else { None }
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -369,6 +380,44 @@ mod tests {
 
     use super::{fetch, preserve_server_identity, require_https, user_agent_override};
     use crate::link::parse_link;
+
+    #[test]
+    fn applying_a_response_preserves_metadata_and_uses_its_supplied_timestamp() {
+        let mut sub = crate::model::Subscription::new(
+            "https://panel.example/sub".into(),
+            Some("Before".into()),
+        );
+        sub.description = Some("local description".into());
+        sub.user_agent = Some("explicit-client".into());
+        sub.send_hwid = true;
+        sub.servers = vec![parse_link("trojan://invented@node.example:443#Old").unwrap()];
+        sub.servers[0].alias = Some("my-node".into());
+        let id = sub.servers[0].id.clone();
+        let (servers, skipped) = crate::subscription_format::parse(
+            "trojan://invented@node.example:443#New\nunsupported://invented",
+        )
+        .unwrap();
+        super::apply_fetch(
+            &mut sub,
+            super::FetchResult {
+                servers,
+                skipped,
+                not_taken: Default::default(),
+                userinfo: None,
+                title: Some("Provider title".into()),
+                update_interval: Some(12),
+            },
+            123,
+        );
+        assert_eq!(sub.name, "Provider title");
+        assert_eq!(sub.description.as_deref(), Some("local description"));
+        assert_eq!(sub.user_agent.as_deref(), Some("explicit-client"));
+        assert!(sub.send_hwid);
+        assert_eq!(sub.updated_at, Some(123));
+        assert_eq!(sub.skipped.lines, 1);
+        assert_eq!(sub.servers[0].id, id);
+        assert_eq!(sub.servers[0].alias.as_deref(), Some("my-node"));
+    }
 
     /// A blank override must clear the field rather than be stored. An empty
     /// string reaching `refresh` would be sent as the literal User-Agent, and a
