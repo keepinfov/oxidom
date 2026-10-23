@@ -1783,4 +1783,160 @@ mod tests {
             );
         }
     }
+
+    struct DaemonDiagnosticFixture(std::path::PathBuf);
+
+    impl DaemonDiagnosticFixture {
+        fn new(lock_directory: bool) -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = loop {
+                let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let root = std::env::temp_dir().join(format!(
+                    "oxidom-daemon-diagnostics-{}-{next}",
+                    std::process::id()
+                ));
+                match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+                    Ok(()) => break root,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("creating isolated diagnostic fixture: {error}"),
+                }
+            };
+            oxidom_core::paths::set_test_root(Some(root.clone()));
+            let fixture = Self(root);
+            let write = |name: &str, bytes: &[u8]| {
+                oxidom_core::fsutil::write_private_atomic(&fixture.0.join(name), bytes).unwrap();
+            };
+            write(".test-parent", &std::process::id().to_le_bytes());
+            write("state.toml", b"unloaded_state = [");
+            write("core-stub", b"#!/bin/sh\nprintf 'Xray 26.3.27\\n'\n");
+            std::fs::set_permissions(
+                fixture.0.join("core-stub"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let config = oxidom_core::config::Config {
+                xray_binary: fixture.0.join("core-stub").display().to_string(),
+                ..oxidom_core::config::Config::default()
+            };
+            write("config.toml", toml::to_string(&config).unwrap().as_bytes());
+            if lock_directory {
+                std::fs::create_dir(fixture.0.join("store.lock")).unwrap();
+            }
+            fixture
+        }
+
+        fn run(&self) -> std::process::Output {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::early_daemon_fixture_process",
+                    "--nocapture",
+                ])
+                .env("OXIDOM_TEST_DAEMON_PARENT", std::process::id().to_string())
+                .env("STATE_DIRECTORY", &self.0)
+                .env("HOME", &self.0)
+                .env("XDG_CONFIG_HOME", self.0.join("config"))
+                .env("XDG_DATA_HOME", self.0.join("data"))
+                .env("RUST_LOG", "off")
+                .env(
+                    "DBUS_SYSTEM_BUS_ADDRESS",
+                    format!("unix:path={}", self.0.join("no-system-bus").display()),
+                )
+                .env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={}", self.0.join("no-session-bus").display()),
+                )
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+        }
+
+        fn records(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(self.0.join("oxidom-daemon.log"))
+                .expect("the early daemon failure must leave persistent diagnostics")
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    impl Drop for DaemonDiagnosticFixture {
+        fn drop(&mut self) {
+            oxidom_core::paths::set_test_root(None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn early_daemon_fixture_process() {
+        use clap::Parser;
+        use std::os::unix::fs::MetadataExt;
+        let Some(parent) = std::env::var("OXIDOM_TEST_DAEMON_PARENT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return;
+        };
+        // SAFETY: this process-state query has no preconditions.
+        if parent != unsafe { nix::libc::getppid() as u32 }
+            || !std::env::args().any(|arg| arg == "tests::early_daemon_fixture_process")
+        {
+            return;
+        }
+        let root = std::path::PathBuf::from(std::env::var_os("STATE_DIRECTORY").unwrap());
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        let prefix = format!("oxidom-daemon-diagnostics-{parent}-");
+        let suffix = root
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_prefix(&prefix)
+            .unwrap();
+        assert!(!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()));
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+        // SAFETY: this uid query has no preconditions.
+        assert_eq!(metadata.uid(), unsafe { nix::libc::geteuid() });
+        let marker = root.join(".test-parent");
+        assert!(std::fs::symlink_metadata(&marker).unwrap().is_file());
+        assert_eq!(std::fs::read(marker).unwrap(), parent.to_le_bytes());
+        let _lock = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        oxidom_core::paths::set_test_root(Some(root));
+        let terminal = env_logger::Builder::from_env(env_logger::Env::default()).build();
+        let level = terminal.filter();
+        assert_eq!(level, log::LevelFilter::Off);
+        oxidom_core::logbook::install_logger(Box::new(terminal), level, None);
+        let result = super::dispatch(super::Cli::parse_from(["oxidom", "daemon"]));
+        let code = result
+            .as_ref()
+            .map_or_else(|failure| super::exit_code_for(failure.kind), |_| 0);
+        let _ = super::exit_status(result);
+        std::process::exit(i32::from(code));
+    }
+
+    #[test]
+    fn a_failure_before_loading_the_store_is_persisted_with_terminal_logging_off() {
+        let _lock = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let fixture = DaemonDiagnosticFixture::new(true);
+        let output = fixture.run();
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(stderr.matches("opening store lock").count(), 1);
+        let records = fixture.records();
+        assert!(
+            records
+                .iter()
+                .any(|record| record["event"] == "phase" && record["phase"] == "store")
+        );
+        assert!(records.iter().any(|record| record["event"] == "problem"
+            && record["phase"] == "store"
+            && record["fatal"] == true));
+        assert_eq!(
+            std::fs::read(fixture.0.join("state.toml")).unwrap(),
+            b"unloaded_state = ["
+        );
+    }
 }
