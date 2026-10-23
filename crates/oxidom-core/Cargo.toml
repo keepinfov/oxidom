@@ -29,11 +29,11 @@ shell-words.workspace = true
 libc.workspace = true
 nix.workspace = true
 rtnetlink.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 futures-util.workspace = true
 log.workspace = true
 zbus.workspace = true
 
 [dev-dependencies]
-# The netlink threading test stands in for zbus's runtime, which is threaded.
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+# Pause discovery's clock in deterministic, offline deadline tests.
+tokio = { workspace = true, features = ["test-util"] }

@@ -15,6 +15,7 @@ mod prefs;
 mod reduce;
 mod server_card;
 mod sidebar;
+mod startup;
 mod tray;
 mod views;
 mod window;

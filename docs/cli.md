@@ -12,6 +12,15 @@ There are **no global flags** beyond `-h`/`--help` and `-V`/`--version`. `--json
 is a per-command flag, not a global one, and exists only on `status`, `list`, and
 `profile list`.
 
+Daemon discovery bounds bus setup and readiness, not just individual replies.
+Commands requiring an existing daemon allow 2 seconds per bus. `up` and
+`connect` allow 10 seconds for the system phase, 2 seconds for an existing session
+daemon and 6 seconds for a newly started one. A timeout reports an error rather
+than silently selecting another database. An early daemon exit includes its exit
+status, allowing a short same-session grace for a competing starter. These are
+discovery I/O budgets, not total command deadlines; a slow first daemon/core
+installation may require retrying later. See [architecture.md](architecture.md#finding-the-daemon).
+
 ## Contents
 
 - [Two ways to name a profile](#two-ways-to-name-a-profile)

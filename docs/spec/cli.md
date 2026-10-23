@@ -44,6 +44,14 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
 Only `up` and `connect` may spawn a private session daemon; every other control command requires
 an existing daemon.
 
+Discovery, including bus connection/authentication and readiness, follows the monotonic phase
+budgets in `storage.md`: existing-only commands allow 2 seconds per bus; `up` and `connect` allow
+10 seconds for system discovery, 2 seconds for an existing session daemon and 6 seconds for a
+spawned one. Timeout/`NoReply` fails rather than silently selecting another database. A spawned
+daemon's early exit is reported after a bounded same-session readiness grace for a competing
+starter. These are discovery I/O budgets, not total command or ordinary RPC deadlines; no command
+syntax, D-Bus signature or exit-code mapping changes.
+
 The canonical order is verb first (`oxidom up work`). For profile-scoped commands, profile first
 is an argv-normalized synonym (`oxidom work up`); a real subcommand in the first position always
 wins. `oxidom env` prints POSIX `export` statements for both SOCKS and HTTP endpoints.
