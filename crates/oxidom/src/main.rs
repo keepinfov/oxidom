@@ -1750,4 +1750,34 @@ mod tests {
             set_alias("no-such-server", "whatever")
         });
     }
+
+    #[test]
+    fn externally_managed_start_commands_never_bootstrap_a_competing_daemon() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let mut watch = SpawnWatch::install().expect("install the spawn watch");
+        watch.restore.push((
+            "OXIDOM_SESSION_DAEMON",
+            std::env::var_os("OXIDOM_SESSION_DAEMON"),
+        ));
+        // SAFETY: the process-wide environment lock is held through watch's Drop.
+        unsafe { std::env::set_var("OXIDOM_SESSION_DAEMON", "external") };
+
+        for (command, result) in [
+            ("up", up("default")),
+            ("connect", connect("invented-missing-server")),
+        ] {
+            let failure = result.expect_err("both buses point at missing private sockets");
+            assert_eq!(failure.kind, FailureKind::DaemonUnavailable);
+            assert!(
+                failure.message.as_deref().is_some_and(|message| {
+                    message.contains("externally managed oxidom session daemon")
+                }),
+                "{command} must report external ownership, not merely failed discovery"
+            );
+            assert!(
+                !watch.started_a_daemon(),
+                "{command} bootstrapped a competing daemon despite external ownership"
+            );
+        }
+    }
 }
