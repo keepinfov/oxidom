@@ -3571,17 +3571,26 @@ fn spawn_core_supervisor(shared: Shared) {
     });
 }
 
-pub fn run(options: DaemonOptions) -> Result<()> {
+pub(super) fn run(
+    options: DaemonOptions,
+    diagnostics: &mut crate::diagnostics::DaemonLog,
+) -> Result<()> {
+    use oxidom_core::diagnostics::Phase;
+
     // Block SIGINT/SIGTERM before anything spawns a thread: zbus serves on its own
     // workers, and only threads created after the mask is set inherit it. Waiting
     // with sigwait then costs no main loop at all.
+    diagnostics.phase(Phase::Signals);
     let mut stop = SigSet::empty();
     stop.add(Signal::SIGINT);
     stop.add(Signal::SIGTERM);
     stop.thread_block()?;
 
+    diagnostics.phase(Phase::Store);
     let _store_lock = crate::store_lock::StoreLock::acquire(&oxidom_core::paths::data_dir()?)?;
+    diagnostics.phase(Phase::Recovery);
     let mut engine = Engine::load();
+    diagnostics.catalog_load_warnings(engine.registry.load_warnings.len());
     for warning in engine.registry.load_warnings.drain(..) {
         log::warn!("{warning}");
     }
@@ -3598,6 +3607,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
 
     // Report the core up front: `journalctl -u oxidom` should show a missing
     // binary before anyone clicks Connect and wonders why it failed.
+    diagnostics.phase(Phase::CoreResolution);
     let resolved = oxidom_core::xray::resolve::resolve(&engine.registry.config.xray_binary);
     match resolved {
         Ok(resolved) => log::info!(
@@ -3605,14 +3615,19 @@ pub fn run(options: DaemonOptions) -> Result<()> {
             resolved.path.display(),
             resolved.source.label(&oxidom_core::xray::resolve::XRAY)
         ),
-        Err(error) => log::warn!("no usable Xray core: {error:#}"),
+        Err(error) => {
+            diagnostics.problem(&error, false);
+            log::warn!("no usable Xray core: {error:#}");
+        }
     }
 
     // Seeded from the running config, so `oxidom up` works on a fresh install
     // without the user first writing a profile by hand. Never fatal: a daemon
     // that refuses to start because it could not write an example profile is
     // worse than one with no profiles.
+    diagnostics.phase(Phase::DefaultProfile);
     if let Err(error) = profile::ensure_default(&engine) {
+        diagnostics.problem(&error, false);
         log::warn!("could not create the default profile: {error:#}");
     }
 
@@ -3631,6 +3646,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
     let service = Service {
         shared: shared.clone(),
     };
+    diagnostics.phase(Phase::Bus);
     let builder = if options.system_bus {
         zbus::blocking::connection::Builder::system().context("connecting to the system bus")?
     } else {
@@ -3643,6 +3659,7 @@ pub fn run(options: DaemonOptions) -> Result<()> {
         .context("registering the service object")?
         .build()
         .context("starting the D-Bus service")?;
+    diagnostics.phase(Phase::Serving);
     log::info!(
         "oxidom daemon serving {BUS_NAME} on the {} bus",
         if options.system_bus {
@@ -3658,16 +3675,21 @@ pub fn run(options: DaemonOptions) -> Result<()> {
             Ok(_) => continue,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(error) => {
+                diagnostics.problem(&anyhow::Error::new(error), false);
                 log::error!("sigwait failed: {error}");
                 break;
             }
         }
     }
 
+    diagnostics.phase(Phase::Shutdown);
     shared.stop_standby();
-    if let Err(error) = oxidom_core::sync::lock(&shared.engine).disconnect_all() {
+    let shutdown = oxidom_core::sync::lock(&shared.engine).disconnect_all();
+    if let Err(error) = shutdown {
+        diagnostics.problem(&error, false);
         log::warn!("could not persist the clean daemon shutdown: {error:#}");
     }
+    diagnostics.phase(Phase::Stopped);
     log::info!("oxidom daemon stopped");
     Ok(())
 }

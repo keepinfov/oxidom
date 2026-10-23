@@ -26,10 +26,19 @@ Under an ordinary user daemon:
 | `~/.local/share/oxidom/subscriptions.json` | cached subscriptions and their parsed servers |
 | `~/.local/share/oxidom/state.toml` | live session records, for crash recovery |
 | `~/.local/share/oxidom/hwid` | per-install id, **only created if a subscription opts in** |
+| `~/.local/share/oxidom/oxidom-daemon.log` | structured daemon lifecycle/error categories; private, at most 2 MiB plus one 2 MiB `.log.1` backup |
 | `~/.local/share/oxidom/current-config-<profile>.json` | the generated Xray config in use |
 | `~/.cache/oxidom/egress.json` | 60-second cache for `oxidom ip --egress` |
 
 `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME` and `$XDG_CACHE_HOME` are honoured.
+
+The daemon diagnostic journal follows its data root, including `STATE_DIRECTORY`
+for the system service. `oxidom-daemon.log.lock` is a private diagnostic-writer
+lock, separate from `store.lock`; never remove either to unlock a running owner.
+The journal has no configuration switch and is independent of `RUST_LOG`.
+It retains typed lifecycle facts, not raw log text or credentials. If storage is
+unavailable, startup retains its original stderr and outcome. See
+[diagnostic limits and recovery](troubleshooting.md#persistent-daemon-diagnostics).
 
 ## The two databases
 

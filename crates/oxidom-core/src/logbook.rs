@@ -534,7 +534,8 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// any `Log` method is reached.
 ///
 /// `file`, when given, also appends every accepted record to that path. Only
-/// the GUI passes one: the daemon's stderr already reaches the journal.
+/// the GUI passes one. The daemon uses separate structured lifecycle diagnostics
+/// rather than persisting arbitrary logbook text.
 ///
 /// Idempotent, and quiet about it. `log` permits exactly one logger per process
 /// and `cargo test` runs many tests in one, so a second call must be a no-op

@@ -330,10 +330,45 @@ terminal and would otherwise leave nothing behind if it were killed:
 ~/.local/share/oxidom/oxidom-gui.log     # 0600, rotated at 2MB (.log.1 kept)
 ```
 
-The daemon has no such file. Managed services send stderr to the journal above.
+Managed services also send stderr to the journal above.
 A standalone daemon retains its launcher's stdout/stderr; those streams are not
 guaranteed to reach a journal and may already be redirected by a detached GUI.
 Use foreground `oxidom daemon` when diagnosing startup outside a service.
+
+### Persistent daemon diagnostics
+
+Daemon lifecycle facts also survive in a separate structured JSONL journal:
+
+```text
+~/.local/share/oxidom/oxidom-daemon.log
+~/.local/share/oxidom/oxidom-daemon.log.1
+# System daemon: /var/lib/oxidom/oxidom-daemon.log and .log.1 instead.
+```
+
+Files are `0600` in the daemon's `0700` data directory. Each generation is capped
+at 2 MiB, with at most one backup; each new record is at most 1 KiB. The journal
+records startup/recovery/service/shutdown checkpoints and safe error categories,
+including returned early failures with `RUST_LOG=off`. `store_busy` means another
+owner prevented startup, while `phase` indicates the operation that failed.
+These markers are not tunnel-health or successful-cleanup claims.
+
+This journal intentionally excludes raw error chains, paths, server/profile
+names, subscription content and core output. Full error context still uses the
+existing stderr/journal paths; this feature does not make legacy raw logs safe
+to publish without review. It does not yet add a CLI log cursor or report export.
+
+If persistence fails, stderr and the process-local Logs view receive the fixed
+warning **persistent daemon diagnostics unavailable; original stderr remains
+enabled**, at most once per daemon process. Startup failure/exit codes remain
+unchanged. Check disk space, permissions and the configured data root. Unsafe
+symlink/hardlink/nonregular targets and existing files over 2 MiB are refused,
+not followed or silently truncated. Stop the daemon before repairing or moving
+oversized files aside. Do not delete `oxidom-daemon.log.lock` to bypass a writer.
+
+Rotation is not transactional across files. A partial current tail is repaired
+on a later open/write. Successful records are synced, but an abort, SIGKILL,
+power failure or unavailable filesystem can still prevent final evidence.
+Pre-exec/argument-parser failures and arbitrary panic payloads are not captured.
 
 If an externally managed session daemon is unavailable, clients with
 `OXIDOM_SESSION_DAEMON=external` deliberately do not bootstrap a replacement.

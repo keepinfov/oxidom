@@ -124,8 +124,16 @@ credentials) and runs `xray run -c <that file>`. Output goes into a 5000-record 
 buffer, which is what the GUI's Logs page shows. The core gets no log file of its own:
 managed services send the daemon's stderr to the journal; standalone launches retain the
 supplied streams without that guarantee. The GUI, which detaches and has no
-journal, keeps its own `oxidom-gui.log` — both described in
+journal, keeps its own `oxidom-gui.log`, described in
 [`spec/storage.md`](spec/storage.md).
+
+The daemon separately retains bounded **structured lifecycle diagnostics** in
+`oxidom-daemon.log`, including returned failures before D-Bus readiness. This is
+not a raw-output copy: phase markers, closed error categories and numeric facts
+exclude arbitrary error/configuration/traffic text. It does not change the
+process-local logbook or replay previous runs. File initialization and writes
+are synchronous and best effort; supplied stderr remains available. Storage
+failure never selects another store or replaces the original startup outcome.
 
 Before spawning, oxidom **resolves the binary first and then checks the ports** —
 in that order, so a busy port can never mask a missing core. Stopping is SIGTERM,

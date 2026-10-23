@@ -15,6 +15,7 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Added
+- **Daemon startup failures leave bounded structured diagnostics even without a GUI or journal.** `oxidom-daemon.log` records private lifecycle checkpoints and safe error categories before D-Bus readiness, independently of `RUST_LOG`, with two generations capped at 2 MiB each. Raw errors/configuration/core output are not copied. Storage failures preserve existing stderr and the original daemon outcome.
 - **Session-daemon supervision is an explicit opt-in.** Packages include an unprivileged `oxidom-session.service` user unit with rate-limited failure restarts; NixOS exposes `programs.oxidom.sessionDaemon.enable`. Clients with `OXIDOM_SESSION_DAEMON=external` report absence instead of privately bootstrapping a competing daemon. Default standalone/AppImage operation remains systemd-independent and has no daemon restart loop.
 - **Tunnel checks have an explicit policy.** `watchdog = "conservative"` is the default: repeated failed checks are reported without stopping a live Xray core. `aggressive` retains live-core restart after three negative checks; `off` disables these checks without disabling process-exit supervision. The policy is selectable in Settings.
 
