@@ -7292,4 +7292,72 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn deletion_cancels_pending_targets_even_after_a_failed_attempt_cleared_selection() -> Result<()>
+    {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        for remove_subscription in [false, true] {
+            let root = TestRoot::install(if remove_subscription {
+                "empty-selection-subscription-retry"
+            } else {
+                "empty-selection-server-retry"
+            })?;
+            let service = for_test();
+            configure_fake_core(&service, &root)?;
+            let (subscription, server) = {
+                let engine = oxidom_core::sync::lock(&service.shared.engine);
+                let subscription = engine
+                    .registry
+                    .subscriptions
+                    .first()
+                    .context("subscription")?;
+                (
+                    subscription.id.clone(),
+                    subscription.servers.first().context("server")?.id.clone(),
+                )
+            };
+            service.connect(server.clone())?;
+            confirm_live_session(&service, "default")?;
+            let generation = service
+                .shared
+                .current_generation("default")
+                .context("generation")?;
+            let target = ConnectionTarget::Server(server.clone());
+            {
+                let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+                engine.registry.config.reconnect = true;
+                let session = engine.sessions.get_mut("default").context("session")?;
+                session.core.disconnect();
+                session.selection = None;
+                *oxidom_core::sync::lock(&session.core.status) =
+                    Status::Error("invented retry failure".into());
+            }
+            oxidom_core::sync::lock(&service.shared.override_status).insert(
+                "default".into(),
+                ErrorOverride {
+                    status: Status::Error(RECONNECTING_MESSAGE.into()),
+                    selection: target.selection(),
+                },
+            );
+            if remove_subscription {
+                service.remove_subscription(subscription)?;
+            } else {
+                service.remove_server(server)?;
+            }
+            assert!(!service.shared.generation_is_current("default", generation));
+            assert!(
+                !service
+                    .shared
+                    .reconnect_is_pending("default", &target, generation)
+            );
+            assert!(
+                oxidom_core::sync::lock(&service.shared.override_status)
+                    .get("default")
+                    .is_none()
+            );
+            service.stop_all_profiles()?;
+        }
+        Ok(())
+    }
 }
