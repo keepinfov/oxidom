@@ -29,7 +29,8 @@ missing files (treat as defaults/empty).
   running recovery, regardless of which bus it intended to serve.
 - `~/.local/share/oxidom/oxidom-gui.log` — the graphical client's own log, `0600`, rotated at 2MB
   with one `.log.1` kept. Written only by the GUI, which detaches and sends stderr to `/dev/null`
-  and so has no journal; the daemon writes no file because its stderr already reaches one.
+  and so has no journal. The daemon writes no file: managed services send stderr to the journal,
+  while standalone launches retain the supplied streams without a journal guarantee.
 - `~/.local/share/oxidom/assets/{geoip.dat,geosite.dat}` — the geo data the core needs, when
   oxidom installed it. `0600` in a `0700` directory like every other file here: the core runs as
   the same user as the daemon that spawns it, so nothing wider is required. Written only when the
@@ -89,6 +90,44 @@ can already be running as uncancellable blocking work, so the persistent discove
 such blocking work at one thread. Normal RPCs retain a separate 300-second per-reply limit, not
 an aggregate startup, hydration or subscription-update deadline. No mutating request is retried
 because of a client timeout.
+
+### Session-daemon supervision ownership (binding)
+
+Clients discover or bootstrap; they are not restart supervisors. `OXIDOM_SESSION_DAEMON` is
+a client launch policy, not a `config.toml` key, store selector or proof of the serving process's
+supervisor. Unset, empty and `standalone` preserve one-shot private bootstrap. `external` keeps
+system-first discovery but forbids a private spawn when no existing daemon is available. Return
+an externally-managed-unavailable error instead; never run `systemctl`, retry a mutation, kill an
+owner or race the configured supervisor. Invalid/non-Unicode values fail before discovery and
+must not be echoed in errors. Existing-only commands still never bootstrap.
+
+Automatic standalone startup keeps the env/sibling/PATH binary resolution and caller
+environment, opens null stdin, creates a new POSIX session and resets/unblocks SIGINT/SIGTERM
+before exec. Preserve stdout/stderr so startup diagnostics are not discarded. Provision one
+child-specific waiter before spawning, retain exclusive `Child` ownership through discovery,
+then transfer it on success, failure or unwind. No discovery outcome kills or restarts the child.
+The wait owner lasts only as long as its launching process; after that normal OS adoption applies.
+This is reaping, not crash restart, cgroup isolation, logout survival or full stream isolation.
+Foreground `oxidom daemon` keeps its existing service/terminal behavior.
+
+The opt-in `oxidom-session.service` user unit owns managed starts/restarts in a separate cgroup
+from the GUI/tray. It is `Type=dbus`, uses the same session-bus name and ordinary user XDG roots,
+has no capabilities or `StateDirectory`, and follows the user manager's `default.target`, not
+`graphical-session.target`. Restart only on failure, after 2 seconds, limited to 3 starts per
+60 seconds. Allow 180 seconds for unit startup, including first core installation.
+`KillMode=process` preserves children for existing recovery; only eligible pool cores
+are adopted, not every session. Installation must neither enable this unit nor enable lingering.
+Stopping the service does not authorize clients in external mode to bootstrap a substitute.
+
+NixOS enables the mode only with both `programs.oxidom.enable` and
+`programs.oxidom.sessionDaemon.enable`; the latter defaults to false. Set external mode in login
+session variables and explicitly in the tray, and order the tray after the daemon with `Wants`,
+not reverse `PartOf`/`Requires` coupling. Custom XDG/binary settings belong in the user manager's
+environment, not only in a client shell. Service enablement alone cannot constrain clients that
+lack the policy, and older clients do not honor it. Never take over a pre-existing standalone
+owner; switching owners is an explicit operator action. D-Bus signatures and on-disk schemas
+remain unchanged. Bus-transport reconnection and generalized shutdown quiescence are not supplied
+by this launch-ownership contract.
 
 ## Reading the log over D-Bus (binding)
 

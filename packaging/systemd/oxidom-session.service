@@ -1,0 +1,23 @@
+[Unit]
+Description=oxidom unprivileged session daemon
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=dbus
+BusName=dev.keepinfov.oxidom.Daemon
+# Keep the user's normal XDG configuration and data roots.
+ExecStart=/usr/bin/oxidom daemon
+# A first pinned-core installation can take up to its 120-second HTTP budget.
+TimeoutStartSec=180
+Restart=on-failure
+RestartSec=2
+# Preserve cores for recovery; only eligible pool sessions can be adopted.
+KillMode=process
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Opt-in only: installing this unit must not enable it or enable lingering.
+[Install]
+WantedBy=default.target

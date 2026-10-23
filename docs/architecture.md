@@ -96,12 +96,34 @@ lock. Discovery failure does not kill a daemon. These are cooperative I/O
 deadlines, not guarantees against stalled filesystem or process-spawn work;
 ordinary calls and initial GUI hydration have separate timeout semantics.
 
+## Who supervises the session daemon
+
+By default, the GUI or `up`/`connect` bootstraps one standalone session daemon
+without a restart loop. The launcher reaps its child eventually but never kills
+or restarts it because discovery failed or the GUI closed. Automatic startup
+creates a new POSIX session and null stdin; stdout/stderr remain available for
+diagnosis. This does not escape a launcher's cgroup or promise logout survival.
+
+Managed installations may opt into a separate **user** `oxidom-session.service`.
+The user manager alone owns its failure restarts, independently of the tray's
+cgroup. Clients must receive `OXIDOM_SESSION_DAEMON=external`, which preserves
+normal discovery but forbids private bootstrap during absence or a restart gap.
+There is no automatic takeover of an existing standalone owner. The system
+daemon remains a distinct service/store and retains discovery priority.
+
+The user unit uses normal user XDG directories without capabilities or an
+implicit lingering setting. A crash restart is not universal tunnel resumption:
+only eligible pool cores are adopted; other recorded cores and interfaces follow
+existing cleanup. [Installation](installation.md#managed-session-daemon) explains
+the explicit opt-in and migration boundaries.
+
 ## Running the core
 
 Each session writes its own `current-config-<profile>.json` (mode `0600` — it holds
 credentials) and runs `xray run -c <that file>`. Output goes into a 5000-record ring
 buffer, which is what the GUI's Logs page shows. The core gets no log file of its own:
-the daemon's stderr already reaches the journal, and the GUI, which detaches and has no
+managed services send the daemon's stderr to the journal; standalone launches retain the
+supplied streams without that guarantee. The GUI, which detaches and has no
 journal, keeps its own `oxidom-gui.log` — both described in
 [`spec/storage.md`](spec/storage.md).
 

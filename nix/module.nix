@@ -18,13 +18,33 @@ in {
       description = "The oxidom package to use.";
     };
 
+    sessionDaemon = {
+      enable = lib.mkEnableOption ''
+        a separately supervised, unprivileged oxidom session daemon, independent
+        of the GUI and tray. It uses the user's normal XDG configuration and data
+        roots and restarts on failure, with rate limiting. Only eligible pool
+        sessions can be adopted during recovery; not every tunnel survives a
+        crash. It runs with the user manager, without enabling lingering.
+        By default clients start a standalone daemon without crash restart
+      '';
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = cliPkg;
+        description = "The oxidom package the unprivileged session daemon runs from.";
+      };
+    };
+
     trayAutostart = lib.mkOption {
       type = lib.types.bool;
       default = false;
       description = ''
         Start `oxidom-gui --background` with the graphical session, so the
         tray icon (and the GNOME system-proxy toggle) are present before the
-        window is ever opened.
+        window is ever opened. This does not enable the managed session daemon:
+        by default its standalone daemon has no crash restart. Enable
+        `programs.oxidom.sessionDaemon.enable` for supervision independent of
+        the GUI and tray.
       '';
     };
   };
@@ -82,11 +102,28 @@ in {
     (lib.mkIf cfg.enable {
       environment.systemPackages = [cfg.package cliPkg];
 
+      environment.sessionVariables = lib.mkIf cfg.sessionDaemon.enable {
+        OXIDOM_SESSION_DAEMON = "external";
+      };
+
+      # Share the packaged unit; only its binary path and declarative enablement
+      # differ on NixOS. This is a user-manager service, not a GUI dependency.
+      systemd.user.units."oxidom-session.service" = lib.mkIf cfg.sessionDaemon.enable {
+        wantedBy = ["default.target"];
+        text =
+          lib.replaceStrings ["/usr/bin/oxidom"] ["${cfg.sessionDaemon.package}/bin/oxidom"]
+          (builtins.readFile ../packaging/systemd/oxidom-session.service);
+      };
+
       systemd.user.services.oxidom-tray = lib.mkIf cfg.trayAutostart {
         description = "oxidom tray and background GUI";
         wantedBy = ["graphical-session.target"];
         partOf = ["graphical-session.target"];
-        after = ["graphical-session.target"];
+        after = ["graphical-session.target"] ++ lib.optional cfg.sessionDaemon.enable "oxidom-session.service";
+        wants = lib.optional cfg.sessionDaemon.enable "oxidom-session.service";
+        environment = lib.mkIf cfg.sessionDaemon.enable {
+          OXIDOM_SESSION_DAEMON = "external";
+        };
         serviceConfig = {
           ExecStart = "${cfg.package}/bin/oxidom-gui --background";
           Restart = "on-failure";

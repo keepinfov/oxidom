@@ -19,6 +19,7 @@ oxidom downloads its pinned, verified **Xray core** automatically on first use.
 - [Nix without NixOS](#nix-without-nixos)
 - [Arch](#arch)
 - [From source](#from-source)
+- [Managed session daemon](#managed-session-daemon)
 - [Tested distro matrix](#tested-distro-matrix)
 - [Getting an Xray core](#getting-an-xray-core)
 - [Optional runtime dependencies](#optional-runtime-dependencies)
@@ -197,6 +198,8 @@ If it will not start, your system may lack a usable FUSE. Run it without:
 |---|---|---|---|
 | `programs.oxidom.enable` | bool | `false` | Installs **both** the GUI and CLI packages. |
 | `programs.oxidom.package` | package | `oxidom-gui` | Which GUI package to install. |
+| `programs.oxidom.sessionDaemon.enable` | bool | `false` | Opts into an unprivileged user daemon supervised independently of the tray, using normal XDG roots. Sets external client bootstrap ownership. Requires `programs.oxidom.enable`. |
+| `programs.oxidom.sessionDaemon.package` | package | `oxidom-cli` | Which package the managed user daemon runs. |
 | `programs.oxidom.trayAutostart` | bool | `false` | Adds a user unit running `oxidom-gui --background` with the graphical session, so the tray and the GNOME proxy toggle exist before a window is opened. |
 
 ### `services.oxidom` — the system daemon
@@ -350,6 +353,76 @@ sudo dnf install gcc pkgconf-pkg-config rust cargo \
 ```sh
 sudo pacman -S base-devel rust gtk4 libadwaita
 ```
+
+## Managed session daemon
+
+Standalone startup remains the default, including AppImage: GUI and `up`/`connect`
+can bootstrap a daemon without systemd, but do not restart it after a crash.
+`setsid` and a child waiter do not move that daemon out of a launcher's cgroup.
+In particular, a standalone daemon started inside a tray service can still be
+stopped with that service.
+
+For independent, rate-limited supervision, packages also carry the optional
+**user** unit `oxidom-session.service`. Installation does not enable it. Choose
+this instead of a standalone session owner, not as a second process against the
+same store. First disconnect sessions deliberately and stop the existing
+standalone daemon using its known process or foreground terminal. Never delete
+`store.lock` or kill a different daemon to make the new unit start.
+
+On a packaged systemd installation, after that explicit migration:
+
+```sh
+systemctl --user enable --now oxidom-session.service
+export OXIDOM_SESSION_DAEMON=external
+oxidom-gui
+# The same exported policy also applies to oxidom up / oxidom connect.
+```
+
+The export must reach **all** GUI and CLI launchers, not only this terminal.
+Configure it in the chosen desktop/login environment and start a new login
+session, or supply it explicitly per launcher. Enabling a unit alone does not
+prevent a client with the default policy, or an older client, from privately
+bootstrapping during a restart gap. External mode does not invoke `systemctl` or
+resurrect a stopped service; it reports daemon-unavailable instead. Normal
+system-first discovery remains in effect, so this policy does not force use of
+the session database.
+
+On NixOS, opt in declaratively instead of enabling the packaged unit by hand:
+
+```nix
+programs.oxidom.enable = true;
+programs.oxidom.sessionDaemon.enable = true;
+programs.oxidom.trayAutostart = true; # optional; not the daemon's supervisor
+```
+
+This sets external policy in new login sessions and explicitly in the tray,
+and orders the tray after the separately managed daemon. The daemon is not
+`PartOf` the tray or graphical-session target. The default option remains false;
+`trayAutostart` alone retains standalone behavior. A custom daemon package can
+be selected with `programs.oxidom.sessionDaemon.package`.
+
+The service follows the **user manager**, with no automatic lingering. It has
+no capabilities, no system-service account and no `StateDirectory` override:
+normal user XDG configuration/data roots still apply. Custom XDG directories or
+binary environment overrides must be configured for that manager, not just a
+client shell. TUN still requires the separately configured system daemon.
+
+`Restart=on-failure` waits 2 seconds between attempts and limits starts to three
+per 60 seconds. The startup limit is 180 seconds to allow first core installation.
+Stopping the unit is not a crash restart; recover deliberately after hitting the
+start limit. `KillMode=process` leaves cores for existing recovery, but only
+eligible pool cores are adopted: this is not seamless restoration of every
+tunnel or interface. Check current sessions after a restart.
+
+Logs and service state:
+
+```sh
+systemctl --user status oxidom-session.service
+journalctl --user -u oxidom-session.service -f
+```
+
+The unit does not introduce portable automatic supervision, transport reconnection
+after loss of the bus itself, or a new daemon shutdown protocol.
 
 ## Tested distro matrix
 

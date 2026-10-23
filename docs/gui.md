@@ -472,6 +472,11 @@ programs.oxidom.trayAutostart = true;
 
 ## Notes
 
+- For a separately supervised session daemon, use the explicit
+  [managed session setup](installation.md#managed-session-daemon). With
+  `OXIDOM_SESSION_DAEMON=external`, startup Retry never creates a competing private
+  daemon. Runtime loss stays visible as unknown state; the GUI is not a daemon
+  restart supervisor. Standalone startup remains available without systemd.
 - Startup discovers the daemon and loads its initial catalog, profiles, status,
   settings and capabilities in a worker. The startup window stays responsive and
   says **Loading daemon state...** during loading; `--background` stays hidden.

@@ -15,9 +15,11 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Added
+- **Session-daemon supervision is an explicit opt-in.** Packages include an unprivileged `oxidom-session.service` user unit with rate-limited failure restarts; NixOS exposes `programs.oxidom.sessionDaemon.enable`. Clients with `OXIDOM_SESSION_DAEMON=external` report absence instead of privately bootstrapping a competing daemon. Default standalone/AppImage operation remains systemd-independent and has no daemon restart loop.
 - **Tunnel checks have an explicit policy.** `watchdog = "conservative"` is the default: repeated failed checks are reported without stopping a live Xray core. `aggressive` retains live-core restart after three negative checks; `off` disables these checks without disabling process-exit supervision. The policy is selectable in Settings.
 
 ### Fixed
+- **Automatically started session daemons have a child wait owner.** The launcher provisions the waiter before spawning and transfers ownership after discovery succeeds, fails or unwinds, without killing the daemon. Standalone bootstrap starts a new POSIX session with null stdin and usable stop signals while preserving diagnostic stdout/stderr; foreground daemon execution is unchanged.
 - **Initial daemon data no longer blocks GTK while the GUI opens.** Catalog, profile, status, settings and capability reads run behind the responsive startup window. Discovery budgets include bus setup and readiness, distinguish a timeout from an absent daemon, and report early daemon exit without rejecting a competing starter that became ready on the same session bus.
 - **Updating a subscription no longer monopolizes tunnel control.** Fetching and parsing run outside the daemon engine lock and D-Bus executor. Status and disconnect remain available; the GUI allows one Stop while a subscription fetch is pending, without losing either operation's completion or replacing Stop with an older snapshot.
 - **Refresh results merge into the current catalog rather than an old copy.** Concurrent aliases, pins, overrides and metadata edits survive. Removed subscriptions, replaced lifetimes, removed servers and changed request settings reject stale results; queued requests recheck HWID opt-in before starting. Refresh All still saves successful targets and reports the others.

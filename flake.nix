@@ -30,12 +30,13 @@
         # pinned by crane's own lock.
         craneLib = crane.mkLib pkgs;
 
-        # Cargo sources plus the three directories the crates actually read:
+        # Cargo sources plus the directories the crates and packaging read:
         # `data/` and the flag PNGs are `include_bytes!`/`include_str!` inputs as
         # well as `postInstall` inputs, and the fixtures are needed because this
         # flake runs `cargo test` inside the CLI derivation. A filter that keeps
-        # only cargo sources drops all three, and the failure lands as an
+        # only cargo sources drops these, and the failure lands as an
         # unresolved `include_str!` rather than as a missing file.
+        # The shared systemd unit is also an input to the CLI's postInstall.
         src = lib.fileset.toSource {
           root = ./.;
           fileset = lib.fileset.unions [
@@ -43,6 +44,7 @@
             ./data
             ./crates/oxidom-gui/data
             ./crates/oxidom-core/src/subscription_format/fixtures
+            ./packaging/systemd
           ];
         };
 
@@ -84,6 +86,10 @@
                 $out/share/dbus-1/system.d/dev.keepinfov.oxidom.Daemon.conf
               install -Dm444 data/dev.keepinfov.oxidom.Daemon.service \
                 $out/share/dbus-1/system-services/dev.keepinfov.oxidom.Daemon.service
+              install -Dm444 packaging/systemd/oxidom-session.service \
+                $out/lib/systemd/user/oxidom-session.service
+              substituteInPlace $out/lib/systemd/user/oxidom-session.service \
+                --replace-fail /usr/bin/oxidom $out/bin/oxidom
             '';
             # Two binaries end up in the joined package, so nothing can infer which
             # one `nix run` and `nix bundle` mean. Naming it is also what lets the
@@ -151,10 +157,17 @@
           type = "app";
           program = "${oxidom-gui}/bin/oxidom-gui";
         };
-        checks = {
-          cli = oxidom-cli;
-          gui = oxidom-gui;
-        };
+        checks =
+          {
+            cli = oxidom-cli;
+            gui = oxidom-gui;
+          }
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            session-daemon = import ./nix/checks/session-daemon.nix {
+              inherit self pkgs lib;
+              inherit (inputs) nixpkgs;
+            };
+          };
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [pkg-config wrapGAppsHook4];
           buildInputs = with pkgs; [

@@ -52,6 +52,29 @@ grant. Add it with `systemctl edit oxidom.service`:
     AmbientCapabilities=CAP_NET_ADMIN
     CapabilityBoundingSet=CAP_NET_ADMIN
 
+## Optional session supervision
+
+The package also installs `oxidom-session.service` as an opt-in **user** unit.
+It is not enabled automatically and needs no root or capabilities. It uses
+normal user XDG configuration/data roots and follows the user manager, not the
+GUI. Lingering is not enabled. Only eligible pool cores can be adopted after
+a crash; restarts do not guarantee that every tunnel survives.
+
+Before switching, deliberately disconnect and stop an existing standalone
+daemon; the user service does not take over a live store. Then:
+
+    systemctl --user enable --now oxidom-session.service
+    export OXIDOM_SESSION_DAEMON=external
+    oxidom-gui
+
+Ensure that export reaches every GUI/CLI launcher, including future login
+sessions. It prevents new private daemon starts during managed-service absence;
+service enablement alone does not, and older clients ignore the policy. It does
+not force selection of the session database over a reachable system daemon.
+
+The unit restarts on failure after 2 seconds, at most three starts per minute.
+Its logs are available with `journalctl --user -u oxidom-session.service`.
+
 ## Optional programs
 
 | Program | Needed for |

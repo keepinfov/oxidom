@@ -119,8 +119,8 @@ fn main() -> ExitCode {
         };
     }
     let cli = Cli::parse_from(cli::normalize(std::env::args_os().collect()));
-    // The daemon's log is its journal, and `journalctl -u oxidom` is the only
-    // window into it. For every other subcommand the same lines are noise in
+    // Daemon diagnostics belong on stderr (the journal under systemd).
+    // For every other subcommand the same lines are noise in
     // front of whatever the user actually asked for — "no daemon on the system
     // bus" is a step, not a problem. $RUST_LOG still overrides either way.
     let default_level = if matches!(cli.command, Command::Daemon { .. }) {
@@ -135,9 +135,8 @@ fn main() -> ExitCode {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
             .build();
     let max_level = terminal.filter();
-    // No file sink here: the daemon's stderr is its journal, and a second
-    // root-owned copy under STATE_DIRECTORY would be one more thing to rotate
-    // for no reader that journalctl does not already serve.
+    // No file sink here: managed services journal stderr, while foreground and
+    // standalone launches retain the diagnostic streams supplied by the caller.
     oxidom_core::logbook::install_logger(Box::new(terminal), max_level, None);
     exit_status(dispatch(cli))
 }
@@ -1661,8 +1660,12 @@ mod tests {
 
     impl SpawnWatch {
         fn install() -> std::io::Result<Self> {
-            let directory =
-                std::env::temp_dir().join(format!("oxidom-spawn-watch-{}", std::process::id()));
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let instance = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "oxidom-spawn-watch-{}-{instance}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&directory)?;
             let marker = directory.join("started");
             let stub = directory.join("oxidom-stub");
@@ -1749,5 +1752,35 @@ mod tests {
         assert_no_daemon_started(&watch, "alias <HANDLE> <NEW>", || {
             set_alias("no-such-server", "whatever")
         });
+    }
+
+    #[test]
+    fn externally_managed_start_commands_never_bootstrap_a_competing_daemon() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let mut watch = SpawnWatch::install().expect("install the spawn watch");
+        watch.restore.push((
+            "OXIDOM_SESSION_DAEMON",
+            std::env::var_os("OXIDOM_SESSION_DAEMON"),
+        ));
+        // SAFETY: the process-wide environment lock is held through watch's Drop.
+        unsafe { std::env::set_var("OXIDOM_SESSION_DAEMON", "external") };
+
+        for (command, result) in [
+            ("up", up("default")),
+            ("connect", connect("invented-missing-server")),
+        ] {
+            let failure = result.expect_err("both buses point at missing private sockets");
+            assert_eq!(failure.kind, FailureKind::DaemonUnavailable);
+            assert!(
+                failure.message.as_deref().is_some_and(|message| {
+                    message.contains("externally managed oxidom session daemon")
+                }),
+                "{command} must report external ownership, not merely failed discovery"
+            );
+            assert!(
+                !watch.started_a_daemon(),
+                "{command} bootstrapped a competing daemon despite external ownership"
+            );
+        }
     }
 }

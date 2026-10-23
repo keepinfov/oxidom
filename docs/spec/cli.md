@@ -52,6 +52,12 @@ daemon's early exit is reported after a bounded same-session readiness grace for
 starter. These are discovery I/O budgets, not total command or ordinary RPC deadlines; no command
 syntax, D-Bus signature or exit-code mapping changes.
 
+`OXIDOM_SESSION_DAEMON=external` also forbids `up` and `connect` from privately bootstrapping an
+unavailable session daemon. Existing system/session daemons remain usable in the normal order;
+absence reports daemon-unavailable (exit 4), not a service-manager invocation. Unset, empty or
+`standalone` retains private bootstrap. Invalid values fail before discovery without echoing the
+value. The policy does not daemonize foreground `oxidom daemon` or change existing-only commands.
+
 The canonical order is verb first (`oxidom up work`). For profile-scoped commands, profile first
 is an argv-normalized synonym (`oxidom work up`); a real subcommand in the first position always
 wins. `oxidom env` prints POSIX `export` statements for both SOCKS and HTTP endpoints.
