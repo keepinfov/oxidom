@@ -403,6 +403,7 @@ files in your home directory. A session daemon installs into
 | `OXIDOM_TUN2SOCKS_BIN` | tun2socks path. |
 | `OXIDOM_NFT_BIN` | `nft` path. |
 | `OXIDOM_BIN` | Which `oxidom` binary the GUI spawns as a session daemon. Set by the Nix wrapper. |
+| `OXIDOM_SESSION_DAEMON` | Client bootstrap ownership: unset/empty/`standalone` permits one-shot private startup; `external` requires an existing daemon and leaves starts/restarts to its supervisor. Invalid values fail closed. Does not select a store or force the session bus. |
 | `OXIDOM_GUI_BIN` | Which `oxidom-gui` binary `oxidom gui` execs. |
 | `OXIDOM_EGRESS_URL` | Override `https://api.ipify.org` for `oxidom ip --egress`. |
 | `EDITOR`, `VISUAL` | Editor for `oxidom profile edit` (then `vi`). |
@@ -410,6 +411,12 @@ files in your home directory. A session daemon installs into
 | `XRAY_LOCATION_ASSET` | Where the **core** looks for `geoip.dat` and `geosite.dat`. Read, not owned: oxidom sets it on the core it spawns only when nothing else has, and only when it holds both files itself. Set it yourself and oxidom leaves it alone. |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` | Base directories. |
 | `XDG_RUNTIME_DIR` | Where `oxidom run` looks for the systemd user socket. |
+
+External ownership must reach **every** GUI and spawning CLI client; enabling a
+user service alone does not set it in arbitrary shells or desktop launchers.
+Older clients ignore it. A managed daemon inherits the user manager's environment,
+so custom XDG directories or binary overrides set only in a client shell do not
+configure that daemon. See [managed session setup](installation.md#managed-session-daemon).
 
 ## File handling
 

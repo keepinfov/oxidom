@@ -18,6 +18,8 @@ use crate::model::Subscription;
 use crate::profile::Profile;
 use crate::run::CgroupSlice;
 
+mod session_daemon;
+
 /// Ordinary per-reply limit, separate from discovery's end-to-end budgets.
 /// This is not a total operation deadline: RefreshAll can queue and fetch many
 /// subscriptions sequentially, and even sending a call precedes its reply timer.
@@ -359,35 +361,42 @@ impl DaemonClient {
     ///
     /// `progress` is called on the calling thread before each step, so a caller
     /// that runs this off the main loop can report what it is waiting on.
+    /// `OXIDOM_SESSION_DAEMON=external` leaves launch ownership to an external
+    /// supervisor; unset, empty and `standalone` retain private bootstrap.
     pub fn connect_any(progress: impl Fn(ConnectStage)) -> Result<Self> {
-        let (proxy, source) = block_discovery(async {
-            if let Some(client) = find_existing(
-                &progress,
-                true,
-                system_daemon_installed(),
-                &mut Self::try_bus,
-            )
-            .await?
-            {
-                return Ok(client);
-            }
-
-            progress(ConnectStage::Starting);
-            let deadline = Instant::now() + SESSION_STARTUP;
-            let executable = daemon_binary();
-            let mut child = std::process::Command::new(&executable)
-                .arg("daemon")
-                .spawn()
+        let owner = session_daemon::LaunchOwner::parse(
+            std::env::var_os("OXIDOM_SESSION_DAEMON").as_deref(),
+        )?;
+        let existing = block_discovery(find_existing(
+            &progress,
+            true,
+            system_daemon_installed(),
+            &mut Self::try_bus,
+        ))?;
+        let (proxy, source) = session_daemon::connect_or_launch(existing, owner, || {
+            block_discovery(async {
+                progress(ConnectStage::Starting);
+                let deadline = Instant::now() + SESSION_STARTUP;
+                let executable = daemon_binary();
+                let mut daemon = session_daemon::SessionDaemon::spawn(
+                    std::process::Command::new(&executable).arg("daemon"),
+                )
                 .context("spawning a session daemon")?;
-            let proxy = wait_spawned(deadline, &mut Self::try_bus, || {
-                if let Some(status) = child.try_wait().context("checking the session daemon")? {
-                    bail!("the session daemon exited before becoming ready ({status})");
-                }
-                Ok(())
+                let proxy = wait_spawned(deadline, &mut Self::try_bus, || {
+                    if let Some(status) = daemon
+                        .child
+                        .as_mut()
+                        .context("session daemon child is missing")?
+                        .try_wait()
+                        .context("checking the session daemon")?
+                    {
+                        bail!("the session daemon exited before becoming ready ({status})");
+                    }
+                    Ok(())
+                })
+                .await?;
+                Ok((proxy, DaemonSource::Spawned))
             })
-            .await?;
-            // Dropping Child does not kill it, including on discovery timeout.
-            Ok((proxy, DaemonSource::Spawned))
         })?;
         Ok(Self {
             proxy: proxy.into(),

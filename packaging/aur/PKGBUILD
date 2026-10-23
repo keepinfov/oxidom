@@ -88,6 +88,8 @@ package() {
     "$pkgdir/usr/lib/systemd/system/oxidom.service"
   install -Dm644 packaging/systemd/oxidom@.service \
     "$pkgdir/usr/lib/systemd/system/oxidom@.service"
+  install -Dm644 packaging/systemd/oxidom-session.service \
+    "$pkgdir/usr/lib/systemd/user/oxidom-session.service"
   install -Dm644 packaging/systemd/oxidom.sysusers \
     "$pkgdir/usr/lib/sysusers.d/oxidom.conf"
 }

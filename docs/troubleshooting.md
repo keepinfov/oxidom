@@ -311,7 +311,7 @@ The daemon logs to stderr, so under systemd:
 
 ```sh
 journalctl -u oxidom.service -f          # system daemon
-journalctl --user -f | grep oxidom       # session daemon
+journalctl --user -u oxidom-session.service -f # opt-in managed session daemon
 ```
 
 The GUI's **Logs** page shows the Xray core, the network interface helper and
@@ -330,7 +330,17 @@ terminal and would otherwise leave nothing behind if it were killed:
 ~/.local/share/oxidom/oxidom-gui.log     # 0600, rotated at 2MB (.log.1 kept)
 ```
 
-The daemon has no such file — its stderr already reaches the journal above.
+The daemon has no such file. Managed services send stderr to the journal above.
+A standalone daemon retains its launcher's stdout/stderr; those streams are not
+guaranteed to reach a journal and may already be redirected by a detached GUI.
+Use foreground `oxidom daemon` when diagnosing startup outside a service.
+
+If an externally managed session daemon is unavailable, clients with
+`OXIDOM_SESSION_DAEMON=external` deliberately do not bootstrap a replacement.
+Inspect `systemctl --user status oxidom-session.service` and its journal. A
+pre-existing standalone daemon can hold the store lock; do not delete that file
+or start a second recovery owner. Restart the configured supervisor deliberately
+after resolving the cause or rate limit. GUI/tray restarts are not daemon repair.
 
 Raise the level with `RUST_LOG`:
 

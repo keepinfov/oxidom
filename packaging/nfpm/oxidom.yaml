@@ -45,6 +45,9 @@ contents:
   - src: packaging/systemd/oxidom@.service
     dst: /usr/lib/systemd/system/oxidom@.service
     file_info: {mode: 0644}
+  - src: packaging/systemd/oxidom-session.service
+    dst: /usr/lib/systemd/user/oxidom-session.service
+    file_info: {mode: 0644}
   - src: packaging/systemd/oxidom.sysusers
     dst: /usr/lib/sysusers.d/oxidom.conf
     file_info: {mode: 0644}

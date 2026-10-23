@@ -97,11 +97,12 @@ nix develop -c cargo fmt --all -- --check                                # ~2s
 nix develop -c cargo clippy --all-targets --all-features -- -D warnings  # ~1min
 nix develop -c cargo test --workspace                                    # ~90s cold, ~7s warm
 nix run nixpkgs#alejandra -- --check .                                   # ~3s, Nix files
-nix build                                                                # ~6min cold
+nix flake check                                                          # packages and module checks
 ```
 
-`nix flake check` realises the same two derivations as `nix build`; run one,
-not both. On a machine you are also using, prefix the slow ones with
+`nix flake check` realises the same CLI/GUI derivations as `nix build` and also
+checks the session-daemon module configuration. Do not run both package builds.
+On a machine you are also using, prefix the slow ones with
 `nice -n 19 ionice -c3` and cap them with `-j8`.
 
 **Documentation-only changes** — anything touching just `docs/`, `README.md`,

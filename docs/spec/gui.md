@@ -25,6 +25,13 @@ defaults and older-daemon degradation for other fields. Capability checks run on
 existing order. This does not impose a total hydration deadline or move tray/desktop-proxy work
 off the main thread.
 
+`OXIDOM_SESSION_DAEMON=external` makes startup a discovery-only client of externally supervised
+daemons. On absence, use the existing unavailable dialog; Retry must not create a private daemon
+or invoke a service manager. Runtime poll failure continues to retry the bound client, not run
+discovery or a daemon restart loop. Closing the window, Quit and discovery failure are not daemon
+stop commands. The opt-in user daemon unit is independent of the tray unit; ordinary standalone
+startup does not promise cgroup or logout survival.
+
 ## Layout
 
 Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):

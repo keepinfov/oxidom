@@ -118,6 +118,7 @@ jobs:
           status=0
           for f in packaging/systemd/oxidom.service \
                    packaging/systemd/oxidom@.service \
+                   packaging/systemd/oxidom-session.service \
                    packaging/systemd/oxidom.sysusers; do
             if [ ! -f "$f" ]; then
               echo "::error file=packaging/aur/PKGBUILD::PKGBUILD installs $f, which does not exist"

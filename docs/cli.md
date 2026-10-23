@@ -21,6 +21,13 @@ status, allowing a short same-session grace for a competing starter. These are
 discovery I/O budgets, not total command deadlines; a slow first daemon/core
 installation may require retrying later. See [architecture.md](architecture.md#finding-the-daemon).
 
+With an externally supervised session daemon, export
+`OXIDOM_SESSION_DAEMON=external` to every GUI/CLI launcher. `up` and `connect`
+then report daemon-unavailable (exit 4) rather than start a competing private
+process. This does not force the session bus: a reachable system daemon still
+wins. Unset, empty or `standalone` keeps default one-shot startup without a daemon
+crash-restart loop. Foreground `oxidom daemon` is unchanged.
+
 ## Contents
 
 - [Two ways to name a profile](#two-ways-to-name-a-profile)
