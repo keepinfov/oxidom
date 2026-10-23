@@ -1661,8 +1661,12 @@ mod tests {
 
     impl SpawnWatch {
         fn install() -> std::io::Result<Self> {
-            let directory =
-                std::env::temp_dir().join(format!("oxidom-spawn-watch-{}", std::process::id()));
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let instance = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "oxidom-spawn-watch-{}-{instance}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&directory)?;
             let marker = directory.join("started");
             let stub = directory.join("oxidom-stub");
