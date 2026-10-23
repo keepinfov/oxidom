@@ -1885,7 +1885,7 @@ impl Controller {
             (
                 state.profiles.clone(),
                 session_rows(&state.profiles, &state.ui, ipc::now_unix_ms()),
-                state.ui.operation.clone(),
+                state.ui.foreground_operation().cloned(),
             )
         };
         let callbacks = SessionCallbacks {
@@ -2098,7 +2098,11 @@ impl Controller {
                 state.ui.connected_id.clone(),
                 state.ui.connected_profiles.clone(),
                 latency_states(&state.ui, ipc::now_unix_ms()),
-                state.ui.operation.clone(),
+                state
+                    .ui
+                    .operation
+                    .clone()
+                    .or_else(|| state.ui.stop_operation.clone()),
             )
         };
         let callbacks = super::views::servers::CardCallbacks {
@@ -2542,7 +2546,13 @@ impl Controller {
         // A connect job still in flight owns the operation slot, so a Disconnect
         // sent now is refused as busy — and the refusal used to arrive looking
         // like the tunnel itself had failed. There is nothing to stop yet.
-        if matches!(status, Status::Connecting) && self.state.borrow().ui.operation.is_some() {
+        if matches!(status, Status::Connecting)
+            && !self
+                .state
+                .borrow()
+                .ui
+                .can_start(UiOperationKind::Disconnect)
+        {
             self.show_message("Still connecting — wait for it to finish or fail");
             return;
         }
@@ -2983,6 +2993,10 @@ impl Controller {
     }
 
     fn connect_server(self: &Rc<Self>, server_id: String) {
+        if !self.state.borrow().ui.can_start(UiOperationKind::Connect) {
+            self.show_message("Another operation is still running");
+            return;
+        }
         {
             let mut state = self.state.borrow_mut();
             state.selected_id = Some(server_id.clone());
@@ -3064,6 +3078,15 @@ impl Controller {
     }
 
     fn disconnect(self: &Rc<Self>) {
+        if !self
+            .state
+            .borrow()
+            .ui
+            .can_start(UiOperationKind::Disconnect)
+        {
+            self.show_message("Another operation is still running");
+            return;
+        }
         {
             let mut state = self.state.borrow_mut();
             // Symmetrically with `connect_server`: `Disconnect` stops the
@@ -3692,6 +3715,24 @@ impl Controller {
         );
     }
 
+    fn sync_operations(self: &Rc<Self>) {
+        let (foreground, catalog) = {
+            let state = self.state.borrow();
+            (
+                state.ui.foreground_operation().cloned(),
+                state
+                    .ui
+                    .operation
+                    .clone()
+                    .or_else(|| state.ui.stop_operation.clone()),
+            )
+        };
+        self.sessions.set_operation(foreground);
+        self.subscriptions.set_operation(catalog);
+        self.sync_session_rows();
+        self.refresh_activity_status();
+    }
+
     /// Run one daemon call on a worker thread with the operation spinner up.
     /// The fresh subscriptions snapshot is fetched on the same thread right
     /// after the call, so completions see consistent state.
@@ -3707,7 +3748,7 @@ impl Controller {
     {
         {
             let mut state = self.state.borrow_mut();
-            if state.ui.operation.is_some() {
+            if !state.ui.begin_operation(operation.clone()) {
                 drop(state);
                 // Hand the refusal to the completion handler instead of
                 // returning silently. It owns the per-call cleanup — clearing
@@ -3717,22 +3758,25 @@ impl Controller {
                 complete(self, Err(anyhow!(Busy)));
                 return;
             }
-            state.ui.operation = Some(operation.clone());
         }
-        self.sessions.set_operation(Some(operation.clone()));
-        self.subscriptions.set_operation(Some(operation));
-        self.refresh_activity_status();
+        self.sync_operations();
 
         // Stamped on the main thread, before the worker exists: `AppState` is
         // not `Send`, and an epoch read after the D-Bus calls would certify
         // exactly the staleness it is supposed to catch.
         let epoch = self.bump_epoch();
         let client = self.state.borrow().client.clone();
+        let urgent_stop = self.state.borrow().ui.stop_operation.is_some();
         let log_cursor = self.log_feed.borrow().remote_cursor();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let result = work(&client);
-            let subscriptions = client.subscriptions();
+            // An overlapping Stop must not overwrite the fetch's newer catalog.
+            let subscriptions = if urgent_stop {
+                None
+            } else {
+                client.subscriptions().ok()
+            };
             // Fetch a fresh status/probe snapshot on the same thread right
             // after the call, so the completion handler can apply it
             // immediately instead of waiting for the next 500ms poll tick —
@@ -3757,9 +3801,9 @@ impl Controller {
                     let Some(controller) = weak.upgrade() else {
                         return glib::ControlFlow::Break;
                     };
-                    {
+                    let snapshot_current = {
                         let mut state = controller.state.borrow_mut();
-                        if let Ok(subscriptions) = subscriptions {
+                        if let Some(subscriptions) = subscriptions {
                             state.subscriptions = subscriptions;
                         }
                         // The pin is deliberately left standing: retiring it
@@ -3767,10 +3811,9 @@ impl Controller {
                         // repaint the pre-click frame. `reduce` drops it once
                         // the daemon stops reporting the old world, or after
                         // its deadline.
-                        state.ui.operation = None;
-                    }
-                    controller.sessions.set_operation(None);
-                    controller.subscriptions.set_operation(None);
+                        state.ui.finish_operation(&operation, epoch, false)
+                    };
+                    controller.sync_operations();
                     // The handler runs *before* the snapshot is applied: it is
                     // where a failed connect pins its outcome, and applying
                     // first would paint one frame of the pre-failure state and
@@ -3778,17 +3821,17 @@ impl Controller {
                     if let Some(complete) = complete.take() {
                         complete(&controller, result);
                     }
-                    // Whatever the handler just decided outranks the reads this
-                    // worker made — but its own reads happened after the daemon
-                    // returned from the operation, so they are authoritative by
-                    // construction and get re-stamped rather than dropped.
-                    let epoch = controller.bump_epoch();
-                    match snapshot {
-                        Ok(mut snapshot) => {
-                            snapshot.epoch = epoch;
-                            controller.apply_snapshot(snapshot);
+                    if snapshot_current {
+                        let epoch = controller.bump_epoch();
+                        match snapshot {
+                            Ok(mut snapshot) => {
+                                snapshot.epoch = epoch;
+                                controller.apply_snapshot(snapshot);
+                            }
+                            Err(error) => {
+                                controller.apply_poll_failure(epoch, format!("{error:#}"))
+                            }
                         }
-                        Err(error) => controller.apply_poll_failure(epoch, format!("{error:#}")),
                     }
                     glib::ControlFlow::Break
                 }
@@ -3796,12 +3839,12 @@ impl Controller {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if let Some(controller) = weak.upgrade() {
                         let mut state = controller.state.borrow_mut();
-                        state.ui.clear_pin();
-                        state.ui.operation = None;
+                        let snapshot_current = state.ui.finish_operation(&operation, epoch, true);
                         drop(state);
-                        controller.bump_epoch();
-                        controller.sessions.set_operation(None);
-                        controller.subscriptions.set_operation(None);
+                        if snapshot_current || !operation.kind.is_subscription_fetch() {
+                            controller.bump_epoch();
+                        }
+                        controller.sync_operations();
                         // Hand the loss to the completion handler, for the same
                         // reason the `Busy` refusal above does: it owns the
                         // per-call cleanup. Skipping it here left the settings
@@ -4661,11 +4704,17 @@ impl Controller {
             .keys()
             .filter(|id| state.ui.is_checking(id))
             .count();
-        let activity = match (state.ui.operation.as_ref(), checking) {
-            (Some(operation), _) => Some(operation.label().to_string()),
-            (None, 0) => None,
-            (None, 1) => Some("Checking latency…".to_string()),
-            (None, count) => Some(format!("Checking latency · {count}")),
+        let activity = match (
+            state.ui.operation.as_ref(),
+            state.ui.stop_operation.as_ref(),
+            checking,
+        ) {
+            (Some(fetch), Some(stop), _) => Some(format!("{} / {}", fetch.label(), stop.label())),
+            (None, Some(stop), _) => Some(stop.label().to_string()),
+            (Some(operation), None, _) => Some(operation.label().to_string()),
+            (None, None, 0) => None,
+            (None, None, 1) => Some("Checking latency…".to_string()),
+            (None, None, count) => Some(format!("Checking latency · {count}")),
         };
         for spinner in [&self.sidebar_status_spinner, &self.header_status_spinner] {
             spinner.set_visible(activity.is_some());

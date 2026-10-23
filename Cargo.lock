@@ -1261,6 +1261,7 @@ dependencies = [
  "oxidom-core",
  "serde",
  "serde_json",
+ "tokio",
  "toml 0.8.23",
  "zbus",
 ]

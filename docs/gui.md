@@ -254,6 +254,11 @@ logs use for it.
 Add by URL, refresh, reorder, collapse, remove. Quota and expiry appear when the
 provider sends them.
 
+A subscription fetch does not block the session Stop controls. One disconnect can run alongside
+Add/Update/Update All, and activity names both operations until each completes. Stopping the tunnel
+does not cancel the subscription fetch. Other mutations remain serialized; an old update snapshot
+cannot put a stopped session back on screen as connected.
+
 Two per-subscription settings worth knowing:
 
 - **Send HWID** — off by default, and off is the whole point. See

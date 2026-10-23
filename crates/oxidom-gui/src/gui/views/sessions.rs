@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::gui::operation::UiOperation;
+use crate::gui::operation::{UiOperation, UiOperationKind};
 use crate::gui::reduce::{SessionDetail, SessionRow, SessionRowState};
 use oxidom_core::ipc::ProfileEntry;
 
@@ -279,14 +279,25 @@ impl SessionsView {
         let operation = self.operation.borrow().clone();
         let busy = operation.is_some();
         self.header.add.set_sensitive(!busy);
-        for (name, controls) in self.operation_widgets.borrow().iter() {
-            let affected = operation
-                .as_ref()
-                .and_then(|operation| operation.profile.as_deref())
-                == Some(name.as_str());
-            controls.row.set_sensitive(!busy);
-            controls.spinner.set_spinning(affected);
-            controls.spinner.set_visible(affected);
+        for controls in self.operation_widgets.borrow().values() {
+            let applied = controls.applied.borrow();
+            let Some(row) = applied.as_ref() else {
+                continue;
+            };
+            let next = if row.toggle_on {
+                UiOperationKind::DownProfile
+            } else {
+                UiOperationKind::UpProfile
+            };
+            controls.row.set_sensitive(!row.busy);
+            controls.edit.set_sensitive(!busy);
+            controls.toggle.set_sensitive(
+                !row.busy
+                    && row.state != SessionRowState::Unknown
+                    && operation.as_ref().is_none_or(|op| op.kind.permits(next)),
+            );
+            controls.spinner.set_spinning(row.busy);
+            controls.spinner.set_visible(row.busy);
         }
     }
 }
