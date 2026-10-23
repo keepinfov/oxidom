@@ -495,6 +495,11 @@ fi
 - **stdout** carries data, and only data.
 - **stderr** carries diagnostics, warnings, and ambiguous-handle candidates.
 
+Daemon execution additionally keeps bounded structured lifecycle facts in its
+data directory, independently of `RUST_LOG`. This does not copy arbitrary stderr
+or change command exit codes/output; other CLI commands do not open that file.
+See [persistent daemon diagnostics](troubleshooting.md#persistent-daemon-diagnostics).
+
 Read commands never start a daemon. Only `up` and `connect` may.
 
 ## JSON schemas

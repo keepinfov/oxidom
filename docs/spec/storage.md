@@ -29,8 +29,10 @@ missing files (treat as defaults/empty).
   running recovery, regardless of which bus it intended to serve.
 - `~/.local/share/oxidom/oxidom-gui.log` — the graphical client's own log, `0600`, rotated at 2MB
   with one `.log.1` kept. Written only by the GUI, which detaches and sends stderr to `/dev/null`
-  and so has no journal. The daemon writes no file: managed services send stderr to the journal,
-  while standalone launches retain the supplied streams without a journal guarantee.
+  and so has no journal.
+- `~/.local/share/oxidom/oxidom-daemon.log`, `.log.1` and `.log.lock` — bounded structured daemon
+  lifecycle diagnostics, independent of stderr/journal and distinct from raw logbook records.
+  The exact format, limits and failure policy are specified below.
 - `~/.local/share/oxidom/assets/{geoip.dat,geosite.dat}` — the geo data the core needs, when
   oxidom installed it. `0600` in a `0700` directory like every other file here: the core runs as
   the same user as the daemon that spawns it, so nothing wider is required. Written only when the
@@ -128,6 +130,75 @@ lack the policy, and older clients do not honor it. Never take over a pre-existi
 owner; switching owners is an explicit operator action. D-Bus signatures and on-disk schemas
 remain unchanged. Bus-transport reconnection and generalized shutdown quiescence are not supplied
 by this launch-ownership contract.
+
+## Persistent Diagnostics (binding)
+
+Only daemon execution opens `data_dir()/oxidom-daemon.log`, including foreground, managed and
+automatically bootstrapped session daemons. Resolution uses the test override, then nonempty
+`STATE_DIRECTORY`, then user XDG data, like the store. No separate root or setting is introduced.
+GUI and ordinary CLI commands do not open it. Initialize before stop-signal setup, store locking
+or recovery, without starting threads. Never discard supplied stdout/stderr or change launch,
+store, routing or exit semantics because diagnostics failed.
+
+The journal records safe lifecycle checkpoints and typed failure categories, not a tee of the
+log facade, error chains, raw core output or configuration. Records contain only closed enums,
+fixed-width numbers and booleans: no paths, names, server addresses, links, credentials, arbitrary
+messages or environment values. Unrecognized error types become `other`, not formatted text.
+This does not sanitize or replay legacy logbook/terminal output.
+
+Version 1 is UTF-8 JSONL. Every new record has `version: 1`, `unix_ms: u64` (realtime, not a
+monotonic ordering guarantee), `pid: u32`, and a flattened event. Literal examples including LF:
+
+```jsonl
+{"version":1,"unix_ms":1234,"pid":42,"event":"phase","phase":"starting"}
+{"version":1,"unix_ms":1235,"pid":42,"event":"problem","phase":"store","kind":"store_busy","os_code":null,"fatal":true}
+{"version":1,"unix_ms":1236,"pid":42,"event":"catalog_load_warnings","count":3}
+```
+
+`phase` values are `starting`, `signals`, `store`, `recovery`, `core_resolution`, `default_profile`,
+`bus`, `serving`, `shutdown`, `stopped`. These describe diagnostic control-flow checkpoints, not
+tunnel health or proof that every resource was cleaned. `problem` includes the current phase,
+`fatal: bool`, a numeric OS code when available (otherwise null), and `kind`: `store_busy`,
+`permission_denied`, `not_found`, `already_exists`, `invalid_input`, `invalid_data`, `storage_full`,
+`read_only_filesystem`, `write_zero`, `interrupted`, `other_io`, `bus`, or `other`.
+
+Record checkpoints before operations that may fail or print to a blocked stderr. Record returned
+fatal errors before the CLI prints the original error and exits; retain those facts even with
+`RUST_LOG=off`. Nonfatal core-resolution/default-profile/shutdown errors and collected catalog-load
+warning counts are retained without their raw text. `catalog_load_warnings` counts only the
+subscriptions-store warnings returned by catalog loading, not all config/state/recovery warnings
+that other code writes to legacy logs. No guarantee is made for pre-exec failures, argument
+parsing, arbitrary panic payloads, abort, SIGKILL, or execution that never reaches the recorder.
+Per-attempt attribution, repeat summaries, persistent cursors and export are separate work.
+
+Each newly encoded record is at most 1,024 bytes including LF. Current and one backup
+`oxidom-daemon.log.1` are each at most 2,097,152 bytes, at most 4 MiB payload combined. A separate
+empty stable `oxidom-daemon.log.lock` serializes size checks, tail repair, rotation and append
+across threads/processes; never unlink it. Acquisition is nonblocking: contention reports
+unavailability rather than waiting for a writer. Rotation uses projected size, and a failed
+required rotation never falls through to append. On restart, append within the same budget and
+repair an incomplete current tail to its last LF. Already oversized generations are refused
+unchanged; opening does not certify externally supplied complete lines as valid/safe records.
+
+New directory components are created private; the final owned directory is pinned and set to
+`0700`. Relative opens and rotation stay on that pinned directory even if its pathname changes.
+Current, backup and lock are owned regular files with one link, `0600`; reject leaf symlinks,
+hardlinks and nonregular files before modification. Reject a symlink final directory. Ancestor
+resolution and hostile same-UID entry mutation are outside this guarantee.
+
+Successful appends synchronize file data and directory changes; permission metadata is also
+synchronized. This is synchronous I/O for sparse lifecycle events, not a filesystem time bound,
+cross-file atomic rotation or a power-loss transaction. An error can follow a visible partial
+change. Failed appends attempt rollback; later writes repair incomplete current tails.
+
+Unavailable, contended, unsafe, oversized, full or failing storage never changes the original
+daemon result or chooses an alternate destination. Emit at most one fixed safe warning per
+process through stderr and the process-local logbook, without recursive logging. If open fails,
+file diagnostics stay disabled for that process; an already-open sink attempts later events
+again after write failure. Neither successful persistence nor an alternate fallback file may be
+claimed when storage failed. No file can be guaranteed when storage and terminal fallback are
+both unavailable. Existing D-Bus log cursors and `ClearLogs` remain memory-only and do not read,
+replay or delete these generations.
 
 ## Reading the log over D-Bus (binding)
 
