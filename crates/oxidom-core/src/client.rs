@@ -880,6 +880,29 @@ impl DaemonClient {
     pub fn clear_logs(&self) -> Result<()> {
         self.proxy.call("ClearLogs", &()).map_err(friendly)
     }
+
+    /// Persistent typed diagnostics, separate from the volatile logbook cursor.
+    /// An older daemon is explicitly unsupported; never substitute memory logs
+    /// or a different store's local journal.
+    pub fn diagnostics_since(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<crate::diagnostics::Page> {
+        let json: String = self
+            .proxy
+            .call("DiagnosticsSince", &(cursor.unwrap_or_default(), limit))
+            .map_err(|error| unknown_method(error, "read persistent diagnostics"))?;
+        Self::decode_diagnostics(&json)
+    }
+
+    fn decode_diagnostics(json: &str) -> Result<crate::diagnostics::Page> {
+        let page: crate::diagnostics::Page = serde_json::from_str(json)
+            .map_err(|_| anyhow::anyhow!("invalid or unsupported diagnostic page"))?;
+        page.validate()
+            .map_err(|_| anyhow::anyhow!("invalid or unsupported diagnostic page"))?;
+        Ok(page)
+    }
 }
 
 /// Does this daemon simply not have the method we called? Turned into a
@@ -902,6 +925,45 @@ fn is_unknown_method(error: &zbus::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_wire_pages_are_typed_and_rejected_text_never_reaches_errors() {
+        let literal = r#"{"version":1,"records":[{"version":1,"unix_ms":1,"pid":42,"event":"phase","phase":"starting","secret":"invented-private-secret"}],"next_cursor":null,"gap":false,"rejected":0,"incomplete_tail":false,"more":false}"#;
+        let page = super::DaemonClient::decode_diagnostics(literal).unwrap();
+        assert!(
+            !serde_json::to_string(&page)
+                .unwrap()
+                .contains("invented-private-secret")
+        );
+        for invalid in [
+            literal.replace("starting", "invented-private-secret"),
+            literal.replace(
+                "\"next_cursor\":null",
+                "\"next_cursor\":\"invented-private-secret\"",
+            ),
+            literal.replacen("\"version\":1", "\"version\":2", 1),
+        ] {
+            let error = super::DaemonClient::decode_diagnostics(&invalid).unwrap_err();
+            assert_eq!(error.to_string(), "invalid or unsupported diagnostic page");
+        }
+        let call = zbus::Message::method_call(super::OBJECT_PATH, "DiagnosticsSince")
+            .unwrap()
+            .build(&(String::new(), 64_u32))
+            .unwrap();
+        assert_eq!(call.body().signature().to_string(), "su");
+        let unknown =
+            zbus::Message::error(&call.header(), "org.freedesktop.DBus.Error.UnknownMethod")
+                .unwrap()
+                .build(&"invented old daemon")
+                .unwrap();
+        let error =
+            super::unknown_method(zbus::Error::from(unknown), "read persistent diagnostics");
+        assert!(
+            error
+                .to_string()
+                .contains("too old to read persistent diagnostics")
+        );
+    }
+
     #[test]
     fn an_unanswered_status_does_not_authorize_database_fallback() {
         let call = zbus::Message::method_call(super::OBJECT_PATH, "Status")

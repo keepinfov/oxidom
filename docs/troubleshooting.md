@@ -355,7 +355,27 @@ These markers are not tunnel-health or successful-cleanup claims.
 This journal intentionally excludes raw error chains, paths, server/profile
 names, subscription content and core output. Full error context still uses the
 existing stderr/journal paths; this feature does not make legacy raw logs safe
-to publish without review. It does not yet add a CLI log cursor or report export.
+to publish without review.
+
+Read/export these typed diagnostics without starting a daemon:
+
+```sh
+oxidom core diagnostics
+oxidom core report --output ./oxidom-report.txt
+# For a failed standalone launch, bypass D-Bus explicitly:
+oxidom core report --file ~/.local/share/oxidom/oxidom-daemon.log --output ./oxidom-report.txt
+```
+
+Each request exports one oldest-first page (64 records by default, at most 256).
+Pass `--cursor` the returned `next_cursor` to continue when `more` is true. A lost
+cursor reports a gap and resets to oldest retained data, possibly repeating records;
+it never silently claims continuous history. Rejected lines are counted, not copied;
+an incomplete current tail remains unread. Files are not repaired or chmodded.
+Default D-Bus mode uses only the selected daemon; an older daemon is unsupported.
+Explicit `--file` mode contacts no daemon and requires ownership/private permissions.
+The report uses shared best-effort redaction, omits raw logs/settings/server identities,
+and explains its limits. Review it before sharing; nothing is uploaded. See
+[CLI diagnostic export](cli.md#diagnostic-export) for continuation and exit codes.
 
 Runtime events use opaque numeric `run`, `session`, `generation`, `attempt` and
 `core` context. A retry gets a new attempt/core identity even when cancellation

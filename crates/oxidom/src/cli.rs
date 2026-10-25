@@ -233,6 +233,33 @@ impl DraftProtocol {
 
 #[derive(Subcommand, Debug)]
 pub enum CoreCommand {
+    /// Read one oldest-first page of persistent daemon diagnostics as JSON.
+    Diagnostics {
+        /// Opaque next_cursor from an earlier page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum records (0 means 64; capped at 256).
+        #[arg(long, default_value_t = 0)]
+        limit: u32,
+        /// Read this journal directly, without contacting or starting a daemon.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Export one diagnostic page as a local, reviewable problem report.
+    Report {
+        /// Opaque next_cursor from an earlier page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum records (0 means 64; capped at 256).
+        #[arg(long, default_value_t = 0)]
+        limit: u32,
+        /// Read this journal directly, without contacting or starting a daemon.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Atomically save a private report instead of printing to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Print each resolved setting and the level it came from.
     Show {
         /// Profile whose `[core]` is folded over the machine-wide settings.
@@ -319,6 +346,40 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(normalize(args.iter().map(OsString::from).collect()))
+    }
+
+    #[test]
+    fn diagnostic_commands_keep_file_cursor_limit_and_output_explicit() {
+        let parsed = parse(&[
+            "oxidom",
+            "core",
+            "diagnostics",
+            "--file",
+            "journal",
+            "--cursor",
+            "position",
+            "--limit",
+            "1",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Command::Core {
+            command: CoreCommand::Diagnostics { cursor: Some(cursor), limit: 1, file: Some(file) }
+        } if cursor == "position" && file == PathBuf::from("journal")));
+        assert!(matches!(
+            parse(&["oxidom", "core", "report", "--output", "report.txt"])
+                .unwrap()
+                .command,
+            Command::Core {
+                command: CoreCommand::Report {
+                    cursor: None,
+                    limit: 0,
+                    file: None,
+                    output: Some(_)
+                }
+            }
+        ));
+        assert!(parse(&["oxidom", "core", "diagnostics", "--output", "report.txt"]).is_err());
+        assert!(parse(&["oxidom", "core", "report", "--limit", "-1"]).is_err());
     }
 
     #[test]

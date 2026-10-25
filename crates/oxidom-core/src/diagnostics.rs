@@ -35,6 +35,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::ipc::ProbeDetail;
 
+mod reader;
+pub use reader::{Page, read};
+
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 1024;
 
@@ -256,13 +259,13 @@ pub enum Event {
     },
 }
 
-#[derive(Serialize)]
-struct Record {
-    version: u8,
-    unix_ms: u64,
-    pid: u32,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Record {
+    pub version: u8,
+    pub unix_ms: u64,
+    pub pid: u32,
     #[serde(flatten)]
-    event: Event,
+    pub event: Event,
 }
 
 fn encode(event: Event, unix_ms: u64, pid: u32) -> io::Result<Vec<u8>> {
