@@ -4243,6 +4243,39 @@ mod tests {
         Ok(())
     }
 
+    // Uses only pre-terminal APIs so this regression can also run on the
+    // pre-fix tree without importing the lifecycle implementation.
+    #[test]
+    fn dropping_a_recovered_engine_does_not_erase_an_unrelated_owners_pid() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("drop-unrelated-owner")?;
+        let saved = saved_profile_session("work", Some(std::process::id()));
+        State {
+            sessions: vec![saved.clone()],
+            run_cgroups: Vec::new(),
+        }
+        .save()?;
+        drop(Engine::load());
+        assert_eq!(State::load(&Config::default()).sessions, vec![saved]);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_port_overrides_preserve_unresolved_default_recovery_resources() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("startup-unrelated-default")?;
+        let saved = saved_profile_session("default", Some(std::process::id()));
+        State {
+            sessions: vec![saved],
+            run_cgroups: Vec::new(),
+        }
+        .save()?;
+        let mut engine = Engine::load();
+        engine.set_default_ports(18080, 18081);
+        assert_eq!(engine.state.sessions[0].xray_pid, Some(std::process::id()));
+        Ok(())
+    }
+
     #[test]
     fn recovery_does_not_forget_an_unrelated_live_process() -> Result<()> {
         use std::process::{Command, Stdio};
