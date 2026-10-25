@@ -135,7 +135,8 @@ remain unchanged. Bus-transport reconnection is not supplied by this launch-owne
 SIGINT/SIGTERM, loss of the selected D-Bus transport or well-known name, and fatal service setup
 failure after recovery converge on one terminal cleanup path. Loss is terminal, not permission
 to reconnect, reclaim the name, switch stores or replay a request. GUI closure is not a terminal
-event. Recurring workers start only after service registration succeeds.
+event. Request the name without allowing or attempting replacement; verify primary ownership
+before recurring workers start or Serving is published.
 
 Terminal closure is one-way. Serialize closure with engine transitions and final filesystem
 commits: reject new requests with a D-Bus failure, invalidate pending generations, cancel retry

@@ -4738,6 +4738,8 @@ pub(super) fn run(
         };
         let connection = builder
             .method_timeout(Duration::from_secs(1))
+            .allow_name_replacements(false)
+            .replace_existing_names(false)
             .name(BUS_NAME)
             .context("claiming the bus name (is another oxidom daemon running?)")?
             .serve_at(OBJECT_PATH, service)
@@ -5097,6 +5099,8 @@ mod tests {
         let shared = service.shared.clone();
         let connection = zbus::blocking::connection::Builder::address(address)?
             .method_timeout(Duration::from_secs(1))
+            .allow_name_replacements(false)
+            .replace_existing_names(false)
             .name(BUS_NAME)?
             .serve_at(OBJECT_PATH, service)?
             .build()?;
@@ -5115,6 +5119,8 @@ mod tests {
         let rejected = contender.shared.clone();
         let collision = zbus::blocking::connection::Builder::address(address)?
             .method_timeout(Duration::from_secs(1))
+            .allow_name_replacements(false)
+            .replace_existing_names(false)
             .name(BUS_NAME)?
             .serve_at(OBJECT_PATH, contender)?
             .build();
@@ -5141,6 +5147,8 @@ mod tests {
         let signalled = service.shared.clone();
         let signal_connection = zbus::blocking::connection::Builder::address(address)?
             .method_timeout(Duration::from_secs(1))
+            .allow_name_replacements(false)
+            .replace_existing_names(false)
             .name(BUS_NAME)?
             .serve_at(OBJECT_PATH, service)?
             .build()?;
@@ -5158,6 +5166,8 @@ mod tests {
         let shared = service.shared.clone();
         let connection = zbus::blocking::connection::Builder::address(address)?
             .method_timeout(Duration::from_secs(1))
+            .allow_name_replacements(false)
+            .replace_existing_names(false)
             .name(BUS_NAME)?
             .serve_at(OBJECT_PATH, service)?
             .build()?;
