@@ -375,8 +375,16 @@ impl XrayCore {
         if let Some(mut child) = self.child.take() {
             stop_child(&mut child);
         }
-        if let Some((pid, _)) = self.recovered.take() {
-            let _ = crate::proc::stop_pid(pid);
+        if let Some((pid, profile)) = self.recovered.take() {
+            let _ = crate::proc::stop_verified_pid(pid, || {
+                Self::config_path(&profile).is_ok_and(|config| {
+                    crate::proc::cmdline(pid).is_some_and(|arguments| {
+                        arguments
+                            .iter()
+                            .any(|argument| std::path::Path::new(argument) == config)
+                    })
+                })
+            });
         }
         self.active = None;
         self.set_status(Status::Disconnected);
@@ -440,6 +448,23 @@ mod tests {
     use anyhow::Result;
 
     use super::XrayCore;
+
+    #[test]
+    fn an_adopted_pid_without_our_identity_is_never_signalled() -> Result<()> {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        // Invalid profile identity is rejected without consulting global paths.
+        let mut core = XrayCore::new("../invented".into(), 10808, 10809, String::new());
+        core.adopt(child.id(), "../invented");
+        core.disconnect();
+        let alive = child.try_wait()?.is_none();
+        drop(child.stdin.take());
+        child.wait()?;
+        assert!(alive);
+        Ok(())
+    }
 
     #[test]
     fn a_log_run_is_not_a_successful_core_incarnation() {

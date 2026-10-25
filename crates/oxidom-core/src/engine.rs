@@ -2203,7 +2203,17 @@ impl Engine {
             return;
         };
         session.set_ports(socks_port, http_port);
-        self.sync_session("default");
+        // Port overrides must not replace unresolved recovery resources with
+        // the reconstructed session's empty process/interface handles.
+        if let Some(saved) = self
+            .state
+            .sessions
+            .iter_mut()
+            .find(|saved| saved.profile == "default")
+        {
+            saved.socks_port = socks_port;
+            saved.http_port = http_port;
+        }
     }
 
     pub fn active_server_id(&self) -> Option<String> {
@@ -2385,8 +2395,12 @@ impl Engine {
             .remove(profile)
             .expect("the session was checked above");
         session.disconnect();
+        let saved = self.state.sessions.clone();
         self.state.sessions.retain(|saved| saved.profile != profile);
-        self.state.save()?;
+        if let Err(error) = self.state.save() {
+            self.state.sessions = saved;
+            return Err(error);
+        }
         Ok(true)
     }
 
@@ -2411,6 +2425,57 @@ impl Engine {
             return Err(error);
         }
         Ok(had_sessions)
+    }
+
+    /// Terminal cleanup must not discard resources recovery could not identify
+    /// or clean. They remain recorded for the next owner of the store lock.
+    pub fn shutdown(&mut self) -> Result<()> {
+        let profiles = self
+            .sessions
+            .iter()
+            .map(|(profile, _)| profile.to_string())
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for profile in profiles {
+            let session = self.sessions.get(&profile).expect("listed session");
+            let unresolved = self.state.sessions.iter().any(|saved| {
+                saved.profile == profile
+                    && ((saved.xray_pid.is_some() && saved.xray_pid != session.core.child_pid())
+                        || (saved.interface.is_some() && session.interface.is_none()))
+            });
+            if unresolved {
+                self.sessions
+                    .get_mut(&profile)
+                    .expect("listed session")
+                    .core
+                    .disconnect();
+                errors.push(format!(
+                    "unresolved recovery resources for profile {profile:?}"
+                ));
+            } else {
+                let core = &mut self
+                    .sessions
+                    .get_mut(&profile)
+                    .expect("listed session")
+                    .core;
+                let pid = core.child_pid();
+                core.disconnect();
+                if pid.is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists()) {
+                    errors.push(format!(
+                        "could not confirm core stopped for profile {profile:?}"
+                    ));
+                    continue;
+                }
+                if let Err(error) = self.remove_session(&profile) {
+                    errors.push(format!("{error:#}"));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("{}", errors.join("; "))
+        }
     }
 
     pub fn status(&self) -> Status {
@@ -2766,6 +2831,17 @@ impl Drop for Engine {
     fn drop(&mut self) {
         // Stop the child before the struct fields drop so the recovery flag
         // can be persisted as clean in the same pass.
+        let owned = self
+            .sessions
+            .inner
+            .values()
+            .filter_map(|session| {
+                session
+                    .core
+                    .child_pid()
+                    .map(|pid| (session.profile.clone(), pid))
+            })
+            .collect::<Vec<_>>();
         for session in self.sessions.inner.values_mut() {
             session.core.disconnect();
         }
@@ -2776,7 +2852,16 @@ impl Drop for Engine {
             .any(|session| session.xray_pid.is_some())
         {
             for session in &mut self.state.sessions {
-                session.xray_pid = None;
+                // Recovery can retain a PID belonging to an unrelated owner.
+                // Only clear a process this Engine actually owned and stopped;
+                // failed interface cleanup metadata must survive unchanged.
+                if owned.iter().any(|(profile, pid)| {
+                    session.profile == *profile
+                        && session.xray_pid == Some(*pid)
+                        && !std::path::Path::new(&format!("/proc/{pid}")).exists()
+                }) {
+                    session.xray_pid = None;
+                }
             }
             if let Err(error) = self.state.save() {
                 log::warn!("could not clear the Xray recovery PID on shutdown: {error:#}");
@@ -2795,7 +2880,7 @@ fn kill_stale_xray(pid: u32, profile: &str) -> bool {
         log::warn!("refusing to signal stale PID {pid}: it is not an oxidom Xray core");
         return false;
     }
-    crate::proc::stop_pid(pid)
+    crate::proc::stop_verified_pid(pid, || is_our_xray(pid, profile))
 }
 
 fn kill_stale_tun2socks(pid: u32, device: &str) -> bool {
@@ -2809,7 +2894,7 @@ fn kill_stale_tun2socks(pid: u32, device: &str) -> bool {
         );
         return false;
     }
-    crate::proc::stop_pid(pid)
+    crate::proc::stop_verified_pid(pid, || is_our_tun2socks(pid, device))
 }
 
 /// Does this PID belong to a core oxidom started?
@@ -4240,6 +4325,88 @@ mod tests {
             "a clean shutdown's session is a memory, not a session"
         );
         assert!(engine.sessions.get("work").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_cleanup_and_drop_preserve_an_unrelated_owners_recovery_record() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("terminal-unrelated-owner")?;
+        let saved = saved_profile_session("work", Some(std::process::id()));
+        State {
+            sessions: vec![saved.clone()],
+            run_cgroups: Vec::new(),
+        }
+        .save()?;
+        let mut engine = Engine::load();
+        assert!(engine.shutdown().is_err());
+        assert_eq!(engine.state.sessions, vec![saved.clone()]);
+        drop(engine);
+        assert_eq!(
+            State::load(&crate::config::Config::default()).sessions,
+            vec![saved]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_a_recovered_engine_does_not_erase_an_unrelated_owners_pid() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("drop-unrelated-owner")?;
+        let saved = saved_profile_session("work", Some(std::process::id()));
+        State {
+            sessions: vec![saved.clone()],
+            run_cgroups: Vec::new(),
+        }
+        .save()?;
+        drop(Engine::load());
+        assert_eq!(
+            State::load(&crate::config::Config::default()).sessions,
+            vec![saved]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_port_overrides_preserve_unresolved_default_recovery_resources() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("startup-unrelated-default")?;
+        let saved = saved_profile_session("default", Some(std::process::id()));
+        State {
+            sessions: vec![saved],
+            run_cgroups: Vec::new(),
+        }
+        .save()?;
+        let mut engine = Engine::load();
+        engine.set_default_ports(18080, 18081);
+        assert_eq!(engine.state.sessions[0].xray_pid, Some(std::process::id()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_terminal_state_write_keeps_recovery_metadata_for_drop() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("terminal-state-write-failure")?;
+        let mut engine = Engine::load();
+        engine.prepare_session("work", "127.77.0.2".parse()?, 10808, 10809)?;
+        let saved = saved_profile_session("work", None);
+        engine.state.sessions = vec![saved.clone()];
+        let path = crate::paths::state_file()?;
+        if path.is_file() {
+            std::fs::remove_file(&path)?;
+        }
+        std::fs::create_dir_all(&path)?;
+        assert!(engine.shutdown().is_err());
+        assert_eq!(engine.state.sessions, vec![saved.clone()]);
+        // Restore writability before Drop to ensure its metadata is not silently
+        // replaced by a successful retry of a partially mutated state.
+        std::fs::remove_dir(&path)?;
+        engine.state.save()?;
+        drop(engine);
+        assert_eq!(
+            State::load(&crate::config::Config::default()).sessions,
+            vec![saved]
+        );
         Ok(())
     }
 

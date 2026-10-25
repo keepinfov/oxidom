@@ -16,6 +16,15 @@ pub const XRAY: BinarySpec = BinarySpec {
 /// Resolve a matching explicit core, or install and resolve the managed pinned
 /// release before accepting an environment or `PATH` fallback.
 pub fn resolve(configured: &str) -> Result<ResolvedXray> {
+    resolve_with_commit(configured, || Ok(()))
+}
+
+/// Preserve installing resolution while allowing an owner to fence the final
+/// filesystem mutation independently of the release download.
+pub fn resolve_with_commit<G>(
+    configured: &str,
+    commit: impl FnOnce() -> Result<G>,
+) -> Result<ResolvedXray> {
     if !configured.trim().is_empty() {
         let resolved = crate::resolve::resolve(&XRAY, configured)?;
         crate::xray::managed::require_version(&resolved.path)?;
@@ -32,7 +41,7 @@ pub fn resolve(configured: &str) -> Result<ResolvedXray> {
         return Ok(resolved);
     }
 
-    match crate::xray::managed::ensure_installed() {
+    match crate::xray::managed::ensure_installed_with_commit(commit) {
         Ok(path) => Ok(ResolvedXray {
             path,
             // The generic resolver has no managed source. RuntimeInfo suppresses

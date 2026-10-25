@@ -71,6 +71,8 @@
             cargoArtifacts = workspaceDeps;
             cargoBuildExtraArgs = "-p oxidom";
             cargoTestExtraArgs = "-p oxidom -p oxidom-core";
+            nativeCheckInputs = [pkgs.dbus];
+            OXIDOM_TEST_DBUS_DAEMON = "${pkgs.dbus}/bin/dbus-daemon";
             # Without wrapGAppsHook4 there is no gappsWrapperArgs, so point the daemon at
             # the nix-provided core by hand: an unwrapped binary falls back to `xray` on
             # $PATH and a systemd unit has none.
@@ -170,6 +172,7 @@
           };
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [pkg-config wrapGAppsHook4];
+          OXIDOM_TEST_DBUS_DAEMON = "${pkgs.dbus}/bin/dbus-daemon";
           buildInputs = with pkgs; [
             gtk4
             libadwaita

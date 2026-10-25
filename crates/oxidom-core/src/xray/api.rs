@@ -2,8 +2,8 @@
 
 use std::net::SocketAddrV4;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -66,33 +66,15 @@ pub fn balancer_info(
     timeout: Duration,
 ) -> Result<BalancerInfo> {
     let timeout_secs = timeout.as_secs().max(1).to_string();
-    let mut child = Command::new(xray)
-        .args(["api", "bi", "--json", "--server"])
-        .arg(api.to_string())
-        .args(["--timeout", &timeout_secs])
-        .arg(tag)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawning {} api bi", xray.display()))?;
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait().context("waiting for xray api bi")? {
-            Some(_) => break,
-            None if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("xray api bi timed out after {} ms", timeout.as_millis());
-            }
-        }
-    }
-    let output = child
-        .wait_with_output()
-        .context("collecting xray api bi output")?;
+    let output = crate::proc::output_timeout(
+        Command::new(xray)
+            .args(["api", "bi", "--json", "--server"])
+            .arg(api.to_string())
+            .args(["--timeout", &timeout_secs])
+            .arg(tag),
+        timeout,
+    )
+    .context("collecting xray api bi output")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(

@@ -35,6 +35,7 @@ use oxidom_core::probe;
 use oxidom_core::profile::{self, MAX_POOL_MEMBERS, Profile, RouteMode};
 use oxidom_core::xray::core::Status;
 
+mod lifecycle;
 mod trace;
 use trace::{Facts, Identities};
 
@@ -407,6 +408,8 @@ struct TunnelStreak {
 
 #[derive(Clone)]
 pub(crate) struct Shared {
+    lifecycle: lifecycle::Lifecycle,
+    terminal_cleanup: Arc<Mutex<Option<Result<(), String>>>>,
     engine: Arc<Mutex<Engine>>,
     recorder: crate::diagnostics::Recorder,
     identities: Arc<Mutex<Identities>>,
@@ -454,6 +457,9 @@ pub(crate) struct Shared {
     /// Direct SOCKS5/HTTP listener when enabled and no session is up or holding
     /// traffic. Lock order is engine, override_status, standby.
     standby: Arc<Mutex<Option<oxidom_core::standby::StandbyProxy>>>,
+    // Every service/worker clone keeps the store leased until its engine Arc
+    // has been released. In particular, zbus may retain a completed task.
+    store_lease: Option<Arc<crate::store_lock::StoreLock>>,
 }
 
 /// The daemon's memory of the geo data question.
@@ -486,6 +492,65 @@ pub(crate) struct CoreVersion {
 }
 
 impl Shared {
+    fn admit(&self) -> fdo::Result<lifecycle::Work> {
+        self.lifecycle
+            .enter()
+            .ok_or_else(|| failed("daemon is stopping"))
+    }
+
+    fn ensure_open(&self) -> fdo::Result<()> {
+        if self.lifecycle.is_closed() {
+            return Err(failed("daemon is stopping"));
+        }
+        Ok(())
+    }
+
+    fn spawn(&self, work: impl FnOnce() + Send + 'static) -> bool {
+        let Some(ticket) = self.lifecycle.enter() else {
+            return false;
+        };
+        let lifecycle = self.lifecycle.clone();
+        std::thread::spawn(move || {
+            let _ticket = ticket;
+            if !lifecycle.is_closed() {
+                work();
+            }
+        });
+        true
+    }
+
+    fn begin_terminal(&self) {
+        // Engine transitions take diagnostic_order before engine. Closure uses
+        // that same order, then no pending attempt may become current again.
+        {
+            let _order = oxidom_core::sync::lock(&self.diagnostic_order);
+            let _engine = oxidom_core::sync::lock(&self.engine);
+            self.lifecycle.close();
+            self.invalidate_all_generations();
+            self.geo_cancel.cancel();
+            oxidom_core::sync::lock(&self.probes).queued.clear();
+        }
+    }
+
+    fn terminate(&self) -> Result<()> {
+        self.begin_terminal();
+        self.lifecycle.drain();
+        let mut cleanup = oxidom_core::sync::lock(&self.terminal_cleanup);
+        if let Some(result) = &*cleanup {
+            return result.clone().map_err(anyhow::Error::msg);
+        }
+        self.stop_standby();
+        let mut probes = oxidom_core::sync::lock(&self.probes);
+        probes.queued.clear();
+        probes.running.clear();
+        drop(probes);
+        let result = oxidom_core::sync::lock(&self.engine)
+            .shutdown()
+            .map_err(|error| format!("{error:#}"));
+        *cleanup = Some(result.clone());
+        result.map_err(anyhow::Error::msg)
+    }
+
     async fn update_subscriptions(
         &self,
         operation: SubscriptionOperation,
@@ -496,14 +561,20 @@ impl Shared {
         + Send
         + 'static,
     ) -> Result<()> {
+        let ticket = self.admit().map_err(anyhow::Error::new)?;
         let guard = self.subscription_work.clone().lock_owned().await;
         let shared = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _ticket = ticket;
             let _guard = guard;
-            let update =
-                oxidom_core::sync::lock(&shared.engine).prepare_subscription_update(operation)?;
+            let update = {
+                let engine = oxidom_core::sync::lock(&shared.engine);
+                shared.ensure_open().map_err(anyhow::Error::new)?;
+                engine.prepare_subscription_update(operation)?
+            };
             let results = update.fetch(
                 |target| {
+                    shared.ensure_open().map_err(anyhow::Error::new)?;
                     oxidom_core::sync::lock(&shared.engine).validate_subscription_fetch(target)
                 },
                 fetch,
@@ -511,6 +582,7 @@ impl Shared {
             let result = {
                 let order = oxidom_core::sync::lock(&shared.diagnostic_order);
                 let mut engine = oxidom_core::sync::lock(&shared.engine);
+                let commit = shared.lifecycle.commit().context("daemon is stopping")?;
                 let before = Identities::selections(&engine);
                 let (result, stopped) = engine.apply_subscription_update(results);
                 for profile in stopped {
@@ -521,6 +593,7 @@ impl Shared {
                 shared.capture_teardown(&before, &engine, &mut facts);
                 drop(engine);
                 drop(order);
+                drop(commit);
                 facts.emit(&shared.recorder);
                 result
             };
@@ -589,6 +662,8 @@ impl Shared {
             }
         }
         let shared = Shared {
+            lifecycle: lifecycle::Lifecycle::default(),
+            terminal_cleanup: Arc::new(Mutex::new(None)),
             engine: Arc::new(Mutex::new(engine)),
             recorder,
             identities: Arc::new(Mutex::new(identities)),
@@ -613,6 +688,7 @@ impl Shared {
             core_version: Arc::new(Mutex::new(CoreVersion::default())),
             geo_cancel: Arc::new(oxidom_core::xray::assets::Cancel::default()),
             standby: Arc::new(Mutex::new(None)),
+            store_lease: None,
         };
         facts.emit(&shared.recorder);
         shared
@@ -628,6 +704,9 @@ impl Shared {
         // Keep the engine locked through the listener change. Session startup
         // stops standby under the same lock, so a stale reconcile cannot undo it.
         let engine = oxidom_core::sync::lock(&self.engine);
+        if self.lifecycle.is_closed() {
+            return;
+        }
         let overrides = oxidom_core::sync::lock(&self.override_status);
         let wanted = {
             if !engine.registry.config.standby_proxy {
@@ -722,10 +801,14 @@ impl Shared {
     }
 
     fn generation_is_current(&self, profile: &str, generation: u64) -> bool {
-        oxidom_core::sync::lock(&self.current_generations).get(profile) == Some(&generation)
+        !self.lifecycle.is_closed()
+            && oxidom_core::sync::lock(&self.current_generations).get(profile) == Some(&generation)
     }
 
     fn current_generation(&self, profile: &str) -> Option<u64> {
+        if self.lifecycle.is_closed() {
+            return None;
+        }
         oxidom_core::sync::lock(&self.current_generations)
             .get(profile)
             .copied()
@@ -804,6 +887,9 @@ impl Shared {
     fn capture_core_deaths(&self) -> Vec<(String, ConnectionTarget, Confirmation)> {
         let order = oxidom_core::sync::lock(&self.diagnostic_order);
         let mut engine = oxidom_core::sync::lock(&self.engine);
+        if self.lifecycle.is_closed() {
+            return Vec::new();
+        }
         let mut facts = Facts::default();
         let profiles = engine
             .sessions
@@ -861,7 +947,7 @@ impl Shared {
             return;
         }
         let shared = self.clone();
-        std::thread::spawn(move || {
+        self.spawn(move || {
             shared.reconnect(profile, target, snapshot.generation, snapshot.context)
         });
     }
@@ -998,7 +1084,9 @@ impl Shared {
                 self.retry_fact(&profile, trigger, RetryState::Cancelled, attempt);
                 return;
             }
-            std::thread::sleep(reconnect_delay(attempt));
+            if !self.lifecycle.wait(reconnect_delay(attempt)) {
+                return;
+            }
             if !self.reconnect_is_pending(&profile, &target, generation) {
                 self.retry_fact(&profile, trigger, RetryState::Cancelled, attempt);
                 return;
@@ -1146,8 +1234,14 @@ impl Shared {
     }
 
     fn runtime_info(&self) -> RuntimeInfo {
+        // Resolution and geo/version checks may spawn subprocesses. Snapshot
+        // settings first so terminal closure never waits on this engine lock.
         let engine = oxidom_core::sync::lock(&self.engine);
-        let resolved = oxidom_core::xray::resolve::resolve(&engine.registry.config.xray_binary);
+        let configured = engine.registry.config.xray_binary.clone();
+        let socks_port = engine.registry.config.socks_port;
+        let http_port = engine.registry.config.http_port;
+        drop(engine);
+        let resolved = self.resolve_xray(&configured);
         let (resolved_path, xray_path, xray_error, xray_source) = match resolved {
             Ok(resolved) => (
                 Some(resolved.path.clone()),
@@ -1158,12 +1252,6 @@ impl Shared {
             ),
             Err(error) => (None, None, Some(format!("{error:#}")), None),
         };
-        // Read the ports out before the lock goes, because the geo check below
-        // spawns a process and holding the engine across `xray run -test` would
-        // stall every other caller behind a subprocess.
-        let socks_port = engine.registry.config.socks_port;
-        let http_port = engine.registry.config.http_port;
-        drop(engine);
         RuntimeInfo {
             xray_path,
             xray_error,
@@ -1200,14 +1288,15 @@ impl Shared {
         if cached.read_for.as_deref() == Some(xray) {
             return cached.version.clone();
         }
-        let version = std::process::Command::new(xray)
-            .arg("version")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| {
-                oxidom_core::versions::core_version(&String::from_utf8_lossy(&output.stdout))
-            });
+        let version = oxidom_core::proc::output_timeout(
+            std::process::Command::new(xray).arg("version"),
+            Duration::from_secs(5),
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            oxidom_core::versions::core_version(&String::from_utf8_lossy(&output.stdout))
+        });
         cached.read_for = Some(xray.to_path_buf());
         cached.version = version.clone();
         version
@@ -1289,6 +1378,11 @@ impl Shared {
     fn start_geo_download(&self, through_tunnel: bool) -> Result<(), String> {
         use oxidom_core::xray::assets;
 
+        let proxy = through_tunnel.then(|| self.local_socks_proxy()).flatten();
+        let _commit = self
+            .lifecycle
+            .commit()
+            .ok_or_else(|| "daemon is stopping".to_string())?;
         let dir = assets::own_dir().map_err(|error| format!("{error:#}"))?;
         {
             let mut state = oxidom_core::sync::lock(&self.geo);
@@ -1305,10 +1399,9 @@ impl Shared {
         // Chosen here rather than taken from the caller: the daemon knows its
         // own inbounds, and an address supplied over the bus would make this a
         // "send my traffic wherever you like" primitive.
-        let proxy = through_tunnel.then(|| self.local_socks_proxy()).flatten();
         // `Shared` is a bundle of `Arc`s, so the clone is the same state.
         let shared = self.clone();
-        std::thread::spawn(move || {
+        self.spawn(move || {
             let outcome = shared.run_geo_download(&dir, proxy.as_deref());
             let mut state = oxidom_core::sync::lock(&shared.geo);
             state.downloading = false;
@@ -1345,7 +1438,14 @@ impl Shared {
                 oxidom_core::sync::lock(&self.shared.geo).progress = progress.clone();
             }
             fn cancelled(&self) -> bool {
-                self.shared.geo_cancel.is_cancelled()
+                self.shared.lifecycle.is_closed() || self.shared.geo_cancel.is_cancelled()
+            }
+            fn install(&self, target: &std::path::Path, bytes: &[u8]) -> Result<()> {
+                let _commit = self.shared.lifecycle.commit().ok_or(assets::Cancelled)?;
+                if self.cancelled() {
+                    return Err(assets::Cancelled.into());
+                }
+                oxidom_core::fsutil::write_private_atomic(target, bytes)
             }
         }
         // Safety of the borrow: the thread joins on nothing, but `Reporter`
@@ -1392,9 +1492,16 @@ impl Shared {
         let engine = oxidom_core::sync::lock(&self.engine);
         let configured = engine.registry.config.xray_binary.clone();
         drop(engine);
-        oxidom_core::xray::resolve::resolve(&configured)
+        self.resolve_xray(&configured)
             .ok()
             .map(|resolved| resolved.path)
+    }
+
+    fn resolve_xray(&self, configured: &str) -> Result<oxidom_core::xray::resolve::ResolvedXray> {
+        self.ensure_open().map_err(anyhow::Error::new)?;
+        oxidom_core::xray::resolve::resolve_with_commit(configured, || {
+            self.lifecycle.commit().context("daemon is stopping")
+        })
     }
 
     fn geo_scratch() -> anyhow::Result<std::path::PathBuf> {
@@ -1439,9 +1546,13 @@ impl Shared {
             ProbeTarget::Proxied(profile) => self.current_generation(profile),
             ProbeTarget::Direct(_) => None,
         };
+        let Some(commit) = self.lifecycle.commit() else {
+            return;
+        };
         if !oxidom_core::sync::lock(&self.probes).enqueue(target, server_id, generation) {
             return;
         }
+        drop(commit);
         self.pump_probes();
     }
 
@@ -1460,6 +1571,9 @@ impl Shared {
     /// same reason, and the same answer, as a server removed between the
     /// request and its slot.
     fn cancel_probes(&self, server_ids: &[String]) -> usize {
+        let Some(_commit) = self.lifecycle.commit() else {
+            return 0;
+        };
         let wanted: HashSet<String> = server_ids.iter().cloned().collect();
         let cancelled = oxidom_core::sync::lock(&self.probes).cancel_direct(&wanted);
         if cancelled.is_empty() {
@@ -1482,6 +1596,9 @@ impl Shared {
 
     fn enqueue_session_probe(&self, profile: String, label: String) {
         let generation = self.current_generation(&profile);
+        let Some(commit) = self.lifecycle.commit() else {
+            return;
+        };
         if !oxidom_core::sync::lock(&self.probes).enqueue(
             ProbeTarget::Proxied(profile),
             label,
@@ -1489,20 +1606,26 @@ impl Shared {
         ) {
             return;
         }
+        drop(commit);
         self.pump_probes();
     }
 
     fn pump_probes(&self) {
         loop {
+            if self.lifecycle.is_closed() {
+                return;
+            }
             let Some(next) = oxidom_core::sync::lock(&self.probes).start_next() else {
                 return;
             };
             let shared = self.clone();
-            std::thread::spawn(move || {
+            if !self.spawn(move || {
                 shared.run_probe(&next);
                 oxidom_core::sync::lock(&shared.probes).finish(next.token);
                 shared.pump_probes();
-            });
+            }) {
+                return;
+            }
         }
     }
 
@@ -1517,6 +1640,9 @@ impl Shared {
     }
 
     fn run_direct_probe(&self, server_id: &str) -> Option<u32> {
+        if self.lifecycle.is_closed() {
+            return None;
+        }
         let target = {
             let engine = oxidom_core::sync::lock(&self.engine);
             engine
@@ -1532,11 +1658,13 @@ impl Shared {
         let (reading, measured) = match target {
             Some((server, config)) => {
                 let method = config.latency_method;
-                let reading = match probe::measure(
+                let reading = match probe::measure_with_commit(
                     &server,
                     &config,
                     probe::Route::Direct,
                     Ipv4Addr::LOCALHOST,
+                    Duration::from_secs(3),
+                    || self.lifecycle.commit().context("daemon is stopping"),
                 ) {
                     // The reading carries the method that produced it, not the
                     // one the config asked for: a hysteria2 server may answer
@@ -1562,6 +1690,7 @@ impl Shared {
                 false,
             ),
         };
+        let _commit = self.lifecycle.commit()?;
         let value = reading.value;
         oxidom_core::sync::lock(&self.readings).insert(server_id.to_string(), reading);
         if measured {
@@ -1606,6 +1735,9 @@ impl Shared {
         timeout: Duration,
         expected: Option<Confirmation>,
     ) -> Option<(probe::ProbeOutcome, LatencyMethod)> {
+        if self.lifecycle.is_closed() {
+            return None;
+        }
         let (server, config, address, selection) = {
             let engine = oxidom_core::sync::lock(&self.engine);
             if expected
@@ -1714,8 +1846,8 @@ impl Shared {
             ),
         };
         let value = reading.value;
+        let engine = oxidom_core::sync::lock(&self.engine);
         let still_current = {
-            let engine = oxidom_core::sync::lock(&self.engine);
             engine.sessions.get(profile).is_some_and(|session| {
                 session.status() == Status::Connected && session.selection.is_some()
             }) && generation
@@ -1961,7 +2093,9 @@ impl Shared {
             {
                 return completion;
             }
-            std::thread::sleep(POOL_CONFIRM_RETRY_GAP);
+            if !self.lifecycle.wait(POOL_CONFIRM_RETRY_GAP) {
+                return (None, None, ConfirmationEnd::Superseded);
+            }
         }
     }
 
@@ -2010,9 +2144,12 @@ impl Shared {
     ) -> mpsc::Receiver<bool> {
         let (confirmed, confirmation) = mpsc::channel();
         let shared = self.clone();
-        std::thread::spawn(move || {
+        self.spawn(move || {
             let (address, socks_port, method) = {
                 let Some(inbound) = snapshot.inbound else {
+                    let Some(commit) = shared.lifecycle.commit() else {
+                        return;
+                    };
                     oxidom_core::sync::lock(&shared.proxied).insert(
                         profile.clone(),
                         LatencyReading::failed(
@@ -2022,6 +2159,7 @@ impl Shared {
                         ),
                     );
                     oxidom_core::sync::lock(&shared.probes).finish(probe_token);
+                    drop(commit);
                     shared.record_finished(
                         snapshot,
                         ObservationOutcome::MissingSubject,
@@ -2084,7 +2222,9 @@ impl Shared {
             // race with the pipe reader thread often enough to miss the line —
             // the same race `ProbeCore::complaint` pays a short sleep for on
             // the failing path.
-            std::thread::sleep(Duration::from_millis(200));
+            if !shared.lifecycle.wait(Duration::from_millis(200)) {
+                return;
+            }
             shared.apply_confirmation_failure(
                 &profile,
                 &target,
@@ -2557,11 +2697,16 @@ impl Shared {
     /// fresh but never tears an established connection down.
     fn spawn_active_probe_loop(&self) {
         let shared = self.clone();
-        std::thread::spawn(move || {
+        self.spawn(move || {
             loop {
-                std::thread::sleep(ACTIVE_PROBE_INTERVAL);
+                if !shared.lifecycle.wait(ACTIVE_PROBE_INTERVAL) {
+                    return;
+                }
                 let active = {
                     let mut engine = oxidom_core::sync::lock(&shared.engine);
+                    if shared.lifecycle.is_closed() {
+                        return;
+                    }
                     let profiles = engine
                         .sessions
                         .iter()
@@ -2595,7 +2740,7 @@ impl Shared {
     /// destination as proof that a live core must be killed.
     fn spawn_tunnel_watchdog(&self) {
         let shared = self.clone();
-        std::thread::spawn(move || {
+        self.spawn(move || {
             loop {
                 let mode = oxidom_core::sync::lock(&shared.engine)
                     .registry
@@ -2604,9 +2749,14 @@ impl Shared {
                 let interval = watchdog_policy(mode)
                     .map(|(interval, _, _)| interval)
                     .unwrap_or(Duration::from_secs(60));
-                std::thread::sleep(interval);
+                if !shared.lifecycle.wait(interval) {
+                    return;
+                }
                 let (mode, watched) = {
                     let mut engine = oxidom_core::sync::lock(&shared.engine);
+                    if shared.lifecycle.is_closed() {
+                        return;
+                    }
                     let mode = engine.registry.config.watchdog;
                     if mode == WatchdogMode::Off {
                         oxidom_core::sync::lock(&shared.tunnel_failures).clear();
@@ -2667,9 +2817,11 @@ impl Shared {
 
     fn spawn_pool_status_loop(&self) {
         let shared = self.clone();
-        std::thread::spawn(move || {
+        self.spawn(move || {
             loop {
-                std::thread::sleep(POOL_POLL_INTERVAL);
+                if !shared.lifecycle.wait(POOL_POLL_INTERVAL) {
+                    return;
+                }
                 let profiles = {
                     let engine = oxidom_core::sync::lock(&shared.engine);
                     engine
@@ -2688,6 +2840,9 @@ impl Shared {
                         .and_then(|profile| profile.select.pool);
                     let api_task = {
                         let mut engine = oxidom_core::sync::lock(&shared.engine);
+                        if shared.lifecycle.is_closed() {
+                            return;
+                        }
                         let selection = engine
                             .sessions
                             .get(&profile_name)
@@ -2723,16 +2878,18 @@ impl Shared {
                     let Some((selection, xray_binary, api, api_port)) = api_task else {
                         continue;
                     };
-                    let result =
-                        oxidom_core::xray::resolve::resolve(&xray_binary).and_then(|resolved| {
-                            oxidom_core::xray::api::balancer_info(
-                                &resolved.path,
-                                api,
-                                "pool",
-                                BALANCER_API_TIMEOUT,
-                            )
-                        });
+                    let result = shared.resolve_xray(&xray_binary).and_then(|resolved| {
+                        oxidom_core::xray::api::balancer_info(
+                            &resolved.path,
+                            api,
+                            "pool",
+                            BALANCER_API_TIMEOUT,
+                        )
+                    });
                     let mut engine = oxidom_core::sync::lock(&shared.engine);
+                    if shared.lifecycle.is_closed() {
+                        return;
+                    }
                     let Some(session) = engine.sessions.get_mut(&profile_name) else {
                         continue;
                     };
@@ -2759,9 +2916,10 @@ pub(crate) struct Service {
 impl Service {
     fn stop_profile(&self, profile: &str) -> fdo::Result<bool> {
         let order = oxidom_core::sync::lock(&self.shared.diagnostic_order);
+        let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
         self.shared.clear_override(profile);
         self.shared.invalidate_generation(profile);
-        let mut engine = oxidom_core::sync::lock(&self.shared.engine);
         let mut facts = Facts::default();
         oxidom_core::sync::lock(&self.shared.identities).supersede(profile, &mut facts);
         let stopped = engine.remove_session(profile);
@@ -2777,9 +2935,10 @@ impl Service {
 
     fn stop_all_profiles(&self) -> fdo::Result<()> {
         let order = oxidom_core::sync::lock(&self.shared.diagnostic_order);
+        let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
         self.shared.clear_all_overrides();
         self.shared.invalidate_all_generations();
-        let mut engine = oxidom_core::sync::lock(&self.shared.engine);
         let mut facts = Facts::default();
         for (profile, _) in engine.sessions.iter() {
             oxidom_core::sync::lock(&self.shared.identities).supersede(profile, &mut facts);
@@ -3176,6 +3335,7 @@ fn candidate_list(candidates: &[&Server]) -> String {
 #[zbus::interface(name = "dev.keepinfov.oxidom1")]
 impl Service {
     fn list_subscriptions(&self) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let engine = oxidom_core::sync::lock(&self.shared.engine);
         json(&engine.registry.subscriptions)
     }
@@ -3186,6 +3346,7 @@ impl Service {
         name: String,
         send_hwid: bool,
     ) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         let name = (!name.is_empty()).then_some(name);
         self.shared
             .update_subscriptions(
@@ -3201,8 +3362,10 @@ impl Service {
     }
 
     fn remove_subscription(&self, subscription_id: String) -> fdo::Result<bool> {
+        let _request = self.shared.admit()?;
         let order = oxidom_core::sync::lock(&self.shared.diagnostic_order);
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
         let before = Identities::selections(&engine);
         let result = engine.remove_subscription(&subscription_id);
         let mut facts = Facts::default();
@@ -3215,6 +3378,7 @@ impl Service {
     }
 
     async fn refresh(&self, subscription_id: String) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         self.shared
             .update_subscriptions(
                 SubscriptionOperation::Refresh(subscription_id),
@@ -3225,6 +3389,7 @@ impl Service {
     }
 
     async fn refresh_all(&self) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         self.shared
             .update_subscriptions(SubscriptionOperation::RefreshAll, fetch_subscription)
             .await
@@ -3232,15 +3397,22 @@ impl Service {
     }
 
     fn import_links(&self, text: String) -> fdo::Result<(u32, u32)> {
-        let result = oxidom_core::sync::lock(&self.shared.engine).import_links(&text);
+        let _request = self.shared.admit()?;
+        let result = {
+            let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            self.shared.ensure_open()?;
+            engine.import_links(&text)
+        };
         self.shared.prune_readings();
         let (added, unsupported) = result.map_err(failed)?;
         Ok((added as u32, unsupported as u32))
     }
 
     fn remove_server(&self, server_id: String) -> fdo::Result<bool> {
+        let _request = self.shared.admit()?;
         let order = oxidom_core::sync::lock(&self.shared.diagnostic_order);
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
         let before = Identities::selections(&engine);
         let result = engine.remove_server(&server_id);
         let mut facts = Facts::default();
@@ -3253,6 +3425,7 @@ impl Service {
     }
 
     fn set_server_alias(&self, server_id: String, alias: String) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         if !alias::is_valid(&alias) {
             return Err(failed(
                 "alias must be 1-32 lowercase letters, digits, or hyphens, start with a \
@@ -3260,6 +3433,7 @@ impl Service {
             ));
         }
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
         let target = engine
             .registry
             .subscriptions
@@ -3300,12 +3474,15 @@ impl Service {
     /// fails. The draft arrives as JSON so the method can grow fields without
     /// the wire signature moving.
     fn create_server(&self, draft: String) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let draft: oxidom_core::draft::ServerDraft = serde_json::from_str(&draft)
             .map_err(|error| failed(format!("the draft does not parse: {error}")))?;
         let server = oxidom_core::draft::resolve(&draft).map_err(failed)?;
-        let stored = oxidom_core::sync::lock(&self.shared.engine)
-            .add_server(server)
-            .map_err(failed)?;
+        let stored = {
+            let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            self.shared.ensure_open()?;
+            engine.add_server(server).map_err(failed)?
+        };
         serde_json::to_string(&oxidom_core::ipc::CreatedServer {
             id: stored.id,
             name: stored.name,
@@ -3320,11 +3497,14 @@ impl Service {
     /// while the draft grows fields. A subscription's server records the
     /// changed fields as overrides; a hand-made one is simply rewritten.
     fn update_server(&self, server_id: String, draft: String) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let draft: oxidom_core::draft::ServerDraft = serde_json::from_str(&draft)
             .map_err(|error| failed(format!("the draft does not parse: {error}")))?;
-        let stored = oxidom_core::sync::lock(&self.shared.engine)
-            .update_server(&server_id, &draft)
-            .map_err(failed)?;
+        let stored = {
+            let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            self.shared.ensure_open()?;
+            engine.update_server(&server_id, &draft).map_err(failed)?
+        };
         serde_json::to_string(&oxidom_core::ipc::CreatedServer {
             id: stored.id,
             name: stored.name,
@@ -3336,9 +3516,14 @@ impl Service {
     /// Drop one override from a subscription's server and take back what
     /// the provider last sent for the field.
     fn drop_override(&self, server_id: String, field: String) -> fdo::Result<String> {
-        let stored = oxidom_core::sync::lock(&self.shared.engine)
-            .drop_server_override(&server_id, &field)
-            .map_err(failed)?;
+        let _request = self.shared.admit()?;
+        let stored = {
+            let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            self.shared.ensure_open()?;
+            engine
+                .drop_server_override(&server_id, &field)
+                .map_err(failed)?
+        };
         serde_json::to_string(&oxidom_core::ipc::CreatedServer {
             id: stored.id,
             name: stored.name,
@@ -3354,6 +3539,7 @@ impl Service {
     /// pin whatever the second handshake returned, which is precisely the
     /// substitution a pin exists to prevent.
     fn inspect_certificate(&self, server_id: String) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let (address, port, sni) = {
             let engine = oxidom_core::sync::lock(&self.shared.engine);
             let server = engine
@@ -3384,6 +3570,7 @@ impl Service {
     /// accepted any certificate on every connection, while a pin accepts one
     /// certificate the user looked at.
     fn trust_certificate(&self, server_id: String, sha256: String) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         let pin = sha256.trim().to_ascii_lowercase();
         if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(failed(
@@ -3391,6 +3578,7 @@ impl Service {
             ));
         }
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
         let server = engine
             .registry
             .subscriptions
@@ -3407,7 +3595,9 @@ impl Service {
     }
 
     fn set_hwid(&self, subscription_id: String, enabled: bool) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
         if let Some(subscription) = engine
             .registry
             .subscriptions
@@ -3430,7 +3620,9 @@ impl Service {
         subscription_id: String,
         user_agent: String,
     ) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
         let Some(subscription) = engine
             .registry
             .subscriptions
@@ -3444,6 +3636,7 @@ impl Service {
     }
 
     fn connect(&self, server_id: String) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         // Bare Connect predates profiles and must keep working for a user who
         // has no `default.toml`: it is read here only to learn whether an
         // interface was requested.
@@ -3454,6 +3647,7 @@ impl Service {
         let mut facts = Facts::default();
         let generation = {
             let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            self.shared.ensure_open()?;
             let socks_port = engine.registry.config.socks_port;
             let http_port = engine.registry.config.http_port;
             if engine.registry.config.system_proxy
@@ -3521,6 +3715,7 @@ impl Service {
     /// Saving a selection is still a separate, deliberate act, and repointing a
     /// saved profile still goes through `SaveProfile` and still asks first.
     fn connect_pool(&self, query_json: String) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let query: oxidom_core::pool::PoolQuery =
             serde_json::from_str(&query_json).map_err(failed)?;
         let session_name = query.session_or_default().to_string();
@@ -3540,6 +3735,7 @@ impl Service {
         let mut facts = Facts::default();
         let (target, generation) = {
             let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            self.shared.ensure_open()?;
             let (socks_port, http_port, _) = if session_name == "default" {
                 (
                     engine.registry.config.socks_port,
@@ -3620,11 +3816,13 @@ impl Service {
     }
 
     fn disconnect(&self) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         self.stop_profile("default")?;
         Ok(())
     }
 
     fn list_profiles(&self) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let names = profile::list().map_err(failed)?;
         let mut entries = Vec::with_capacity(names.len());
         for name in names {
@@ -3650,18 +3848,31 @@ impl Service {
     }
 
     fn get_profile(&self, name: String) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         json(&profile::load(&name).map_err(failed)?)
     }
 
     fn save_profile(&self, name: String, profile_json: String) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         let profile: Profile = serde_json::from_str(&profile_json).map_err(failed)?;
         // `save` re-checks both the name and the ports. The daemon owns the
         // profiles directory — on the system bus it is root's — so validation
         // that only ran in the caller would be no validation at all.
+        let _commit = self
+            .shared
+            .lifecycle
+            .commit()
+            .ok_or_else(|| failed("daemon is stopping"))?;
         profile::save(&name, &profile).map_err(failed)
     }
 
     fn remove_profile(&self, name: String) -> fdo::Result<bool> {
+        let _request = self.shared.admit()?;
+        let _commit = self
+            .shared
+            .lifecycle
+            .commit()
+            .ok_or_else(|| failed("daemon is stopping"))?;
         // The session/profile association deliberately survives the file: a
         // tunnel this profile brought up is still its tunnel, and `oxidom down
         // <profile>` (i.e. the unit's ExecStop) has to keep taking it down.
@@ -3669,6 +3880,7 @@ impl Service {
     }
 
     fn up_profile(&self, name: String) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let profile = profile::load(&name).map_err(failed)?;
         // Only files written through `SaveProfile` were validated on the way
         // in; this one may have been edited by hand since.
@@ -3691,6 +3903,7 @@ impl Service {
         let mut facts = Facts::default();
         let (target, up_server, ignored_ports, generation) = {
             let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            self.shared.ensure_open()?;
             if engine.sessions.get(&name).is_some() {
                 return Err(failed(format!(
                     "profile {name:?} is already up; run `oxidom down {name}` first"
@@ -3818,6 +4031,7 @@ impl Service {
     }
 
     fn down(&self, profile: String) -> fdo::Result<bool> {
+        let _request = self.shared.admit()?;
         if profile.is_empty() {
             // The old single-session method remains unconditional. With
             // sessions that means bringing every profile down.
@@ -3828,10 +4042,12 @@ impl Service {
     }
 
     fn list_sessions(&self) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         json(&self.shared.list_session_infos())
     }
 
     fn session_status(&self, profile: String) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let session = self
             .shared
             .session_info(&profile)
@@ -3840,12 +4056,15 @@ impl Service {
     }
 
     fn down_profile(&self, profile: String) -> fdo::Result<bool> {
+        let _request = self.shared.admit()?;
         self.stop_profile(&profile)
     }
 
     fn delete_interface(&self, profile: String) -> fdo::Result<bool> {
+        let _request = self.shared.admit()?;
         let order = oxidom_core::sync::lock(&self.shared.diagnostic_order);
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
         let result = engine.delete_interface(&profile);
         let mut facts = Facts::default();
         oxidom_core::sync::lock(&self.shared.identities).prune(&engine, &mut facts);
@@ -3856,22 +4075,28 @@ impl Service {
     }
 
     fn mark_cgroup(&self, profile: String, uid: u32) -> fdo::Result<String> {
-        let slice = oxidom_core::sync::lock(&self.shared.engine)
-            .mark_cgroup(&profile, uid)
-            .map_err(failed)?;
+        let _request = self.shared.admit()?;
+        let slice = {
+            let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+            self.shared.ensure_open()?;
+            engine.mark_cgroup(&profile, uid).map_err(failed)?
+        };
         json(&slice)
     }
 
     fn status(&self) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         json(&self.shared.status_info())
     }
 
     fn request_probe(&self, server_id: String) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         self.shared.enqueue_probe(server_id);
         Ok(())
     }
 
     fn request_probes(&self, server_ids: Vec<String>) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
         for id in server_ids {
             self.shared.enqueue_probe(id);
         }
@@ -3890,11 +4115,13 @@ impl Service {
     /// they end within about ten seconds. What this removes is the queue behind
     /// them, which on a large subscription is the minutes.
     fn cancel_probes(&self, server_ids: Vec<String>) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let cancelled = self.shared.cancel_probes(&server_ids);
         json(&serde_json::json!({ "cancelled": cancelled }))
     }
 
     fn probe_state(&self) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let (running, queued) = oxidom_core::sync::lock(&self.shared.probes).snapshot();
         let state = ProbeState {
             version: PROBE_STATE_VERSION,
@@ -3915,6 +4142,7 @@ impl Service {
     /// empty list rather than an error — there is nothing wrong with a server
     /// that has never been checked.
     fn probe_history(&self, server_id: String) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let readings = oxidom_core::sync::lock(&self.shared.history)
             .get(&server_id)
             .cloned()
@@ -3923,14 +4151,17 @@ impl Service {
     }
 
     fn get_settings(&self) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         json(&oxidom_core::sync::lock(&self.shared.engine).registry.config)
     }
 
     fn set_settings(&self, config_json: String) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let raw: serde_json::Value = serde_json::from_str(&config_json).map_err(failed)?;
         let mut config: Config = serde_json::from_value(raw.clone()).map_err(failed)?;
         let order = oxidom_core::sync::lock(&self.shared.diagnostic_order);
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
 
         // A GUI older than this key sends a payload without it; treat that as
         // "leave it alone" rather than clearing the path the daemon may need
@@ -4178,6 +4409,7 @@ impl Service {
     }
 
     fn runtime_info(&self) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         json(&self.shared.runtime_info())
     }
 
@@ -4206,6 +4438,7 @@ impl Service {
     /// reason — this installs data from a fixed address, verified against a
     /// digest published beside it, that the caller cannot influence.
     fn download_geo_assets(&self, through_tunnel: bool) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         self.shared
             .start_geo_download(through_tunnel)
             .map_err(fdo::Error::Failed)?;
@@ -4215,6 +4448,7 @@ impl Service {
     /// Stop a running download. Idempotent: asking twice, or when none is
     /// running, is not an error.
     fn cancel_geo_download(&self) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         self.shared.geo_cancel.cancel();
         json(&serde_json::json!({ "cancelled": true }))
     }
@@ -4227,6 +4461,7 @@ impl Service {
     /// is *usable* rather than what merely exists — a truncated list is
     /// rejected here exactly as it would be at connect time.
     fn find_geo_assets(&self) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         use oxidom_core::xray::assets;
 
         let Some(xray) = self.shared.resolved_xray() else {
@@ -4246,6 +4481,7 @@ impl Service {
     /// here rather than trusted: this is a path from a caller, and a system
     /// daemon takes them from other users.
     fn adopt_geo_assets(&self, dir: String) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         use oxidom_core::xray::assets;
 
         let Some(xray) = self.shared.resolved_xray() else {
@@ -4262,7 +4498,13 @@ impl Service {
             )));
         }
         let into = assets::own_dir().map_err(|error| fdo::Error::Failed(format!("{error:#}")))?;
+        let commit = self
+            .shared
+            .lifecycle
+            .commit()
+            .ok_or_else(|| failed("daemon is stopping"))?;
         assets::adopt(&source, &into).map_err(|error| fdo::Error::Failed(format!("{error:#}")))?;
+        drop(commit);
         log::info!("installed the geo data found in {dir}");
         // Measured before these files existed, so ask again on the next read.
         oxidom_core::sync::lock(&self.shared.geo).probed_for = None;
@@ -4276,6 +4518,7 @@ impl Service {
     /// of any other profile were unreachable by the CLI, the GUI and the bus
     /// alike — the one place a failure explains itself, blank.
     fn recent_logs(&self) -> fdo::Result<Vec<String>> {
+        let _request = self.shared.admit()?;
         Ok(oxidom_core::logbook::global().legacy_lines())
     }
 
@@ -4286,6 +4529,7 @@ impl Service {
     /// reshuffled log and has to redraw. Passing what it has already seen makes
     /// a refresh an append.
     fn logs_since(&self, after_seq: u64, limit: u32) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
         let limit = if limit == 0 {
             oxidom_core::logbook::DEFAULT_LIMIT
         } else {
@@ -4295,6 +4539,12 @@ impl Service {
     }
 
     fn clear_logs(&self) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
+        let _commit = self
+            .shared
+            .lifecycle
+            .commit()
+            .ok_or_else(|| failed("daemon is stopping"))?;
         oxidom_core::logbook::global().clear();
         Ok(())
     }
@@ -4302,7 +4552,9 @@ impl Service {
     /// Read the selected daemon's journal without taking application locks or
     /// occupying the D-Bus executor with filesystem I/O. No caller path is used.
     async fn diagnostics_since(&self, cursor: String, limit: u32) -> fdo::Result<String> {
+        let ticket = self.shared.admit()?;
         tokio::task::spawn_blocking(move || {
+            let _ticket = ticket;
             let path = oxidom_core::paths::daemon_log_file()
                 .map_err(|_| fdo::Error::Failed("diagnostic path unavailable".into()))?;
             let page = oxidom_core::diagnostics::read(
@@ -4319,12 +4571,79 @@ impl Service {
 }
 
 fn spawn_core_supervisor(shared: Shared) {
-    std::thread::spawn(move || {
+    let lifecycle = shared.clone();
+    lifecycle.spawn(move || {
         loop {
-            std::thread::sleep(CORE_WATCH_INTERVAL);
+            if !shared.lifecycle.wait(CORE_WATCH_INTERVAL) {
+                return;
+            }
             shared.supervise_once();
         }
     });
+}
+
+fn check_bus(connection: &zbus::blocking::Connection) -> Result<()> {
+    if connection.is_closed() {
+        anyhow::bail!("D-Bus transport closed");
+    }
+    let owner = zbus::blocking::fdo::DBusProxy::new(connection)
+        .ok()
+        .and_then(|bus| {
+            bus.get_name_owner(
+                zbus::names::BusName::from_static_str(BUS_NAME).expect("static bus name"),
+            )
+            .ok()
+        });
+    match owner {
+        Some(owner)
+            if connection
+                .unique_name()
+                .is_some_and(|ours| ours.as_str() == owner.as_str()) =>
+        {
+            Ok(())
+        }
+        Some(_) => anyhow::bail!("D-Bus service name lost"),
+        None => anyhow::bail!("D-Bus service ownership unavailable"),
+    }
+}
+
+fn serve_until_terminal(
+    shared: &Shared,
+    setup: Result<zbus::blocking::Connection>,
+    mut stop_requested: impl FnMut() -> Result<bool>,
+    serving: impl FnOnce(&zbus::blocking::Connection),
+) -> Result<()> {
+    let terminal = match &setup {
+        Ok(connection) => {
+            shared.reconcile_standby();
+            shared.spawn_active_probe_loop();
+            shared.spawn_tunnel_watchdog();
+            shared.spawn_pool_status_loop();
+            spawn_core_supervisor(shared.clone());
+            serving(connection);
+            loop {
+                match stop_requested() {
+                    Ok(true) => break Ok(()),
+                    Ok(false) => {}
+                    Err(error) => break Err(error),
+                }
+                if let Err(error) = check_bus(connection) {
+                    break Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        Err(_) => Ok(()),
+    };
+    let shutdown = shared.terminate();
+    let terminal = setup.and(terminal);
+    match (terminal, shutdown) {
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("terminal cleanup failed: {cleanup:#}")))
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 pub(super) fn run(
@@ -4334,16 +4653,22 @@ pub(super) fn run(
     use oxidom_core::diagnostics::Phase;
 
     // Block SIGINT/SIGTERM before anything spawns a thread: zbus serves on its own
-    // workers, and only threads created after the mask is set inherit it. Waiting
-    // with sigwait then costs no main loop at all.
+    // workers, and only threads created after the mask is set inherit it.
+    // signalfd lets the serving thread observe shutdown without a waiter thread.
     diagnostics.phase(Phase::Signals);
     let mut stop = SigSet::empty();
     stop.add(Signal::SIGINT);
     stop.add(Signal::SIGTERM);
     stop.thread_block()?;
+    let signals = nix::sys::signalfd::SignalFd::with_flags(
+        &stop,
+        nix::sys::signalfd::SfdFlags::SFD_NONBLOCK | nix::sys::signalfd::SfdFlags::SFD_CLOEXEC,
+    )?;
 
     diagnostics.phase(Phase::Store);
-    let _store_lock = crate::store_lock::StoreLock::acquire(&oxidom_core::paths::data_dir()?)?;
+    let store_lock = Arc::new(crate::store_lock::StoreLock::acquire(
+        &oxidom_core::paths::data_dir()?,
+    )?);
     diagnostics.phase(Phase::Recovery);
     let mut engine = Engine::load();
     diagnostics.catalog_load_warnings(engine.registry.load_warnings.len());
@@ -4387,69 +4712,65 @@ pub(super) fn run(
         log::warn!("could not create the default profile: {error:#}");
     }
 
-    let shared = Shared::new_with_recorder(
+    let mut shared = Shared::new_with_recorder(
         engine,
         options.socks_port.is_some(),
         options.http_port.is_some(),
         options.system_bus,
         diagnostics.recorder(),
     );
-    shared.reconcile_standby();
-    shared.spawn_active_probe_loop();
-    shared.spawn_tunnel_watchdog();
-    shared.spawn_pool_status_loop();
-    spawn_core_supervisor(shared.clone());
+    shared.store_lease = Some(store_lock);
 
-    let service = Service {
-        shared: shared.clone(),
-    };
     diagnostics.phase(Phase::Bus);
-    let builder = if options.system_bus {
-        zbus::blocking::connection::Builder::system().context("connecting to the system bus")?
-    } else {
-        zbus::blocking::connection::Builder::session().context("connecting to the session bus")?
-    };
-    let _connection = builder
-        .name(BUS_NAME)
-        .context("claiming the bus name (is another oxidom daemon running?)")?
-        .serve_at(OBJECT_PATH, service)
-        .context("registering the service object")?
-        .build()
-        .context("starting the D-Bus service")?;
-    diagnostics.phase(Phase::Serving);
-    log::info!(
-        "oxidom daemon serving {BUS_NAME} on the {} bus",
-        if options.system_bus {
-            "system"
+    let setup = (|| -> Result<zbus::blocking::Connection> {
+        let service = Service {
+            shared: shared.clone(),
+        };
+        let builder = if options.system_bus {
+            zbus::blocking::connection::Builder::system().context("connecting to the system bus")?
         } else {
-            "session"
-        }
+            zbus::blocking::connection::Builder::session()
+                .context("connecting to the session bus")?
+        };
+        let connection = builder
+            .method_timeout(Duration::from_secs(1))
+            .name(BUS_NAME)
+            .context("claiming the bus name (is another oxidom daemon running?)")?
+            .serve_at(OBJECT_PATH, service)
+            .context("registering the service object")?
+            .build()
+            .context("starting the D-Bus service")?;
+        Ok(connection)
+    })();
+    let shutdown = serve_until_terminal(
+        &shared,
+        setup,
+        || match signals.read_signal() {
+            Ok(signal) => Ok(signal.is_some()),
+            Err(nix::errno::Errno::EINTR) => Ok(false),
+            Err(error) => Err(anyhow::Error::new(error).context("reading shutdown signal")),
+        },
+        |_| {
+            diagnostics.phase(Phase::Serving);
+            log::info!(
+                "oxidom daemon serving {BUS_NAME} on the {} bus",
+                if options.system_bus {
+                    "system"
+                } else {
+                    "session"
+                }
+            );
+        },
     );
-
-    loop {
-        match stop.wait() {
-            Ok(Signal::SIGINT | Signal::SIGTERM) => break,
-            Ok(_) => continue,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(error) => {
-                diagnostics.problem(&anyhow::Error::new(error), false);
-                log::error!("sigwait failed: {error}");
-                break;
-            }
-        }
-    }
-
     diagnostics.close_runtime();
     diagnostics.phase(Phase::Shutdown);
-    shared.stop_standby();
-    let shutdown = oxidom_core::sync::lock(&shared.engine).disconnect_all();
-    if let Err(error) = shutdown {
-        diagnostics.problem(&error, false);
+    if let Err(error) = &shutdown {
+        diagnostics.problem(error, false);
         log::warn!("could not persist the clean daemon shutdown: {error:#}");
     }
     diagnostics.phase(Phase::Stopped);
     log::info!("oxidom daemon stopped");
-    Ok(())
+    shutdown
 }
 
 /// What the last direct probe says about a candidate, for pool ordering.
@@ -4671,6 +4992,165 @@ fn core_rejected_the_protocol(logs: &[String]) -> bool {
 mod tests {
     use super::*;
     use oxidom_core::bind;
+
+    struct PrivateBus(std::process::Child);
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn run_private_serving(
+        shared: Shared,
+        setup: Result<zbus::blocking::Connection>,
+        serving: impl FnOnce(&zbus::blocking::Connection) + Send + 'static,
+    ) -> Result<()> {
+        let (done, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let outcome = serve_until_terminal(
+                &shared,
+                setup,
+                || {
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "private serving deadline exhausted"
+                    );
+                    Ok(false)
+                },
+                serving,
+            );
+            let _ = done.send(outcome);
+        });
+        let outcome = result.recv_timeout(Duration::from_secs(10))?;
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("private serving worker panicked"))?;
+        outcome
+    }
+
+    #[test]
+    fn private_bus_name_and_transport_loss_close_admission_and_drain_workers() -> Result<()> {
+        use std::io::BufRead;
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("terminal-private-bus")?;
+        let binary =
+            std::env::var_os("OXIDOM_TEST_DBUS_DAEMON").unwrap_or_else(|| "dbus-daemon".into());
+        let mut bus = PrivateBus(
+            std::process::Command::new(binary)
+                .args(["--session", "--nofork", "--print-address=1"])
+                .env("HOME", &_root.path)
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
+                .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .context("private dbus-daemon is required for terminal regression")?,
+        );
+        let stdout = bus.0.stdout.take().context("bus stdout")?;
+        let address = std::thread::scope(|scope| -> Result<String> {
+            let (ready, address) = mpsc::channel();
+            scope.spawn(move || {
+                let mut line = String::new();
+                let result = std::io::BufReader::new(stdout)
+                    .read_line(&mut line)
+                    .map(|_| line);
+                let _ = ready.send(result);
+            });
+            match address.recv_timeout(Duration::from_secs(5)) {
+                Ok(result) => Ok(result?),
+                Err(error) => {
+                    let _ = bus.0.kill();
+                    let _ = bus.0.wait();
+                    Err(error.into())
+                }
+            }
+        })?;
+        let address = address.trim();
+        assert!(!address.is_empty());
+        let service = for_test();
+        let shared = service.shared.clone();
+        let connection = zbus::blocking::connection::Builder::address(address)?
+            .method_timeout(Duration::from_secs(1))
+            .name(BUS_NAME)?
+            .serve_at(OBJECT_PATH, service)?
+            .build()?;
+        check_bus(&connection)?;
+        let client = zbus::blocking::connection::Builder::address(address)?
+            .method_timeout(Duration::from_secs(1))
+            .build()?;
+        let unique = connection
+            .unique_name()
+            .context("private service name")?
+            .as_str();
+        let proxy =
+            zbus::blocking::Proxy::new(&client, unique, OBJECT_PATH, "dev.keepinfov.oxidom1")?;
+        let _: String = proxy.call("Status", &())?;
+        let contender = for_test();
+        let rejected = contender.shared.clone();
+        let collision = zbus::blocking::connection::Builder::address(address)?
+            .method_timeout(Duration::from_secs(1))
+            .name(BUS_NAME)?
+            .serve_at(OBJECT_PATH, contender)?
+            .build();
+        let collision = run_private_serving(
+            rejected.clone(),
+            collision.map_err(anyhow::Error::new),
+            |_| panic!("name collision must not start workers"),
+        );
+        assert!(collision.is_err());
+        assert!(rejected.admit().is_err());
+        let loss = run_private_serving(shared.clone(), Ok(connection.clone()), |connection| {
+            assert!(connection.release_name(BUS_NAME).unwrap());
+        });
+        assert!(
+            loss.unwrap_err()
+                .to_string()
+                .contains("ownership unavailable")
+        );
+        assert!(shared.admit().is_err());
+        let rejected_call: zbus::Result<String> = proxy.call("Status", &());
+        assert!(rejected_call.is_err());
+
+        let service = for_test();
+        let signalled = service.shared.clone();
+        let signal_connection = zbus::blocking::connection::Builder::address(address)?
+            .method_timeout(Duration::from_secs(1))
+            .name(BUS_NAME)?
+            .serve_at(OBJECT_PATH, service)?
+            .build()?;
+        serve_until_terminal(
+            &signalled,
+            Ok(signal_connection),
+            || Ok(true),
+            |connection| {
+                assert!(connection.release_name(BUS_NAME).unwrap());
+            },
+        )?;
+        assert!(signalled.admit().is_err());
+
+        let service = for_test();
+        let shared = service.shared.clone();
+        let connection = zbus::blocking::connection::Builder::address(address)?
+            .method_timeout(Duration::from_secs(1))
+            .name(BUS_NAME)?
+            .serve_at(OBJECT_PATH, service)?
+            .build()?;
+        check_bus(&connection)?;
+        let loss = run_private_serving(shared.clone(), Ok(connection), move |_| {
+            bus.0.kill().unwrap();
+            bus.0.wait().unwrap();
+        });
+        let error = loss.unwrap_err().to_string();
+        assert!(
+            error.contains("transport closed") || error.contains("ownership unavailable"),
+            "{error}"
+        );
+        assert!(shared.admit().is_err());
+        Ok(())
+    }
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -7018,6 +7498,201 @@ mod tests {
 
     fn subscription_runtime() -> Result<tokio::runtime::Runtime> {
         Ok(tokio::runtime::Builder::new_current_thread().build()?)
+    }
+
+    #[test]
+    fn an_admitted_import_waiting_for_the_engine_cannot_write_after_closure() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("terminal-admitted-import")?;
+        let service = for_test();
+        let shared = service.shared.clone();
+        let engine = oxidom_core::sync::lock(&shared.engine);
+        let worker = std::thread::spawn(move || {
+            service.import_links("trojan://invented@node.example.invalid:443#Offline".into())
+        });
+        shared.lifecycle.wait_for_work();
+        shared.lifecycle.close();
+        drop(engine);
+        assert!(worker.join().unwrap().is_err());
+        shared.terminate()?;
+        assert!(
+            oxidom_core::sync::lock(&shared.engine)
+                .registry
+                .subscriptions
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_closure_rejects_delayed_explicit_retry_and_confirmation_transitions() -> Result<()>
+    {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("terminal-attempts")?;
+        let service = for_test();
+        let generation = service.shared.next_connect_generation("work");
+        let snapshot = {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            mark_active(&mut engine, "work", "invented")?;
+            service
+                .shared
+                .capture_confirmation(&engine, "work", generation, None)
+        };
+        let target = ConnectionTarget::Server("invented".into());
+        service.shared.begin_terminal();
+        assert!(
+            service
+                .shared
+                .start_connection_target_captured(
+                    "work",
+                    &target,
+                    generation,
+                    ConnectionOrigin::Explicit
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .shared
+                .start_reconnect_attempt("work", &target, generation)
+                .is_none()
+        );
+        assert!(!service.shared.claim_reconnect("work", &target, snapshot));
+        assert!(!service.shared.apply_confirmation_success(
+            "work",
+            &target,
+            ConnectionOrigin::Explicit,
+            snapshot
+        ));
+        service.shared.apply_confirmation_failure(
+            "work",
+            &target,
+            ConnectionOrigin::Explicit,
+            snapshot,
+            ConfirmationEnd::InboundNotReady,
+            None,
+        );
+        assert!(oxidom_core::sync::lock(&service.shared.override_status).is_empty());
+        service.shared.terminate()?;
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_cleanup_failure_is_retained_across_repeated_calls() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("terminal-cleanup-error")?;
+        let service = for_test();
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            mark_active(&mut engine, "work", "invented")?;
+            engine
+                .state
+                .sessions
+                .push(oxidom_core::state::SessionState {
+                    profile: "work".into(),
+                    xray_pid: Some(std::process::id()),
+                    ..Default::default()
+                });
+        }
+        let other = service.shared.clone();
+        let concurrent = std::thread::spawn(move || other.terminate().unwrap_err().to_string());
+        let first = service.shared.terminate().unwrap_err().to_string();
+        let second = concurrent.join().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, service.shared.terminate().unwrap_err().to_string());
+        assert!(
+            oxidom_core::sync::lock(&service.shared.engine)
+                .state
+                .sessions
+                .iter()
+                .any(|saved| saved.xray_pid == Some(std::process::id()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_retained_service_clone_keeps_the_store_leased_after_terminal_cleanup() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("terminal-store-lease")?;
+        let data = oxidom_core::paths::data_dir()?;
+        let mut service = for_test();
+        service.shared.store_lease = Some(Arc::new(crate::store_lock::StoreLock::acquire(&data)?));
+        let retained = service.shared.clone();
+        service.shared.terminate()?;
+        drop(service);
+        assert!(crate::store_lock::StoreLock::acquire(&data).is_err());
+        drop(retained);
+        let _next = crate::store_lock::StoreLock::acquire(&data)?;
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_closure_rejects_a_subscription_response_already_in_flight() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("terminal-subscription")?;
+        let service = for_test();
+        subscription_runtime()?.block_on(async {
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (release, blocked) = mpsc::channel();
+            let worker = service.shared.clone();
+            let mut entered = Some(entered);
+            let operation = tokio::spawn(async move {
+                worker
+                    .update_subscriptions(
+                        SubscriptionOperation::Add {
+                            url: "https://panel.example.invalid/sub".into(),
+                            name: Some("invented".into()),
+                            send_hwid: false,
+                        },
+                        move |_, _| {
+                            let _ = entered.take().context("one fetch")?.send(());
+                            blocked.recv()?;
+                            Ok(subscription_response())
+                        },
+                    )
+                    .await
+            });
+            waiting.await?;
+            service.shared.lifecycle.close();
+            assert!(service.status().is_err());
+            assert!(service.get_settings().is_err());
+            assert!(service.runtime_info().is_err());
+            release.send(())?;
+            assert!(operation.await?.is_err());
+            service.shared.terminate()?;
+            assert!(
+                oxidom_core::sync::lock(&service.shared.engine)
+                    .registry
+                    .subscriptions
+                    .is_empty()
+            );
+            assert!(service.shared.subscription_work.try_lock().is_ok());
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    #[test]
+    fn terminal_shutdown_drains_periodic_workers_and_cannot_revive_standby() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("terminal-periodic-workers")?;
+        let service = for_test();
+        let generation = service.shared.next_connect_generation("work");
+        service.shared.spawn_active_probe_loop();
+        service.shared.spawn_tunnel_watchdog();
+        service.shared.spawn_pool_status_loop();
+        spawn_core_supervisor(service.shared.clone());
+        service.shared.terminate()?;
+        assert!(!service.shared.generation_is_current("work", generation));
+        assert!(!service.shared.spawn(|| panic!("terminal work ran")));
+        oxidom_core::sync::lock(&service.shared.engine)
+            .registry
+            .config
+            .standby_proxy = true;
+        service.shared.reconcile_standby();
+        assert!(oxidom_core::sync::lock(&service.shared.standby).is_none());
+        assert!(service.request_probe("invented".into()).is_err());
+        Ok(())
     }
 
     #[test]

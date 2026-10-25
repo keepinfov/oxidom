@@ -11,6 +11,7 @@ Organised by what you see. Error text is quoted as oxidom actually prints it.
 - [Subscriptions](#subscriptions)
 - [TUN and `oxidom run`](#tun-and-oxidom-run)
 - [The GUI](#the-gui)
+- [The daemon stops after bus loss](#the-daemon-stops-after-bus-loss)
 - [Files moved aside](#files-moved-aside)
 - [Getting logs](#getting-logs)
 
@@ -43,6 +44,25 @@ cause is that the client could not reach the system one:
 
 Servers added to one database can be re-imported into the other from the same
 subscription URL.
+
+## The daemon stops after bus loss
+
+The daemon treats loss of its D-Bus connection or service name as terminal. It rejects new
+requests, cancels pending connection/retry work, drains active workers and cleans its sessions
+before releasing the database. Closing the GUI does not trigger this behavior. It does not
+silently reconnect to a different bus or database.
+
+Unexpected bus loss and failed cleanup exit with an error. An explicitly enabled external
+supervisor can restart the daemon according to its existing policy; standalone mode has no
+automatic restart loop. Wait for the selected bus to be available before restarting manually.
+Requests during teardown can return `daemon is stopping`; this is not proof that every resource
+has already been removed. Cleanup failures retain recovery metadata for the next owner.
+
+Shutdown is not guaranteed to finish within a fixed time: active network, DNS, filesystem and
+helper operations may delay it. Do not delete the database lock or recovery records to force a
+second owner. Diagnose the original process first. If no daemon answers, use
+`oxidom core diagnostics --file PATH` with the selected store's diagnostic journal, as described
+in [Getting logs](#getting-logs).
 
 ## The core will not start
 
