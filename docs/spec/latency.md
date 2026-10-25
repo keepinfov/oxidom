@@ -25,7 +25,11 @@ All public status surfaces report `connecting` until the SOCKS-path confirmation
 the requested interface has started. Starting a process or binding its listener is insufficient.
 An adopted running pool is not a fresh attempt. Internal process status remains usable by probes
 and exit supervision while confirmation is pending; terminal errors are not masked by the pending
-flag. Confirmation success is applied only to its current generation.
+flag. Confirmation success is applied only to its current generation and core subject.
+Automatic recovery also revalidates the confirmed incarnation when consuming a delayed success
+receipt, before clearing the reconnect override. A core that died in that gap must leave recovery
+pending, not be reported as recovered. Settings-driven restarts claim their probe job with the
+engine transition, before diagnostic persistence can delay background confirmation.
 
 ## Tunnel watchdog (binding)
 

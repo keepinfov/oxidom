@@ -40,6 +40,11 @@ It retains typed lifecycle facts, not raw log text or credentials. If storage is
 unavailable, startup retains its original stderr and outcome. See
 [diagnostic limits and recovery](troubleshooting.md#persistent-daemon-diagnostics).
 
+Runtime correlation IDs and the fixed 64-bucket/16-repeat observation-summary
+policy are diagnostic-only, not profile settings or retry/health policy. They
+do not change `watchdog`, reconnect backoff, saved targets or authorization, and
+are never written into profile/state configuration.
+
 ## The two databases
 
 When oxidom runs as a **system daemon**, systemd sets `StateDirectory=oxidom`, and

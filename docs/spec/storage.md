@@ -169,7 +169,8 @@ warning counts are retained without their raw text. `catalog_load_warnings` coun
 subscriptions-store warnings returned by catalog loading, not all config/state/recovery warnings
 that other code writes to legacy logs. No guarantee is made for pre-exec failures, argument
 parsing, arbitrary panic payloads, abort, SIGKILL, or execution that never reaches the recorder.
-Per-attempt attribution, repeat summaries, persistent cursors and export are separate work.
+Runtime attribution and repeat summaries are specified below. Persistent cursors and export
+remain separate work.
 
 Each newly encoded record is at most 1,024 bytes including LF. Current and one backup
 `oxidom-daemon.log.1` are each at most 2,097,152 bytes, at most 4 MiB payload combined. A separate
@@ -199,6 +200,113 @@ again after write failure. Neither successful persistence nor an alternate fallb
 claimed when storage failed. No file can be guaranteed when storage and terminal fallback are
 both unavailable. Existing D-Bus log cursors and `ClearLogs` remain memory-only and do not read,
 replay or delete these generations.
+
+### Runtime attribution (binding)
+
+Runtime records add a closed `context` object to version 1 without changing existing lifecycle
+record shapes: `{run: u64, session: u64, generation: u64, attempt: u64|null, core: u64|null}`.
+`run` comes from one eight-byte random request per recorder; unavailable entropy or zero disables
+runtime correlation without an identity-derived fallback. It is a diagnostic namespace, not
+proof of daemon/store continuity. Tests inject fixed IDs. Session and attempt IDs are checked,
+shared monotonic allocations; exhaustion disables affected attribution, never process control.
+No raw-name dictionary or name-derived hash is persisted.
+
+A session ID covers one accepted runtime lifetime, surviving replacement and retries until
+actual removal or complete disconnection. Held sessions, pending retries and failed cleanup
+retain identity. Recreating an ended runtime, even with the same profile name/server, gets a new
+ID. Each accepted start, including automatic retry and settings-driven port restart, gets a new
+attempt ID; a cancellation generation alone is not an attempt identifier.
+Catalog deletion invalidates affected application generations and reconnect overrides before
+recording cancellation/retirement; diagnostic cancellation cannot substitute for actual control
+cancellation or allow an old retry to resurrect the deleted target.
+
+Core IDs are separately checked process-local allocations made only after successful OS spawn
+or adoption. Opening a log run, failed resolution/configuration/spawn, a PID and the log watermark
+are not core IDs. A failed attempt never borrows a surviving core's identity. An existing core
+keeps its original context even when a newer-generation start fails before replacing it;
+watch/recovery observations retain that trigger rather than restamping its generation.
+
+Capture immutable context and the applicable generation/incarnation/watermark at the engine
+ownership boundary and pass it with background work. Validate the subject when taking a probe
+snapshot and consuming its result. Stale success/failure records keep the old context and say
+`discarded_stale`. Emit accepted confirmation only after interface bring-up and traffic
+confirmation. A delayed recovery-success receipt must revalidate that confirmed core before
+clearing the retry override. Settings restarts claim their probe job before diagnostic emission,
+so delayed persistence cannot steal a newer job.
+
+Additive runtime events and their fields are:
+
+- `session_opened`, `session_retired`: `context`. Retirement reflects observed runtime cleanup,
+  not merely a Stop request or successful diagnostic write.
+- `attempt_started`: `context`, `origin` (`explicit`, `automatic`, `settings`, `adopted`),
+  `target` (`server`, `pool`). Never include target contents.
+- `core_started`: `context`, `adopted: bool`. Adoption is not fresh confirmation.
+- `attempt_finished`: `context`, `outcome`, `disposition` (`accepted`, `discarded_stale`),
+  nullable `failure` (the existing closed failure categories), `os_code`, and closed `detail`.
+- `liveness_lost`: `context`, `holding_traffic: bool`. This does not invent a process exit status:
+  failed supervision can include an interface-helper failure with Xray still alive.
+- `retry`: original trigger `context`, `state` (`pending`, `cancelled`, `recovered`), numeric
+  `ordinal: u32` and `delay_ms: u64`. Each actual retry still has a separate attempt ID.
+- `watch`: `context`, `policy_epoch: u64`, `mode` (`off`, `conservative`, `aggressive`),
+  `outcome`, nullable closed `detail`, and `action` (`observed`, `reset`, `discarded_stale`,
+  `conservative_retained`, `recovery_applied`, `recovery_rejected`). Evidence, threshold and
+  recovery action are distinct facts; an overtaken conservative action cannot claim a live core.
+
+`outcome` is one of `reachable`, `timeout`, `unreachable`, `no_network`, `internal`,
+`inbound_not_ready`, `pool_window_exhausted`, `interface_failed`, `start_failed`, `missing_subject`.
+`detail` uses the closed `ProbeDetail` values, never formatted core text. A pool's early termination
+keeps its typed observation/detail; only the window cutoff produces `pool_window_exhausted`.
+
+```jsonl
+{"version":1,"unix_ms":1234,"pid":42,"event":"attempt_started","context":{"run":1,"session":2,"generation":3,"attempt":4,"core":null},"origin":"explicit","target":"server"}
+```
+
+Capture ordering and persistence are separate. No file I/O or fallback stderr occurs while
+holding engine, probe, generation, streak, identity or lifecycle-ordering mutexes. The recorder
+releases its reducer-state mutex before I/O; a recorder-specific emission mutex serializes its
+own writes. Slow storage is still possible and no network/control behavior depends on diagnostic
+availability. Immutable facts may reach disk after later application transitions: `accepted`
+describes the decision when captured, not currentness at file-write time. Neither append order
+nor realtime timestamps establish total application order. Raw child-log lines remain outside
+this attribution contract.
+
+### Repeated observations (binding)
+
+Summarize only `watch` events with `action=observed` and an identical complete observation key:
+`context`, policy epoch/mode, outcome/detail and action. The first observation emits immediately;
+each 16 additional identical observations emits a delta. Keep at most 64 FIFO buckets, with no
+timer, idle deadline or extra thread. Cause/action change within a context/epoch flushes its old
+bucket. Explicit retirement, replacement of a surviving older core, policy change and capacity
+eviction flush pending deltas; closing runtime recording flushes all remaining buckets.
+Different sessions, attempts, cores and policy epochs never share a counter. Lifecycle events,
+attempt results, retry transitions, recovery/retention actions and stale observations are not
+suppressed. Routine healthy checks need not produce records unless they reset a failure streak.
+
+`watch_summary` contains `key` (the original full watch object), `suppressed_count: u64`,
+`first_ordinal: u64`, `last_ordinal: u64` and `reason` (`batch`, `context_ended`, `cause_changed`,
+`capacity`, `shutdown`). Count means additional occurrences only, excluding the first detail;
+each summary is a delta, not a cumulative total. Ordinals are recorder acceptance positions,
+not durable cursors, wall times or file offsets; their range may include other observations.
+Ordinal exhaustion flushes pending deltas and disables aggregation rather than wrapping.
+
+Failed writes are distinct from suppression. `persistence_gap` reports numeric
+`unconfirmed_write_attempts`, `unconfirmed_occurrences`, the safe `last_kind`/nullable
+`last_os_code`, and `saturated: bool`. A failed summary contributes its whole delta; an ordinary
+failed emitted record contributes one occurrence. A failed gap report updates the safe error
+category but never counts itself, preventing recursive amplification. Try one pending gap before
+each later emitted record; acknowledge its snapshot only after a successful write. Counters
+saturate explicitly. Because write errors can follow visible changes, these are unconfirmed
+occurrences, not proof that records are absent. Open failure still follows the disabled-sink
+policy above; no delivery claim is made for it.
+
+Before shutdown lifecycle checkpoints, close runtime acceptance and flush pending summaries plus
+one bounded gap-only attempt, even if there were no summaries or the final summary failed.
+Later runtime events cannot reopen buckets; repeated closure drains no summary twice and can
+retry a pending gap once. After the final lifecycle/fatal record, make a final bounded gap drain.
+P05 lifecycle/fatal records remain enabled after the runtime fence. This fences diagnostics,
+not background workers, and does not implement general shutdown quiescence or guarantee final
+evidence on blocked/failing storage or abrupt process termination. Existing D-Bus memory cursors,
+logbook records and `ClearLogs` are unchanged.
 
 ## Reading the log over D-Bus (binding)
 

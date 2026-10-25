@@ -1,4 +1,4 @@
-//! Bounded, private daemon lifecycle diagnostics, separate from the logbook.
+//! Bounded, private daemon lifecycle and attributed runtime diagnostics.
 //!
 //! Only closed enums and numeric/boolean fields can reach this sink. It neither
 //! captures stdout/stderr nor logs its own errors; the caller must report a fixed,
@@ -32,6 +32,8 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::ipc::ProbeDetail;
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 1024;
@@ -69,6 +71,114 @@ pub enum FailureKind {
     Other,
 }
 
+/// Diagnostic-only process-local correlation, never a PID, health counter,
+/// profile/store identity, or a value to persist back into application state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Context {
+    pub run: u64,
+    pub session: u64,
+    pub generation: u64,
+    pub attempt: Option<u64>,
+    pub core: Option<u64>,
+}
+
+/// One bounded entropy request per recorder; failure (including zero) disables
+/// run correlation rather than falling back to a machine or store identity.
+pub fn generate_run_id() -> Option<u64> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0; 8];
+    SystemRandom::new().fill(&mut bytes).ok()?;
+    let id = u64::from_le_bytes(bytes);
+    (id != 0).then_some(id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    Explicit,
+    Automatic,
+    Settings,
+    Adopted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    Server,
+    Pool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    Accepted,
+    DiscardedStale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationOutcome {
+    Reachable,
+    Timeout,
+    Unreachable,
+    NoNetwork,
+    Internal,
+    InboundNotReady,
+    PoolWindowExhausted,
+    InterfaceFailed,
+    StartFailed,
+    MissingSubject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryState {
+    Pending,
+    Cancelled,
+    Recovered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticWatchMode {
+    Off,
+    Conservative,
+    Aggressive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchAction {
+    Observed,
+    Reset,
+    DiscardedStale,
+    ConservativeRetained,
+    RecoveryApplied,
+    RecoveryRejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlushReason {
+    Batch,
+    ContextEnded,
+    CauseChanged,
+    Capacity,
+    Shutdown,
+}
+
+/// The original, exact observation key. Recorder-produced summaries always have
+/// `action: Observed`; actions and stale results are never aggregated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchObservation {
+    pub context: Context,
+    pub policy_epoch: u64,
+    pub mode: DiagnosticWatchMode,
+    pub outcome: ObservationOutcome,
+    pub detail: Option<ProbeDetail>,
+    pub action: WatchAction,
+}
+
 /// No raw error messages, paths, profile names, or other free-form text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -84,6 +194,65 @@ pub enum Event {
     },
     CatalogLoadWarnings {
         count: u32,
+    },
+    SessionOpened {
+        context: Context,
+    },
+    SessionRetired {
+        context: Context,
+    },
+    AttemptStarted {
+        context: Context,
+        origin: Origin,
+        target: TargetKind,
+    },
+    CoreStarted {
+        context: Context,
+        adopted: bool,
+    },
+    AttemptFinished {
+        context: Context,
+        outcome: ObservationOutcome,
+        disposition: Disposition,
+        failure: Option<FailureKind>,
+        os_code: Option<i32>,
+        detail: Option<ProbeDetail>,
+    },
+    LivenessLost {
+        context: Context,
+        holding_traffic: bool,
+    },
+    Retry {
+        context: Context,
+        state: RetryState,
+        ordinal: u32,
+        delay_ms: u64,
+    },
+    Watch {
+        context: Context,
+        policy_epoch: u64,
+        mode: DiagnosticWatchMode,
+        outcome: ObservationOutcome,
+        detail: Option<ProbeDetail>,
+        action: WatchAction,
+    },
+    WatchSummary {
+        key: WatchObservation,
+        /// Additional occurrences only, excluding the first visible observation.
+        suppressed_count: u64,
+        /// Recorder acceptance ordinals of this delta's suppressed occurrences.
+        first_ordinal: u64,
+        last_ordinal: u64,
+        reason: FlushReason,
+    },
+    /// A failed sync can follow a visible write. These are unconfirmed writes,
+    /// not a claim that the corresponding occurrences were definitely lost.
+    PersistenceGap {
+        unconfirmed_write_attempts: u64,
+        unconfirmed_occurrences: u64,
+        last_kind: FailureKind,
+        last_os_code: Option<i32>,
+        saturated: bool,
     },
 }
 
@@ -417,6 +586,250 @@ mod tests {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn runtime_records_have_literal_private_version_one_bytes() {
+        let context = Context {
+            run: 1,
+            session: 2,
+            generation: 3,
+            attempt: Some(4),
+            core: Some(5),
+        };
+        let key = WatchObservation {
+            context,
+            policy_epoch: 6,
+            mode: DiagnosticWatchMode::Conservative,
+            outcome: ObservationOutcome::Timeout,
+            detail: Some(crate::ipc::ProbeDetail::NoCore),
+            action: WatchAction::Observed,
+        };
+        for (event, literal) in [
+            (
+                Event::SessionOpened { context },
+                r#"{"event":"session_opened","context":{"run":1,"session":2,"generation":3,"attempt":4,"core":5}}"#,
+            ),
+            (
+                Event::SessionRetired { context },
+                r#"{"event":"session_retired","context":{"run":1,"session":2,"generation":3,"attempt":4,"core":5}}"#,
+            ),
+            (
+                Event::AttemptStarted {
+                    context,
+                    origin: Origin::Explicit,
+                    target: TargetKind::Pool,
+                },
+                r#"{"event":"attempt_started","context":{"run":1,"session":2,"generation":3,"attempt":4,"core":5},"origin":"explicit","target":"pool"}"#,
+            ),
+            (
+                Event::CoreStarted {
+                    context,
+                    adopted: true,
+                },
+                r#"{"event":"core_started","context":{"run":1,"session":2,"generation":3,"attempt":4,"core":5},"adopted":true}"#,
+            ),
+            (
+                Event::AttemptFinished {
+                    context,
+                    outcome: ObservationOutcome::StartFailed,
+                    disposition: Disposition::DiscardedStale,
+                    failure: Some(FailureKind::OtherIo),
+                    os_code: Some(-1),
+                    detail: None,
+                },
+                r#"{"event":"attempt_finished","context":{"run":1,"session":2,"generation":3,"attempt":4,"core":5},"outcome":"start_failed","disposition":"discarded_stale","failure":"other_io","os_code":-1,"detail":null}"#,
+            ),
+            (
+                Event::LivenessLost {
+                    context,
+                    holding_traffic: true,
+                },
+                r#"{"event":"liveness_lost","context":{"run":1,"session":2,"generation":3,"attempt":4,"core":5},"holding_traffic":true}"#,
+            ),
+            (
+                Event::Retry {
+                    context,
+                    state: RetryState::Pending,
+                    ordinal: 7,
+                    delay_ms: 8,
+                },
+                r#"{"event":"retry","context":{"run":1,"session":2,"generation":3,"attempt":4,"core":5},"state":"pending","ordinal":7,"delay_ms":8}"#,
+            ),
+            (
+                Event::Watch {
+                    context,
+                    policy_epoch: 6,
+                    mode: key.mode,
+                    outcome: key.outcome,
+                    detail: key.detail,
+                    action: key.action,
+                },
+                r#"{"event":"watch","context":{"run":1,"session":2,"generation":3,"attempt":4,"core":5},"policy_epoch":6,"mode":"conservative","outcome":"timeout","detail":"no_core","action":"observed"}"#,
+            ),
+            (
+                Event::WatchSummary {
+                    key,
+                    suppressed_count: 16,
+                    first_ordinal: 2,
+                    last_ordinal: 17,
+                    reason: FlushReason::Batch,
+                },
+                r#"{"event":"watch_summary","key":{"context":{"run":1,"session":2,"generation":3,"attempt":4,"core":5},"policy_epoch":6,"mode":"conservative","outcome":"timeout","detail":"no_core","action":"observed"},"suppressed_count":16,"first_ordinal":2,"last_ordinal":17,"reason":"batch"}"#,
+            ),
+            (
+                Event::PersistenceGap {
+                    unconfirmed_write_attempts: 2,
+                    unconfirmed_occurrences: 17,
+                    last_kind: FailureKind::OtherIo,
+                    last_os_code: Some(5),
+                    saturated: false,
+                },
+                r#"{"event":"persistence_gap","unconfirmed_write_attempts":2,"unconfirmed_occurrences":17,"last_kind":"other_io","last_os_code":5,"saturated":false}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&event).unwrap(), literal);
+            let expected = format!(
+                "{{\"version\":1,\"unix_ms\":0,\"pid\":1,{}\n",
+                &literal[1..]
+            );
+            assert_eq!(encode(event, 0, 1).unwrap(), expected.as_bytes());
+            assert_eq!(serde_json::from_str::<Event>(literal).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn maximal_runtime_records_stay_below_one_kib_including_the_newline() {
+        let context = Context {
+            run: u64::MAX,
+            session: u64::MAX,
+            generation: u64::MAX,
+            attempt: Some(u64::MAX),
+            core: Some(u64::MAX),
+        };
+        for event in [
+            Event::SessionOpened { context },
+            Event::SessionRetired { context },
+            Event::AttemptStarted {
+                context,
+                origin: Origin::Automatic,
+                target: TargetKind::Server,
+            },
+            Event::CoreStarted {
+                context,
+                adopted: false,
+            },
+            Event::AttemptFinished {
+                context,
+                outcome: ObservationOutcome::PoolWindowExhausted,
+                disposition: Disposition::Accepted,
+                failure: Some(FailureKind::ReadOnlyFilesystem),
+                os_code: Some(i32::MIN),
+                detail: Some(crate::ipc::ProbeDetail::InsecureTlsUnsupported),
+            },
+            Event::LivenessLost {
+                context,
+                holding_traffic: false,
+            },
+            Event::Retry {
+                context,
+                state: RetryState::Recovered,
+                ordinal: u32::MAX,
+                delay_ms: u64::MAX,
+            },
+            Event::Watch {
+                context,
+                policy_epoch: u64::MAX,
+                mode: DiagnosticWatchMode::Aggressive,
+                outcome: ObservationOutcome::PoolWindowExhausted,
+                detail: Some(crate::ipc::ProbeDetail::InsecureTlsUnsupported),
+                action: WatchAction::ConservativeRetained,
+            },
+            Event::WatchSummary {
+                key: WatchObservation {
+                    context,
+                    policy_epoch: u64::MAX,
+                    mode: DiagnosticWatchMode::Conservative,
+                    outcome: ObservationOutcome::PoolWindowExhausted,
+                    detail: Some(crate::ipc::ProbeDetail::InsecureTlsUnsupported),
+                    action: WatchAction::Observed,
+                },
+                suppressed_count: u64::MAX,
+                first_ordinal: u64::MAX,
+                last_ordinal: u64::MAX,
+                reason: FlushReason::ContextEnded,
+            },
+            Event::PersistenceGap {
+                unconfirmed_write_attempts: u64::MAX,
+                unconfirmed_occurrences: u64::MAX,
+                last_kind: FailureKind::ReadOnlyFilesystem,
+                last_os_code: Some(i32::MIN),
+                saturated: true,
+            },
+        ] {
+            assert!(encode(event, u64::MAX, u32::MAX).unwrap().len() <= 1024);
+        }
+    }
+
+    #[test]
+    fn maximum_summary_and_gap_fields_have_literal_bytes_without_truncation() {
+        let context = Context {
+            run: u64::MAX,
+            session: u64::MAX,
+            generation: u64::MAX,
+            attempt: Some(u64::MAX),
+            core: Some(u64::MAX),
+        };
+        assert_eq!(
+            encode(Event::WatchSummary { key: WatchObservation { context, policy_epoch: u64::MAX, mode: DiagnosticWatchMode::Conservative, outcome: ObservationOutcome::PoolWindowExhausted, detail: Some(crate::ipc::ProbeDetail::InsecureTlsUnsupported), action: WatchAction::Observed }, suppressed_count: u64::MAX, first_ordinal: u64::MAX, last_ordinal: u64::MAX, reason: FlushReason::ContextEnded }, u64::MAX, u32::MAX).unwrap(),
+            b"{\"version\":1,\"unix_ms\":18446744073709551615,\"pid\":4294967295,\"event\":\"watch_summary\",\"key\":{\"context\":{\"run\":18446744073709551615,\"session\":18446744073709551615,\"generation\":18446744073709551615,\"attempt\":18446744073709551615,\"core\":18446744073709551615},\"policy_epoch\":18446744073709551615,\"mode\":\"conservative\",\"outcome\":\"pool_window_exhausted\",\"detail\":\"insecure_tls_unsupported\",\"action\":\"observed\"},\"suppressed_count\":18446744073709551615,\"first_ordinal\":18446744073709551615,\"last_ordinal\":18446744073709551615,\"reason\":\"context_ended\"}\n"
+        );
+        assert_eq!(
+            encode(Event::PersistenceGap { unconfirmed_write_attempts: u64::MAX, unconfirmed_occurrences: u64::MAX, last_kind: FailureKind::ReadOnlyFilesystem, last_os_code: Some(i32::MIN), saturated: true }, u64::MAX, u32::MAX).unwrap(),
+            b"{\"version\":1,\"unix_ms\":18446744073709551615,\"pid\":4294967295,\"event\":\"persistence_gap\",\"unconfirmed_write_attempts\":18446744073709551615,\"unconfirmed_occurrences\":18446744073709551615,\"last_kind\":\"read_only_filesystem\",\"last_os_code\":-2147483648,\"saturated\":true}\n"
+        );
+        assert_eq!(
+            serde_json::to_string(&Context {
+                run: 1,
+                session: 2,
+                generation: 3,
+                attempt: None,
+                core: None
+            })
+            .unwrap(),
+            r#"{"run":1,"session":2,"generation":3,"attempt":null,"core":null}"#
+        );
+    }
+
+    #[test]
+    fn runtime_enum_spellings_are_closed_and_fixed() {
+        macro_rules! fixed {
+            ($ty:ty, $($variant:path => $literal:literal),+ $(,)?) => {{
+                $(
+                    let literal = concat!("\"", $literal, "\"");
+                    assert_eq!(serde_json::to_string(&$variant).unwrap(), literal);
+                    assert_eq!(serde_json::from_str::<$ty>(literal).unwrap(), $variant);
+                )+
+                assert!(serde_json::from_str::<$ty>(r#""invented-private-name""#).is_err());
+            }};
+        }
+        fixed!(Origin, Origin::Explicit => "explicit", Origin::Automatic => "automatic", Origin::Settings => "settings", Origin::Adopted => "adopted");
+        fixed!(TargetKind, TargetKind::Server => "server", TargetKind::Pool => "pool");
+        fixed!(Disposition, Disposition::Accepted => "accepted", Disposition::DiscardedStale => "discarded_stale");
+        fixed!(ObservationOutcome,
+            ObservationOutcome::Reachable => "reachable", ObservationOutcome::Timeout => "timeout",
+            ObservationOutcome::Unreachable => "unreachable", ObservationOutcome::NoNetwork => "no_network",
+            ObservationOutcome::Internal => "internal", ObservationOutcome::InboundNotReady => "inbound_not_ready",
+            ObservationOutcome::PoolWindowExhausted => "pool_window_exhausted", ObservationOutcome::InterfaceFailed => "interface_failed",
+            ObservationOutcome::StartFailed => "start_failed", ObservationOutcome::MissingSubject => "missing_subject",
+        );
+        fixed!(RetryState, RetryState::Pending => "pending", RetryState::Cancelled => "cancelled", RetryState::Recovered => "recovered");
+        fixed!(DiagnosticWatchMode, DiagnosticWatchMode::Off => "off", DiagnosticWatchMode::Conservative => "conservative", DiagnosticWatchMode::Aggressive => "aggressive");
+        fixed!(WatchAction,
+            WatchAction::Observed => "observed", WatchAction::Reset => "reset", WatchAction::DiscardedStale => "discarded_stale",
+            WatchAction::ConservativeRetained => "conservative_retained", WatchAction::RecoveryApplied => "recovery_applied", WatchAction::RecoveryRejected => "recovery_rejected",
+        );
+        fixed!(FlushReason, FlushReason::Batch => "batch", FlushReason::ContextEnded => "context_ended", FlushReason::CauseChanged => "cause_changed", FlushReason::Capacity => "capacity", FlushReason::Shutdown => "shutdown");
+    }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(super) enum Stage {

@@ -500,6 +500,11 @@ data directory, independently of `RUST_LOG`. This does not copy arbitrary stderr
 or change command exit codes/output; other CLI commands do not open that file.
 See [persistent daemon diagnostics](troubleshooting.md#persistent-daemon-diagnostics).
 
+The structured journal now correlates runtime attempts and summarizes repeated
+watch observations, but it is not the process-local D-Bus log cursor and adds
+no CLI log-reading command yet. A late confirmation cannot end recovery for an
+already-dead incarnation; deleting a target cancels its pending retry ownership.
+
 Read commands never start a daemon. Only `up` and `connect` may.
 
 ## JSON schemas

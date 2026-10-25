@@ -357,6 +357,31 @@ names, subscription content and core output. Full error context still uses the
 existing stderr/journal paths; this feature does not make legacy raw logs safe
 to publish without review. It does not yet add a CLI log cursor or report export.
 
+Runtime events use opaque numeric `run`, `session`, `generation`, `attempt` and
+`core` context. A retry gets a new attempt/core identity even when cancellation
+generation is unchanged. Names and addresses are not encoded or hashed into
+these IDs. They correlate events inside a diagnostic run, not a saved profile or
+database across daemon restarts. A failed newer start does not rename an older
+core that survived it. `discarded_stale` belongs to the old work, not its replacement.
+
+Read `core_started` with `adopted=true` as adoption, not newly confirmed traffic.
+`liveness_lost` is a supervision observation, not necessarily an OS exit; check
+the separate hold/retry/watch action facts. Slow persistence can place an earlier
+captured fact after a newer transition, so file order is not total control order.
+
+For identical attributable watch observations, the first detail is followed by
+`watch_summary` deltas every 16 additional repeats, or a partial delta at cause,
+context, policy, capacity or shutdown boundaries. `suppressed_count` excludes
+the first detail. At most 64 buckets are retained; there is no idle flush timer.
+Individual attempts and recovery actions are not hidden by this summarization.
+
+`persistence_gap` reports records/occurrences whose persistence was not confirmed,
+not definitely lost records: a sync failure can follow a visible write. This is
+different from intentional suppression represented by summaries. Gap reports are
+retried only with later emissions or finalization and are themselves best effort.
+Closing runtime recording rejects late diagnostic events but does not prove
+that daemon workers or routing resources have finished shutdown.
+
 If persistence fails, stderr and the process-local Logs view receive the fixed
 warning **persistent daemon diagnostics unavailable; original stderr remains
 enabled**, at most once per daemon process. Startup failure/exit codes remain

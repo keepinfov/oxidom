@@ -472,6 +472,10 @@ programs.oxidom.trayAutostart = true;
 
 ## Notes
 
+- Structured daemon diagnostics retain the original attempt/core context even
+  when the GUI replaces a connection. They do not restamp an old completion as
+  the new session. The Logs page remains the existing raw process-local stream;
+  diagnostic file summaries are not a new GUI log viewer or export flow.
 - For a separately supervised session daemon, use the explicit
   [managed session setup](installation.md#managed-session-daemon). With
   `OXIDOM_SESSION_DAEMON=external`, startup Retry never creates a competing private

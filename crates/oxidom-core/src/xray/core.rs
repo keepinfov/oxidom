@@ -1,6 +1,7 @@
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -53,6 +54,9 @@ pub struct XrayCore {
     /// own words to diagnose a failure must start here: a marker left by an
     /// earlier attempt would otherwise be read as this attempt's reason.
     spawn_seq: u64,
+    /// Process-local diagnostic identity, allocated only after spawn/adoption.
+    /// It is not a PID, log watermark, readiness or liveness verdict.
+    incarnation: Option<u64>,
     pub socks_port: u16,
     pub http_port: u16,
     /// Configured path to the Xray binary; empty falls back to the environment
@@ -69,6 +73,7 @@ impl XrayCore {
             status: Arc::new(Mutex::new(Status::Disconnected)),
             profile,
             spawn_seq: 0,
+            incarnation: None,
             socks_port,
             http_port,
             xray_binary,
@@ -108,6 +113,7 @@ impl XrayCore {
     /// notes attributed to the previous attempt, and taking it any earlier
     /// would fold in the previous attempt's dying words.
     fn open_run(&mut self) {
+        self.incarnation = None;
         self.spawn_seq = logbook::global().next_seq();
         logbook::global().push(
             LogSource::Oxidom,
@@ -121,6 +127,12 @@ impl XrayCore {
     /// First sequence number of the current run. See [`Self::spawn_seq`].
     pub fn spawn_seq(&self) -> u64 {
         self.spawn_seq
+    }
+
+    /// Identity of the last successful spawn/adoption in this run. A failed
+    /// start has no identity; observing an ID does not prove the core is alive.
+    pub fn incarnation(&self) -> Option<u64> {
+        self.incarnation
     }
 
     /// Move to a failed state once, recording why. Callers that detect the
@@ -335,6 +347,7 @@ impl XrayCore {
         }
 
         self.child = Some(child);
+        self.incarnation = next_incarnation();
         // Process launched. Readiness is confirmed by a latency probe from the caller;
         // mark Connected optimistically and let the caller downgrade on probe failure.
         self.set_status(Status::Connected);
@@ -344,6 +357,7 @@ impl XrayCore {
     pub(crate) fn adopt(&mut self, pid: u32, profile: &str) {
         self.child = None;
         self.recovered = Some((pid, profile.to_string()));
+        self.incarnation = next_incarnation();
         self.active = None;
         self.set_status(Status::Connected);
     }
@@ -407,11 +421,49 @@ impl Drop for XrayCore {
     }
 }
 
+fn next_incarnation() -> Option<u64> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    allocate_incarnation(&NEXT)
+}
+
+fn allocate_incarnation(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .ok()
+        .and_then(|value| value.checked_add(1))
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
 
     use super::XrayCore;
+
+    #[test]
+    fn a_log_run_is_not_a_successful_core_incarnation() {
+        let mut core = XrayCore::new("invented".into(), 10808, 10809, String::new());
+        assert_eq!(core.incarnation(), None);
+        core.open_run();
+        assert_eq!(core.incarnation(), None);
+        // This sentinel cannot convert to the signed PID accepted by stop_pid,
+        // so dropping this inert adopted fixture never signals a real process.
+        core.adopt(u32::MAX, "invented");
+        let first = core.incarnation().unwrap();
+        core.adopt(u32::MAX, "invented");
+        assert_ne!(core.incarnation(), Some(first));
+        core.open_run();
+        assert_eq!(core.incarnation(), None);
+    }
+
+    #[test]
+    fn exhausted_incarnation_ids_never_wrap_or_disable_process_control() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        assert_eq!(super::allocate_incarnation(&counter), Some(u64::MAX));
+        assert_eq!(super::allocate_incarnation(&counter), None);
+        assert_eq!(super::allocate_incarnation(&counter), None);
+    }
 
     #[test]
     fn config_paths_are_profile_scoped_and_validate_the_name() -> Result<()> {
