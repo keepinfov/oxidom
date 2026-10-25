@@ -169,8 +169,8 @@ warning counts are retained without their raw text. `catalog_load_warnings` coun
 subscriptions-store warnings returned by catalog loading, not all config/state/recovery warnings
 that other code writes to legacy logs. No guarantee is made for pre-exec failures, argument
 parsing, arbitrary panic payloads, abort, SIGKILL, or execution that never reaches the recorder.
-Runtime attribution and repeat summaries are specified below. Persistent cursors and export
-remain separate work.
+Runtime attribution, repeat summaries and persistent cursor reading are specified below.
+Local CLI export follows `cli.md`; memory-log cursors remain separate.
 
 Each newly encoded record is at most 1,024 bytes including LF. Current and one backup
 `oxidom-daemon.log.1` are each at most 2,097,152 bytes, at most 4 MiB payload combined. A separate
@@ -307,6 +307,51 @@ P05 lifecycle/fatal records remain enabled after the runtime fence. This fences 
 not background workers, and does not implement general shutdown quiescence or guarantee final
 evidence on blocked/failing storage or abrupt process termination. Existing D-Bus memory cursors,
 logbook records and `ClearLogs` are unchanged.
+
+## Persistent diagnostic reading (binding)
+
+`DiagnosticsSince(cursor: String, limit: u32) -> String` is an additive D-Bus method on
+`dev.keepinfov.oxidom1`. It reads only the selected daemon's diagnostic journal, never a caller
+path or a different database. Empty cursor starts at the oldest retained bytes. `limit = 0`
+means 64 valid records; limits above 256 are capped. Filesystem I/O runs off the D-Bus executor
+without holding engine, session or diagnostic-recorder locks. Storage/lock failures are errors,
+not empty history. Old clients and `RecentLogs`, `LogsSince`, `ClearLogs` remain unchanged.
+New clients report UnknownMethod as unsupported, without substituting memory logs or local files.
+
+The JSON page is version 1 with fields `version`, `records`, nullable `next_cursor`, `gap`,
+`rejected`, `incomplete_tail`, `more`. Records use the existing version-1 typed record schema.
+Read backup before current, oldest first, consuming only through the returned page position;
+pagination never selects a newest tail. `more` means consumable snapshot bytes remain, including
+invalid complete lines. Follow `next_cursor` to continue; it is not a logbook sequence, runtime
+ordinal, timestamp or authorization token. Pages are separate snapshots, not one atomic export.
+
+The opaque cursor is versioned URL-safe unpadded base64, bounded to 87 characters. It encodes
+device/inode, consumed byte offset, prefix length and SHA-256 of consumed bytes. Restarting the
+writer does not reset a cursor. One rotation follows the old current into backup then the new
+current. Eviction, replacement, truncation or changed consumed bytes invalidate continuity;
+an invalid/unrecognized cursor also does so. Return `gap = true` and restart at the oldest
+retained position, with unknown lost count. This reset can repeat previously delivered records;
+consumers must surface the gap rather than silently append as continuous history. An offset-zero
+cursor hashes no unread bytes: legitimate partial-tail repair must not replay an already drained
+backup. Exact restoration of the same file identity and consumed bytes is indistinguishable
+from continuity; cursors are not authenticated and do not detect every same-uid modification.
+
+Each complete line is bounded to 1 KiB including LF and deserialized into the closed typed schema.
+Malformed, oversized or unsupported-version records increment `rejected` and are consumed, but
+their text and parser errors are never exported. Unknown fields are discarded, not forwarded.
+An incomplete current tail is not consumed and sets `incomplete_tail = true`, not `more` by itself.
+An incomplete backup tail is rejected and consumed so traversal can reach current. An initially
+empty journal can have null cursor. Remote pages are validated for version, record count/size
+and cursor encoding before CLI/report use.
+
+Reading is non-mutating: no creation, chmod, repair or writable open, including for the stable
+lock. Pin an owned `0700` directory and open relative leaves with nofollow/nonblock. Require owned,
+single-link regular `0600` leaves, each at most 2 MiB, including the lock; refuse unsafe or oversized
+entries. A nonblocking shared lock excludes the writer's exclusive lock and permits parallel
+readers, including readonly locking on NFS. Snapshot at most 4 MiB and release the lock before
+parsing. Missing journal/lock returns NotFound, contention WouldBlock. No wall-clock I/O deadline
+is promised; hostile same-uid processes ignoring the lock remain outside the protection boundary.
+Existing retention and writer behavior are unchanged; reads do not clear anything.
 
 ## Reading the log over D-Bus (binding)
 

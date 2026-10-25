@@ -37,11 +37,48 @@ crash-restart loop. Foreground `oxidom daemon` is unchanged.
 - [Servers](#servers) — `ping`, `alias`
 - [Profiles](#profiles) — `profile list|show|new|edit|rm`
 - [Core settings](#core-settings) — `core show`
+- [Diagnostic export](#diagnostic-export) — `core diagnostics`, `core report`
 - [Running things](#running-things) — `run`
 - [Processes](#processes) — `daemon`, `gui`
 - [Exit codes](#exit-codes)
 - [Output contract](#output-contract)
 - [JSON schemas](#json-schemas)
+
+## Diagnostic export
+
+```sh
+oxidom core diagnostics --limit 64
+oxidom core diagnostics --cursor 'TOKEN_FROM_NEXT_CURSOR'
+oxidom core report --output ./oxidom-report.txt
+# A daemon that failed before D-Bus readiness: explicitly read its local journal.
+oxidom core report --file ~/.local/share/oxidom/oxidom-daemon.log --output ./oxidom-report.txt
+```
+
+These commands never start a daemon. Without `--file`, they read the selected existing
+daemon over D-Bus; an older daemon reports unsupported, not substituted memory logs.
+With `--file`, no daemon is contacted and only that private journal plus `.1` and `.lock`
+are read. Files are not repaired or chmodded; unsafe files, missing files and contention
+are errors. A user's CLI cannot directly open a different uid's private system journal.
+
+`core diagnostics` always prints JSON. Pages contain `records`, `next_cursor`, `gap`,
+`rejected`, `incomplete_tail` and `more`, plus schema `version: 1`. Default limit is 64,
+capped at 256; 0 selects the default. Read oldest first and pass back `next_cursor`
+unchanged. `more` means another page is available. A restart preserves the position;
+rotation can eventually evict it. `gap: true` means continuity could not be proved and
+reading reset to the oldest retained data, possibly repeating records; lost count is
+unknown. Invalid complete lines are counted in `rejected` without copying their text.
+An incomplete current tail waits for a later read. This cursor is unrelated to memory
+log sequence numbers and runtime IDs.
+
+`core report` accepts the same `--cursor`, `--limit`, `--file` options. It formats **one
+bounded page**, not a complete or atomic archive. Without `--output` the report goes to
+stdout; with it the CLI atomically writes a `0600` file, creating missing directories
+privately. The report includes the next cursor and explains gaps and omissions.
+Daemon/core versions, connection settings, raw logs and server identities are not
+collected. Shared best-effort redaction is applied; **review the whole report before
+sharing**. Nothing is uploaded automatically. Successful reads with explicit gaps or
+rejected lines still exit 0; storage/export/unsupported-method errors exit 1, absent
+daemon in default mode exits 4. No local-file fallback happens implicitly.
 
 ## Two ways to name a profile
 
@@ -497,12 +534,13 @@ fi
 
 Daemon execution additionally keeps bounded structured lifecycle facts in its
 data directory, independently of `RUST_LOG`. This does not copy arbitrary stderr
-or change command exit codes/output; other CLI commands do not open that file.
+or change existing command exit codes/output. Only explicit diagnostic `--file`
+mode reads that journal directly; default diagnostic commands use D-Bus.
 See [persistent daemon diagnostics](troubleshooting.md#persistent-daemon-diagnostics).
 
 The structured journal now correlates runtime attempts and summarizes repeated
-watch observations, but it is not the process-local D-Bus log cursor and adds
-no CLI log-reading command yet. A late confirmation cannot end recovery for an
+watch observations, but its persistent cursor is not the process-local D-Bus log
+cursor. See [diagnostic export](#diagnostic-export). A late confirmation cannot end recovery for an
 already-dead incarnation; deleting a target cancels its pending retry ownership.
 
 Read commands never start a daemon. Only `up` and `connect` may.

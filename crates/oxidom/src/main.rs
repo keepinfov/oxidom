@@ -1,5 +1,6 @@
 mod cli;
 mod daemon;
+mod diagnostic_report;
 mod diagnostics;
 mod store_lock;
 
@@ -774,9 +775,32 @@ fn profile_command(command: ProfileCommand) -> CliResult {
 }
 
 fn core_command(command: CoreCommand) -> CliResult {
-    let client = existing_client()?;
     match command {
+        CoreCommand::Diagnostics {
+            cursor,
+            limit,
+            file,
+        } => {
+            let (page, _) = diagnostic_page(file.as_deref(), cursor.as_deref(), limit)?;
+            print_json(&page)
+        }
+        CoreCommand::Report {
+            cursor,
+            limit,
+            file,
+            output,
+        } => {
+            let (page, source) = diagnostic_page(file.as_deref(), cursor.as_deref(), limit)?;
+            let report = diagnostic_report::render(&page, source).map_err(Failure::error)?;
+            if let Some(output) = output {
+                oxidom_core::fsutil::write_private_atomic(&output, report.as_bytes())
+                    .map_err(|_| Failure::message("could not save the private diagnostic report"))
+            } else {
+                print_text(report)
+            }
+        }
         CoreCommand::Show { profile, json } => {
+            let client = existing_client()?;
             let global = client.settings().map_err(Failure::error)?;
             let overrides = client.profile(&profile).map_err(Failure::error)?;
             let output = CoreOutput::new(&profile, &global.core, &overrides.core);
@@ -792,6 +816,26 @@ fn core_command(command: CoreCommand) -> CliResult {
             Ok(())
         }
     }
+}
+
+fn diagnostic_page(
+    file: Option<&Path>,
+    cursor: Option<&str>,
+    limit: u32,
+) -> CliResult<(
+    oxidom_core::diagnostics::Page,
+    Option<oxidom_core::client::DaemonSource>,
+)> {
+    if let Some(file) = file {
+        return oxidom_core::diagnostics::read(file, cursor, limit)
+            .map(|page| (page, None))
+            .map_err(Failure::error);
+    }
+    let client = existing_client()?;
+    let page = client
+        .diagnostics_since(cursor, limit)
+        .map_err(Failure::error)?;
+    Ok((page, Some(client.source())))
 }
 
 fn new_profile(client: &DaemonClient, name: &str) -> CliResult {
@@ -1734,6 +1778,35 @@ mod tests {
              database no other daemon reads"
         );
         watch.forget();
+    }
+
+    #[test]
+    fn diagnostic_reads_and_reports_never_start_a_daemon_or_fall_back_to_local_files() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let watch = SpawnWatch::install().expect("install the spawn watch");
+        assert_no_daemon_started(&watch, "core diagnostics", || {
+            core_command(CoreCommand::Diagnostics {
+                cursor: None,
+                limit: 0,
+                file: None,
+            })
+        });
+        assert_no_daemon_started(&watch, "core report", || {
+            core_command(CoreCommand::Report {
+                cursor: None,
+                limit: 0,
+                file: None,
+                output: None,
+            })
+        });
+        let file = watch.directory.join("missing-journal");
+        let failure = match diagnostic_page(Some(&file), None, 0) {
+            Ok(_) => panic!("the explicitly missing journal must fail"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.kind, FailureKind::Error);
+        assert!(!file.exists());
+        assert!(!watch.started_a_daemon());
     }
 
     #[test]

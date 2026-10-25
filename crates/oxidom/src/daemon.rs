@@ -4298,6 +4298,24 @@ impl Service {
         oxidom_core::logbook::global().clear();
         Ok(())
     }
+
+    /// Read the selected daemon's journal without taking application locks or
+    /// occupying the D-Bus executor with filesystem I/O. No caller path is used.
+    async fn diagnostics_since(&self, cursor: String, limit: u32) -> fdo::Result<String> {
+        tokio::task::spawn_blocking(move || {
+            let path = oxidom_core::paths::daemon_log_file()
+                .map_err(|_| fdo::Error::Failed("diagnostic path unavailable".into()))?;
+            let page = oxidom_core::diagnostics::read(
+                &path,
+                (!cursor.is_empty()).then_some(cursor.as_str()),
+                limit,
+            )
+            .map_err(|error| fdo::Error::Failed(format!("diagnostic read failed: {error}")))?;
+            json(&page)
+        })
+        .await
+        .map_err(|_| fdo::Error::Failed("diagnostic reader worker failed".into()))?
+    }
 }
 
 fn spawn_core_supervisor(shared: Shared) {

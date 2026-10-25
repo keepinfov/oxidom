@@ -92,6 +92,33 @@ Exit codes are binding:
 | 3 | No active connection |
 | 4 | Daemon unavailable |
 
+## Persistent diagnostics and reports (binding)
+
+`oxidom core diagnostics [--cursor TOKEN] [--limit N] [--file PATH]` prints one version-1
+persistent diagnostic page as JSON, with the schema and continuation/gap semantics in
+`storage.md`. It does not accept `--json` because JSON is its only format. No daemon is started.
+Without `--file`, require the existing selected daemon and its additive `DiagnosticsSince`
+method; no fallback to another store or memory-only logs is permitted. With `--file`, read exactly
+that journal plus its `.1`/`.lock` locally without contacting D-Bus, creating files or changing
+permissions. This explicit path supports diagnosing failures before readiness. It does not grant
+access to another uid's private journal; system-daemon reads normally use D-Bus.
+
+`oxidom core report [--cursor TOKEN] [--limit N] [--file PATH] [--output PATH]` reads the same
+single bounded page and formats a local report using the shared report/redaction implementation.
+Default output is stdout; `--output` atomically replaces a file with mode `0600`, creating missing
+directories privately. The CLI, never the privileged daemon, opens the output path. No upload or
+clipboard operation occurs. Versions/install/distribution/desktop are local-client facts; daemon
+and core versions, connection transport and subscription User-Agent are explicitly not collected.
+No raw memory logs, server identities, config or journal path are included. Environment-derived
+text headings are redacted as well as record lines. The report states page limits, gap/rejection/
+partial-tail facts and review requirements, and includes the generated next cursor unchanged.
+It is not a complete or atomic diagnostic archive; `more` requires another page request.
+Redaction is best-effort, not a guarantee that arbitrary raw logs are safe to share.
+
+No new top-level profile word is reserved. Exit codes remain 0 on a successfully read/exported
+page (including explicit gaps/rejections), 1 on storage/unsupported-method/export errors, and 4
+when the default mode cannot reach an existing daemon. Data stays on stdout, errors on stderr.
+
 ## Handles and aliases (binding)
 
 Server ids use hand-written FNV-1a 64 and aliases are globally unique, stable human handles.
