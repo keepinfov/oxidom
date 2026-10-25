@@ -4613,6 +4613,10 @@ fn serve_until_terminal(
     mut stop_requested: impl FnMut() -> Result<bool>,
     serving: impl FnOnce(&zbus::blocking::Connection),
 ) -> Result<()> {
+    let setup = setup.and_then(|connection| {
+        check_bus(&connection)?;
+        Ok(connection)
+    });
     let terminal = match &setup {
         Ok(connection) => {
             shared.reconcile_standby();
