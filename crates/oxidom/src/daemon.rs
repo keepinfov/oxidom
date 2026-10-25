@@ -962,11 +962,10 @@ impl Shared {
         }
         let mut engine = oxidom_core::sync::lock(&self.engine);
         if !self.confirmation_is_current(&engine, profile, snapshot)
-            || !engine.sessions.get_mut(profile).is_some_and(|session| {
-                session.selection.as_ref() == Some(&target.selection())
-                    && session.reported_status() == Status::Connected
-                    && session.is_alive()
-            })
+            || !engine
+                .sessions
+                .get_mut(profile)
+                .is_some_and(|session| session.selection.as_ref() == Some(&target.selection()))
         {
             return false;
         }
