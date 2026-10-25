@@ -5038,14 +5038,23 @@ mod tests {
         let _root = TestRoot::install("terminal-private-bus")?;
         let binary =
             std::env::var_os("OXIDOM_TEST_DBUS_DAEMON").unwrap_or_else(|| "dbus-daemon".into());
+        let config = _root.path.join("private-bus.conf");
+        std::fs::write(
+            &config,
+            b"<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen>\
+              <auth>EXTERNAL</auth><policy context=\"default\">\
+              <allow send_destination=\"*\"/><allow receive_sender=\"*\"/>\
+              <allow own=\"*\"/><allow user=\"*\"/></policy></busconfig>",
+        )?;
         let mut bus = PrivateBus(
             std::process::Command::new(binary)
-                .args(["--session", "--nofork", "--print-address=1"])
+                .arg(format!("--config-file={}", config.display()))
+                .args(["--nofork", "--print-address=1"])
                 .env("HOME", &_root.path)
                 .env_remove("DBUS_SESSION_BUS_ADDRESS")
                 .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
                 .spawn()
                 .context("private dbus-daemon is required for terminal regression")?,
         );
@@ -5069,7 +5078,17 @@ mod tests {
             }
         })?;
         let address = address.trim();
-        assert!(!address.is_empty());
+        if address.is_empty() {
+            use std::io::Read;
+            let status = bus.0.wait()?;
+            let mut stderr = String::new();
+            bus.0
+                .stderr
+                .take()
+                .context("bus stderr")?
+                .read_to_string(&mut stderr)?;
+            anyhow::bail!("private bus exited {status}: {stderr}");
+        }
         let service = for_test();
         let shared = service.shared.clone();
         let connection = zbus::blocking::connection::Builder::address(address)?
