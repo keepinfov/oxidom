@@ -4256,7 +4256,10 @@ mod tests {
         }
         .save()?;
         drop(Engine::load());
-        assert_eq!(State::load(&Config::default()).sessions, vec![saved]);
+        assert_eq!(
+            State::load(&crate::config::Config::default()).sessions,
+            vec![saved]
+        );
         Ok(())
     }
 
