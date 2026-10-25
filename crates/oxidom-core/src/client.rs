@@ -949,7 +949,7 @@ mod tests {
             .unwrap()
             .build(&(String::new(), 64_u32))
             .unwrap();
-        assert_eq!(call.body().signature().to_string(), "su");
+        assert_eq!(call.body().signature().to_string(), "(su)");
         let unknown =
             zbus::Message::error(&call.header(), "org.freedesktop.DBus.Error.UnknownMethod")
                 .unwrap()

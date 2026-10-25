@@ -364,7 +364,7 @@ mod tests {
         .unwrap();
         assert!(matches!(parsed.command, Command::Core {
             command: CoreCommand::Diagnostics { cursor: Some(cursor), limit: 1, file: Some(file) }
-        } if cursor == "position" && file == PathBuf::from("journal")));
+        } if cursor == "position" && file == std::path::Path::new("journal")));
         assert!(matches!(
             parse(&["oxidom", "core", "report", "--output", "report.txt"])
                 .unwrap()
