@@ -135,6 +135,16 @@ process-local logbook or replay previous runs. File initialization and writes
 are synchronous and best effort; supplied stderr remains available. Storage
 failure never selects another store or replaces the original startup outcome.
 
+Runtime diagnostics carry captured opaque session/attempt/core context rather
+than looking up whichever connection exists when a worker finishes. Successful
+spawn/adoption IDs are distinct from the existing log watermark, and every
+automatic retry is a separate attempt even within one cancellation generation.
+Typed watchdog observations retain evidence separately from stale/retained/recovery
+actions. Bounded count-driven summaries combine only identical attributable
+observations; lifecycle transitions and individual attempts remain visible.
+Persistence-gap accounting is separate from suppression. These additions do not
+attribute arbitrary raw core output or introduce persistent CLI cursors.
+
 Before spawning, oxidom **resolves the binary first and then checks the ports** —
 in that order, so a busy port can never mask a missing core. Stopping is SIGTERM,
 a 2-second grace, then SIGKILL.
