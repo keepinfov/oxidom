@@ -14,6 +14,31 @@ pub const BUS_NAME: &str = "dev.keepinfov.oxidom.Daemon";
 pub const OBJECT_PATH: &str = "/dev/keepinfov/oxidom/Daemon";
 pub const INTERFACE: &str = "dev.keepinfov.oxidom1";
 
+/// Read-only handshake. These identifiers are continuity hints, not authentication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonInfo {
+    pub version: u32,
+    pub incarnation: String,
+    pub store_id: String,
+    pub capabilities: Vec<String>,
+}
+
+impl DaemonInfo {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.version == 1, "unsupported daemon identity version");
+        for token in [&self.incarnation, &self.store_id] {
+            anyhow::ensure!(
+                token.len() == 64
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "invalid daemon identity token"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Connection state as reported by the daemon.
 ///
 /// `serde(default)` is not cosmetic here: the GUI fetches status, probe state
@@ -684,6 +709,26 @@ pub struct CreatedServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_identity_requires_explicit_version_and_complete_tokens() {
+        let literal = format!(
+            r#"{{"version":1,"incarnation":"{}","store_id":"{}","capabilities":["probe_cancel","geo_download"]}}"#,
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        let mut info: DaemonInfo = serde_json::from_str(&literal).unwrap();
+        assert_eq!(serde_json::to_string(&info).unwrap(), literal);
+        info.validate().unwrap();
+        info.version = 2;
+        assert!(info.validate().is_err());
+        info.version = 1;
+        info.store_id.replace_range(..1, "G");
+        assert!(info.validate().is_err());
+        info.store_id.clear();
+        assert!(info.validate().is_err());
+        assert!(serde_json::from_str::<DaemonInfo>("{}").is_err());
+    }
 
     /// A daemon that predates the field sends readings without it, and those
     /// must still parse — the whole snapshot is folded in one closure, so one
