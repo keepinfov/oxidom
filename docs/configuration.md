@@ -4,6 +4,13 @@ oxidom has one settings file, `config.toml`. Connection-specific settings live i
 [profiles](profiles-and-pools.md) instead, so that several tunnels can differ
 without fighting over one file.
 
+The daemon also maintains a private `store.identity` seed in its data directory, initialized
+before recovery. It is not a setting or credential and should not be edited. Invalid contents,
+unsafe permissions or unreadable identity stop daemon startup rather than silently assigning
+a new identity. Keep it with a store backup; relocating roots changes the advertised continuity
+identity. Identity does not prove equal contents or detect a restored older backup, and this
+foundation does not yet enable automatic client recovery after daemon replacement.
+
 ## Contents
 
 - [Where the files are](#where-the-files-are)

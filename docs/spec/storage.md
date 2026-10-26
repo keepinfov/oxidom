@@ -27,6 +27,8 @@ missing files (treat as defaults/empty).
   loading or recovering state until exit. The file is private and must never be unlinked to
   release the lock: every contender must lock the same inode. A second owner fails without
   running recovery, regardless of which bus it intended to serve.
+- `~/.local/share/oxidom/store.identity` — private persistent continuity seed, initialized under
+  the store lease before recovery; see the read-only identity contract below.
 - `~/.local/share/oxidom/oxidom-gui.log` — the graphical client's own log, `0600`, rotated at 2MB
   with one `.log.1` kept. Written only by the GUI, which detaches and sends stderr to `/dev/null`
   and so has no journal.
@@ -92,6 +94,43 @@ can already be running as uncancellable blocking work, so the persistent discove
 such blocking work at one thread. Normal RPCs retain a separate 300-second per-reply limit, not
 an aggregate startup, hydration or subscription-update deadline. No mutating request is retried
 because of a client timeout.
+
+### Read-only daemon identity (binding)
+
+The additive `DaemonInfo() -> String` method on the existing interface returns JSON:
+
+```json
+{"version":1,"incarnation":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","store_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","capabilities":["probe_cancel","geo_download"]}
+```
+
+Both tokens are exactly 64 lowercase hexadecimal characters. Incarnation is a fresh random
+256-bit value for each daemon startup, immutable throughout serving. The method reads immutable
+facts only: no engine lock, subprocess, network work or cancellation. Capability names describe
+implemented methods, not authorization or current readiness. Unknown capabilities are ignorable;
+missing required fields, invalid tokens and unsupported versions are not verified identity.
+Terminal admission closure rejects this request just like existing requests.
+
+After acquiring `store.lock`, before loading/recovering the engine, create `store.identity` if
+absent: 64 random lowercase hexadecimal characters followed by one LF, atomically persisted
+and synchronized as `0600`. Existing identity must be a regular file owned by the daemon user,
+with one link, exact `0600` mode and exactly those 65 bytes. Do not follow symlinks, repair,
+quarantine or regenerate invalid/unreadable identity. Identity persistence/validation failure
+fails startup before recovery. Re-sync an existing seed and its directory before advertising it.
+
+Compute store identity as SHA-256 of the literal bytes `oxidom-store-v1` followed by NUL, the
+65 seed bytes, then the canonical data-root path and canonical config-root path in that order.
+Each path is encoded as its raw Unix bytes prefixed with its byte length as an unsigned 64-bit
+big-endian integer. Hex-encode the digest. This covers both roots without publishing paths.
+Changing either canonical root, replacing/deleting the seed or independently initializing another
+store changes continuity. A symlink alias of the same roots does not. Relocation intentionally
+requires a new explicit client selection. Copying/restoring the seed at the same paths can retain
+identity; this is not content equality, rollback detection, cryptographic authentication or proof
+against a malicious owner. It is independent of diagnostics run IDs, core IDs and logbook IDs.
+
+This method supplies identity facts, not automatic client recovery. Existing client selection,
+timeouts and no-mutation-replay rules remain unchanged. Older daemons may return `UnknownMethod`;
+other errors must not be interpreted as proof of legacy support or store continuity. All existing
+D-Bus methods and payloads remain compatible.
 
 ### Session-daemon supervision ownership (binding)
 

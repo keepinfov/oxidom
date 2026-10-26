@@ -408,6 +408,7 @@ struct TunnelStreak {
 
 #[derive(Clone)]
 pub(crate) struct Shared {
+    daemon_info: Option<oxidom_core::ipc::DaemonInfo>,
     lifecycle: lifecycle::Lifecycle,
     terminal_cleanup: Arc<Mutex<Option<Result<(), String>>>>,
     engine: Arc<Mutex<Engine>>,
@@ -662,6 +663,7 @@ impl Shared {
             }
         }
         let shared = Shared {
+            daemon_info: None,
             lifecycle: lifecycle::Lifecycle::default(),
             terminal_cleanup: Arc::new(Mutex::new(None)),
             engine: Arc::new(Mutex::new(engine)),
@@ -3334,6 +3336,16 @@ fn candidate_list(candidates: &[&Server]) -> String {
 
 #[zbus::interface(name = "dev.keepinfov.oxidom1")]
 impl Service {
+    fn daemon_info(&self) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
+        json(
+            self.shared
+                .daemon_info
+                .as_ref()
+                .ok_or_else(|| failed("daemon identity is unavailable"))?,
+        )
+    }
+
     fn list_subscriptions(&self) -> fdo::Result<String> {
         let _request = self.shared.admit()?;
         let engine = oxidom_core::sync::lock(&self.shared.engine);
@@ -4673,6 +4685,10 @@ pub(super) fn run(
     let store_lock = Arc::new(crate::store_lock::StoreLock::acquire(
         &oxidom_core::paths::data_dir()?,
     )?);
+    let daemon_info = store_lock.daemon_info(
+        &oxidom_core::paths::data_dir()?,
+        &oxidom_core::paths::config_dir()?,
+    )?;
     diagnostics.phase(Phase::Recovery);
     let mut engine = Engine::load();
     diagnostics.catalog_load_warnings(engine.registry.load_warnings.len());
@@ -4724,6 +4740,7 @@ pub(super) fn run(
         diagnostics.recorder(),
     );
     shared.store_lease = Some(store_lock);
+    shared.daemon_info = Some(daemon_info);
 
     diagnostics.phase(Phase::Bus);
     let setup = (|| -> Result<zbus::blocking::Connection> {
@@ -4997,6 +5014,30 @@ fn core_rejected_the_protocol(logs: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_handshake_does_not_touch_engine_or_cancel_downloads() {
+        let _lock = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("identity-handshake").unwrap();
+        let mut service = for_test();
+        let lease = crate::store_lock::StoreLock::acquire(&root.path).unwrap();
+        let info = lease.daemon_info(&root.path, &root.path).unwrap();
+        service.shared.daemon_info = Some(info.clone());
+        assert!(!service.shared.geo_cancel.is_cancelled());
+        // Holding the engine proves the handshake does not inspect mutable
+        // runtime or spawn a helper to discover capabilities.
+        let engine = oxidom_core::sync::lock(&service.shared.engine);
+        let first: oxidom_core::ipc::DaemonInfo =
+            serde_json::from_str(&service.daemon_info().unwrap()).unwrap();
+        let second: oxidom_core::ipc::DaemonInfo =
+            serde_json::from_str(&service.daemon_info().unwrap()).unwrap();
+        assert_eq!(first, info);
+        assert_eq!(second, info);
+        assert!(!service.shared.geo_cancel.is_cancelled());
+        drop(engine);
+        service.shared.begin_terminal();
+        assert!(service.daemon_info().is_err());
+    }
     use oxidom_core::bind;
 
     struct PrivateBus(std::process::Child);

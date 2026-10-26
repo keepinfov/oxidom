@@ -22,3 +22,4 @@ tokio = { workspace = true, features = ["sync"] }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+ring.workspace = true
