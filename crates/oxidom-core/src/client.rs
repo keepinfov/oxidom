@@ -925,6 +925,124 @@ fn is_unknown_method(error: &zbus::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    struct PrivateBus {
+        child: std::process::Child,
+        root: PathBuf,
+        address: String,
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl PrivateBus {
+        fn start() -> anyhow::Result<Self> {
+            use std::io::BufRead;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "oxidom-client-bus-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root)?;
+            let config = root.join("bus.conf");
+            std::fs::write(&config, b"<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen><auth>EXTERNAL</auth><policy context=\"default\"><allow send_destination=\"*\"/><allow receive_sender=\"*\"/><allow own=\"*\"/><allow user=\"*\"/></policy></busconfig>")?;
+            let mut bus = Self {
+                child: std::process::Command::new(
+                    std::env::var_os("OXIDOM_TEST_DBUS_DAEMON")
+                        .unwrap_or_else(|| "dbus-daemon".into()),
+                )
+                .arg(format!("--config-file={}", config.display()))
+                .args(["--nofork", "--print-address=1"])
+                .env("HOME", &root)
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
+                .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?,
+                root,
+                address: String::new(),
+            };
+            let stdout = bus.child.stdout.take().unwrap();
+            let result = std::thread::scope(|scope| -> anyhow::Result<String> {
+                let (send, receive) = std::sync::mpsc::channel();
+                scope.spawn(move || {
+                    let mut address = String::new();
+                    let result = std::io::BufReader::new(stdout)
+                        .read_line(&mut address)
+                        .map(|_| address);
+                    let _ = send.send(result);
+                });
+                match receive.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(result) => Ok(result?),
+                    Err(error) => {
+                        let _ = bus.child.kill();
+                        let _ = bus.child.wait();
+                        Err(error.into())
+                    }
+                }
+            })?;
+            anyhow::ensure!(
+                !result.trim().is_empty(),
+                "private bus did not publish an address"
+            );
+            bus.address = result.trim().into();
+            Ok(bus)
+        }
+    }
+
+    struct LegacyDaemon(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[zbus::interface(name = "dev.keepinfov.oxidom1")]
+    impl LegacyDaemon {
+        fn status(&self) -> String {
+            "{}".into()
+        }
+        fn cancel_geo_download(&self) -> String {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "{}".into()
+        }
+        fn cancel_probes(&self, _ids: Vec<String>) -> String {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "{}".into()
+        }
+    }
+
+    #[test]
+    fn legacy_capability_discovery_never_calls_cancellation_methods() -> anyhow::Result<()> {
+        let bus = PrivateBus::start()?;
+        let cancellations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _server = zbus::blocking::connection::Builder::address(bus.address.as_str())?
+            .allow_name_replacements(false)
+            .replace_existing_names(false)
+            .name(super::BUS_NAME)?
+            .serve_at(super::OBJECT_PATH, LegacyDaemon(cancellations.clone()))?
+            .build()?;
+        let connection = zbus::blocking::connection::Builder::address(bus.address.as_str())?
+            .method_timeout(std::time::Duration::from_secs(1))
+            .build()?;
+        let client = super::DaemonClient {
+            proxy: zbus::blocking::Proxy::new(
+                &connection,
+                super::BUS_NAME,
+                super::OBJECT_PATH,
+                super::INTERFACE,
+            )?,
+            source: DaemonSource::Session,
+        };
+        let _ = client.supports_geo_download();
+        let _ = client.supports_probe_cancel();
+        assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    use std::path::PathBuf;
+
     #[test]
     fn diagnostic_wire_pages_are_typed_and_rejected_text_never_reaches_errors() {
         let literal = r#"{"version":1,"records":[{"version":1,"unix_ms":1,"pid":42,"event":"phase","phase":"starting","secret":"invented-private-secret"}],"next_cursor":null,"gap":false,"rejected":0,"incomplete_tail":false,"more":false}"#;
