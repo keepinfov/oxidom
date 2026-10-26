@@ -15,6 +15,12 @@ terminal does not take the window and tray with it. `--debug` keeps it attached.
 Nothing is detached when stdout is not a terminal, so `oxidom-gui | tee` and the
 tray unit behave normally.
 
+The client stays bound to the daemon owner selected at startup. If that owner disappears, it
+does not silently follow a replacement or switch databases; reopen the GUI to select a daemon
+again. Automatic replacement recovery is not yet connected to the GUI. With older daemons that
+do not expose `DaemonInfo`, optional geo-download and probe-cancel controls are disabled rather
+than tested by issuing cancellation requests. Ordinary existing daemon operations remain available.
+
 ## The five pages
 
 | Page | What it is for |

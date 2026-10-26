@@ -33,8 +33,7 @@ struct InitialResults {
 
 impl InitialData {
     pub fn load(client: &DaemonClient) -> Self {
-        // Preserve this order and call each capability exactly once:
-        // supports_geo_download actually calls CancelGeoDownload.
+        // Capability checks read cached handshake facts and never cancel work.
         InitialResults {
             subscriptions: client.subscriptions(),
             profiles: client.list_profiles(),

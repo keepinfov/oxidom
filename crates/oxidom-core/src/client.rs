@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -78,6 +79,31 @@ pub enum ConnectStage {
 pub struct DaemonClient {
     proxy: zbus::blocking::Proxy<'static>,
     source: DaemonSource,
+    address: zbus::Address,
+    info: Option<crate::ipc::DaemonInfo>,
+    binding: Arc<()>,
+}
+
+/// Local binding identity. Clones share it; recovered candidates never do.
+#[derive(Clone)]
+pub struct BindingStamp(Arc<()>);
+
+impl PartialEq for BindingStamp {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for BindingStamp {}
+
+fn accepts_successor(previous: &DaemonClient, next: &DaemonClient) -> bool {
+    match (&previous.info, &next.info) {
+        (Some(old), Some(new)) => old.store_id == new.store_id,
+        (None, _) => {
+            previous.proxy.connection().server_guid() == next.proxy.connection().server_guid()
+                && previous.proxy.destination() == next.proxy.destination()
+        }
+        _ => false,
+    }
 }
 
 fn friendly(error: zbus::Error) -> anyhow::Error {
@@ -330,17 +356,95 @@ where
 }
 
 impl DaemonClient {
-    async fn try_bus(source: DaemonSource) -> zbus::Result<zbus::Proxy<'static>> {
-        let builder = if source == DaemonSource::System {
-            zbus::connection::Builder::system()?
-        } else {
-            zbus::connection::Builder::session()?
+    async fn at_address(
+        address: zbus::Address,
+        source: DaemonSource,
+        activate: bool,
+    ) -> zbus::Result<Self> {
+        let connection = zbus::connection::Builder::address(address.clone())?
+            .method_timeout(METHOD_TIMEOUT)
+            .build()
+            .await?;
+        let bus = zbus::fdo::DBusProxy::new(&connection).await?;
+        let name = zbus::names::BusName::try_from(BUS_NAME)?;
+        let owner = match bus.get_name_owner(name.clone()).await {
+            Ok(owner) => owner,
+            Err(error) if activate && name_unowned(&zbus::Error::from(error.clone())) => {
+                // Preserve initial D-Bus activation, never use this reply as
+                // binding evidence. All operational calls below use a unique name.
+                let activation =
+                    zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
+                let _: String = activation.call("Status", &()).await?;
+                bus.get_name_owner(name.clone()).await?
+            }
+            Err(error) => return Err(error.into()),
         };
-        let connection = builder.method_timeout(METHOD_TIMEOUT).build().await?;
-        let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
-        // Reject name owners that don't answer: a real daemon replies fast.
-        let _: String = proxy.call("Status", &()).await?;
-        Ok(proxy)
+        let proxy = zbus::Proxy::new(&connection, owner.clone(), OBJECT_PATH, INTERFACE).await?;
+        let info = match proxy.call::<_, _, String>("DaemonInfo", &()).await {
+            Ok(json) => {
+                let info: crate::ipc::DaemonInfo = serde_json::from_str(&json)
+                    .map_err(|_| zbus::Error::Failure("invalid daemon identity".into()))?;
+                info.validate().map_err(|_| {
+                    zbus::Error::Failure("invalid or unsupported daemon identity".into())
+                })?;
+                Some(info)
+            }
+            Err(error) if is_unknown_method(&error) => None,
+            Err(error) => return Err(error),
+        };
+        let json: String = proxy.call("Status", &()).await?;
+        serde_json::from_str::<StatusInfo>(&json)
+            .map_err(|_| zbus::Error::Failure("invalid daemon status".into()))?;
+        if bus.get_name_owner(name).await? != owner {
+            return Err(zbus::Error::Failure(
+                "daemon owner changed during binding".into(),
+            ));
+        }
+        Ok(Self {
+            proxy: proxy.into(),
+            source,
+            address,
+            info,
+            binding: Arc::new(()),
+        })
+    }
+
+    async fn try_bus(source: DaemonSource) -> zbus::Result<Self> {
+        let address = if source == DaemonSource::System {
+            zbus::Address::system()?
+        } else {
+            zbus::Address::session()?
+        };
+        Self::at_address(address, source, true).await
+    }
+
+    pub fn binding_stamp(&self) -> BindingStamp {
+        BindingStamp(self.binding.clone())
+    }
+
+    /// Only prepares a candidate. Callers must fully hydrate it before replacing
+    /// their active client; no old clone or in-flight operation is retargeted.
+    pub fn recover_selected(&self) -> Result<Self> {
+        // A bus restart changes its authentication GUID, not the selected socket.
+        // Verified store identity, checked below, authorizes that transition.
+        let address = if self.info.is_some() {
+            zbus::Address::new(self.address.transport().clone())
+        } else {
+            self.address.clone()
+        };
+        let candidate = block_discovery(async {
+            before_deadline(
+                Instant::now() + DISCOVERY_TIMEOUT,
+                Self::at_address(address, self.source, false),
+            )
+            .await
+            .map_err(anyhow::Error::new)
+        })?;
+        anyhow::ensure!(
+            accepts_successor(self, &candidate),
+            "selected store continuity could not be verified; reopen explicitly to select a daemon"
+        );
+        Ok(candidate)
     }
 
     /// Which daemon this client is driving.
@@ -373,7 +477,7 @@ impl DaemonClient {
             system_daemon_installed(),
             &mut Self::try_bus,
         ))?;
-        let (proxy, source) = session_daemon::connect_or_launch(existing, owner, || {
+        let (mut client, source) = session_daemon::connect_or_launch(existing, owner, || {
             block_discovery(async {
                 progress(ConnectStage::Starting);
                 let deadline = Instant::now() + SESSION_STARTUP;
@@ -398,23 +502,19 @@ impl DaemonClient {
                 Ok((proxy, DaemonSource::Spawned))
             })
         })?;
-        Ok(Self {
-            proxy: proxy.into(),
-            source,
-        })
+        client.source = source;
+        Ok(client)
     }
 
     /// Reach an already running daemon without starting a private session
     /// daemon. Read-only CLI commands use this so a status check never changes
     /// machine state merely by asking.
     pub fn connect_existing() -> Result<Self> {
-        let (proxy, source) =
+        let (mut client, source) =
             block_discovery(find_existing(&|_| {}, false, false, &mut Self::try_bus))?
                 .ok_or_else(|| anyhow!("the oxidom daemon is not available"))?;
-        Ok(Self {
-            proxy: proxy.into(),
-            source,
-        })
+        client.source = source;
+        Ok(client)
     }
 
     pub fn subscriptions(&self) -> Result<Vec<Subscription>> {
@@ -677,14 +777,14 @@ impl DaemonClient {
     ///
     /// Distinguishes "asked and there was nothing queued" from "too old to
     /// ask", which a client needs in order to offer a stop control rather than
-    /// one that cannot work. Asked with an empty list, so the question costs
-    /// nothing and cancels nothing.
+    /// one that cannot work. Legacy daemons without identity conservatively
+    /// disable optional controls rather than probing mutation methods.
     pub fn supports_probe_cancel(&self) -> bool {
-        let empty: Vec<String> = Vec::new();
-        match self.proxy.call::<_, _, String>("CancelProbes", &(&empty,)) {
-            Ok(_) => true,
-            Err(error) => !is_unknown_method(&error),
-        }
+        self.info.as_ref().is_some_and(|info| {
+            info.capabilities
+                .iter()
+                .any(|capability| capability == "probe_cancel")
+        })
     }
 
     /// What this server's recent checks measured, newest first.
@@ -804,10 +904,11 @@ impl DaemonClient {
     /// needs in order to offer a manual recipe rather than a button that cannot
     /// work.
     pub fn supports_geo_download(&self) -> bool {
-        match self.proxy.call::<_, _, String>("CancelGeoDownload", &()) {
-            Ok(_) => true,
-            Err(error) => !is_unknown_method(&error),
-        }
+        self.info.as_ref().is_some_and(|info| {
+            info.capabilities
+                .iter()
+                .any(|capability| capability == "geo_download")
+        })
     }
 
     pub fn settings(&self) -> Result<Config> {
@@ -921,10 +1022,313 @@ fn unknown_method(error: zbus::Error, what: &str) -> anyhow::Error {
 fn is_unknown_method(error: &zbus::Error) -> bool {
     matches!(error, zbus::Error::MethodError(name, _, _)
         if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod")
+        || matches!(error, zbus::Error::FDO(error) if matches!(error.as_ref(), zbus::fdo::Error::UnknownMethod(_)))
 }
 
 #[cfg(test)]
 mod tests {
+    struct PrivateBus {
+        child: std::process::Child,
+        root: PathBuf,
+        address: String,
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl PrivateBus {
+        fn start() -> anyhow::Result<Self> {
+            use std::io::BufRead;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "oxidom-client-bus-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root)?;
+            let config = root.join("bus.conf");
+            std::fs::write(&config, b"<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen><auth>EXTERNAL</auth><policy context=\"default\"><allow send_destination=\"*\"/><allow receive_sender=\"*\"/><allow own=\"*\"/><allow user=\"*\"/></policy></busconfig>")?;
+            let mut bus = Self {
+                child: std::process::Command::new(
+                    std::env::var_os("OXIDOM_TEST_DBUS_DAEMON")
+                        .unwrap_or_else(|| "dbus-daemon".into()),
+                )
+                .arg(format!("--config-file={}", config.display()))
+                .args(["--nofork", "--print-address=1"])
+                .env("HOME", &root)
+                .env_remove("DBUS_SESSION_BUS_ADDRESS")
+                .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?,
+                root,
+                address: String::new(),
+            };
+            let stdout = bus.child.stdout.take().unwrap();
+            let result = std::thread::scope(|scope| -> anyhow::Result<String> {
+                let (send, receive) = std::sync::mpsc::channel();
+                scope.spawn(move || {
+                    let mut address = String::new();
+                    let result = std::io::BufReader::new(stdout)
+                        .read_line(&mut address)
+                        .map(|_| address);
+                    let _ = send.send(result);
+                });
+                match receive.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(result) => Ok(result?),
+                    Err(error) => {
+                        let _ = bus.child.kill();
+                        let _ = bus.child.wait();
+                        Err(error.into())
+                    }
+                }
+            })?;
+            anyhow::ensure!(
+                !result.trim().is_empty(),
+                "private bus did not publish an address"
+            );
+            bus.address = result.trim().into();
+            Ok(bus)
+        }
+
+        fn restart(&mut self) -> anyhow::Result<()> {
+            use std::io::BufRead;
+            let address: zbus::Address = self.address.as_str().try_into()?;
+            let endpoint = address.transport().to_string();
+            self.child.kill()?;
+            self.child.wait()?;
+            self.child = std::process::Command::new(
+                std::env::var_os("OXIDOM_TEST_DBUS_DAEMON").unwrap_or_else(|| "dbus-daemon".into()),
+            )
+            .arg(format!(
+                "--config-file={}",
+                self.root.join("bus.conf").display()
+            ))
+            .arg(format!("--address={endpoint}"))
+            .args(["--nofork", "--print-address=1"])
+            .env("HOME", &self.root)
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+            let stdout = self.child.stdout.take().unwrap();
+            self.address = std::thread::scope(|scope| -> anyhow::Result<String> {
+                let (send, receive) = std::sync::mpsc::channel();
+                scope.spawn(move || {
+                    let mut line = String::new();
+                    let result = std::io::BufReader::new(stdout)
+                        .read_line(&mut line)
+                        .map(|_| line);
+                    let _ = send.send(result);
+                });
+                match receive.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(result) => Ok(result?.trim().into()),
+                    Err(error) => {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                        Err(error.into())
+                    }
+                }
+            })?;
+            anyhow::ensure!(
+                !self.address.is_empty(),
+                "restarted bus did not publish an address"
+            );
+            Ok(())
+        }
+    }
+
+    struct LegacyDaemon(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[zbus::interface(name = "dev.keepinfov.oxidom1")]
+    impl LegacyDaemon {
+        fn status(&self) -> String {
+            "{}".into()
+        }
+        fn cancel_geo_download(&self) -> String {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "{}".into()
+        }
+        fn cancel_probes(&self, _ids: Vec<String>) -> String {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "{}".into()
+        }
+    }
+
+    fn private_service(
+        bus: &PrivateBus,
+        service: impl zbus::object_server::Interface,
+    ) -> anyhow::Result<zbus::blocking::Connection> {
+        super::block_discovery(async {
+            let builder = zbus::connection::Builder::address(bus.address.as_str())?
+                .method_timeout(std::time::Duration::from_secs(2))
+                .allow_name_replacements(false)
+                .replace_existing_names(false)
+                .name(super::BUS_NAME)?
+                .serve_at(super::OBJECT_PATH, service)?;
+            Ok(
+                super::before_deadline(Instant::now() + super::DISCOVERY_TIMEOUT, builder.build())
+                    .await?
+                    .into(),
+            )
+        })
+    }
+
+    #[test]
+    fn legacy_capability_discovery_never_calls_cancellation_methods() -> anyhow::Result<()> {
+        let bus = PrivateBus::start()?;
+        let cancellations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _server = private_service(&bus, LegacyDaemon(cancellations.clone()))?;
+        let client = private_client(&bus)?;
+        assert!(!client.supports_geo_download());
+        assert!(!client.supports_probe_cancel());
+        assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    struct IdentifiedDaemon {
+        store: String,
+        incarnation: String,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        malformed: bool,
+    }
+
+    #[zbus::interface(name = "dev.keepinfov.oxidom1")]
+    impl IdentifiedDaemon {
+        fn daemon_info(&self) -> String {
+            if self.malformed {
+                return "{}".into();
+            }
+            serde_json::to_string(&crate::ipc::DaemonInfo {
+                version: 1,
+                store_id: self.store.clone(),
+                incarnation: self.incarnation.clone(),
+                capabilities: vec!["geo_download".into(), "probe_cancel".into()],
+            })
+            .unwrap()
+        }
+        fn status(&self) -> String {
+            serde_json::json!({"error": self.incarnation}).to_string()
+        }
+        fn disconnect(&self) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn identified_server(
+        bus: &PrivateBus,
+        store: char,
+        incarnation: char,
+        malformed: bool,
+    ) -> anyhow::Result<(
+        zbus::blocking::Connection,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    )> {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connection = private_service(
+            bus,
+            IdentifiedDaemon {
+                store: store.to_string().repeat(64),
+                incarnation: incarnation.to_string().repeat(64),
+                calls: calls.clone(),
+                malformed,
+            },
+        )?;
+        Ok((connection, calls))
+    }
+
+    fn private_client(bus: &PrivateBus) -> anyhow::Result<super::DaemonClient> {
+        super::block_discovery(async {
+            Ok(super::before_deadline(
+                Instant::now() + super::DISCOVERY_TIMEOUT,
+                super::DaemonClient::at_address(
+                    bus.address.as_str().try_into()?,
+                    DaemonSource::Session,
+                    false,
+                ),
+            )
+            .await?)
+        })
+    }
+
+    #[test]
+    fn replacement_never_retargets_old_calls_or_replays_mutations() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let bus = PrivateBus::start()?;
+        let (old_server, old_calls) = identified_server(&bus, 'a', 'b', false)?;
+        let old = private_client(&bus)?;
+        let clone = old.clone();
+        assert!(old.supports_geo_download());
+        assert!(old.supports_probe_cancel());
+        assert!(old.binding_stamp() == clone.binding_stamp());
+        old.disconnect()?;
+        assert!(old_server.release_name(super::BUS_NAME)?);
+        let (_next_server, next_calls) = identified_server(&bus, 'a', 'c', false)?;
+        assert_eq!(old.status()?.error, Some("b".repeat(64)));
+        clone.disconnect()?;
+        assert_eq!(old_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+        let recovered = old.recover_selected()?;
+        assert!(old.binding_stamp() != recovered.binding_stamp());
+        assert_eq!(recovered.status()?.error, Some("c".repeat(64)));
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+        old_server.close()?;
+        let result = old.disconnect();
+        assert!(result.is_err());
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_different_stores_malformed_identity_and_legacy_downgrade()
+    -> anyhow::Result<()> {
+        let bus = PrivateBus::start()?;
+        let (server, _) = identified_server(&bus, 'a', 'b', false)?;
+        let old = private_client(&bus)?;
+        assert!(server.release_name(super::BUS_NAME)?);
+        let (different, _) = identified_server(&bus, 'c', 'd', false)?;
+        assert!(old.recover_selected().is_err());
+        assert!(different.release_name(super::BUS_NAME)?);
+        let (malformed, _) = identified_server(&bus, 'a', 'd', true)?;
+        assert!(old.recover_selected().is_err());
+        assert!(malformed.release_name(super::BUS_NAME)?);
+        let cancellations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let legacy = private_service(&bus, LegacyDaemon(cancellations))?;
+        assert!(old.recover_selected().is_err());
+        let legacy_client = private_client(&bus)?;
+        assert!(legacy_client.recover_selected().is_ok());
+        assert!(legacy.release_name(super::BUS_NAME)?);
+        let (_replacement, _) = identified_server(&bus, 'a', 'd', false)?;
+        assert!(legacy_client.recover_selected().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verified_store_recovery_survives_bus_restart_at_the_same_endpoint() -> anyhow::Result<()> {
+        let mut bus = PrivateBus::start()?;
+        let (_server, _) = identified_server(&bus, 'a', 'b', false)?;
+        let old = private_client(&bus)?;
+        let old_guid = old.proxy.connection().server_guid().to_owned();
+        assert!(old.address.guid().is_some());
+        bus.restart()?;
+        let (_server, calls) = identified_server(&bus, 'a', 'c', false)?;
+        let next = old.recover_selected()?;
+        assert_ne!(old_guid, next.proxy.connection().server_guid());
+        assert_eq!(next.status()?.error, Some("c".repeat(64)));
+        assert!(old.disconnect().is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    use std::path::PathBuf;
+
     #[test]
     fn diagnostic_wire_pages_are_typed_and_rejected_text_never_reaches_errors() {
         let literal = r#"{"version":1,"records":[{"version":1,"unix_ms":1,"pid":42,"event":"phase","phase":"starting","secret":"invented-private-secret"}],"next_cursor":null,"gap":false,"rejected":0,"incomplete_tail":false,"more":false}"#;

@@ -127,10 +127,39 @@ requires a new explicit client selection. Copying/restoring the seed at the same
 identity; this is not content equality, rollback detection, cryptographic authentication or proof
 against a malicious owner. It is independent of diagnostics run IDs, core IDs and logbook IDs.
 
-This method supplies identity facts, not automatic client recovery. Existing client selection,
-timeouts and no-mutation-replay rules remain unchanged. Older daemons may return `UnknownMethod`;
-other errors must not be interpreted as proof of legacy support or store continuity. All existing
-D-Bus methods and payloads remain compatible.
+All existing D-Bus methods and payloads remain compatible. Only explicit `UnknownMethod` selects
+legacy/unverified identity; timeout, access denial, malformed JSON or unsupported version does not.
+
+### Client owner binding and selected recovery (binding)
+
+Initial discovery retains its system-first budgets and activation policy. Resolve the well-known
+name to a unique owner, then perform `DaemonInfo` and decode readiness `Status` on that unique
+destination. Confirm that the well-known name still belongs to this owner before returning.
+When initially absent, a read-only well-known `Status` may trigger normal D-Bus activation;
+its reply is not identity evidence. Capture the actual selected address, bus instance and owner.
+Every operational call, fallback and clone stays pinned to this immutable unique destination on
+its original transport; owner replacement cannot redirect a multi-call operation to its successor.
+
+Capabilities come only from validated immutable handshake facts and are cached per binding.
+Never call `CancelGeoDownload`, `CancelProbes` or another mutation to probe support. Legacy
+daemons without `DaemonInfo` retain existing calls but conservatively disable optional geo-download
+and probe-cancel controls, even when the methods may exist. Capabilities do not prove permission.
+
+`DaemonClient::recover_selected` is an explicit candidate-construction API, not an automatic retry
+or replacement of any active client. One attempt has a cooperative 2-second aggregate setup,
+owner/identity/readiness deadline. Reuse only the captured address; do not reread bus-selection
+environment, discover another bus, activate an absent service, bootstrap or invoke a supervisor.
+Verified selection accepts only another validated identity with the same store ID, including across
+bus/owner/incarnation changes; never downgrade to legacy. Legacy selection accepts only the same
+unique owner on the same authenticated bus GUID, not a replacement or a matching unique-name text
+on another bus. Failures leave the original binding and all its clones unchanged. Each candidate
+has a fresh process-local binding stamp; clones share the stamp.
+
+No mutation is retried or replayed, including after a timeout or lost reply: execution may already
+have happened. Recovery does not resolve that ambiguity. A consumer must hydrate required state
+and reject retired-binding completions before installing a candidate and resuming control. The
+current GUI does not yet call this API: after replacement it remains unavailable until explicitly
+reopened. This boundary does not claim automatic GUI recovery or complete GUI callback fencing.
 
 ### Session-daemon supervision ownership (binding)
 
