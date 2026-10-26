@@ -107,6 +107,19 @@ pub fn measure_with_timeout(
     bind: Ipv4Addr,
     proxied_timeout: Duration,
 ) -> ProbeOutcome {
+    measure_with_commit(server, config, route, bind, proxied_timeout, || Ok(()))
+}
+
+/// Fence managed installation and probe config/process creation separately
+/// from resolution and network measurement. No guard spans network work.
+pub fn measure_with_commit<G>(
+    server: &Server,
+    config: &Config,
+    route: Route,
+    bind: Ipv4Addr,
+    proxied_timeout: Duration,
+    mut commit: impl FnMut() -> anyhow::Result<G>,
+) -> ProbeOutcome {
     let method = config.latency_method;
     match (route, method) {
         (Route::Direct, LatencyMethod::Icmp) => icmp_ping(&server.address),
@@ -125,7 +138,7 @@ pub fn measure_with_timeout(
                     verb,
                     proxied_timeout,
                 ),
-                Route::Direct => real_delay(server, config, verb),
+                Route::Direct => real_delay(server, config, verb, &mut commit),
             }
         }
     }
@@ -138,8 +151,13 @@ pub fn measure_with_timeout(
 /// the outbound handshake, the TLS/REALITY negotiation, and a request the
 /// censor gets to see. Cores are torn down as soon as the number is in, and the
 /// daemon's probe queue caps how many run at once.
-fn real_delay(server: &Server, config: &Config, verb: &str) -> ProbeOutcome {
-    let mut core = match ProbeCore::start(server, config) {
+fn real_delay<G>(
+    server: &Server,
+    config: &Config,
+    verb: &str,
+    commit: &mut impl FnMut() -> anyhow::Result<G>,
+) -> ProbeOutcome {
+    let mut core = match ProbeCore::start(server, config, commit) {
         Ok(core) => core,
         Err(outcome) => return outcome,
     };
@@ -204,8 +222,12 @@ struct ProbeCore {
 }
 
 impl ProbeCore {
-    fn start(server: &Server, config: &Config) -> Result<ProbeCore, ProbeOutcome> {
-        let xray = match resolve::resolve(&config.xray_binary) {
+    fn start<G>(
+        server: &Server,
+        config: &Config,
+        commit: &mut impl FnMut() -> anyhow::Result<G>,
+    ) -> Result<ProbeCore, ProbeOutcome> {
+        let xray = match resolve::resolve_with_commit(&config.xray_binary, &mut *commit) {
             Ok(xray) => xray,
             Err(error) => {
                 // Not the server's fault, and worth saying out loud: without a
@@ -243,6 +265,7 @@ impl ProbeCore {
             .join(format!("probe-{socks_port}.json"));
         let body = serde_json::to_string(&generated)
             .map_err(|_| local("a probe config would not serialize"))?;
+        let _guard = commit().map_err(|_| ProbeOutcome::Internal(ProbeDetail::Cancelled))?;
         if let Err(error) = fsutil::write_private_atomic(&config_path, body.as_bytes()) {
             log::warn!("could not write a probe config: {error:#}");
             return Err(local("a probe config could not be written"));
@@ -661,6 +684,46 @@ fn has_default_route(proc_net_route: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_rejected_after_resolution_creates_no_config_or_core() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::sync::lock(&paths::TEST_ROOT_LOCK);
+        struct Root(PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                paths::set_test_root(None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Root(
+            std::env::temp_dir().join(format!("oxidom-rejected-probe-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&root.0)?;
+        paths::set_test_root(Some(root.0.clone()));
+        let binary = root.0.join("fake-core");
+        std::fs::write(
+            &binary,
+            b"#!/bin/sh\nif [ \"$1\" = version ]; then printf 'Xray 26.3.27'; else exit 91; fi\n",
+        )?;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))?;
+        let (servers, _) = crate::subscription_format::parse(
+            "trojan://invented@node.example.invalid:443#Offline",
+        )?;
+        let config = Config {
+            xray_binary: binary.display().to_string(),
+            ..Default::default()
+        };
+        let outcome = ProbeCore::start(&servers[0], &config, &mut || -> anyhow::Result<()> {
+            anyhow::bail!("daemon is stopping")
+        });
+        assert!(matches!(
+            outcome,
+            Err(ProbeOutcome::Internal(ProbeDetail::Cancelled))
+        ));
+        assert_eq!(std::fs::read_dir(&root.0)?.count(), 1);
+        Ok(())
+    }
 
     fn socket(text: &str) -> SocketAddr {
         text.parse().expect("a literal address")

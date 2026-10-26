@@ -168,7 +168,7 @@ pub fn probe(xray: &Path, location: Option<&Path>, scratch: &Path) -> Result<(),
     if let Some(dir) = location {
         command.env(LOCATION_ENV, dir);
     }
-    let output = command.output();
+    let output = crate::proc::output_timeout(&mut command, std::time::Duration::from_secs(5));
     let _ = std::fs::remove_file(scratch);
     let output = match output {
         Ok(output) => output,
@@ -415,6 +415,13 @@ pub struct Progress {
 pub trait Sink: Send {
     fn progress(&self, progress: &Progress);
     fn cancelled(&self) -> bool;
+    /// Owners may serialize installation against terminal cancellation.
+    fn install(&self, target: &Path, bytes: &[u8]) -> Result<()> {
+        if self.cancelled() {
+            return Err(Cancelled.into());
+        }
+        fsutil::write_private_atomic(target, bytes)
+    }
 }
 
 /// A sink that never cancels and reports nowhere.
@@ -593,6 +600,9 @@ pub fn download(
     agent: &ureq::Agent,
     sink: &dyn Sink,
 ) -> Result<PathBuf> {
+    if sink.cancelled() {
+        return Err(Cancelled.into());
+    }
     validate_url(url)?;
     let expected = fetch_digest(url, agent)?;
 
@@ -648,7 +658,10 @@ pub fn download(
     }
 
     let target = into.join(asset.installed_name());
-    fsutil::write_private_atomic(&target, &bytes)
+    if sink.cancelled() {
+        return Err(Cancelled.into());
+    }
+    sink.install(&target, &bytes)
         .with_context(|| format!("installing {}", target.display()))?;
     Ok(target)
 }
@@ -683,6 +696,44 @@ fn transport_error(what: &str, error: ureq::Error) -> anyhow::Error {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn cancellation_rejects_installation_before_touching_the_destination() {
+        struct Stopped;
+        impl Sink for Stopped {
+            fn progress(&self, _: &Progress) {}
+            fn cancelled(&self) -> bool {
+                true
+            }
+        }
+        let dir = Dir::new("cancelled-install");
+        let destination = dir.0.join("geosite.dat");
+        let error = Stopped.install(&destination, b"invented").unwrap_err();
+        assert!(error.is::<Cancelled>());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn an_already_cancelled_download_does_no_validation_or_network_work() {
+        struct Stopped;
+        impl Sink for Stopped {
+            fn progress(&self, _: &Progress) {}
+            fn cancelled(&self) -> bool {
+                true
+            }
+        }
+        let dir = Dir::new("cancelled-before-fetch");
+        let error = download(
+            GeoAsset::GeoIp,
+            "invented-invalid-url",
+            &dir.0,
+            &agent(None).unwrap(),
+            &Stopped,
+        )
+        .unwrap_err();
+        assert!(error.is::<Cancelled>());
+        assert!(!dir.0.join("geoip.dat").exists());
+    }
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 

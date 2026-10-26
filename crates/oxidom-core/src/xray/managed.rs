@@ -71,6 +71,12 @@ pub fn is_managed(path: &Path) -> bool {
 
 /// Return the installed core, downloading the pinned release if necessary.
 pub fn ensure_installed() -> Result<PathBuf> {
+    ensure_installed_with_commit(|| Ok(()))
+}
+
+/// Network work runs without the caller's commit guard. The guard is acquired
+/// only for installation, so terminal closure can reject a delayed download.
+pub fn ensure_installed_with_commit<G>(commit: impl FnOnce() -> Result<G>) -> Result<PathBuf> {
     let _guard = crate::sync::lock(&INSTALL_LOCK);
     let binary = binary_path()?;
     if is_complete_install(&binary) {
@@ -127,7 +133,7 @@ pub fn ensure_installed() -> Result<PathBuf> {
             release.sha256
         );
     }
-    install_archive(&bytes, &install_dir()?)?;
+    install_archive_with_commit(&bytes, &install_dir()?, commit)?;
     require_version(&binary)?;
     Ok(binary)
 }
@@ -135,10 +141,11 @@ pub fn ensure_installed() -> Result<PathBuf> {
 /// Refuse an arbitrary core even when it is executable: generated configuration
 /// semantics are tied to the release above, not merely to an `xray` command.
 pub fn require_version(binary: &Path) -> Result<()> {
-    let output = std::process::Command::new(binary)
-        .arg("version")
-        .output()
-        .with_context(|| format!("running {} version", binary.display()))?;
+    let output = crate::proc::output_timeout(
+        std::process::Command::new(binary).arg("version"),
+        std::time::Duration::from_secs(5),
+    )
+    .with_context(|| format!("running {} version", binary.display()))?;
     if !output.status.success() {
         bail!("{} version exited with {}", binary.display(), output.status);
     }
@@ -200,6 +207,15 @@ fn install_archive(bytes: &[u8], dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn install_archive_with_commit<G>(
+    bytes: &[u8],
+    dir: &Path,
+    commit: impl FnOnce() -> Result<G>,
+) -> Result<()> {
+    let _guard = commit()?;
+    install_archive(bytes, dir)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -294,6 +310,21 @@ mod tests {
             Some("Xray-linux-arm64-v8a.zip")
         );
         assert_eq!(release_for("macos", "aarch64"), None);
+    }
+
+    #[test]
+    fn a_download_finishing_after_closure_cannot_install_the_managed_core() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("closed-install");
+        let dir = install_dir()?;
+        let error =
+            install_archive_with_commit(b"not examined after closure", &dir, || -> Result<()> {
+                bail!("daemon is stopping")
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "daemon is stopping");
+        assert!(!dir.exists());
+        Ok(())
     }
 
     #[test]

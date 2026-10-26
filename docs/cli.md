@@ -479,6 +479,13 @@ tunnel fails the script outside it. A signal becomes `128 + signum`.
 
 Run the headless daemon that owns the tunnel and serves D-Bus.
 
+SIGINT/SIGTERM closes request admission, cancels pending work and drains active workers before
+session cleanup. A successful stop exits 0; failed cleanup, service setup failure or loss of the
+D-Bus connection/name exits 1. There is no automatic bus reconnection or standalone restart.
+Closing the GUI leaves the daemon running. See
+[terminal lifecycle troubleshooting](troubleshooting.md#the-daemon-stops-after-bus-loss) for
+shutdown delays and retained recovery records.
+
 | Flag | Meaning |
 |---|---|
 | `--system` | serve on the system bus instead of the session bus |

@@ -37,6 +37,9 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
   unchanged template creates nothing. `server` is a reserved profile name.
 - `oxidom profile {list,show,new,edit,rm}` manages daemon-owned profiles.
 - `oxidom daemon [--system --socks-port --http-port]` runs the D-Bus service.
+  SIGINT/SIGTERM returns success only after successful terminal cleanup; bus/name loss,
+  startup/wait failure or failed cleanup returns failure. Terminal request rejection and
+  draining follow `storage.md`; closing the GUI is not a daemon stop request.
 - `oxidom <PROFILE> run -- <cmd>...` and `oxidom <PROFILE> run -c "<cmd>"` run one command
   inside the profile's routing domain. The `-c` string is split with shell-word rules but never
   passed to a shell. A proxy-only profile refuses safely and points to `oxidom env`.

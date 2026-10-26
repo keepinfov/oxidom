@@ -128,8 +128,46 @@ not reverse `PartOf`/`Requires` coupling. Custom XDG/binary settings belong in t
 environment, not only in a client shell. Service enablement alone cannot constrain clients that
 lack the policy, and older clients do not honor it. Never take over a pre-existing standalone
 owner; switching owners is an explicit operator action. D-Bus signatures and on-disk schemas
-remain unchanged. Bus-transport reconnection and generalized shutdown quiescence are not supplied
-by this launch-ownership contract.
+remain unchanged. Bus-transport reconnection is not supplied by this launch-ownership contract.
+
+### Terminal daemon lifecycle (binding)
+
+SIGINT/SIGTERM, loss of the selected D-Bus transport or well-known name, and fatal service setup
+failure after recovery converge on one terminal cleanup path. Loss is terminal, not permission
+to reconnect, reclaim the name, switch stores or replay a request. GUI closure is not a terminal
+event. Request the name without allowing or attempting replacement; verify primary ownership
+before recurring workers start or Serving is published.
+
+Terminal closure is one-way. Serialize closure with engine transitions and final filesystem
+commits: reject new requests with a D-Bus failure, invalidate pending generations, cancel retry
+and download work, clear queued probes and wake periodic/backoff waits. Previously admitted
+work remains accounted for even when its caller disappears. Delayed results cannot start a core
+or interface, reopen standby, install downloaded assets or commit catalog changes after closure.
+An operation already inside its serialized commit boundary finishes before closure.
+
+Drain admitted requests and stateful workers without holding application locks, then stop standby
+and clean sessions. Repeated cleanup returns its first result rather than running again. Fence
+runtime diagnostics only after quiescence and cleanup; diagnostic persistence is not a prerequisite
+for closing admission. Keep the store leased through the last engine destruction, including
+references retained by the service, so no final state write races a replacement store owner.
+
+Attempt cleanup for every session. Retain unresolved resource metadata and failed-persistence
+recovery records rather than treating failure as a clean stop. Startup port overrides and engine
+destruction must not erase an unrelated live owner's recovery PID. Recovered-process signalling
+pins the process with a Linux pidfd before identity validation and signals that descriptor; failure
+to establish safe ownership fails closed rather than signalling a numeric replacement PID. This
+does not promise adoption of arbitrary cores or successful cleanup on every kernel.
+
+A signal stop succeeds only if cleanup succeeds. Bus/name loss, setup/wait failure and failed
+cleanup return failure, allowing the existing external supervisor policy to apply. Standalone
+operation gains no automatic restart loop. Serving checks ownership with a one-second outgoing
+method timeout and a 100 ms polling interval; these are not an end-to-end shutdown deadline.
+
+Core version queries have a five-second execution timeout. Query capture closes stdin, bounds
+each output stream to 1 MiB, and kills/reaps its direct child on timeout or capture failure.
+Existing network, DNS, filesystem/kernel and other helper operations can delay closure or drain;
+there is no universal hard shutdown bound. Never release the store merely because a drain timer
+expired while work can still mutate it. Forced termination still requires ordinary recovery.
 
 ## Persistent Diagnostics (binding)
 
@@ -164,7 +202,7 @@ tunnel health or proof that every resource was cleaned. `problem` includes the c
 
 Record checkpoints before operations that may fail or print to a blocked stderr. Record returned
 fatal errors before the CLI prints the original error and exits; retain those facts even with
-`RUST_LOG=off`. Nonfatal core-resolution/default-profile/shutdown errors and collected catalog-load
+`RUST_LOG=off`. Core-resolution/default-profile errors, terminal cleanup errors and collected catalog-load
 warning counts are retained without their raw text. `catalog_load_warnings` counts only the
 subscriptions-store warnings returned by catalog loading, not all config/state/recovery warnings
 that other code writes to legacy logs. No guarantee is made for pre-exec failures, argument
@@ -304,7 +342,7 @@ one bounded gap-only attempt, even if there were no summaries or the final summa
 Later runtime events cannot reopen buckets; repeated closure drains no summary twice and can
 retry a pending gap once. After the final lifecycle/fatal record, make a final bounded gap drain.
 P05 lifecycle/fatal records remain enabled after the runtime fence. This fences diagnostics,
-not background workers, and does not implement general shutdown quiescence or guarantee final
+not background workers; the terminal lifecycle separately drains those workers. The fence alone does not guarantee final
 evidence on blocked/failing storage or abrupt process termination. Existing D-Bus memory cursors,
 logbook records and `ClearLogs` are unchanged.
 
