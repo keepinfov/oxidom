@@ -1,5 +1,12 @@
 # Troubleshooting
 
+After a daemon replacement, an already-open GUI remains bound to the old owner and can report
+unavailable even when a new daemon is serving. Reopen the GUI to select it explicitly. The client
+does not silently switch buses/stores or replay a failed mutation: a timeout or lost reply does
+not prove that the requested change did not happen. Check current state before repeating it.
+Older daemons without the read-only identity handshake have optional geo-download/probe-cancel
+controls disabled; upgrade/restart the daemon to expose these capabilities safely.
+
 Organised by what you see. Error text is quoted as oxidom actually prints it.
 
 ## Contents
