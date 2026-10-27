@@ -1311,6 +1311,11 @@ impl Controller {
                         .profiles
                         .iter()
                         .any(|entry| entry.name == selected_profile)
+                        || state
+                            .ui
+                            .sessions
+                            .iter()
+                            .any(|session| session.profile == selected_profile)
                     {
                         state.ui.selected_profile = selected_profile;
                     }
@@ -2176,10 +2181,26 @@ impl Controller {
     }
 
     fn sync_profile_switcher(self: &Rc<Self>) {
+        {
+            let mut state = self.state.borrow_mut();
+            let items = switcher_items(&state.profiles, &state.ui);
+            if !items
+                .iter()
+                .any(|item| item.profile == state.ui.selected_profile)
+            {
+                state.ui.selected_profile = items
+                    .iter()
+                    .find(|item| item.profile == "default")
+                    .or(items.first())
+                    .map(|item| item.profile.clone())
+                    .unwrap_or_else(|| "default".into());
+            }
+        }
         let (visible, selected_profile, items) = {
             let state = self.state.borrow();
             (
-                switcher_visible(&state.profiles),
+                switcher_visible(&state.profiles)
+                    || switcher_items(&state.profiles, &state.ui).len() > 1,
                 state.ui.selected_profile.clone(),
                 switcher_items(&state.profiles, &state.ui),
             )
@@ -2253,7 +2274,7 @@ impl Controller {
             }
             state.ui.selected_profile = profile.clone();
         }
-        self.profile_switcher.set_label(&profile);
+        self.profile_switcher_label.set_label(&profile);
         self.profile_switcher_popover.popdown();
         self.bump_epoch();
         self.refresh_status();
@@ -3385,6 +3406,16 @@ impl Controller {
     }
 
     fn up_profile(self: &Rc<Self>, name: String) {
+        if !self
+            .state
+            .borrow()
+            .profiles
+            .iter()
+            .any(|entry| entry.name == name)
+        {
+            self.show_message("No saved profile - this session can only be stopped here");
+            return;
+        }
         let work_name = name.clone();
         let finish_name = name.clone();
         self.client_job(
@@ -4576,6 +4607,13 @@ impl Controller {
                     if !self.state.borrow().recovery.accepts(generation) {
                         continue;
                     }
+                    if !self
+                        .tray_sessions()
+                        .iter()
+                        .any(|(name, _)| name == &profile)
+                    {
+                        continue;
+                    }
                     // The same rule the page's switch follows, so a checkmark
                     // and a switch for one profile can never disagree.
                     let running = self
@@ -4634,6 +4672,7 @@ impl Controller {
         }
         session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
             .into_iter()
+            .filter(|row| row.state != SessionRowState::Unknown)
             .map(|row| (row.profile, row.toggle_on))
             .collect()
     }

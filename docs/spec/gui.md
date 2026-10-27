@@ -61,6 +61,14 @@ state must be inspected before repeating it.
 
 ## Layout
 
+Profiles rows and the session switcher share an inventory: saved-profile order followed by
+runtime-only session keys in sorted, deduplicated order. Runtime-only entries say "No saved
+profile", retain Disconnect/Stop (including held traffic), and expose neither Edit nor saved
+Start. A pending Stop turns the switch off; unknown state cannot authorize a tray toggle. When
+a selected runtime-only session disappears, select a remaining default/first entry rather than
+leaving controls bound to an invisible missing key. Recovery retains selection if either saved
+profile or runtime session still exists. Inventory placeholders are never saved as profiles.
+
 Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
 - **`adw::NavigationSplitView`** (or `OverlaySplitView`) for the adaptive sidebar.
   - **Sidebar:** app/logo area at top; a nav list — at least "Servers" (the server browser) plus

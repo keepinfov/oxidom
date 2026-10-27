@@ -24,6 +24,7 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 - **Profile membership hints point to the profile's own editor.** Saved profiles contain independent selections, not live links to Servers-page groups. The dialog now explains the supported `oxidom profile edit <name>` workflow instead of implying group edits update the profile.
+- **Sessions remain manageable after their saved profile is removed.** Runtime-only rows and session choices remain visible with Stop but no invalid Edit/Start, including held traffic. When the session ends, selection returns to a remaining saved/runtime entry rather than an invisible missing profile.
 - **Connection-picker Cancel preserves rotation, and strategy choices do not disconnect traffic.** Rotation stays local until an accepted Apply/Save/Connect; strategy selection configures the next explicit action without invoking the connection toggle or rewriting a profile.
 - **Completed lock scopes release ownership even if a child inherited a descriptor.** Store leases and diagnostic writer/reader snapshots explicitly unlock at logical scope exit, including failures, without unlinking stable locks or shortening live engine ownership.
 - **The GUI recovers only its selected store after daemon loss.** Control stays unavailable until identity and required state are rehydrated; stale workers, dialogs and queued tray actions cannot act on the replacement. Pending mutations are never replayed. Dirty settings drafts and last-known sessions/proxy survive uncertainty, while local Discard/Quit remain available.
