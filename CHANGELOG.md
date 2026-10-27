@@ -23,6 +23,7 @@ surface, packaging, or the CLI belongs here.
 - **Tunnel checks have an explicit policy.** `watchdog = "conservative"` is the default: repeated failed checks are reported without stopping a live Xray core. `aggressive` retains live-core restart after three negative checks; `off` disables these checks without disabling process-exit supervision. The policy is selectable in Settings.
 
 ### Fixed
+- **A previous connected server cannot confirm a pending replacement.** Optimistic single-server transitions match the requested target in their own session; local admission rollback restores the latest reported identity instead of leaving the replacement highlighted.
 - **Profile membership hints point to the profile's own editor.** Saved profiles contain independent selections, not live links to Servers-page groups. The dialog now explains the supported `oxidom profile edit <name>` workflow instead of implying group edits update the profile.
 - **Sessions remain manageable after their saved profile is removed.** Runtime-only rows and session choices remain visible with Stop but no invalid Edit/Start, including held traffic. When the session ends, selection returns to a remaining saved/runtime entry rather than an invisible missing profile.
 - **Connection-picker Cancel preserves rotation, and strategy choices do not disconnect traffic.** Rotation stays local until an accepted Apply/Save/Connect; strategy selection configures the next explicit action without invoking the connection toggle or rewriting a profile.

@@ -48,6 +48,11 @@ The sidebar collapses under a width breakpoint, so the window is usable narrow.
 
 ## Servers
 
+During a single-server replacement, a poll still describing the previous server does not confirm
+the new request. The pending target remains separate from reported runtime state until agreement,
+an error or the existing timeout; a locally refused action restores the latest reported target.
+This does not save or rewrite a profile.
+
 Rotation changes in the connection picker remain a draft until Apply, Save or Connect. Cancel
 leaves the connection bar unchanged. Choosing a strategy from the bar configures the next explicit
 connection action; choosing it does not stop or replace a running connection. Group Save persists

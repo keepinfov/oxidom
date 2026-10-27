@@ -3275,7 +3275,7 @@ impl Controller {
                     // Dropping the optimistic pin is the whole rollback: the
                     // next poll restores the daemon's own view of what is up.
                     if is_busy(&error) {
-                        controller.state.borrow_mut().ui.clear_pin();
+                        controller.state.borrow_mut().ui.rollback_pin();
                         controller.set_cards_connection(CardConnection {
                             active: controller.state.borrow().ui.connected_id.clone(),
                             profiles: controller.state.borrow().ui.connected_profiles.clone(),
@@ -3515,7 +3515,7 @@ impl Controller {
                     // not carry this transition along.
                     state
                         .ui
-                        .pin_status(&name, Status::Connecting, Instant::now());
+                        .pin_target(&name, server_id.clone(), Instant::now());
                 }
                 self.bump_epoch();
                 if let Some(server_id) = server_id {

@@ -61,6 +61,15 @@ state must be inspected before repeating it.
 
 ## Layout
 
+Single-server optimistic starts retain their requested server ID independently of reported
+runtime identity and saved profile configuration. A current poll reporting another server as
+Connecting/Connected cannot acknowledge the request; matching target in the pinned profile,
+terminal error, or the existing pin deadline may retire it. Foreground operation/deadline guards
+remain unchanged. Named-profile reconciliation uses that profile's runtime server ID. Pools do
+not invent a representative server. Admission rollback restores the latest accepted reported
+identity immediately, not the optimistic replacement. Target equality alone does not prove a
+distinct attempt/core incarnation; this is local reconciliation, not new wire attribution.
+
 Profiles rows and the session switcher share an inventory: saved-profile order followed by
 runtime-only session keys in sorted, deduplicated order. Runtime-only entries say "No saved
 profile", retain Disconnect/Stop (including held traffic), and expose neither Edit nor saved
