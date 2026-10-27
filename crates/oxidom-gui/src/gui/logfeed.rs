@@ -62,6 +62,7 @@ pub struct LogFeed {
     /// the view is append-only and cannot keep a subset by itself, so the
     /// reset round has to carry our lines back to it.
     released_ours: VecDeque<LogRecord>,
+    reset_pending: bool,
 }
 
 /// One held record, with the book it came from: the two books die
@@ -82,6 +83,13 @@ impl LogFeed {
         self.remote_cursor
     }
 
+    pub fn reset_remote(&mut self) {
+        self.remote_cursor = 0;
+        self.remote_book = None;
+        self.holding.retain(|held| held.ours);
+        self.reset_pending = true;
+    }
+
     /// The cursor to read this process's own book from.
     pub fn local_cursor(&self) -> u64 {
         self.local_cursor
@@ -96,8 +104,8 @@ impl LogFeed {
 
     /// Take one round of both books and return what is now safe to display.
     pub fn absorb(&mut self, mut remote: LogSlice, local: LogSlice, now_ms: u64) -> FeedBatch {
-        let mut reset = false;
-        let mut restart_reset = false;
+        let mut reset = std::mem::take(&mut self.reset_pending);
+        let mut restart_reset = reset;
         let mut skipped;
 
         // A daemon with no cursor re-sends its whole log every time, so the only
@@ -129,7 +137,7 @@ impl LogFeed {
             // the new book will ever issue and the view goes quietly dead.
             let restarted = self.remote_book != Some(remote.book_id);
             if restarted {
-                reset = self.remote_book.is_some();
+                reset |= self.remote_book.is_some();
                 restart_reset = reset;
                 self.remote_book = Some(remote.book_id);
                 // The dead book's stragglers die with it; ours do not. A
@@ -277,6 +285,33 @@ mod tests {
 
     const DAEMON: u64 = 77;
     const LOCAL: u64 = 99;
+
+    #[test]
+    fn binding_reset_preserves_local_records_but_discards_remote_stragglers() {
+        let mut feed = LogFeed::new();
+        feed.absorb(
+            slice(DAEMON, vec![record(1, 100, LogSource::Xray, "old remote")]),
+            slice(LOCAL, vec![record(1, 100, LogSource::Oxidom, "our record")]),
+            1000,
+        );
+        feed.reset_remote();
+        assert_eq!(feed.remote_cursor(), 0);
+        assert_eq!(feed.local_cursor(), 1);
+        let batch = feed.absorb(empty(DAEMON + 1), empty(LOCAL), 2000);
+        assert!(batch.reset);
+        assert!(
+            batch
+                .records
+                .iter()
+                .any(|record| record.text == "our record")
+        );
+        assert!(
+            !batch
+                .records
+                .iter()
+                .any(|record| record.text == "old remote")
+        );
+    }
 
     /// The window releases on a timestamp, so a stamp from the future — or a
     /// clock stepped backwards — puts the cutoff behind everything held and keeps

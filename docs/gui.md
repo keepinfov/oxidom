@@ -16,8 +16,12 @@ Nothing is detached when stdout is not a terminal, so `oxidom-gui | tee` and the
 tray unit behave normally.
 
 The client stays bound to the daemon owner selected at startup. If that owner disappears, it
-does not silently follow a replacement or switch databases; reopen the GUI to select a daemon
-again. Automatic replacement recovery is not yet connected to the GUI. With older daemons that
+does not blindly follow a replacement or switch databases. It attempts recovery on the selected
+endpoint only, verifies store continuity and reloads required state before enabling control.
+Unverifiable or different stores remain unavailable; reopening explicitly makes a new selection.
+Old dialogs and pending actions are not replayed. Unsaved settings edits survive recovery, but
+must be explicitly reviewed/applied. Local Discard and Quit remain available during an outage.
+With older daemons that
 do not expose `DaemonInfo`, optional geo-download and probe-cancel controls are disabled rather
 than tested by issuing cancellation requests. Ordinary existing daemon operations remain available.
 

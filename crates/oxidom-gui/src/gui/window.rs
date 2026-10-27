@@ -22,6 +22,7 @@ use oxidom_core::{paths, sysproxy};
 
 use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
+use super::recovery::{Generation, RecoveryState};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbePhase, ProbeWait, SessionRowState,
     SnapshotState, SwitcherItem, SystemProxyState, about_comments, active_latency_for, card_action,
@@ -125,6 +126,7 @@ fn status_action_for(status: &Status) -> Option<StatusAction> {
 /// most ticks change nothing, so the icon is only woken when one of these does.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct TrayState {
+    generation: Option<Generation>,
     text: String,
     sessions: Vec<(String, bool)>,
     failed: bool,
@@ -251,6 +253,7 @@ fn servers_available_width(window_width: i32, compact: bool) -> i32 {
 }
 
 struct AppState {
+    recovery: RecoveryState,
     client: DaemonClient,
     subscriptions: Vec<Subscription>,
     profiles: Vec<ProfileEntry>,
@@ -338,8 +341,8 @@ struct Controller {
     /// Last (active, connecting) pair pushed to the cards, to avoid an
     /// O(cards) pass on every poll tick.
     applied_connection: RefCell<CardConnection>,
-    poll_in_flight: Arc<AtomicBool>,
-    poll_snapshot: Arc<Mutex<Option<PollResult>>>,
+    poll: RefCell<(Arc<AtomicBool>, Arc<Mutex<Option<PollResult>>>)>,
+    recovery_retry: Cell<Instant>,
     /// A history fetch is out on a worker thread, and whether a reading landed
     /// while it was. The history is the one card fact that costs a D-Bus call
     /// of its own, and every finished check in a 600-server sweep asks for it:
@@ -628,6 +631,7 @@ fn build(
     let selected_id = initial_status.active_id.clone();
     let servers = ServersView::new(fetched_subscriptions.as_deref());
     let state = Rc::new(RefCell::new(AppState {
+        recovery: RecoveryState::new(ui.poll_error.is_none()),
         client,
         subscriptions: fetched_subscriptions.unwrap_or_default(),
         profiles: profiles_snapshot,
@@ -884,6 +888,7 @@ fn build(
     let tray_handle = {
         use ksni::blocking::TrayMethods;
         let tray = OxidomTray {
+            generation: None,
             sessions: Vec::new(),
             status_text: "Disconnected".to_string(),
             failed: false,
@@ -970,11 +975,11 @@ fn build(
         system_proxy_failure: RefCell::new(None),
         status_action: Cell::new(None),
         applied_connection: RefCell::new(CardConnection::default()),
-        poll_in_flight: Arc::new(AtomicBool::new(false)),
+        poll: RefCell::new((Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)))),
+        recovery_retry: Cell::new(Instant::now()),
         history_in_flight: Cell::new(false),
         history_stale: Cell::new(false),
         sweep_tick: Cell::new(0),
-        poll_snapshot: Arc::new(Mutex::new(None)),
         log_feed: RefCell::new(LogFeed::new()),
         last_remote_logs: RefCell::new(None),
     });
@@ -1001,6 +1006,7 @@ fn build(
     controller.rebuild_views();
     controller.update_profiles_banner(&initial_status.sessions);
     controller.refresh_status();
+    controller.sync_admission();
     controller.add_breakpoint();
     controller.start_timer();
     controller.watch_termination();
@@ -1194,7 +1200,166 @@ enum AfterTrust {
     Measure,
 }
 
+#[derive(Clone)]
+struct BoundController {
+    weak: std::rc::Weak<Controller>,
+    generation: Generation,
+}
+
+impl BoundController {
+    fn upgrade(&self) -> Option<Rc<Controller>> {
+        let controller = self.weak.upgrade()?;
+        let accepted = controller.state.borrow().recovery.accepts(self.generation);
+        accepted.then_some(controller)
+    }
+}
+
 impl Controller {
+    fn bound(self: &Rc<Self>) -> BoundController {
+        BoundController {
+            weak: Rc::downgrade(self),
+            generation: self.state.borrow().recovery.generation(),
+        }
+    }
+
+    fn admitted(&self) -> bool {
+        self.state.borrow().recovery.ready()
+    }
+
+    fn sync_admission(&self) {
+        let ready = self.admitted();
+        self.stack.set_sensitive(ready);
+        self.profile_actions.set_sensitive(ready);
+        self.subscription_actions.set_sensitive(ready);
+        self.settings_actions.set_sensitive(ready);
+        self.profile_switcher.set_sensitive(ready);
+        self.header_status_action.set_sensitive(ready);
+        self.sidebar_status_action.set_sensitive(ready);
+    }
+
+    fn recover(self: &Rc<Self>) {
+        let retiring = self.admitted();
+        if !retiring && Instant::now() < self.recovery_retry.get() {
+            return;
+        }
+        let Some(generation) = self.state.borrow_mut().recovery.begin() else {
+            return;
+        };
+        self.recovery_retry
+            .set(Instant::now() + Duration::from_secs(2));
+        self.close_after_apply.set(false);
+        self.quit_after_close.set(false);
+        self.settings.set_apply_in_progress(false);
+        self.history_in_flight.set(false);
+        self.history_stale.set(false);
+        self.geo_polling.set(false);
+        *self.poll.borrow_mut() = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
+        self.sync_admission();
+        if retiring {
+            self.servers.retire_binding();
+            self.subscriptions.retire_binding();
+            self.profile_switcher_popover.popdown();
+            let dialogs = self.window.dialogs();
+            let dialogs: Vec<_> = (0..dialogs.n_items())
+                .filter_map(|index| dialogs.item(index)?.downcast::<adw::Dialog>().ok())
+                .collect();
+            for dialog in dialogs {
+                dialog.force_close();
+            }
+        }
+        self.refresh_status();
+        let client = self.state.borrow().client.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = (|| {
+                let recovered = client.recover_selected()?;
+                let initial = InitialData::load_recovered(&recovered)?;
+                Ok::<_, anyhow::Error>((recovered, initial))
+            })();
+            let _ = sender.send(result);
+        });
+        // Recovery must be able to complete while ordinary callbacks are fenced out.
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(60), move || {
+            let Some(controller) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let result = match poll_worker(&receiver) {
+                WorkerPoll::Waiting => return glib::ControlFlow::Continue,
+                WorkerPoll::Ready(result) => result,
+                WorkerPoll::Lost => Err(anyhow!(WorkerLost)),
+            };
+            match result {
+                Ok((client, initial)) => {
+                    let mut state = controller.state.borrow_mut();
+                    if state.recovery.generation() != generation || state.recovery.ready() {
+                        return glib::ControlFlow::Break;
+                    }
+                    let selected_profile = state.ui.selected_profile.clone();
+                    let selected_id = state.selected_id.clone();
+                    state.client = client;
+                    state.subscriptions = initial.subscriptions.unwrap_or_default();
+                    state.profiles = initial.profiles;
+                    state.ui = initial.ui;
+                    if state
+                        .profiles
+                        .iter()
+                        .any(|entry| entry.name == selected_profile)
+                    {
+                        state.ui.selected_profile = selected_profile;
+                    }
+                    state.selected_id = selected_id.filter(|id| {
+                        state.subscriptions.iter().any(|subscription| {
+                            subscription.servers.iter().any(|server| &server.id == id)
+                        })
+                    });
+                    let source = state.client.source();
+                    drop(state);
+                    controller.settings.rehydrate(&initial.config);
+                    controller
+                        .settings
+                        .set_daemon_capabilities(source, initial.geo_download_supported);
+                    controller
+                        .settings
+                        .set_watchdog_supported(initial.watchdog_supported);
+                    controller
+                        .servers
+                        .set_probe_cancel_supported(initial.probe_cancel_supported);
+                    let downloading = initial
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.geo.downloading);
+                    controller.set_runtime_info(initial.runtime);
+                    controller.log_feed.borrow_mut().reset_remote();
+                    *controller.last_remote_logs.borrow_mut() = None;
+                    // Widget hydration can emit synchronous signals; admit only once installed.
+                    controller.rebuild_views();
+                    controller.sync_operations();
+                    controller.sync_connection_cards();
+                    let sessions = controller.state.borrow().ui.sessions.clone();
+                    controller.update_profiles_banner(&sessions);
+                    controller.refresh_status();
+                    if !controller.state.borrow_mut().recovery.finish(generation) {
+                        return glib::ControlFlow::Break;
+                    }
+                    controller.sync_admission();
+                    controller.refresh_history();
+                    controller.refresh_status();
+                    controller.reconcile_system_proxy();
+                    if downloading {
+                        controller.poll_geo_progress();
+                    }
+                }
+                Err(_) => {
+                    controller.state.borrow_mut().recovery.failed(generation);
+                    controller
+                        .recovery_retry
+                        .set(Instant::now() + Duration::from_secs(2));
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    }
     /// Keyboard access to everything reachable from the header and sidebar.
     /// GTK needs a `GActionMap` on the window plus app-level accelerators;
     /// neither existed before, so every shortcut lives here.
@@ -1227,6 +1392,9 @@ impl Controller {
             "pick-connection",
             &["<Control>k"],
             Box::new(|controller| {
+                if !controller.admitted() {
+                    return;
+                }
                 controller.navigate_to(Page::Servers);
                 controller.servers.open_connection_picker();
             }),
@@ -1345,6 +1513,9 @@ impl Controller {
     /// subscription URL answers a question nobody asked, and the answer was a
     /// dialog opening over the page being read.
     fn import_from_clipboard(self: &Rc<Self>) {
+        if !self.admitted() {
+            return;
+        }
         if let Some(focused) = text_focus(&self.window) {
             // Both `GtkText` and `GtkTextView` install this action; it is what
             // their own Ctrl+V binding activates.
@@ -1354,7 +1525,7 @@ impl Controller {
         if !paste_imports_on(self.current_page()) {
             return;
         }
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         with_clipboard(&self.window, move |pasted| {
             let Some(controller) = weak.upgrade() else {
                 return;
@@ -1536,6 +1707,9 @@ impl Controller {
             let weak = Rc::downgrade(self);
             move || {
                 if let Some(controller) = weak.upgrade() {
+                    if !controller.admitted() {
+                        return;
+                    }
                     oxidom_core::logbook::global().clear();
                     controller.bump_epoch();
                     let client = controller.state.borrow().client.clone();
@@ -1601,8 +1775,9 @@ impl Controller {
         ]);
         dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
         dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
-        dialog.set_response_enabled("apply", state.valid);
-        dialog.set_default_response(Some(if state.valid { "apply" } else { "cancel" }));
+        let can_apply = state.valid && self.admitted();
+        dialog.set_response_enabled("apply", can_apply);
+        dialog.set_default_response(Some(if can_apply { "apply" } else { "cancel" }));
         dialog.set_close_response("cancel");
         dialog.connect_response(None, {
             let weak = Rc::downgrade(self);
@@ -1612,7 +1787,7 @@ impl Controller {
                     return;
                 };
                 match response {
-                    "apply" => {
+                    "apply" if controller.admitted() => {
                         controller.close_after_apply.set(true);
                         controller.settings.request_apply();
                     }
@@ -1661,6 +1836,9 @@ impl Controller {
     /// has to start from what is on disk now — not from the copy this page was
     /// built with, which may be arbitrarily old.
     fn with_fresh_profiles(self: &Rc<Self>, then: impl FnOnce(&Rc<Self>) + 'static) {
+        if !self.admitted() {
+            return;
+        }
         let client = self.state.borrow().client.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -1668,9 +1846,12 @@ impl Controller {
             let _ = sender.send(result);
         });
 
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         let mut then = Some(then);
         glib::timeout_add_local(Duration::from_millis(40), move || {
+            if weak.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
             match receiver.try_recv() {
                 Ok(Ok(profiles)) => {
                     if let Some(controller) = weak.upgrade() {
@@ -1882,7 +2063,7 @@ impl Controller {
         };
         let callbacks = SessionCallbacks {
             toggle: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |name, active| {
                     if let Some(controller) = weak.upgrade() {
                         if active {
@@ -1894,7 +2075,7 @@ impl Controller {
                 })
             },
             edit: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |name| {
                     if let Some(controller) = weak.upgrade() {
                         controller.edit_profile(name);
@@ -1902,7 +2083,7 @@ impl Controller {
                 })
             },
             create: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move || {
                     if let Some(controller) = weak.upgrade() {
                         controller.open_profile_dialog(None, None);
@@ -1933,7 +2114,7 @@ impl Controller {
         };
         let callbacks = ProfileDialogCallbacks {
             save: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |name, profile| {
                     if let Some(controller) = weak.upgrade() {
                         controller.save_profile(name, profile);
@@ -1941,7 +2122,7 @@ impl Controller {
                 })
             },
             remove: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |name| {
                     if let Some(controller) = weak.upgrade() {
                         controller.remove_profile(name);
@@ -2055,6 +2236,9 @@ impl Controller {
     }
 
     fn select_profile(self: &Rc<Self>, profile: String) {
+        if !self.admitted() {
+            return;
+        }
         {
             let mut state = self.state.borrow_mut();
             if state.ui.selected_profile == profile {
@@ -2099,7 +2283,7 @@ impl Controller {
         };
         let callbacks = super::views::servers::CardCallbacks {
             select: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id| {
                     if let Some(controller) = weak.upgrade() {
                         controller.select_server(id);
@@ -2107,7 +2291,7 @@ impl Controller {
                 })
             },
             show_logs: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id| {
                     if let Some(controller) = weak.upgrade() {
                         controller.show_server_in_logs(&id);
@@ -2115,7 +2299,7 @@ impl Controller {
                 })
             },
             report: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id| {
                     if let Some(controller) = weak.upgrade() {
                         controller.report_server_problem(&id);
@@ -2123,7 +2307,7 @@ impl Controller {
                 })
             },
             activate: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id| {
                     if let Some(controller) = weak.upgrade() {
                         controller.activate_server(id);
@@ -2131,7 +2315,7 @@ impl Controller {
                 })
             },
             ping: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id| {
                     if let Some(controller) = weak.upgrade() {
                         controller.probe_one(id, true);
@@ -2139,7 +2323,7 @@ impl Controller {
                 })
             },
             trust: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id: String| {
                     if let Some(controller) = weak.upgrade() {
                         let name = controller.server_label(&id);
@@ -2151,7 +2335,7 @@ impl Controller {
                 })
             },
             recheck: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |ids: Vec<String>| {
                     if let Some(controller) = weak.upgrade() {
                         controller.enqueue_probes(ids);
@@ -2159,7 +2343,7 @@ impl Controller {
                 })
             },
             refresh: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id: String| {
                     if let Some(controller) = weak.upgrade() {
                         controller.refresh_subscription(id);
@@ -2167,7 +2351,7 @@ impl Controller {
                 })
             },
             set_alias: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |server_id, alias| {
                     if let Some(controller) = weak.upgrade() {
                         controller.set_alias(server_id, alias);
@@ -2175,7 +2359,7 @@ impl Controller {
                 })
             },
             edit: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |server_id: String| {
                     if let Some(controller) = weak.upgrade() {
                         controller.edit_server(server_id);
@@ -2183,7 +2367,7 @@ impl Controller {
                 })
             },
             drop_override: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |server_id: String, field: String| {
                     if let Some(controller) = weak.upgrade() {
                         controller.drop_override(server_id, field);
@@ -2191,7 +2375,7 @@ impl Controller {
                 })
             },
             share_copied: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |not_carried: Vec<String>| {
                     if let Some(controller) = weak.upgrade() {
                         if not_carried.is_empty() {
@@ -2206,7 +2390,7 @@ impl Controller {
                 })
             },
             create_pool: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |query| {
                     if let Some(controller) = weak.upgrade() {
                         controller.open_profile_dialog(None, Some(query));
@@ -2214,7 +2398,7 @@ impl Controller {
                 })
             },
             connect_pool: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |query, members| {
                     if let Some(controller) = weak.upgrade() {
                         controller.connect_pool(query, members);
@@ -2222,7 +2406,7 @@ impl Controller {
                 })
             },
             connect_selection: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |query| {
                     if let Some(controller) = weak.upgrade() {
                         controller.connect_selection(query);
@@ -2230,7 +2414,7 @@ impl Controller {
                 })
             },
             clear_search: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move || {
                     if let Some(controller) = weak.upgrade() {
                         controller.clear_search();
@@ -2256,7 +2440,7 @@ impl Controller {
 
         let sub_callbacks = super::views::subscriptions::SubscriptionCallbacks {
             add: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |url, name, send_hwid| {
                     if let Some(controller) = weak.upgrade() {
                         controller.add_subscription(url, name, send_hwid);
@@ -2264,7 +2448,7 @@ impl Controller {
                 })
             },
             import: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |text| {
                     if let Some(controller) = weak.upgrade() {
                         controller.import_servers(text);
@@ -2272,7 +2456,7 @@ impl Controller {
                 })
             },
             create: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |draft| {
                     if let Some(controller) = weak.upgrade() {
                         controller.create_server(draft);
@@ -2280,7 +2464,7 @@ impl Controller {
                 })
             },
             refresh: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id| {
                     if let Some(controller) = weak.upgrade() {
                         controller.refresh_subscription(id);
@@ -2288,7 +2472,7 @@ impl Controller {
                 })
             },
             refresh_all: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move || {
                     if let Some(controller) = weak.upgrade() {
                         controller.refresh_all_subscriptions();
@@ -2296,7 +2480,7 @@ impl Controller {
                 })
             },
             remove: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id| {
                     if let Some(controller) = weak.upgrade() {
                         controller.remove_subscription(id);
@@ -2304,7 +2488,7 @@ impl Controller {
                 })
             },
             remove_server: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id| {
                     if let Some(controller) = weak.upgrade() {
                         controller.remove_server(id);
@@ -2312,7 +2496,7 @@ impl Controller {
                 })
             },
             hwid: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id, enabled| {
                     if let Some(controller) = weak.upgrade() {
                         controller.set_hwid(id, enabled);
@@ -2320,7 +2504,7 @@ impl Controller {
                 })
             },
             user_agent: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id, user_agent| {
                     if let Some(controller) = weak.upgrade() {
                         controller.set_subscription_user_agent(id, user_agent);
@@ -2328,7 +2512,7 @@ impl Controller {
                 })
             },
             groups_holding: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id: String| {
                     weak.upgrade()
                         .map(|controller| controller.servers.groups_holding(&id))
@@ -2336,7 +2520,7 @@ impl Controller {
                 })
             },
             groups_holding_any: {
-                let weak = Rc::downgrade(self);
+                let weak = self.bound();
                 Rc::new(move |id: String| {
                     weak.upgrade()
                         .map(|controller| controller.servers.groups_holding_any(&id))
@@ -2362,6 +2546,9 @@ impl Controller {
     }
 
     fn activate_server(self: &Rc<Self>, server_id: String) {
+        if !self.admitted() {
+            return;
+        }
         let action = {
             let state = self.state.borrow();
             card_action(&state.profiles, &state.ui, &server_id)
@@ -2468,7 +2655,7 @@ impl Controller {
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
         dialog.connect_response(None, {
-            let weak = Rc::downgrade(self);
+            let weak = self.bound();
             move |dialog, response| {
                 dialog.close();
                 if response != "repoint" {
@@ -2488,6 +2675,9 @@ impl Controller {
     /// no profile file is rewritten. The picker's always-labelled Connect uses
     /// `connect_selection` directly rather than this bar's toggle action.
     fn connect_pool(self: &Rc<Self>, query: PoolQuery, members: Vec<String>) {
+        if !self.admitted() {
+            return;
+        }
         let action = {
             let state = self.state.borrow();
             pool_action(&state.ui, &members)
@@ -2506,6 +2696,9 @@ impl Controller {
     }
 
     fn connect_selection(self: &Rc<Self>, mut query: PoolQuery) {
+        if !self.admitted() {
+            return;
+        }
         let profile = self.state.borrow().ui.selected_profile.clone();
         if query.session.is_empty() {
             query.session.clone_from(&profile);
@@ -2528,6 +2721,9 @@ impl Controller {
     }
 
     fn disconnect_if_active(self: &Rc<Self>) {
+        if !self.admitted() {
+            return;
+        }
         let (profile, status) = {
             let state = self.state.borrow();
             (
@@ -2604,6 +2800,9 @@ impl Controller {
     /// arriving while one is out is remembered and made once, on its return,
     /// instead of stacking a thread per tick.
     fn refresh_history(self: &Rc<Self>) {
+        if !self.admitted() {
+            return;
+        }
         let Some(server_id) = self.state.borrow().selected_id.clone() else {
             return;
         };
@@ -2621,8 +2820,11 @@ impl Controller {
             let _ = sender.send(client.probe_history(&wanted));
         });
 
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         glib::timeout_add_local(Duration::from_millis(40), move || {
+            if weak.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
             let answer = match receiver.try_recv() {
                 Ok(answer) => answer,
                 Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
@@ -2786,6 +2988,9 @@ impl Controller {
     /// Mark a card as checking and ask the daemon for a probe. Results come
     /// back through the poll snapshot; the daemon caps concurrency.
     fn probe_one(self: &Rc<Self>, server_id: String, notify_failure: bool) {
+        if !self.admitted() {
+            return;
+        }
         let stoppable;
         {
             let mut state = self.state.borrow_mut();
@@ -2821,6 +3026,9 @@ impl Controller {
     }
 
     fn enqueue_probes(self: &Rc<Self>, ids: Vec<String>) {
+        if !self.admitted() {
+            return;
+        }
         {
             let state = self.state.borrow();
             if press_stops(&ids, &state.ui.checking, &state.ui.sessions) {
@@ -2877,6 +3085,9 @@ impl Controller {
     /// (`docs/spec/latency.md`), and the activity indicator is refreshed at the
     /// press rather than at whichever later poll happens to shrink.
     fn cancel_probes(self: &Rc<Self>, ids: Vec<String>) {
+        if !self.admitted() {
+            return;
+        }
         if ids.is_empty() {
             return;
         }
@@ -2891,8 +3102,11 @@ impl Controller {
         });
         // The same 40 ms poll `request_probes` uses to bring a worker's answer
         // back to the main thread.
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         glib::timeout_add_local(Duration::from_millis(40), move || {
+            if weak.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
             let answer = match receiver.try_recv() {
                 Ok(answer) => answer,
                 Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
@@ -2925,6 +3139,9 @@ impl Controller {
     /// bus call refused — would otherwise leave the spinner turning for the
     /// rest of the session with no way to retry.
     fn request_probes(self: &Rc<Self>, ids: Vec<String>) {
+        if !self.admitted() {
+            return;
+        }
         let client = self.state.borrow().client.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let work_ids = ids.clone();
@@ -2936,8 +3153,11 @@ impl Controller {
             let _ = sender.send(result.err().map(|error| format!("{error:#}")));
         });
 
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         glib::timeout_add_local(Duration::from_millis(40), move || {
+            if weak.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
             let failure = match receiver.try_recv() {
                 Ok(None) => return glib::ControlFlow::Break,
                 Ok(Some(error)) => error,
@@ -2985,6 +3205,9 @@ impl Controller {
     }
 
     fn connect_server(self: &Rc<Self>, server_id: String) {
+        if !self.admitted() {
+            return;
+        }
         if !self.state.borrow().ui.can_start(UiOperationKind::Connect) {
             self.show_message("Another operation is still running");
             return;
@@ -3180,9 +3403,8 @@ impl Controller {
         self.client_job(
             UiOperation::for_profile(UiOperationKind::UpProfile, name),
             move |client| {
-                // The failure this follows is not a reason to stop: a profile
-                // that was never up is exactly what `up` wants.
-                let _ = client.down_profile(&work_name);
+                // An indeterminate stop must never be followed by another start.
+                client.down_profile(&work_name)?;
                 Ok(refresh_profiles_after(
                     client,
                     client.up_profile(&work_name),
@@ -3474,7 +3696,7 @@ impl Controller {
                 subscription.id == "local" && subscription.servers.iter().any(|s| s.id == server_id)
             });
         let values = super::views::server_dialog::values_from_server(&server);
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         super::views::server_dialog::show_server_edit_dialog(
             &self.window,
             values,
@@ -3594,6 +3816,10 @@ impl Controller {
     }
 
     fn save_settings(self: &Rc<Self>, values: SettingsValues) {
+        if !self.admitted() {
+            self.settings.set_apply_in_progress(false);
+            return;
+        }
         let validation = self.settings.validation();
         if !validation.is_valid() {
             self.settings.set_apply_in_progress(false);
@@ -3738,6 +3964,9 @@ impl Controller {
         Work: FnOnce(&DaemonClient) -> Result<R> + Send + 'static,
         Complete: FnOnce(&Rc<Self>, Result<R>) + 'static,
     {
+        if !self.admitted() {
+            return;
+        }
         {
             let mut state = self.state.borrow_mut();
             if !state.ui.begin_operation(operation.clone()) {
@@ -3785,13 +4014,26 @@ impl Controller {
             let _ = sender.send((result, subscriptions, snapshot));
         });
 
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         let mut complete = Some(complete);
         glib::timeout_add_local(Duration::from_millis(40), move || {
+            if weak.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
             match receiver.try_recv() {
                 Ok((result, subscriptions, snapshot)) => {
                     let Some(controller) = weak.upgrade() else {
                         return glib::ControlFlow::Break;
+                    };
+                    let mut snapshot = match snapshot {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            // A stale action epoch cannot certify the binding either.
+                            // Retire it before any optimistic completion or catalog update.
+                            let epoch = controller.state.borrow().ui.state_epoch;
+                            controller.apply_poll_failure(epoch, format!("{error:#}"));
+                            return glib::ControlFlow::Break;
+                        }
                     };
                     let snapshot_current = {
                         let mut state = controller.state.borrow_mut();
@@ -3814,16 +4056,8 @@ impl Controller {
                         complete(&controller, result);
                     }
                     if snapshot_current {
-                        let epoch = controller.bump_epoch();
-                        match snapshot {
-                            Ok(mut snapshot) => {
-                                snapshot.epoch = epoch;
-                                controller.apply_snapshot(snapshot);
-                            }
-                            Err(error) => {
-                                controller.apply_poll_failure(epoch, format!("{error:#}"))
-                            }
-                        }
+                        snapshot.epoch = controller.bump_epoch();
+                        controller.apply_snapshot(snapshot);
                     }
                     glib::ControlFlow::Break
                 }
@@ -3879,31 +4113,48 @@ impl Controller {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_millis(500), move || {
             controller.drain_tray_commands();
-            if let Some((epoch, result)) = oxidom_core::sync::lock(&controller.poll_snapshot).take()
-            {
+            if !controller.admitted() {
+                controller.recover();
+                return glib::ControlFlow::Continue;
+            }
+            let result = {
+                let poll = controller.poll.borrow();
+                oxidom_core::sync::lock(&poll.1).take()
+            };
+            if let Some((epoch, result)) = result {
                 match result {
                     Ok(snapshot) => controller.apply_snapshot(snapshot),
                     Err(error) => controller.apply_poll_failure(epoch, error),
                 }
+            }
+            if !controller.admitted() {
+                controller.recover();
+                return glib::ControlFlow::Continue;
             }
             let tick = controller.sweep_tick.get().wrapping_add(1);
             controller.sweep_tick.set(tick % AGE_SWEEP_TICKS);
             if controller.sweep_tick.get() == 0 {
                 controller.sweep_latency_ages();
             }
-            if !controller.poll_in_flight.swap(true, Ordering::SeqCst) {
+            let (in_flight, slot) = controller.poll.borrow().clone();
+            if !in_flight.swap(true, Ordering::SeqCst) {
                 let state = controller.state.borrow();
                 let client = state.client.clone();
                 // Read before the reads, on the main thread: this round can
                 // only speak for the world as it stood when it started.
                 let epoch = state.ui.state_epoch;
                 drop(state);
-                let slot = controller.poll_snapshot.clone();
-                let in_flight = controller.poll_in_flight.clone();
                 // Likewise read here: the cursor says what this round has
                 // already seen, and it only moves on the main thread.
                 let log_cursor = controller.log_feed.borrow().remote_cursor();
                 std::thread::spawn(move || {
+                    struct ResetBusy<'a>(&'a AtomicBool);
+                    impl Drop for ResetBusy<'_> {
+                        fn drop(&mut self) {
+                            self.0.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    let _busy = ResetBusy(&in_flight);
                     let snapshot = (|| {
                         Ok::<PolledSnapshot, anyhow::Error>(PolledSnapshot {
                             status: client.status()?,
@@ -3914,7 +4165,6 @@ impl Controller {
                     })();
                     *oxidom_core::sync::lock(&slot) =
                         Some((epoch, snapshot.map_err(|error| format!("{error:#}"))));
-                    in_flight.store(false, Ordering::SeqCst);
                 });
             }
             glib::ControlFlow::Continue
@@ -3929,7 +4179,7 @@ impl Controller {
     fn bump_epoch(&self) -> u64 {
         let mut state = self.state.borrow_mut();
         state.ui.state_epoch += 1;
-        *oxidom_core::sync::lock(&self.poll_snapshot) = None;
+        *oxidom_core::sync::lock(&self.poll.borrow().1) = None;
         state.ui.state_epoch
     }
 
@@ -4013,6 +4263,7 @@ impl Controller {
         self.sync_profile_switcher();
         self.sync_connection_cards();
         self.refresh_status();
+        self.recover();
         let remote = self.last_remote_logs.borrow().clone();
         if let Some(remote) = remote {
             self.absorb_logs(remote);
@@ -4290,12 +4541,18 @@ impl Controller {
         while let Ok(command) = self.tray_commands.try_recv() {
             match command {
                 TrayCommand::ShowWindow => self.window.present(),
-                TrayCommand::PickConnection => {
+                TrayCommand::PickConnection(generation) => {
+                    if !self.state.borrow().recovery.accepts(generation) {
+                        continue;
+                    }
                     self.window.present();
                     self.navigate_to(Page::Servers);
                     self.servers.open_connection_picker();
                 }
-                TrayCommand::Toggle(profile) => {
+                TrayCommand::Toggle(generation, profile) => {
+                    if !self.state.borrow().recovery.accepts(generation) {
+                        continue;
+                    }
                     // The same rule the page's switch follows, so a checkmark
                     // and a switch for one profile can never disagree.
                     let running = self
@@ -4398,7 +4655,12 @@ impl Controller {
                 .sessions
                 .iter()
                 .any(|session| session.state == "error");
+        let generation = {
+            let state = self.state.borrow();
+            state.recovery.ready().then(|| state.recovery.generation())
+        };
         let pushed = TrayState {
+            generation,
             text: text.clone(),
             sessions: sessions.clone(),
             failed,
@@ -4408,6 +4670,7 @@ impl Controller {
         }
         *self.tray_pushed.borrow_mut() = pushed;
         handle.update(move |tray| {
+            tray.generation = generation;
             tray.status_text = text.clone();
             tray.sessions.clone_from(&sessions);
             tray.failed = failed;
@@ -4792,7 +5055,7 @@ impl Controller {
         // `set_action_name` would need a GActionMap the window does not
         // register; a direct handler keeps this self-contained.
         toast.connect_button_clicked({
-            let weak = Rc::downgrade(self);
+            let weak = self.bound();
             let title = title.to_string();
             let detail = detail.to_string();
             move |_| {
@@ -4823,10 +5086,13 @@ impl Controller {
     /// neither of which belongs on that clock. So progress is followed on its
     /// own slower timer, and only while something is actually downloading.
     fn poll_geo_progress(self: &Rc<Self>) {
+        if !self.admitted() {
+            return;
+        }
         if self.geo_polling.replace(true) {
             return;
         }
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         let inflight = Rc::new(Cell::new(false));
         glib::timeout_add_local(Duration::from_millis(700), move || {
             let Some(controller) = weak.upgrade() else {
@@ -4901,12 +5167,15 @@ impl Controller {
 
     /// Re-read it after something that would have changed the answer.
     fn refresh_runtime_info(self: &Rc<Self>) {
+        if !self.admitted() {
+            return;
+        }
         let client = self.state.borrow().client.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let _ = sender.send(client.runtime_info().ok());
         });
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         glib::timeout_add_local(Duration::from_millis(40), move || {
             match receiver.try_recv() {
                 Ok(runtime) => {
@@ -4970,7 +5239,7 @@ impl Controller {
         dialog.set_default_response(Some("use"));
         dialog.set_close_response("cancel");
         dialog.connect_response(None, {
-            let weak = Rc::downgrade(self);
+            let weak = self.bound();
             move |dialog, response| {
                 dialog.close();
                 let Some(controller) = weak.upgrade() else {
@@ -5027,7 +5296,7 @@ impl Controller {
         }
         dialog.set_close_response("cancel");
         dialog.connect_response(None, {
-            let weak = Rc::downgrade(self);
+            let weak = self.bound();
             move |dialog, response| {
                 dialog.close();
                 let Some(controller) = weak.upgrade() else {
@@ -5047,12 +5316,15 @@ impl Controller {
     /// through the poll, so this holds no operation slot — Cancel has to stay
     /// clickable while 23 MB comes down.
     fn start_geo_download(self: &Rc<Self>, through_tunnel: bool) {
+        if !self.admitted() {
+            return;
+        }
         let client = self.state.borrow().client.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let _ = sender.send(client.download_geo_assets(through_tunnel));
         });
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         glib::timeout_add_local(Duration::from_millis(40), move || {
             match receiver.try_recv() {
                 Ok(result) => {
@@ -5074,6 +5346,9 @@ impl Controller {
 
     /// Stop one.
     fn cancel_geo_download(self: &Rc<Self>) {
+        if !self.admitted() {
+            return;
+        }
         let client = self.state.borrow().client.clone();
         std::thread::spawn(move || {
             if let Err(error) = client.cancel_geo_download() {
@@ -5126,13 +5401,16 @@ impl Controller {
         server_name: String,
         after: AfterTrust,
     ) {
+        if !self.admitted() {
+            return;
+        }
         let client = self.state.borrow().client.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let id = server_id.clone();
         std::thread::spawn(move || {
             let _ = sender.send(client.inspect_certificate(&id));
         });
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         glib::timeout_add_local(Duration::from_millis(50), move || {
             let result = match poll_worker(&receiver) {
                 WorkerPoll::Waiting => return glib::ControlFlow::Continue,
@@ -5195,7 +5473,7 @@ impl Controller {
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
         dialog.connect_response(None, {
-            let weak = Rc::downgrade(self);
+            let weak = self.bound();
             let server_id = server_id.to_string();
             let sha256 = sha256.to_string();
             move |dialog, response| {
@@ -5213,6 +5491,9 @@ impl Controller {
     }
 
     fn trust_certificate(self: &Rc<Self>, server_id: &str, sha256: &str, after: AfterTrust) {
+        if !self.admitted() {
+            return;
+        }
         let client = self.state.borrow().client.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let id = server_id.to_string();
@@ -5220,7 +5501,7 @@ impl Controller {
         std::thread::spawn(move || {
             let _ = sender.send(client.trust_certificate(&id, &pin));
         });
-        let weak = Rc::downgrade(self);
+        let weak = self.bound();
         let server_id = server_id.to_string();
         glib::timeout_add_local(Duration::from_millis(50), move || {
             let result = match poll_worker(&receiver) {
@@ -5282,7 +5563,7 @@ impl Controller {
         dialog.set_default_response(Some("close"));
         dialog.set_close_response("close");
         dialog.connect_response(None, {
-            let weak = Rc::downgrade(self);
+            let weak = self.bound();
             move |dialog, response| {
                 dialog.close();
                 if response == "settings"

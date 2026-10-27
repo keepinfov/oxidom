@@ -852,6 +852,15 @@ impl DaemonClient {
         Ok(serde_json::from_str(&json)?)
     }
 
+    /// Only explicit legacy method absence is optional, not transport failure.
+    pub fn runtime_info_optional(&self) -> Result<Option<RuntimeInfo>> {
+        match self.proxy.call::<_, _, String>("RuntimeInfo", &()) {
+            Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
+            Err(error) if self.info.is_none() && is_unknown_method(&error) => Ok(None),
+            Err(error) => Err(friendly(error)),
+        }
+    }
+
     /// Ask the daemon to install the geo data its core needs.
     ///
     /// Returns when the download has *started*, not when it has finished: the

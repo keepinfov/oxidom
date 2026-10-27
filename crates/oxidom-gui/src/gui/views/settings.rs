@@ -159,6 +159,14 @@ impl SettingsModel {
         self.applied = values;
         self.applying = false;
     }
+
+    fn rehydrate(&mut self, values: SettingsValues) {
+        let dirty = self.draft != self.applied;
+        if !dirty {
+            self.draft = values.clone();
+        }
+        self.mark_applied(values);
+    }
 }
 
 #[derive(Clone)]
@@ -796,6 +804,19 @@ impl SettingsView {
         refresh_state(&self.widgets, &self.model);
     }
 
+    /// Refresh authoritative baseline without silently submitting or dropping edits.
+    pub fn rehydrate(&self, config: &Config) {
+        self.model
+            .borrow_mut()
+            .rehydrate(SettingsValues::from(config));
+        let draft = self.model.borrow().draft.clone();
+        self.updating_widgets.set(true);
+        self.widgets.set_values(&draft);
+        sync_preset(&self.widgets);
+        self.updating_widgets.set(false);
+        refresh_state(&self.widgets, &self.model);
+    }
+
     /// Reports whether the desktop proxy could actually be installed. The
     /// switch used to stay on and look applied on a session where `gsettings`
     /// is not there to apply it, which made this the one setting that could be
@@ -820,6 +841,8 @@ impl SettingsView {
             self.widgets.watchdog.set_subtitle(
                 "This daemon cannot configure tunnel checks. Restart the upgraded daemon to enable this setting",
             );
+        } else {
+            self.widgets.watchdog.set_subtitle("For automatic recovery sessions. Conservative keeps a live core; aggressive may interrupt traffic");
         }
     }
 
@@ -998,6 +1021,26 @@ impl SettingsView {
     pub fn set_runtime_info(&self, info: Option<&RuntimeInfo>) {
         let widgets = &self.widgets;
         let Some(info) = info else {
+            widgets.install_hint.set_visible(false);
+            widgets.install_command.borrow_mut().clear();
+            widgets.install_link.borrow_mut().clear();
+            widgets.open_install.set_visible(false);
+            widgets.socks.set_sensitive(true);
+            widgets
+                .socks
+                .set_subtitle("Local port other apps can use as a SOCKS5 proxy");
+            widgets.http.set_sensitive(true);
+            widgets
+                .http
+                .set_subtitle("Local port other apps can use as an HTTP proxy");
+            for row in [
+                &widgets.xray_binary,
+                &widgets.tun2socks_binary,
+                &widgets.nft_binary,
+            ] {
+                row.set_sensitive(true);
+            }
+            widgets.xray_binary.set_tooltip_text(None);
             widgets
                 .xray_effective
                 .set_subtitle("Unavailable — this daemon is older than the app");
@@ -1433,6 +1476,26 @@ fn validate(values: &SettingsValues) -> SettingsValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rehydration_updates_clean_drafts_but_preserves_unsubmitted_edits() {
+        let mut model = SettingsModel::new(values());
+        let mut next = values();
+        next.socks_port = 12080;
+        model.applying = true;
+        model.rehydrate(next.clone());
+        assert_eq!(model.draft, next);
+        assert!(!model.state().dirty);
+        assert!(!model.state().applying);
+        model.draft.http_port = 12081;
+        let edited = model.draft.clone();
+        let mut successor = next;
+        successor.subscription_user_agent = "oxidom/successor".into();
+        model.rehydrate(successor.clone());
+        assert_eq!(model.applied, successor);
+        assert_eq!(model.draft, edited);
+        assert!(model.state().dirty);
+    }
 
     fn values() -> SettingsValues {
         SettingsValues {
