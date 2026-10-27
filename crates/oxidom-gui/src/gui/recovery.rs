@@ -1,5 +1,23 @@
 //! Binding freshness is independent of ordering actions within one daemon.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+pub(super) struct RetiredWork {
+    pub live: Arc<AtomicBool>,
+    pub changed: Arc<AtomicBool>,
+}
+
+impl Drop for RetiredWork {
+    fn drop(&mut self) {
+        if !self.live.load(Ordering::SeqCst) {
+            self.changed.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Generation(u64);
 
@@ -59,6 +77,26 @@ impl RecoveryState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_work_requests_fresh_reads_without_accepting_its_old_outcome() {
+        let live = Arc::new(AtomicBool::new(true));
+        let changed = Arc::new(AtomicBool::new(false));
+        let pending = RetiredWork {
+            live: live.clone(),
+            changed: changed.clone(),
+        };
+        live.store(false, Ordering::SeqCst);
+        assert!(!changed.load(Ordering::SeqCst));
+        drop(pending);
+        assert!(changed.swap(false, Ordering::SeqCst));
+        let current = RetiredWork {
+            live: Arc::new(AtomicBool::new(true)),
+            changed: changed.clone(),
+        };
+        drop(current);
+        assert!(!changed.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn retirement_rejects_all_old_payloads_before_a_successor_is_ready() {

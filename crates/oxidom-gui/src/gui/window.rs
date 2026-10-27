@@ -22,7 +22,7 @@ use oxidom_core::{paths, sysproxy};
 
 use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
-use super::recovery::{Generation, RecoveryState};
+use super::recovery::{Generation, RecoveryState, RetiredWork};
 use super::reduce::{
     CardAction, Effect, PolledSnapshot, PoolAction, ProbePhase, ProbeWait, SessionRowState,
     SnapshotState, SwitcherItem, SystemProxyState, about_comments, active_latency_for, card_action,
@@ -265,6 +265,8 @@ struct AppState {
 }
 
 struct Controller {
+    binding_live: RefCell<Arc<AtomicBool>>,
+    retired_work_changed: Arc<AtomicBool>,
     window: adw::ApplicationWindow,
     state: Rc<RefCell<AppState>>,
     /// The daemon's last answer about itself. Held here as well as pushed into
@@ -916,6 +918,8 @@ fn build(
     drop_focus_on_outside_click(&window);
 
     let controller = Rc::new(Controller {
+        binding_live: RefCell::new(Arc::new(AtomicBool::new(true))),
+        retired_work_changed: Arc::new(AtomicBool::new(false)),
         runtime: RefCell::new(initial_runtime.clone()),
         geo_polling: Cell::new(false),
         window: window.clone(),
@@ -1244,6 +1248,9 @@ impl Controller {
         let Some(generation) = self.state.borrow_mut().recovery.begin() else {
             return;
         };
+        self.binding_live.borrow().store(false, Ordering::SeqCst);
+        *self.binding_live.borrow_mut() = Arc::new(AtomicBool::new(true));
+        self.retired_work_changed.store(false, Ordering::SeqCst);
         self.recovery_retry
             .set(Instant::now() + Duration::from_secs(2));
         self.close_after_apply.set(false);
@@ -3995,10 +4002,18 @@ impl Controller {
         let epoch = self.bump_epoch();
         let client = self.state.borrow().client.clone();
         let urgent_stop = self.state.borrow().ui.stop_operation.is_some();
+        let binding_live = self.binding_live.borrow().clone();
+        let retired_work_changed = self.retired_work_changed.clone();
         let log_cursor = self.log_feed.borrow().remote_cursor();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let result = work(&client);
+            let result = {
+                let _retired = RetiredWork {
+                    live: binding_live,
+                    changed: retired_work_changed,
+                };
+                work(&client)
+            };
             // An overlapping Stop must not overwrite the fetch's newer catalog.
             let subscriptions = if urgent_stop {
                 None
@@ -4107,6 +4122,17 @@ impl Controller {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_millis(500), move || {
             controller.drain_tray_commands();
+            if controller.admitted()
+                && controller
+                    .retired_work_changed
+                    .swap(false, Ordering::SeqCst)
+            {
+                let epoch = controller.state.borrow().ui.state_epoch;
+                controller.apply_poll_failure(
+                    epoch,
+                    "Refreshing state after retired work completed".into(),
+                );
+            }
             if !controller.admitted() {
                 controller.recover();
                 return glib::ControlFlow::Continue;
