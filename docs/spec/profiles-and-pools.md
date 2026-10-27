@@ -98,6 +98,10 @@ as an unfiltered rule: the action is disabled and its callback rejects it. The
 group-only items (`Edit…`, `Update to what's shown`, `Move left/right`, `Delete`) are simply
 absent when no group is selected, rather than present and dead.
 
+GUI picker rotation is requested run intent, not saved group/profile membership. Only accepted
+Apply/Save/Connect commits that draft to the page's run settings; Cancel does not. Strategy-menu
+selection alone performs no daemon operation or profile write.
+
 **A group stores selection; the Connect bar states rotation width.** The bar carries a rotation
 picker defaulting to `pool::DEFAULT_POOL_ROTATION` (6), and `connect_query` writes it into
 `expected`. It is deliberately *not* also stored on the group: a group answers "which servers",

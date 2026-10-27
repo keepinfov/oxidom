@@ -1465,10 +1465,8 @@ impl ServersView {
                 let popover = popover.clone();
                 move |_| {
                     popover.popdown();
-                    // Picking from the menu both chooses and acts, so the arrow
-                    // is never a settings menu the user has to press twice.
                     view.connect_strategy.set(index);
-                    view.connect_active_group();
+                    view.sync_connect_bar();
                 }
             });
             list.append(&button);
@@ -1717,6 +1715,7 @@ impl ServersView {
     /// user could not see; a form with one commit can also be abandoned.
     fn present_selection_dialog(&self, intent: SelectionIntent) {
         let binding_revision = self.binding_revision.get();
+        let rotation_draft = RotationDraft::new(&self.connect_rotation_value);
         let subscriptions = self.subscriptions.borrow().clone();
         let editing = match &intent {
             SelectionIntent::Edit(group) => Some((**group).clone()),
@@ -2016,6 +2015,7 @@ impl ServersView {
             let preview_scroll = preview_scroll.clone();
             let narrow = narrow.clone();
             let picker_query = picker_query.clone();
+            let rotation_draft = rotation_draft.clone();
             move || {
                 let subscriptions = view.subscriptions.borrow().clone();
                 let borrowed = checks.borrow();
@@ -2072,7 +2072,7 @@ impl ServersView {
                         name_row.text().trim().into(),
                         view.selected_profile.borrow().clone(),
                         connect_choices()[view.connect_strategy.get()].strategy,
-                        view.connect_rotation_value.get(),
+                        rotation_draft.get(),
                     )
                     .unwrap_or_else(|| draft.to_query(name_row.text().trim().into(), draft.kind()));
                 let matched_ids = selection_ids(
@@ -2083,7 +2083,7 @@ impl ServersView {
                 );
                 let count = matched_ids.len();
                 let options = rotation_options(count);
-                let rot_value = view.connect_rotation_value.get();
+                let rot_value = rotation_draft.get();
                 let selected = options
                     .iter()
                     .position(|value| *value == rot_value)
@@ -2225,7 +2225,7 @@ impl ServersView {
             }
         });
         rotation_row.connect_selected_notify({
-            let view = self.clone();
+            let rotation_draft = rotation_draft.clone();
             let refresh = Rc::downgrade(&refresh);
             let rotation_values = rotation_values.clone();
             let syncing_rotation = syncing_rotation.clone();
@@ -2238,8 +2238,7 @@ impl ServersView {
                     .get(row.selected() as usize)
                     .copied()
                     .unwrap_or(0);
-                view.connect_rotation_value.set(value);
-                view.sync_connect_bar();
+                rotation_draft.set(value);
                 if let Some(refresh) = refresh.upgrade() {
                     refresh();
                 }
@@ -2555,12 +2554,14 @@ impl ServersView {
         });
         apply.connect_clicked({
             let view = self.clone();
+            let rotation_draft = rotation_draft.clone();
             let dialog = dialog.downgrade();
             let draft = draft.clone();
             move |_| {
                 if view.binding_revision.get() != binding_revision {
                     return;
                 }
+                rotation_draft.commit(&view.connect_rotation_value);
                 if let Some(dialog) = dialog.upgrade() {
                     dialog.close();
                 }
@@ -2569,6 +2570,7 @@ impl ServersView {
         });
         connect_now.connect_clicked({
             let view = self.clone();
+            let rotation_draft = rotation_draft.clone();
             let callback = self.on_connect_selection.borrow().clone();
             let dialog = dialog.downgrade();
             let draft = draft.clone();
@@ -2594,6 +2596,7 @@ impl ServersView {
                 {
                     return;
                 }
+                rotation_draft.commit(&view.connect_rotation_value);
                 if let Some(dialog) = dialog.upgrade() {
                     dialog.close();
                 }
@@ -2605,6 +2608,7 @@ impl ServersView {
         });
         save.connect_clicked({
             let view = self.clone();
+            let rotation_draft = rotation_draft.clone();
             let dialog = dialog.downgrade();
             let draft = draft.clone();
             let name_row = name_row.clone();
@@ -2617,6 +2621,7 @@ impl ServersView {
                 if name.is_empty() {
                     return;
                 }
+                rotation_draft.commit(&view.connect_rotation_value);
                 if let Some(dialog) = dialog.upgrade() {
                     dialog.close();
                 }
@@ -3869,6 +3874,26 @@ fn suggested_group_name(rule: &PoolQuery) -> String {
     }
 }
 
+/// Requested width is local to a picker until an explicit accepted action.
+#[derive(Clone)]
+struct RotationDraft(Rc<Cell<usize>>);
+
+impl RotationDraft {
+    fn new(applied: &Rc<Cell<usize>>) -> Self {
+        Self(Rc::new(Cell::new(applied.get())))
+    }
+
+    fn get(&self) -> usize {
+        self.0.get()
+    }
+    fn set(&self, value: usize) {
+        self.0.set(value);
+    }
+    fn commit(&self, applied: &Cell<usize>) {
+        applied.set(self.get());
+    }
+}
+
 fn rotation_label(value: usize) -> String {
     match value {
         0 => "All nodes".to_string(),
@@ -4328,6 +4353,27 @@ fn sorted_by_latency(current: &[String], latencies: &HashMap<String, Option<u32>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discarded_picker_rotation_never_changes_applied_run_settings() {
+        let applied = std::rc::Rc::new(std::cell::Cell::new(6));
+        {
+            let draft = super::RotationDraft::new(&applied);
+            let refresh = draft.clone();
+            draft.set(12);
+            assert_eq!(applied.get(), 6);
+            assert_eq!(refresh.get(), 12);
+        }
+        assert_eq!(applied.get(), 6);
+    }
+
+    #[test]
+    fn explicit_rotation_commit_updates_only_the_applied_run_width() {
+        let applied = std::rc::Rc::new(std::cell::Cell::new(6));
+        let draft = super::RotationDraft::new(&applied);
+        draft.set(12);
+        draft.commit(&applied);
+        assert_eq!(applied.get(), 12);
+    }
     use std::collections::HashMap;
 
     use super::{
