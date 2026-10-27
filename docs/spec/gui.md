@@ -172,6 +172,11 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   `Ctrl+K` and tray's **Pick connection…** open the same window, not separate pickers or a small
   popover. Saved groups, country/protocol/subscription filters, exclusions, hand-picked members,
   `Alive only`, a latency ceiling and rotation width share a matching-server preview and count.
+  Rotation is a local requested-width draft, committed to page/run settings only by valid,
+  current-binding Apply/Save/Connect. Cancel/dismissal and rejected submissions do not commit.
+  Preview capping changes effective width, not the remembered request; groups persist membership,
+  not run rotation. Strategy-menu selection configures the next explicit primary action and
+  refreshes presentation only: no Connect, Disconnect or profile saving, and no live replacement.
   Choices within one metadata field are alternatives; the different fields and health constraints
   intersect. Health filtering reads only the daemon's direct `ProbeState.readings`, never the
   displayed badge when it comes from `proxied`. Unknown and failed readings are excluded by

@@ -1466,7 +1466,7 @@ impl ServersView {
                 move |_| {
                     popover.popdown();
                     view.connect_strategy.set(index);
-                    view.connect_active_group();
+                    view.sync_connect_bar();
                 }
             });
             list.append(&button);
@@ -3880,7 +3880,7 @@ struct RotationDraft(Rc<Cell<usize>>);
 
 impl RotationDraft {
     fn new(applied: &Rc<Cell<usize>>) -> Self {
-        Self(applied.clone())
+        Self(Rc::new(Cell::new(applied.get())))
     }
 
     fn get(&self) -> usize {
