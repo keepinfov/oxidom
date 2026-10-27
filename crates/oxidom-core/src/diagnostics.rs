@@ -383,6 +383,9 @@ impl Diagnostics {
             ),
             TryLockError::Error(error) => error,
         })?;
+        let _unlock = Unlock(&lock);
+        #[cfg(test)]
+        tests::retain_lock(&lock);
 
         // Validate both generations before chmod, tail repair, or rotation.
         // In particular, an unsafe/oversized backup is not an expendable target.
@@ -530,6 +533,15 @@ impl Diagnostics {
         #[cfg(test)]
         tests::fail_at(tests::Stage::DirectorySync)?;
         self.directory.sync_all()
+    }
+}
+
+/// Closing alone lets a pre-exec inherited descriptor extend the lock scope.
+struct Unlock<'a>(&'a File);
+
+impl Drop for Unlock<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
     }
 }
 
@@ -854,6 +866,38 @@ mod tests {
 
     thread_local! {
         static FAULT: Cell<Option<Fault>> = const { Cell::new(None) };
+        pub(super) static RETAIN_LOCK: Cell<bool> = const { Cell::new(false) };
+        pub(super) static RETAINED_LOCK: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn retain_lock(file: &File) {
+        if RETAIN_LOCK.replace(false) {
+            RETAINED_LOCK.with_borrow_mut(|retained| *retained = Some(file.try_clone().unwrap()));
+        }
+    }
+
+    #[test]
+    fn completed_writer_scopes_release_locks_despite_retained_descriptors() {
+        let dir = TestDir::new();
+        let path = dir.0.join("journal");
+        let sink = Diagnostics::open(path).unwrap();
+        for fail in [false, true] {
+            RETAIN_LOCK.set(true);
+            let _fault = fail.then(|| FaultGuard::install(Fault::Error(Stage::Write, libc::EIO)));
+            let result = sink.append(b"{}\n");
+            if fail {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+            } else {
+                result.unwrap();
+            }
+            let retained = RETAINED_LOCK.with_borrow_mut(Option::take).unwrap();
+            let contender = File::open(dir.0.join("journal.lock")).unwrap();
+            contender
+                .try_lock()
+                .expect("writer scope must release its lock on every exit");
+            contender.unlock().unwrap();
+            drop(retained);
+        }
     }
 
     struct FaultGuard;
@@ -1427,6 +1471,7 @@ mod tests {
                 .join()
                 .unwrap();
         });
+        lock.unlock().unwrap();
         drop(lock);
         sink.write(event()).unwrap();
     }
@@ -1535,6 +1580,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+        lock.unlock().unwrap();
         drop(lock);
         sink.write(event()).unwrap();
     }

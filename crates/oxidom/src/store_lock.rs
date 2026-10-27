@@ -11,6 +11,12 @@ pub(super) struct StoreLock {
     _file: File,
 }
 
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
 impl StoreLock {
     /// Only the lease owner initializes identity, before any recovery side effects.
     pub(super) fn daemon_info(
@@ -99,12 +105,15 @@ impl StoreLock {
                 lock_path.display()
             )
         })?;
+        let owner = Self { _file: file };
         fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("setting permissions on {}", data_dir.display()))?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
+        owner
+            ._file
+            .set_permissions(fs::Permissions::from_mode(0o600))
             .with_context(|| format!("setting permissions on {}", lock_path.display()))?;
         // Never unlink this file: waiters must always lock the same inode.
-        Ok(Self { _file: file })
+        Ok(owner)
     }
 }
 
@@ -154,6 +163,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn retained_descriptors_cannot_extend_a_dropped_store_lease() {
+        let dir = TestDir::new();
+        let owner = StoreLock::acquire(&dir.0).unwrap();
+        let retained = owner._file.try_clone().unwrap();
+        assert!(StoreLock::acquire(&dir.0).is_err());
+        drop(owner);
+        let next = StoreLock::acquire(&dir.0)
+            .expect("a retained descriptor must not extend the logical store lease");
+        // A duplicate is not another logical owner, nor can closing it release
+        // the independently acquired successor's lock.
+        drop(retained);
+        assert!(StoreLock::acquire(&dir.0).is_err());
+        drop(next);
     }
 
     #[test]
