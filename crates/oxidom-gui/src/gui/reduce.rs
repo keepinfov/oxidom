@@ -4823,6 +4823,29 @@ mod tests {
     /// the world as it was before the click — that lag is the whole reason the
     /// pin exists.
     #[test]
+    fn a_connected_previous_server_does_not_retire_the_pending_target() {
+        let mut state = SnapshotState::new(&StatusInfo::from_status(
+            &Status::Connected,
+            Some("a".into()),
+        ));
+        let now = Instant::now();
+        state.connected_id = Some("b".into());
+        state.pin_status("default", Status::Connecting, now);
+        fold(
+            &mut state,
+            &snapshot(
+                StatusInfo::from_status(&Status::Connected, Some("a".into())),
+                idle(),
+            ),
+            now,
+            true,
+        );
+        assert!(state.is_pinned());
+        assert_eq!(state.current_status(), Status::Connecting);
+        assert_eq!(state.connected_id.as_deref(), Some("b"));
+    }
+
+    #[test]
     fn an_optimistic_status_outlives_a_daemon_that_has_not_caught_up() {
         let mut state = state();
         let now = Instant::now();
