@@ -45,7 +45,7 @@ const ROUTING_HINT: &str =
 const LIST_MEMBERSHIP_HINT: &str = "A fixed list; new servers do not join automatically. This profile \
     stores an independent copy, separate from Servers-page groups. Edit membership with \
     `oxidom profile edit <name>` using this profile's name.";
-const RULE_MEMBERSHIP_HINT: &str = "A rule; matching servers added by refresh can join automatically. \
+const RULE_MEMBERSHIP_HINT: &str = "A rule; matching servers added by refresh can join on the next connection. \
     This profile stores an independent copy, separate from Servers-page groups. Edit the rule with \
     `oxidom profile edit <name>` using this profile's name.";
 
@@ -376,7 +376,7 @@ pub fn show_profile_dialog(
             PoolKind::List => LIST_MEMBERSHIP_HINT,
             PoolKind::Rule => RULE_MEMBERSHIP_HINT,
         })
-        .subtitle_lines(3)
+        .subtitle_lines(0)
         .activatable(false)
         .build();
     pool_group.add(&membership);
