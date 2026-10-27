@@ -422,6 +422,24 @@ impl DaemonClient {
         BindingStamp(self.binding.clone())
     }
 
+    /// A responsive retired unique owner is not the selected well-known owner.
+    /// This check never retargets operational calls or activates a service.
+    pub fn validate_binding(&self) -> Result<()> {
+        block_discovery(async {
+            before_deadline(Instant::now() + DISCOVERY_TIMEOUT, async {
+                let proxy = self.proxy.inner();
+                let bus = zbus::fdo::DBusProxy::new(proxy.connection()).await?;
+                let owner = bus.get_name_owner(BUS_NAME.try_into()?).await?;
+                if proxy.destination().as_str() != owner.as_str() {
+                    return Err(zbus::Error::Failure("selected daemon owner changed".into()));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(anyhow::Error::new)
+        })
+    }
+
     /// Only prepares a candidate. Callers must fully hydrate it before replacing
     /// their active client; no old clone or in-flight operation is retargeted.
     pub fn recover_selected(&self) -> Result<Self> {
@@ -1280,11 +1298,16 @@ mod tests {
         old.disconnect()?;
         assert!(old_server.release_name(super::BUS_NAME)?);
         let (_next_server, next_calls) = identified_server(&bus, 'a', 'c', false)?;
+        assert!(
+            old.validate_binding().is_err(),
+            "responsive retired owners must not certify GUI readiness"
+        );
         assert_eq!(old.status()?.error, Some("b".repeat(64)));
         clone.disconnect()?;
         assert_eq!(old_calls.load(Ordering::SeqCst), 2);
         assert_eq!(next_calls.load(Ordering::SeqCst), 0);
         let recovered = old.recover_selected()?;
+        recovered.validate_binding()?;
         assert!(old.binding_stamp() != recovered.binding_stamp());
         assert_eq!(recovered.status()?.error, Some("c".repeat(64)));
         assert_eq!(next_calls.load(Ordering::SeqCst), 0);

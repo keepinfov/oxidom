@@ -806,9 +806,13 @@ impl SettingsView {
 
     /// Refresh authoritative baseline without silently submitting or dropping edits.
     pub fn rehydrate(&self, config: &Config) {
-        self.model
-            .borrow_mut()
-            .rehydrate(SettingsValues::from(config));
+        let mut values = SettingsValues::from(config);
+        self.updating_widgets.set(true);
+        self.widgets
+            .core
+            .set_values(&CoreOptions::default(), &values.core);
+        values.core = self.widgets.core.values();
+        self.model.borrow_mut().rehydrate(values);
         let draft = self.model.borrow().draft.clone();
         self.updating_widgets.set(true);
         self.widgets.set_values(&draft);

@@ -67,10 +67,8 @@ fn is_busy(error: &anyhow::Error) -> bool {
 
 /// A worker thread ended without sending its result.
 ///
-/// Reported as an ordinary failure of whatever was asked for, so the completion
-/// handler that owns the cleanup runs. It says what is and is not true
-/// afterwards, because "it failed" and "it may or may not have happened" call
-/// for different reactions.
+/// A mutation may have happened before the worker disappeared, so its binding
+/// must be retired rather than reporting an ordinary operation failure.
 #[derive(Debug)]
 struct WorkerLost;
 
@@ -135,6 +133,7 @@ struct TrayState {
 type SettingsCallback = Rc<dyn Fn(SettingsValues)>;
 type ShortcutHandler = Box<dyn Fn(&Rc<Controller>)>;
 type PollResult = (u64, Result<PolledSnapshot, String>);
+type PollSlot = (Arc<AtomicBool>, Arc<Mutex<Option<PollResult>>>);
 
 const SIDEBAR_BREAKPOINT_WIDTH: u32 = 700;
 
@@ -341,7 +340,7 @@ struct Controller {
     /// Last (active, connecting) pair pushed to the cards, to avoid an
     /// O(cards) pass on every poll tick.
     applied_connection: RefCell<CardConnection>,
-    poll: RefCell<(Arc<AtomicBool>, Arc<Mutex<Option<PollResult>>>)>,
+    poll: RefCell<PollSlot>,
     recovery_retry: Cell<Instant>,
     /// A history fetch is out on a worker thread, and whether a reading landed
     /// while it was. The history is the one card fact that costs a D-Bus call
@@ -1248,7 +1247,6 @@ impl Controller {
         self.recovery_retry
             .set(Instant::now() + Duration::from_secs(2));
         self.close_after_apply.set(false);
-        self.quit_after_close.set(false);
         self.settings.set_apply_in_progress(false);
         self.history_in_flight.set(false);
         self.history_stale.set(false);
@@ -1274,6 +1272,7 @@ impl Controller {
             let result = (|| {
                 let recovered = client.recover_selected()?;
                 let initial = InitialData::load_recovered(&recovered)?;
+                recovered.validate_binding()?;
                 Ok::<_, anyhow::Error>((recovered, initial))
             })();
             let _ = sender.send(result);
@@ -3856,11 +3855,19 @@ impl Controller {
                 // stored config is the authority on what was accepted — the
                 // page used to mark the *request* applied and then sat clean
                 // holding values the daemon had reverted.
-                Ok((outcome, client.settings().ok(), client.runtime_info().ok()))
+                Ok((outcome, client.settings().ok(), client.runtime_info_optional()))
             },
             move |controller, result| {
                 match result {
                     Ok((outcome, stored, runtime)) => {
+                        let runtime = match runtime {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                let epoch = controller.state.borrow().ui.state_epoch;
+                                controller.apply_poll_failure(epoch, format!("{error:#}"));
+                                return;
+                            }
+                        };
                         match stored.as_ref() {
                             Some(config) => controller
                                 .settings
@@ -4004,12 +4011,15 @@ impl Controller {
             // that gap is what let the header/sidebar/card flash a stale
             // state right after an operation the user is watching finished.
             let snapshot = (|| {
-                Ok::<PolledSnapshot, anyhow::Error>(PolledSnapshot {
+                client.validate_binding()?;
+                let snapshot = PolledSnapshot {
                     status: client.status()?,
                     probe: client.probe_state()?,
                     logs: client.logs_since(log_cursor, LOG_FETCH_LIMIT)?,
                     epoch,
-                })
+                };
+                client.validate_binding()?;
+                Ok::<PolledSnapshot, anyhow::Error>(snapshot)
             })();
             let _ = sender.send((result, subscriptions, snapshot));
         });
@@ -4055,7 +4065,7 @@ impl Controller {
                     if let Some(complete) = complete.take() {
                         complete(&controller, result);
                     }
-                    if snapshot_current {
+                    if snapshot_current && controller.admitted() {
                         snapshot.epoch = controller.bump_epoch();
                         controller.apply_snapshot(snapshot);
                     }
@@ -4064,24 +4074,8 @@ impl Controller {
                 Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if let Some(controller) = weak.upgrade() {
-                        let mut state = controller.state.borrow_mut();
-                        let snapshot_current = state.ui.finish_operation(&operation, epoch, true);
-                        drop(state);
-                        if snapshot_current || !operation.kind.is_subscription_fetch() {
-                            controller.bump_epoch();
-                        }
-                        controller.sync_operations();
-                        // Hand the loss to the completion handler, for the same
-                        // reason the `Busy` refusal above does: it owns the
-                        // per-call cleanup. Skipping it here left the settings
-                        // spinner up for the rest of the session — `Apply` and
-                        // `Reset` are insensitive until the handler lowers it —
-                        // and left a queued close armed, so a later save shut
-                        // the window without being asked to.
-                        if let Some(complete) = complete.take() {
-                            complete(&controller, Err(anyhow!(WorkerLost)));
-                        }
-                        controller.refresh_status();
+                        let epoch = controller.state.borrow().ui.state_epoch;
+                        controller.apply_poll_failure(epoch, WorkerLost.to_string());
                     }
                     glib::ControlFlow::Break
                 }
@@ -4156,12 +4150,15 @@ impl Controller {
                     }
                     let _busy = ResetBusy(&in_flight);
                     let snapshot = (|| {
-                        Ok::<PolledSnapshot, anyhow::Error>(PolledSnapshot {
+                        client.validate_binding()?;
+                        let snapshot = PolledSnapshot {
                             status: client.status()?,
                             probe: client.probe_state()?,
                             logs: client.logs_since(log_cursor, LOG_FETCH_LIMIT)?,
                             epoch,
-                        })
+                        };
+                        client.validate_binding()?;
+                        Ok::<PolledSnapshot, anyhow::Error>(snapshot)
                     })();
                     *oxidom_core::sync::lock(&slot) =
                         Some((epoch, snapshot.map_err(|error| format!("{error:#}"))));
@@ -5107,7 +5104,7 @@ impl Controller {
             let client = controller.state.borrow().client.clone();
             let (sender, receiver) = mpsc::sync_channel(1);
             std::thread::spawn(move || {
-                let _ = sender.send(client.runtime_info().ok());
+                let _ = sender.send(client.runtime_info_optional());
             });
             let weak = weak.clone();
             let inflight = inflight.clone();
@@ -5117,6 +5114,14 @@ impl Controller {
                         inflight.set(false);
                         let Some(controller) = weak.upgrade() else {
                             return glib::ControlFlow::Break;
+                        };
+                        let runtime = match runtime {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                let epoch = controller.state.borrow().ui.state_epoch;
+                                controller.apply_poll_failure(epoch, format!("{error:#}"));
+                                return glib::ControlFlow::Break;
+                            }
                         };
                         let finished = runtime
                             .as_ref()
@@ -5135,6 +5140,10 @@ impl Controller {
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         inflight.set(false);
+                        if let Some(controller) = weak.upgrade() {
+                            let epoch = controller.state.borrow().ui.state_epoch;
+                            controller.apply_poll_failure(epoch, WorkerLost.to_string());
+                        }
                         glib::ControlFlow::Break
                     }
                 }
@@ -5173,19 +5182,31 @@ impl Controller {
         let client = self.state.borrow().client.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let _ = sender.send(client.runtime_info().ok());
+            let _ = sender.send(client.runtime_info_optional());
         });
         let weak = self.bound();
         glib::timeout_add_local(Duration::from_millis(40), move || {
             match receiver.try_recv() {
                 Ok(runtime) => {
                     if let Some(controller) = weak.upgrade() {
-                        controller.set_runtime_info(runtime);
+                        match runtime {
+                            Ok(runtime) => controller.set_runtime_info(runtime),
+                            Err(error) => {
+                                let epoch = controller.state.borrow().ui.state_epoch;
+                                controller.apply_poll_failure(epoch, format!("{error:#}"));
+                            }
+                        }
                     }
                     glib::ControlFlow::Break
                 }
                 Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(controller) = weak.upgrade() {
+                        let epoch = controller.state.borrow().ui.state_epoch;
+                        controller.apply_poll_failure(epoch, WorkerLost.to_string());
+                    }
+                    glib::ControlFlow::Break
+                }
             }
         });
     }
