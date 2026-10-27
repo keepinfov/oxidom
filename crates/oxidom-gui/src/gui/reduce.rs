@@ -3131,7 +3131,7 @@ mod tests {
         );
         state.operation = Some(UiOperation::for_profile(
             UiOperationKind::DownProfile,
-            "held".into(),
+            "held",
         ));
         assert!(
             !session_rows(&profiles, &state, 0)
