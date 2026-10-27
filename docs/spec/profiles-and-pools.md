@@ -63,9 +63,11 @@ empty, so every pool profile written before lists existed still round-trips to t
 The same `PoolQuery` drives the balancer and the GUI's server filter: a filter is a pool
 constructor, not a second search. A **group** in the GUI is a saved `PoolQuery` under a name.
 Connecting one passes the query to `ConnectPool` in the selected profile's session and writes no
-profile file; saving it as `select.pool` requires an explicit **New profile from this…** action. Group
-membership is edited only where the servers are, in the connection picker on the Servers
-page; the profile editor reports the pool and edits only `strategy`, `max`, `expected` and
+profile file; saving it as `select.pool` requires an explicit **New profile from this…** action.
+The profile holds an independent copy, not a link to the GUI group: later group edits do not
+update it. Group membership is edited in the Servers-page picker; existing profile membership is
+edited through `oxidom profile edit <name>`. The GUI hint must name that supported workflow and
+independent-copy distinction. The profile dialog reports the pool and edits only `strategy`, `max`, `expected` and
 `probe_interval`, carrying everything about *which* servers through untouched. The window says
 **group** for all of this; `pool` stays the word in the TOML, the CLI and the IPC payload, and one
 line in the profile editor says the two are the same thing.

@@ -42,10 +42,12 @@ const POOL_FROM_GROUPS_HINT: &str = "To run several servers at once, pick them o
 const ROUTING_HINT: &str =
     "Edited in the profile file, ahead of the rules oxidom generates. Saved from here untouched.";
 
-const LIST_MEMBERSHIP_HINT: &str = "A fixed list. New servers do not join it on their own. Change \
-    which servers are in it from the group chips on the Servers page.";
-const RULE_MEMBERSHIP_HINT: &str = "A rule, so servers a future refresh adds can join it. Change \
-    what it matches from the group chips on the Servers page.";
+const LIST_MEMBERSHIP_HINT: &str = "A fixed list; new servers do not join automatically. This profile \
+    stores an independent copy, separate from Servers-page groups. Edit membership with \
+    `oxidom profile edit <name>` using this profile's name.";
+const RULE_MEMBERSHIP_HINT: &str = "A rule; matching servers added by refresh can join on the next connection. \
+    This profile stores an independent copy, separate from Servers-page groups. Edit the rule with \
+    `oxidom profile edit <name>` using this profile's name.";
 
 /// One server the profile's picker can point at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,12 +364,8 @@ pub fn show_profile_dialog(
         .build();
     pool_group.add(&strategy);
 
-    // Which servers a pool holds is chosen where the servers are, on the
-    // Servers page, with real country and protocol pickers. Four comma-separated
-    // text fields were the only way to say it before that existed; keeping them
-    // now would be a second, blind editor for the same thing — and a save from
-    // one of them could silently disagree with the group the pool came from.
-    // The membership is carried through untouched and reported here instead.
+    // Membership is copied into the profile, not linked to a GUI group.
+    // This dialog preserves it; the hint names the supported file-edit workflow.
     let membership = adw::ActionRow::builder()
         .title(if initial_pool.name.is_empty() {
             describe_pool(&initial_pool)
@@ -378,7 +376,7 @@ pub fn show_profile_dialog(
             PoolKind::List => LIST_MEMBERSHIP_HINT,
             PoolKind::Rule => RULE_MEMBERSHIP_HINT,
         })
-        .subtitle_lines(3)
+        .subtitle_lines(0)
         .activatable(false)
         .build();
     pool_group.add(&membership);
@@ -1130,6 +1128,32 @@ mod tests {
         assert!(!dns_leak(false, RouteMode::Default));
         assert!(!dns_leak(true, RouteMode::Manual));
         assert!(!dns_leak(true, RouteMode::List));
+    }
+
+    #[test]
+    fn membership_guidance_names_the_independent_profile_and_supported_editor() {
+        for hint in [LIST_MEMBERSHIP_HINT, RULE_MEMBERSHIP_HINT] {
+            assert!(hint.contains("independent copy"));
+            assert!(hint.contains("oxidom profile edit <name>"));
+            assert!(!hint.contains("from the group chips"));
+        }
+    }
+
+    #[test]
+    fn editing_other_profile_options_preserves_fixed_membership() {
+        let entry = ProfileEntry {
+            name: "work".into(),
+            pool: Some(PoolQuery {
+                members: vec!["invented-alpha".into(), "invented-missing".into()],
+                ..PoolQuery::default()
+            }),
+            ..ProfileEntry::default()
+        };
+        let mut values = DialogValues::new(Some(&entry));
+        values.description = "Updated description".into();
+        let saved = profile_from_dialog(values);
+        assert_eq!(saved.select.pool, entry.pool);
+        assert_eq!(saved.description, "Updated description");
     }
 
     #[test]

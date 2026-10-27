@@ -27,6 +27,10 @@ than tested by issuing cancellation requests. Ordinary existing daemon operation
 
 ## The five pages
 
+Group membership shown in a profile is an independent copy, not a live link to the Servers-page
+group. The profile dialog preserves that membership; edit an existing profile's list/rule with
+`oxidom profile edit <name>`. Editing a GUI group alone does not rewrite the profile.
+
 A session can outlive removal of its saved profile. It remains on Profiles and in the session
 switcher/tray with "No saved profile" and a Stop control. Its settings cannot be edited or started
 from that missing profile; stopping it does not recreate the file. Held sessions can also be

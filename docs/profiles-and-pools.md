@@ -1,5 +1,11 @@
 # Profiles and pools
 
+A profile made from a Servers-page group stores an independent copy of its selection. Editing
+the group later does not update that profile. The profile dialog preserves membership while
+editing other options; use `oxidom profile edit <name>` to change an existing profile's list or
+rule, substituting its actual name. This does not change a running session until explicitly
+reconnected.
+
 A **profile** is persistent configuration: which server to use, on which ports,
 with or without a network interface. A **session** is the running instance of one
 profile. Several profiles can be up at once, each on its own loopback address —
@@ -190,8 +196,9 @@ both is rejected rather than silently half-applied.
 
 The difference is the user's, not an implementation detail:
 
-- A **rule** (the filters) *grows*. A server added by tomorrow's subscription
-  refresh joins on its own. You cannot look at a rule and count it.
+- A **rule** (the filters) *grows*. A matching server added by tomorrow's subscription
+  refresh can join on the next connection; a running session keeps its resolved membership.
+  You cannot look at a rule and count it.
 - A **list** (`members`) can be counted and never gains a member without being
   edited. Losing one just means a server went away.
 
@@ -221,8 +228,9 @@ Because a group *is* a filter, group membership is edited where the servers are 
 in the one connection picker opened by `Filter`, the header's **Pick connection…**
 (`Ctrl+K`), the tray, `New group` and `⋮ → Edit…`. The profile editor reports the
 pool and edits only `strategy`, `max`, `expected` and `probe_interval`, carrying
-*which* servers through untouched. Two independent editors for one thing is how a saved profile
-comes to disagree with the group it was made from.
+*which* servers through untouched. A profile made from a group is an independent copy, so
+divergence after editing either copy is expected. Use `oxidom profile edit <name>` to change
+membership in an existing profile; group edits do not rewrite it.
 
 The window calls this a **group** everywhere. `pool` is the word in the profile
 file, in the CLI and in `oxidom status`, and one line in the profile editor says
