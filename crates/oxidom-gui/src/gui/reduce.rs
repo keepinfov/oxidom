@@ -3049,6 +3049,41 @@ pub(super) fn active_latency_for(state: &SnapshotState) -> (Option<u32>, bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sessions_without_saved_profiles_remain_in_rows_and_switcher() {
+        let profiles = vec![ProfileEntry {
+            name: "default".into(),
+            ..ProfileEntry::default()
+        }];
+        let mut state = SnapshotState::new(&StatusInfo::default());
+        state.sessions = vec![
+            SessionInfo {
+                profile: "work".into(),
+                state: "connected".into(),
+                ..SessionInfo::default()
+            },
+            SessionInfo {
+                profile: "held".into(),
+                state: "error".into(),
+                holding_traffic: true,
+                ..SessionInfo::default()
+            },
+        ];
+        let rows = session_rows(&profiles, &state, 0);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.profile.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "held", "work"]
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.profile == "held")
+                .unwrap()
+                .toggle_on
+        );
+        assert_eq!(switcher_items(&profiles, &state).len(), 3);
+    }
     use super::*;
     use oxidom_core::config::LatencyMethod;
     use oxidom_core::ipc::{GeoAssets, InterfaceInfo, PoolMember, ProbeFailure, ProbeRoute};
