@@ -117,7 +117,7 @@ impl SessionsView {
             list.set_header_suffix(Some(&self.header.root));
         }
 
-        if profiles.is_empty() {
+        if profiles.is_empty() && rows.is_empty() {
             let empty = adw::ActionRow::builder()
                 .title("No profiles")
                 .subtitle(
@@ -130,12 +130,7 @@ impl SessionsView {
             list.add(&empty);
         }
 
-        // Only rows the profile list still knows about: a row whose profile
-        // has gone would carry an editor for a name that no longer exists.
         for row in rows {
-            if !profiles.iter().any(|entry| entry.name == row.profile) {
-                continue;
-            }
             self.add_session_row(&list, row, callbacks.clone());
         }
 
@@ -291,9 +286,11 @@ impl SessionsView {
             };
             controls.row.set_sensitive(!row.busy);
             controls.edit.set_sensitive(!busy);
+            controls.edit.set_visible(row.saved_profile);
             controls.toggle.set_sensitive(
                 !row.busy
                     && row.state != SessionRowState::Unknown
+                    && (row.saved_profile || row.toggle_on)
                     && operation.as_ref().is_none_or(|op| op.kind.permits(next)),
             );
             controls.spinner.set_spinning(row.busy);
@@ -331,6 +328,7 @@ fn apply_row(controls: &RowControls, row: &SessionRow) {
     *controls.applied.borrow_mut() = Some(row.clone());
     controls.row.set_title(&row.profile);
     controls.row.set_subtitle(&row.headline);
+    controls.edit.set_visible(row.saved_profile);
     controls.row.set_sensitive(!row.busy);
     controls.spinner.set_spinning(row.busy);
     controls.spinner.set_visible(row.busy);
@@ -450,6 +448,7 @@ mod tests {
 
     fn row(state: SessionRowState) -> SessionRow {
         SessionRow {
+            saved_profile: true,
             profile: "work".to_string(),
             state,
             headline: "ch-trojan".to_string(),

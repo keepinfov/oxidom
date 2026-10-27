@@ -1381,6 +1381,7 @@ pub(super) fn selected_status(state: &SnapshotState) -> Status {
 /// for a warning, which is what a pill is good at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SessionRow {
+    pub saved_profile: bool,
     /// Profile name; also the row's stable key.
     pub profile: String,
     pub state: SessionRowState,
@@ -1638,9 +1639,11 @@ pub(super) fn session_rows(
     state: &SnapshotState,
     now_unix_ms: u64,
 ) -> Vec<SessionRow> {
-    profiles
+    let inventory = session_inventory(profiles, state);
+    inventory
         .iter()
         .map(|entry| {
+            let saved_profile = profiles.iter().any(|saved| saved.name == entry.name);
             let session = session_for(state, &entry.name);
             let in_flight = operation_kind_for(state, &entry.name);
             let row_state = match in_flight {
@@ -1710,6 +1713,12 @@ pub(super) fn session_rows(
                 latency_parts(state.proxied.get(&entry.name), now_unix_ms);
 
             let mut details = Vec::new();
+            if !saved_profile {
+                details.push(SessionDetail::new(
+                    "Profile",
+                    "No saved profile - this session can be stopped but not started or edited here",
+                ));
+            }
             // First, because a failure is what the row was expanded for. The
             // headline carries the same text, but a subtitle ellipsises and
             // cannot be selected — so the one thing worth pasting into a bug
@@ -1793,17 +1802,30 @@ pub(super) fn session_rows(
             }
 
             let mut row = SessionRow {
+                saved_profile,
                 profile: entry.name.clone(),
                 state: row_state,
-                headline: session_headline(row_state, &selection, session),
+                headline: if saved_profile {
+                    session_headline(row_state, &selection, session)
+                } else {
+                    format!(
+                        "No saved profile - {}",
+                        session_headline(row_state, &selection, session)
+                    )
+                },
                 pool: is_pool,
                 latency,
                 warning,
                 details,
-                toggle_on: matches!(
-                    row_state,
-                    SessionRowState::Connected | SessionRowState::Connecting
-                ),
+                toggle_on: !matches!(
+                    in_flight,
+                    Some(UiOperationKind::DownProfile | UiOperationKind::Disconnect)
+                ) && (holding
+                    || (!saved_profile && session.is_some())
+                    || matches!(
+                        row_state,
+                        SessionRowState::Connected | SessionRowState::Connecting
+                    )),
                 busy: in_flight.is_some(),
                 error: session.and_then(|session| session.error.clone()),
             };
@@ -1830,6 +1852,25 @@ pub(super) struct SwitcherItem {
     pub selected: bool,
 }
 
+/// Saved order first; append runtime-only keys deterministically without
+/// manufacturing an editable profile. Placeholder entries are inventory only.
+fn session_inventory(profiles: &[ProfileEntry], state: &SnapshotState) -> Vec<ProfileEntry> {
+    let mut inventory = profiles.to_vec();
+    let mut extras: Vec<_> = state
+        .sessions
+        .iter()
+        .map(|session| session.profile.as_str())
+        .filter(|name| !profiles.iter().any(|profile| profile.name == *name))
+        .collect();
+    extras.sort_unstable();
+    extras.dedup();
+    inventory.extend(extras.into_iter().map(|name| ProfileEntry {
+        name: name.into(),
+        ..ProfileEntry::default()
+    }));
+    inventory
+}
+
 /// Whether the header shows a profile switcher at all.
 ///
 /// One profile means the switcher does not exist — not that it exists with a
@@ -1843,7 +1884,7 @@ pub(super) fn switcher_items(
     profiles: &[ProfileEntry],
     state: &SnapshotState,
 ) -> Vec<SwitcherItem> {
-    profiles
+    session_inventory(profiles, state)
         .iter()
         .map(|entry| SwitcherItem {
             profile: entry.name.clone(),
@@ -3083,6 +3124,22 @@ mod tests {
                 .toggle_on
         );
         assert_eq!(switcher_items(&profiles, &state).len(), 3);
+        assert!(
+            rows.iter()
+                .filter(|row| row.profile != "default")
+                .all(|row| !row.saved_profile)
+        );
+        state.operation = Some(UiOperation::for_profile(
+            UiOperationKind::DownProfile,
+            "held".into(),
+        ));
+        assert!(
+            !session_rows(&profiles, &state, 0)
+                .iter()
+                .find(|row| row.profile == "held")
+                .unwrap()
+                .toggle_on
+        );
     }
     use super::*;
     use oxidom_core::config::LatencyMethod;
