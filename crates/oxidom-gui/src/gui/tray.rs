@@ -3,17 +3,19 @@
 
 use std::sync::mpsc::Sender;
 
+use super::recovery::Generation;
 use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayCommand {
     ShowWindow,
-    PickConnection,
-    Toggle(String),
+    PickConnection(Generation),
+    Toggle(Generation, String),
     Quit,
 }
 
 pub struct OxidomTray {
+    pub generation: Option<Generation>,
     pub sessions: Vec<(String, bool)>,
     pub status_text: String,
     /// A tunnel is down and said why. Toasts do not reach a hidden window —
@@ -70,11 +72,16 @@ impl ksni::Tray for OxidomTray {
             .iter()
             .map(|(profile, running)| {
                 let profile = profile.clone();
+                let generation = self.generation;
                 CheckmarkItem {
                     label: profile.clone(),
                     checked: *running,
                     activate: Box::new(move |tray: &mut Self| {
-                        let _ = tray.commands.send(TrayCommand::Toggle(profile.clone()));
+                        if let Some(generation) = generation {
+                            let _ = tray
+                                .commands
+                                .send(TrayCommand::Toggle(generation, profile.clone()));
+                        }
                     }),
                     ..Default::default()
                 }
@@ -88,9 +95,15 @@ impl ksni::Tray for OxidomTray {
         menu.extend([
             StandardItem {
                 label: "Pick connection…".to_string(),
-                activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.commands.send(TrayCommand::PickConnection);
-                }),
+                enabled: self.generation.is_some(),
+                activate: {
+                    let generation = self.generation;
+                    Box::new(move |tray: &mut Self| {
+                        if let Some(generation) = generation {
+                            let _ = tray.commands.send(TrayCommand::PickConnection(generation));
+                        }
+                    })
+                },
                 ..Default::default()
             }
             .into(),

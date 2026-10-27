@@ -270,6 +270,7 @@ enum SelectionIntent {
 
 #[derive(Clone)]
 pub struct ServersView {
+    binding_revision: Rc<Cell<u64>>,
     pub root: gtk::ScrolledWindow,
     content: gtk::Box,
     /// Just the subscription blocks and the "nothing matches" page — the part a
@@ -558,6 +559,7 @@ impl ServersView {
             on_create_pool: Rc::new(RefCell::new(None)),
             on_connect_pool: Rc::new(RefCell::new(None)),
             on_connect_selection: Rc::new(RefCell::new(None)),
+            binding_revision: Rc::new(Cell::new(0)),
             on_clear_search: Rc::new(RefCell::new(None)),
             direct_latencies: Rc::new(RefCell::new(HashMap::new())),
             picker_refresh: Rc::new(RefCell::new(None)),
@@ -1536,6 +1538,17 @@ impl ServersView {
         self.present_selection_dialog(SelectionIntent::Filter);
     }
 
+    pub fn retire_binding(&self) {
+        self.binding_revision
+            .set(self.binding_revision.get().saturating_add(1));
+        if let Some(popover) = self.connect_button.popover() {
+            popover.popdown();
+        }
+        if let Some(popover) = self.connect_rotation.popover() {
+            popover.popdown();
+        }
+    }
+
     /// What Connect would run: exactly what is on screen, under a name and the
     /// chosen strategy.
     ///
@@ -1703,6 +1716,7 @@ impl ServersView {
     /// a modal dialog can be watched changing, so applying each tick was work the
     /// user could not see; a form with one commit can also be abandoned.
     fn present_selection_dialog(&self, intent: SelectionIntent) {
+        let binding_revision = self.binding_revision.get();
         let subscriptions = self.subscriptions.borrow().clone();
         let editing = match &intent {
             SelectionIntent::Edit(group) => Some((**group).clone()),
@@ -2544,6 +2558,9 @@ impl ServersView {
             let dialog = dialog.downgrade();
             let draft = draft.clone();
             move |_| {
+                if view.binding_revision.get() != binding_revision {
+                    return;
+                }
                 if let Some(dialog) = dialog.upgrade() {
                     dialog.close();
                 }
@@ -2552,10 +2569,14 @@ impl ServersView {
         });
         connect_now.connect_clicked({
             let view = self.clone();
+            let callback = self.on_connect_selection.borrow().clone();
             let dialog = dialog.downgrade();
             let draft = draft.clone();
             let picker_query = picker_query.clone();
             move |_| {
+                if view.binding_revision.get() != binding_revision {
+                    return;
+                }
                 let draft = draft.borrow().clone();
                 let query = picker_query.borrow().clone();
                 let kind = if draft.kind() == GroupKind::List {
@@ -2577,7 +2598,7 @@ impl ServersView {
                     dialog.close();
                 }
                 view.show_selection(&draft);
-                if let Some(callback) = view.on_connect_selection.borrow().clone() {
+                if let Some(callback) = callback.as_ref() {
                     callback(query);
                 }
             }
@@ -2589,6 +2610,9 @@ impl ServersView {
             let name_row = name_row.clone();
             let icon_row = icon_row.clone();
             move |_| {
+                if view.binding_revision.get() != binding_revision {
+                    return;
+                }
                 let name = name_row.text().trim().to_string();
                 if name.is_empty() {
                     return;

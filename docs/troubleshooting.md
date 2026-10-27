@@ -1,7 +1,9 @@
 # Troubleshooting
 
-After a daemon replacement, an already-open GUI remains bound to the old owner and can report
-unavailable even when a new daemon is serving. Reopen the GUI to select it explicitly. The client
+After daemon loss, the GUI reports unknown state and attempts recovery only on its selected
+endpoint. A replacement must prove the same store identity and provide required state before
+controls return. Different/unverifiable stores stay unavailable; reopen to select one explicitly.
+No private daemon is spawned by recovery. The client
 does not silently switch buses/stores or replay a failed mutation: a timeout or lost reply does
 not prove that the requested change did not happen. Check current state before repeating it.
 Older daemons without the read-only identity handshake have optional geo-download/probe-cancel

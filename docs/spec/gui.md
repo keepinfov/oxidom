@@ -21,16 +21,43 @@ No late hydration result may overwrite an interactive action.
 Hydration fields fail independently. A failed subscription read is not an authoritative empty
 catalog and must not prune saved GUI ordering. A failed initial status produces unknown state,
 not proof that tunnels stopped; unavailable state must not clear a desktop proxy. Retain existing
-defaults and older-daemon degradation for other fields. Capability checks run once in their
-existing order. This does not impose a total hydration deadline or move tray/desktop-proxy work
+defaults for display, but failed catalog/profile/settings or non-legacy runtime reads leave control
+unavailable and start selected recovery. Capability checks read cached handshake facts. This does
+not impose a total hydration deadline or move tray/desktop-proxy work
 off the main thread.
 
 `OXIDOM_SESSION_DAEMON=external` makes startup a discovery-only client of externally supervised
 daemons. On absence, use the existing unavailable dialog; Retry must not create a private daemon
-or invoke a service manager. Runtime poll failure continues to retry the bound client, not run
-discovery or a daemon restart loop. Closing the window, Quit and discovery failure are not daemon
+or invoke a service manager. Runtime poll failure uses selected recovery below, never discovery
+or a daemon restart loop. Closing the window, Quit and discovery failure are not daemon
 stop commands. The opt-in user daemon unit is independent of the tray unit; ordinary standalone
 startup does not promise cgroup or logout survival.
+
+## Selected recovery (binding)
+
+A failed authoritative poll or operation follow-up retires the binding before applying operation
+outcomes or reconciling desktop proxy. Preserve last-known sessions and proxy as unknown, never
+infer stopped from missing replies. Retire callbacks by a binding generation separate from action
+epochs; old success, failure and worker-loss results cannot update catalog/settings/status/logs,
+retire successor operations or launch follow-up mutations. Each binding owns its poll mailbox and
+busy flag. Close daemon-derived dialogs/popovers on retirement, reject stale picker submissions
+before selection changes, and stamp queued tray commands when their menu is built.
+
+Run at most one recovery/hydration worker. Retry failed attempts no sooner than two seconds after
+completion. Use only `recover_selected` from `storage.md`: no discovery, bus/store fallback,
+bootstrap, mutation replay or supervisor invocation. Legacy successors remain refused without
+store proof. A candidate is not installed until subscriptions, profiles, status, settings and probe
+state (including queued/running phases) have all loaded. Runtime is required except explicit
+`UnknownMethod` from a legacy binding. All reads use the same immutable client. This is coherent
+identity, not a transactional database snapshot or universal hard hydration deadline.
+
+Install the candidate, state, capabilities, runtime locks and widgets while admission is closed,
+then enable control. Clear old optimistic operations, pending closes, probe notifications and
+remote log cursor; preserve local logs, validated selection and GUI preferences. Refresh settings
+baseline, adopting it for a clean draft while preserving unsubmitted edits in a dirty draft; never
+replay Apply. Local Cancel/Discard/Quit remain usable while unavailable. GUI closure still does not
+stop daemon sessions. No guarantee is made that an indeterminate mutation did not execute; fresh
+state must be inspected before repeating it.
 
 ## Layout
 
@@ -47,7 +74,7 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   away, and a control that waits for it reads as one that missed the press. The card's button
   lives in the region a collapsed card hides, so the context menu borrows the same button and
   therefore shows the same label. Stopping is not a failure and raises no error. Neither
-  control offers a stop unless the daemon answered `CancelProbes` at startup: a button that
+  control offers a stop unless the read-only handshake advertises probe cancellation: a button that
   says it will stop something and then cannot is worse than the second press being ignored.
  - **Server card** (custom widget): country **flag**, server **name**, protocol **subtitle**
    (`transport_label`, e.g. "vless + xhttp + reality"), optional **latency badge** (green when

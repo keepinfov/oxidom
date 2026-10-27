@@ -68,6 +68,7 @@ fn quoted_list(values: &[String]) -> String {
 
 #[derive(Clone)]
 struct HeaderControls {
+    add_popover: gtk::Popover,
     root: gtk::Box,
     add_subscription: gtk::Button,
     import_server: gtk::Button,
@@ -100,6 +101,9 @@ pub struct SubscriptionsView {
 }
 
 impl SubscriptionsView {
+    pub fn retire_binding(&self) {
+        self.header.add_popover.popdown();
+    }
     pub fn new() -> Self {
         let content = gtk::Box::new(gtk::Orientation::Vertical, 22);
         content.set_hexpand(true);
@@ -445,6 +449,7 @@ fn make_header_controls(
     actions.append(&add_menu);
     actions.append(&update_all);
     HeaderControls {
+        add_popover: popover,
         root: actions,
         add_subscription,
         import_server,

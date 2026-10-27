@@ -12,6 +12,7 @@ mod group;
 mod logfeed;
 mod operation;
 mod prefs;
+mod recovery;
 mod reduce;
 mod server_card;
 mod sidebar;

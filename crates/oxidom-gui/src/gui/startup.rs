@@ -3,10 +3,10 @@ use std::sync::mpsc;
 use anyhow::Result;
 use oxidom_core::client::DaemonClient;
 use oxidom_core::config::Config;
-use oxidom_core::ipc::{ProfileEntry, RuntimeInfo, StatusInfo};
+use oxidom_core::ipc::{ProbeState, ProfileEntry, RuntimeInfo, StatusInfo};
 use oxidom_core::model::Subscription;
 
-use super::reduce::SnapshotState;
+use super::reduce::{ProbePhase, ProbeWait, SnapshotState};
 
 /// Owned startup state, delivered once before the window accepts any actions.
 pub(super) struct InitialData {
@@ -32,18 +32,88 @@ struct InitialResults {
 }
 
 impl InitialData {
+    pub fn load_recovered(client: &DaemonClient) -> Result<Self> {
+        let runtime = client.runtime_info_optional()?;
+        let mut data = Self::recovered(
+            InitialResults {
+                subscriptions: client.subscriptions(),
+                profiles: client.list_profiles(),
+                status: client.status(),
+                settings: client.settings_with_watchdog_support(),
+                runtime: Ok(runtime.clone().unwrap_or_default()),
+                geo_download_supported: client.supports_geo_download(),
+                probe_cancel_supported: client.supports_probe_cancel(),
+            },
+            client.probe_state(),
+        )?;
+        data.runtime = runtime;
+        Ok(data)
+    }
+
+    fn recovered(results: InitialResults, probe: Result<ProbeState>) -> Result<Self> {
+        // Do not publish defaults as authoritative replacement state. All these
+        // reads belong to the same immutable unique-owner client.
+        results
+            .subscriptions
+            .as_ref()
+            .map_err(|_| anyhow::anyhow!("catalog hydration failed"))?;
+        results
+            .profiles
+            .as_ref()
+            .map_err(|_| anyhow::anyhow!("profile hydration failed"))?;
+        results
+            .status
+            .as_ref()
+            .map_err(|_| anyhow::anyhow!("status hydration failed"))?;
+        results
+            .settings
+            .as_ref()
+            .map_err(|_| anyhow::anyhow!("settings hydration failed"))?;
+        results
+            .runtime
+            .as_ref()
+            .map_err(|_| anyhow::anyhow!("runtime hydration failed"))?;
+        let probe = probe?;
+        let mut data = Self::from(results);
+        data.ui.readings = probe.readings;
+        data.ui.proxied = probe.proxied;
+        let now = std::time::Instant::now();
+        for (ids, phase) in [
+            (probe.queued, ProbePhase::Queued),
+            (probe.running, ProbePhase::Running),
+        ] {
+            for id in ids {
+                let mut wait = ProbeWait::new(now);
+                wait.acked = true;
+                wait.phase = phase;
+                data.ui.checking.insert(id, wait);
+            }
+        }
+        Ok(data)
+    }
+
     pub fn load(client: &DaemonClient) -> Self {
+        let runtime = client.runtime_info_optional();
+        let runtime_error = runtime
+            .as_ref()
+            .err()
+            .map(|_| "runtime unavailable".to_string());
+        let runtime = runtime.ok().flatten();
         // Capability checks read cached handshake facts and never cancel work.
-        InitialResults {
+        let mut data = Self::from(InitialResults {
             subscriptions: client.subscriptions(),
             profiles: client.list_profiles(),
             status: client.status(),
             settings: client.settings_with_watchdog_support(),
-            runtime: client.runtime_info(),
+            runtime: Ok(runtime.clone().unwrap_or_default()),
             geo_download_supported: client.supports_geo_download(),
             probe_cancel_supported: client.supports_probe_cancel(),
+        });
+        data.runtime = runtime;
+        if let Some(error) = runtime_error {
+            data.ui.poll_failed(0, error);
         }
-        .into()
+        data
     }
 }
 
@@ -53,7 +123,28 @@ impl From<InitialResults> for InitialData {
             .status
             .as_ref()
             .err()
-            .map(|error| format!("{error:#}"));
+            .map(|error| format!("{error:#}"))
+            .or_else(|| {
+                results
+                    .subscriptions
+                    .as_ref()
+                    .err()
+                    .map(|_| "catalog unavailable".into())
+            })
+            .or_else(|| {
+                results
+                    .profiles
+                    .as_ref()
+                    .err()
+                    .map(|_| "profiles unavailable".into())
+            })
+            .or_else(|| {
+                results
+                    .settings
+                    .as_ref()
+                    .err()
+                    .map(|_| "settings unavailable".into())
+            });
         let status = results.status.unwrap_or_default();
         let mut ui = SnapshotState::new(&status);
         if let Some(error) = poll_error {
@@ -100,6 +191,35 @@ mod tests {
     use std::thread;
 
     use super::super::reduce::{SessionRowState, session_rows};
+
+    #[test]
+    fn successor_hydration_rejects_any_missing_authoritative_field() {
+        for missing in 0..6 {
+            let mut fetched = results();
+            fetched.runtime = Ok(RuntimeInfo::default());
+            let mut probe = Ok(ProbeState::default());
+            match missing {
+                0 => fetched.subscriptions = Err(anyhow::anyhow!("offline")),
+                1 => fetched.profiles = Err(anyhow::anyhow!("offline")),
+                2 => fetched.status = Err(anyhow::anyhow!("offline")),
+                3 => fetched.settings = Err(anyhow::anyhow!("offline")),
+                4 => fetched.runtime = Err(anyhow::anyhow!("offline")),
+                _ => probe = Err(anyhow::anyhow!("offline")),
+            }
+            assert!(InitialData::recovered(fetched, probe).is_err());
+        }
+        let mut fetched = results();
+        fetched.runtime = Ok(RuntimeInfo::default());
+        let probe = ProbeState {
+            running: vec!["running".into()],
+            queued: vec!["queued".into()],
+            ..ProbeState::default()
+        };
+        let data = InitialData::recovered(fetched, Ok(probe)).unwrap();
+        assert_eq!(data.ui.checking["running"].phase, ProbePhase::Running);
+        assert_eq!(data.ui.checking["queued"].phase, ProbePhase::Queued);
+        assert!(data.ui.checking.values().all(|wait| wait.acked));
+    }
 
     fn results() -> InitialResults {
         InitialResults {

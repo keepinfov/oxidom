@@ -158,8 +158,8 @@ has a fresh process-local binding stamp; clones share the stamp.
 No mutation is retried or replayed, including after a timeout or lost reply: execution may already
 have happened. Recovery does not resolve that ambiguity. A consumer must hydrate required state
 and reject retired-binding completions before installing a candidate and resuming control. The
-current GUI does not yet call this API: after replacement it remains unavailable until explicitly
-reopened. This boundary does not claim automatic GUI recovery or complete GUI callback fencing.
+GUI follows the selected-recovery and callback-fencing contract in `gui.md`; an unverifiable
+successor stays unavailable and requires explicit new selection rather than silent fallback.
 
 ### Session-daemon supervision ownership (binding)
 
