@@ -885,9 +885,39 @@ eth0 00000000 0100A8C0 0003 0 0 100 00000000 0 0 0
 
     #[test]
     fn a_refused_connection_is_the_servers_fault() -> io::Result<()> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // Reserve the port without listening: closing a listener first leaves
+        // a reuse race with other parallel tests (or inherited pre-exec fds).
+        let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        address.sin_family = libc::AF_INET as _;
+        address.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+        let mut length = std::mem::size_of_val(&address) as libc::socklen_t;
+        if unsafe {
+            libc::bind(
+                socket.as_raw_fd(),
+                (&address as *const libc::sockaddr_in).cast(),
+                length,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe {
+            libc::getsockname(
+                socket.as_raw_fd(),
+                (&mut address as *mut libc::sockaddr_in).cast(),
+                &mut length,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let port = u16::from_be(address.sin_port);
 
         assert_eq!(tcp_ping("127.0.0.1", port), ProbeOutcome::Unreachable);
         Ok(())
