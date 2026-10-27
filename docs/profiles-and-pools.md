@@ -1,5 +1,11 @@
 # Profiles and pools
 
+A profile made from a Servers-page group stores an independent copy of its selection. Editing
+the group later does not update that profile. The profile dialog preserves membership while
+editing other options; use `oxidom profile edit <name>` to change an existing profile's list or
+rule, substituting its actual name. This does not change a running session until explicitly
+reconnected.
+
 A **profile** is persistent configuration: which server to use, on which ports,
 with or without a network interface. A **session** is the running instance of one
 profile. Several profiles can be up at once, each on its own loopback address —

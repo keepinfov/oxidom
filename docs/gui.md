@@ -27,6 +27,10 @@ than tested by issuing cancellation requests. Ordinary existing daemon operation
 
 ## The five pages
 
+Group membership shown in a profile is an independent copy, not a live link to the Servers-page
+group. The profile dialog preserves that membership; edit an existing profile's list/rule with
+`oxidom profile edit <name>`. Editing a GUI group alone does not rewrite the profile.
+
 | Page | What it is for |
 |---|---|
 | **Servers** | The server browser: cards, search, filters, groups, and the Connect bar. |
