@@ -1133,6 +1133,15 @@ mod tests {
     }
 
     #[test]
+    fn membership_guidance_names_the_independent_profile_and_supported_editor() {
+        for hint in [LIST_MEMBERSHIP_HINT, RULE_MEMBERSHIP_HINT] {
+            assert!(hint.contains("independent copy"));
+            assert!(hint.contains("oxidom profile edit <name>"));
+            assert!(!hint.contains("from the group chips"));
+        }
+    }
+
+    #[test]
     fn what_the_dialog_never_shows_survives_an_unchanged_round_trip() {
         let entry = ProfileEntry {
             name: "work".to_string(),
