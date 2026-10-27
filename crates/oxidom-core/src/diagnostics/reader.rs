@@ -185,6 +185,7 @@ fn read_inner(path: &Path, cursor: Option<&str>, limit: u32) -> io::Result<Page>
         TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
         TryLockError::Error(error) => error,
     })?;
+    let unlock = super::Unlock(&lock);
     #[cfg(test)]
     super::tests::retain_lock(&lock);
     let mut generations = Vec::with_capacity(2);
@@ -208,6 +209,7 @@ fn read_inner(path: &Path, cursor: Option<&str>, limit: u32) -> io::Result<Page>
         return Err(io::ErrorKind::NotFound.into());
     }
     // All raw bytes are now bounded and owned; do not hold up appends while parsing.
+    drop(unlock);
     drop(lock);
     let mut page = Page {
         version: 1,
@@ -630,6 +632,33 @@ mod tests {
     }
 
     #[test]
+    fn reader_snapshot_release_does_not_wait_for_retained_descriptors() {
+        use super::super::tests::{RETAIN_LOCK, RETAINED_LOCK};
+        for unsafe_leaf in [false, true] {
+            let journal = Journal::new();
+            if unsafe_leaf {
+                std::os::unix::fs::symlink(journal.0.join("missing"), journal.path()).unwrap();
+            } else {
+                journal.put("journal", ONE);
+            }
+            RETAIN_LOCK.set(true);
+            let result = read(&journal.path(), None, 0);
+            if unsafe_leaf {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ELOOP));
+            } else {
+                assert_eq!(result.unwrap().records.len(), 1);
+            }
+            let retained = RETAINED_LOCK.with_borrow_mut(Option::take).unwrap();
+            let contender = File::open(journal.0.join("journal.lock")).unwrap();
+            contender
+                .try_lock()
+                .expect("snapshot release must not depend on retained shared descriptors");
+            contender.unlock().unwrap();
+            drop(retained);
+        }
+    }
+
+    #[test]
     fn missing_files_are_not_created_and_contention_is_nonblocking() {
         let journal = Journal::new();
         assert_eq!(
@@ -651,6 +680,7 @@ mod tests {
             read(&journal.path(), None, 0).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+        lock.unlock().unwrap();
         drop(lock);
         assert_eq!(journal.read(None, 0).records.len(), 1);
     }

@@ -383,6 +383,7 @@ impl Diagnostics {
             ),
             TryLockError::Error(error) => error,
         })?;
+        let _unlock = Unlock(&lock);
         #[cfg(test)]
         tests::retain_lock(&lock);
 
@@ -532,6 +533,15 @@ impl Diagnostics {
         #[cfg(test)]
         tests::fail_at(tests::Stage::DirectorySync)?;
         self.directory.sync_all()
+    }
+}
+
+/// Closing alone lets a pre-exec inherited descriptor extend the lock scope.
+struct Unlock<'a>(&'a File);
+
+impl Drop for Unlock<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
     }
 }
 
@@ -856,8 +866,8 @@ mod tests {
 
     thread_local! {
         static FAULT: Cell<Option<Fault>> = const { Cell::new(None) };
-        static RETAIN_LOCK: Cell<bool> = const { Cell::new(false) };
-        static RETAINED_LOCK: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
+        pub(super) static RETAIN_LOCK: Cell<bool> = const { Cell::new(false) };
+        pub(super) static RETAINED_LOCK: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
     }
 
     pub(super) fn retain_lock(file: &File) {
@@ -1461,6 +1471,7 @@ mod tests {
                 .join()
                 .unwrap();
         });
+        lock.unlock().unwrap();
         drop(lock);
         sink.write(event()).unwrap();
     }
@@ -1569,6 +1580,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+        lock.unlock().unwrap();
         drop(lock);
         sink.write(event()).unwrap();
     }

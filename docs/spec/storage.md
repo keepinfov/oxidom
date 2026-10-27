@@ -58,6 +58,13 @@ A failure after rename means the replacement may already be visible but its dura
 confirmed; it must not be reported as a successful save. This is per-file durability, not a
 transaction across the store's separate files.
 
+The last logical store-lease owner explicitly unlocks before closing its descriptor. Diagnostic
+writer and bounded reader-snapshot scopes likewise explicitly unlock on success and error, before
+reader parsing. A duplicated/inherited descriptor is not a logical lease owner and must not extend
+these scopes through pre-exec inheritance. Independent contenders retain their own locks; stable
+lock files are never unlinked. Daemon service/worker `Arc` references still retain the actual store
+lease through engine destruction, not merely until terminal cleanup returns.
+
 A system daemon run from the NixOS module keeps all of the above in its `StateDirectory`
 (`/var/lib/oxidom`) instead of the user's XDG dirs, so **the choice of daemon is the choice of
 database**. The GUI must not make that choice by accident:
