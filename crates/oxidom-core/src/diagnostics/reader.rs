@@ -185,6 +185,8 @@ fn read_inner(path: &Path, cursor: Option<&str>, limit: u32) -> io::Result<Page>
         TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
         TryLockError::Error(error) => error,
     })?;
+    #[cfg(test)]
+    super::tests::retain_lock(&lock);
     let mut generations = Vec::with_capacity(2);
     for (suffix, current) in [(b".1".as_slice(), false), (b"".as_slice(), true)] {
         if let Some(file) = open_leaf(&directory, &leaf(suffix)?)? {

@@ -157,6 +157,22 @@ mod tests {
     }
 
     #[test]
+    fn retained_descriptors_cannot_extend_a_dropped_store_lease() {
+        let dir = TestDir::new();
+        let owner = StoreLock::acquire(&dir.0).unwrap();
+        let retained = owner._file.try_clone().unwrap();
+        assert!(StoreLock::acquire(&dir.0).is_err());
+        drop(owner);
+        let next = StoreLock::acquire(&dir.0)
+            .expect("a retained descriptor must not extend the logical store lease");
+        // A duplicate is not another logical owner, nor can closing it release
+        // the independently acquired successor's lock.
+        drop(retained);
+        assert!(StoreLock::acquire(&dir.0).is_err());
+        drop(next);
+    }
+
+    #[test]
     fn independent_acquisitions_conflict_until_the_owner_is_dropped() {
         let dir = TestDir::new();
         let owner = StoreLock::acquire(&dir.0).unwrap();
