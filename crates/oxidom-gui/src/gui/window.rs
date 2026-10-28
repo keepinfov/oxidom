@@ -2598,7 +2598,8 @@ impl Controller {
                 profile,
                 server_id,
                 replaces_pool,
-            } => self.confirm_repoint_and_up(profile, server_id, replaces_pool),
+                saved,
+            } => self.confirm_repoint_and_up(profile, server_id, replaces_pool, saved),
         }
     }
 
@@ -2607,18 +2608,27 @@ impl Controller {
         profile_name: String,
         server_id: String,
         replaces_pool: bool,
+        expected: Box<ProfileEntry>,
     ) {
+        let expected_action = CardAction::RepointAndUp {
+            profile: profile_name.clone(),
+            server_id: server_id.clone(),
+            replaces_pool,
+            saved: expected.clone(),
+        };
         let (profile, server_name) = {
             let state = self.state.borrow();
-            let Some(entry) = state
-                .profiles
-                .iter()
-                .find(|entry| entry.name == profile_name)
-            else {
+            if !super::reduce::saved_entry_matches(&state.profiles, &expected)
+                || card_plan(&state.profiles, &state.ui, &server_id)
+                    .action
+                    .as_ref()
+                    != Some(&expected_action)
+            {
                 drop(state);
-                self.show_message(&format!("Profile “{profile_name}” no longer exists"));
+                self.show_message("Profile or selected action changed - choose the server again");
                 return;
-            };
+            }
+            let entry = &expected;
             let server = state
                 .subscriptions
                 .iter()
@@ -2699,6 +2709,20 @@ impl Controller {
                     return;
                 }
                 if let Some(controller) = weak.upgrade() {
+                    let unchanged = {
+                        let state = controller.state.borrow();
+                        super::reduce::saved_entry_matches(&state.profiles, &expected)
+                            && card_plan(&state.profiles, &state.ui, &server_id)
+                                .action
+                                .as_ref()
+                                == Some(&expected_action)
+                    };
+                    if !unchanged {
+                        controller.show_message(
+                            "Profile or selected action changed - choose the server again",
+                        );
+                        return;
+                    }
                     controller.repoint_and_up(profile_name.clone(), profile.clone());
                 }
             }

@@ -2171,7 +2171,12 @@ pub(super) enum CardAction {
         profile: String,
         server_id: String,
         replaces_pool: bool,
+        saved: Box<ProfileEntry>,
     },
+}
+
+pub(super) fn saved_entry_matches(profiles: &[ProfileEntry], expected: &ProfileEntry) -> bool {
+    profiles.iter().find(|entry| entry.name == expected.name) == Some(expected)
 }
 
 fn profile_points_to_server(entry: &ProfileEntry, state: &SnapshotState, server_id: &str) -> bool {
@@ -2226,9 +2231,10 @@ pub(super) fn card_action(
     }) {
         return CardAction::DownProfile(selected);
     }
-    if let Some(entry) =
-        selected_entry.filter(|entry| profile_points_to_server(entry, state, server_id))
-    {
+    let Some(entry) = selected_entry else {
+        return CardAction::DownProfile(selected);
+    };
+    if profile_points_to_server(entry, state, server_id) {
         if entry.pool.is_none() && session_for(state, &selected).is_some() {
             return CardAction::ReconnectProfile(selected, Box::new(entry.clone()));
         }
@@ -2238,6 +2244,7 @@ pub(super) fn card_action(
         profile: selected,
         server_id: server_id.to_string(),
         replaces_pool,
+        saved: Box::new(entry.clone()),
     }
 }
 
@@ -3529,6 +3536,39 @@ mod tests {
                 assert_ne!(current, displayed, "{wire:?}, edit {edit}");
             }
         }
+    }
+
+    #[test]
+    fn repoint_plans_and_saved_identity_are_invalidated_by_same_named_profile_edits() {
+        let saved = profile("work", "original");
+        let mut state = state();
+        state.selected_profile = "work".into();
+        let profiles = std::slice::from_ref(&saved);
+        let displayed = card_plan(profiles, &state, "target");
+        assert!(matches!(
+            &displayed.action,
+            Some(CardAction::RepointAndUp { saved: expected, .. }) if **expected == saved
+        ));
+        assert!(saved_entry_matches(profiles, &saved));
+        assert!(!saved_entry_matches(&[], &saved));
+        for edit in 0..5 {
+            let mut changed = saved.clone();
+            match edit {
+                0 => changed.socks_port += 1,
+                1 => changed.http_port += 1,
+                2 => changed.core.pool_probe_url = Some("https://probe.example.test/".into()),
+                3 => changed.server = "another".into(),
+                _ => changed.pool = Some(PoolQuery::default()),
+            }
+            let profiles = [changed];
+            assert!(!saved_entry_matches(&profiles, &saved), "edit {edit}");
+            let current = card_plan(&profiles, &state, "target");
+            assert_eq!(current.label, displayed.label);
+            assert_ne!(current, displayed, "edit {edit}");
+        }
+        assert_ne!(card_plan(profiles, &state, "another-target"), displayed);
+        state.selected_profile = "home".into();
+        assert_ne!(card_plan(profiles, &state, "target"), displayed);
     }
 
     #[test]
@@ -5716,11 +5756,12 @@ mod tests {
 
         work.server = "other".to_string();
         assert_eq!(
-            card_action(&[work], &state, "same"),
+            card_action(std::slice::from_ref(&work), &state, "same"),
             CardAction::RepointAndUp {
                 profile: "work".to_string(),
                 server_id: "same".to_string(),
                 replaces_pool: false,
+                saved: Box::new(work.clone()),
             }
         );
     }
@@ -5747,7 +5788,7 @@ mod tests {
             entry.pool = Some(PoolQuery::default());
 
             assert_eq!(
-                card_action(&[entry], &state, "member"),
+                card_action(std::slice::from_ref(&entry), &state, "member"),
                 if selected == "default" {
                     CardAction::Connect("member".to_string())
                 } else {
@@ -5755,6 +5796,7 @@ mod tests {
                         profile: selected.to_string(),
                         server_id: "member".to_string(),
                         replaces_pool: true,
+                        saved: Box::new(entry.clone()),
                     }
                 }
             );
