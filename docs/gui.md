@@ -27,6 +27,17 @@ than tested by issuing cancellation requests. Ordinary existing daemon operation
 
 ## The five pages
 
+Expanded Profiles rows distinguish **Saved selection**, **Pending request** and **Reported
+selection**. The pending headline names the request, not a previous running target. During an
+outage reported facts are last-known and controls remain unavailable. Cards may indicate use by
+other sessions, but their primary button acts only on the selected session; its label and action
+come from one decision. Held connections retain an explicit Stop; failed saved sessions use a
+restart rather than attempting to start an already-existing runtime.
+
+Connecting a pool or a default single server does not save a profile. Retargeting a named
+single-server profile still asks explicitly before Repoint changes its saved selection and
+reconnects. A runtime-only named session can be stopped, not silently turned into a saved profile.
+
 Group membership shown in a profile is an independent copy, not a live link to the Servers-page
 group. The profile dialog preserves that membership; edit an existing profile's list/rule with
 `oxidom profile edit <name>`. Editing a GUI group alone does not rewrite the profile.
