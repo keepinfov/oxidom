@@ -1516,9 +1516,10 @@ pub(super) struct SessionRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SessionAction {
-    Start(String),
+    /// Capture the saved entry so a later edit invalidates this action.
+    Start(String, Box<ProfileEntry>),
     Stop(String),
-    Restart(String),
+    Restart(String, Box<ProfileEntry>),
 }
 
 /// A labelled fact about a session, shown as its own row when expanded.
@@ -2005,9 +2006,15 @@ pub(super) fn session_rows(
             {
                 Some(SessionAction::Stop(entry.name.clone()))
             } else if saved_profile && session.is_some() {
-                Some(SessionAction::Restart(entry.name.clone()))
+                Some(SessionAction::Restart(
+                    entry.name.clone(),
+                    Box::new(entry.clone()),
+                ))
             } else if saved_profile {
-                Some(SessionAction::Start(entry.name.clone()))
+                Some(SessionAction::Start(
+                    entry.name.clone(),
+                    Box::new(entry.clone()),
+                ))
             } else {
                 None
             };
@@ -2024,7 +2031,7 @@ pub(super) fn session_rows(
                     && session_row_state(session) != SessionRowState::Unknown
                     && state.can_start(match action {
                         SessionAction::Stop(_) => UiOperationKind::DownProfile,
-                        SessionAction::Start(_) | SessionAction::Restart(_) => {
+                        SessionAction::Start(_, _) | SessionAction::Restart(_, _) => {
                             UiOperationKind::UpProfile
                         }
                     })
@@ -2162,20 +2169,23 @@ pub(super) fn card_action(
 
     if selected == "default"
         && session_for(state, &selected).is_some_and(|session| {
-            session.server_id.as_deref() == Some(server_id) && session.holding_traffic
+            session.selection.kind != "pool"
+                && session.server_id.as_deref() == Some(server_id)
+                && session.holding_traffic
         })
     {
         return CardAction::Disconnect;
     }
 
-    if selected == "default" && !replaces_pool {
-        // This is a literal move of the pre-sessions branch from
-        // `Controller::activate_server`: default must keep the same path, not a
-        // newly equivalent interpretation of the session list.
+    if selected == "default" {
+        // Default card clicks intentionally use temporary ConnectServer, even
+        // with a saved or running pool; they never rewrite the saved profile.
+        // A reported pool member is not an exact single-server connection.
         if matches!(
             state.current_status(),
             Status::Connected | Status::Connecting
         ) && state.connected_id.as_deref() == Some(server_id)
+            && session_for(state, &selected).is_none_or(|session| session.selection.kind != "pool")
         {
             return CardAction::Disconnect;
         }
@@ -2223,7 +2233,7 @@ pub(super) fn card_plan(
     let selected = &state.selected_profile;
     let session = session_for(state, selected);
     let saved = profiles.iter().any(|entry| entry.name == *selected);
-    if !saved && !session.is_some_and(|session| session.server_id.as_deref() == Some(server_id)) {
+    if !saved && session.is_none_or(|session| session.server_id.as_deref() != Some(server_id)) {
         return ControlPlan {
             label: "Unavailable",
             action: None,
@@ -3478,7 +3488,10 @@ mod tests {
                 true,
                 "error",
                 false,
-                Some(SessionAction::Restart("work".into())),
+                Some(SessionAction::Restart(
+                    "work".into(),
+                    Box::new(profile("work", "saved")),
+                )),
                 false,
             ),
             (
@@ -3492,7 +3505,10 @@ mod tests {
                 true,
                 "disconnected",
                 false,
-                Some(SessionAction::Restart("work".into())),
+                Some(SessionAction::Restart(
+                    "work".into(),
+                    Box::new(profile("work", "saved")),
+                )),
                 false,
             ),
             (
@@ -3676,13 +3692,53 @@ mod tests {
         let profiles = [profile("work", "same")];
         assert_eq!(
             session_rows(&profiles, &state, 0)[0].session_action,
-            Some(SessionAction::Start("work".into()))
+            Some(SessionAction::Start(
+                "work".into(),
+                Box::new(profiles[0].clone()),
+            ))
         );
         state.sessions = vec![session("work", "disconnected", "same")];
         assert_eq!(
             session_rows(&profiles, &state, 0)[0].session_action,
-            Some(SessionAction::Restart("work".into()))
+            Some(SessionAction::Restart(
+                "work".into(),
+                Box::new(profiles[0].clone()),
+            ))
         );
+    }
+
+    #[test]
+    fn saved_profile_edits_invalidate_captured_start_and_restart_actions() {
+        for retained in [false, true] {
+            let mut state = state();
+            if retained {
+                state.sessions = vec![session("work", "error", "original")];
+            }
+            let original = profile("work", "original");
+            let captured = session_rows(std::slice::from_ref(&original), &state, 0)[0]
+                .session_action
+                .clone();
+            assert!(captured.is_some());
+            assert_eq!(
+                captured,
+                session_rows(std::slice::from_ref(&original), &state, 0)[0].session_action
+            );
+            for change in ["server", "pool", "ports", "core"] {
+                let mut edited = original.clone();
+                match change {
+                    "server" => edited.server = "edited".into(),
+                    "pool" => edited.pool = Some(PoolQuery::default()),
+                    "ports" => edited.socks_port = original.socks_port.wrapping_add(1),
+                    "core" => {
+                        edited.core.pool_probe_url = Some("https://probe.example.test/".into());
+                    }
+                    _ => unreachable!(),
+                }
+                let current = session_rows(&[edited], &state, 0)[0].session_action.clone();
+                assert!(current.is_some());
+                assert_ne!(captured, current, "retained={retained}, change={change}");
+            }
+        }
     }
 
     #[test]
@@ -3805,8 +3861,10 @@ mod tests {
             let mut state = state();
             let now = Instant::now();
             state.pin_target(profile, Some("requested".into()), now);
-            let mut status = StatusInfo::default();
-            status.sessions = vec![session("other", "error", "requested")];
+            let mut status = StatusInfo {
+                sessions: vec![session("other", "error", "requested")],
+                ..StatusInfo::default()
+            };
             fold(&mut state, &snapshot(status.clone(), idle()), now, true);
             assert!(state.is_pinned(), "{profile}: another session's error");
             status
@@ -5544,7 +5602,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_member_replaces_a_pool_only_after_confirmation() {
+    fn default_pool_member_clicks_are_temporary_while_named_profiles_require_confirmation() {
         for selected in ["default", "work"] {
             let mut state = state();
             state.selected_profile = selected.to_string();
@@ -5566,13 +5624,32 @@ mod tests {
 
             assert_eq!(
                 card_action(&[entry], &state, "member"),
-                CardAction::RepointAndUp {
-                    profile: selected.to_string(),
-                    server_id: "member".to_string(),
-                    replaces_pool: true,
+                if selected == "default" {
+                    CardAction::Connect("member".to_string())
+                } else {
+                    CardAction::RepointAndUp {
+                        profile: selected.to_string(),
+                        server_id: "member".to_string(),
+                        replaces_pool: true,
+                    }
                 }
             );
         }
+    }
+
+    #[test]
+    fn a_held_default_pool_member_is_not_a_single_server_disconnect() {
+        let mut state = SnapshotState::new(&connected_to("member"));
+        let mut live = session("default", "error", "member");
+        live.holding_traffic = true;
+        live.selection.kind = "pool".into();
+        state.sessions = vec![live];
+        let mut entry = profile("default", "");
+        entry.pool = Some(PoolQuery::default());
+        assert_eq!(
+            card_action(&[entry], &state, "member"),
+            CardAction::Connect("member".into())
+        );
     }
 
     /// The optimistic "Connecting…" has to survive the daemon still reporting

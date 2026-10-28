@@ -668,7 +668,8 @@ fn build(
     let settings = SettingsView::new(&initial_config, {
         let callback = settings_callback.clone();
         move |values| {
-            if let Some(callback) = callback.borrow().as_ref() {
+            let callback = callback.borrow().clone();
+            if let Some(callback) = callback {
                 callback(values);
             }
         }
@@ -2672,7 +2673,8 @@ impl Controller {
                 .to_string()
         } else {
             format!(
-                "This will rewrite the saved server selection for “{profile_name}” and connect it."
+                "This will rewrite the saved server selection for “{profile_name}” and connect it. \
+                 The running connection will reconnect and existing connections will close."
             )
         };
         let dialog = adw::AlertDialog::new(Some(title.as_str()), Some(body.as_str()));
@@ -2772,6 +2774,11 @@ impl Controller {
                 &state.subscriptions,
                 &direct_latencies(&state.ui.readings),
             );
+            let mut target = state.ui.clone();
+            target.selected_profile.clone_from(&query.session);
+            if pool_plan(&target, &ids).action.is_none() {
+                return;
+            }
             state
                 .ui
                 .pin_pool_resolved(&query.session, &query, ids, Instant::now());
@@ -4764,9 +4771,9 @@ impl Controller {
             return;
         }
         match action {
-            SessionAction::Start(name) => self.up_profile(name),
+            SessionAction::Start(name, _) => self.up_profile(name),
             SessionAction::Stop(name) => self.down_profile(name),
-            SessionAction::Restart(name) => self.reconnect_profile(name),
+            SessionAction::Restart(name, _) => self.reconnect_profile(name),
         }
     }
 
@@ -5096,8 +5103,8 @@ impl Controller {
             .and_then(|row| row.session_action);
         let action = match intent.as_ref() {
             Some(SessionAction::Stop(_)) => Some(StatusAction::Disconnect),
-            Some(SessionAction::Start(_)) => Some(StatusAction::Connect),
-            Some(SessionAction::Restart(_)) => Some(StatusAction::Reconnect),
+            Some(SessionAction::Start(_, _)) => Some(StatusAction::Connect),
+            Some(SessionAction::Restart(_, _)) => Some(StatusAction::Reconnect),
             None if matches!(status, Status::Error(_)) => status_action_for(&status),
             None => None,
         };

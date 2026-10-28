@@ -76,9 +76,9 @@ impl ksni::Tray for OxidomTray {
                 let generation = self.generation;
                 let action = action.clone();
                 let verb = match action {
-                    Some(SessionAction::Start(_)) => "Connect",
+                    Some(SessionAction::Start(_, _)) => "Connect",
                     Some(SessionAction::Stop(_)) => "Stop",
-                    Some(SessionAction::Restart(_)) => "Reconnect",
+                    Some(SessionAction::Restart(_, _)) => "Reconnect",
                     None => "Unavailable",
                 };
                 CheckmarkItem {

@@ -11,6 +11,7 @@ use oxidom_core::model::Subscription;
 use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
 
 use super::super::group::subscription_description;
+use super::super::operation::UiOperationKind;
 use super::super::prefs::{FAVOURITES_ID, GroupKind, GuiPrefs, ServerGroup};
 use super::super::reduce::{
     CardAction, ControlPlan, FailureReport, FilterOption, GROUP_CONNECT_SESSION, HistoryChart,
@@ -81,7 +82,7 @@ pub struct CardCallbacks {
     /// deliberate act. The second argument is the selection already resolved to
     /// server ids, which is how the window recognises a session that is already
     /// running it.
-    pub connect_pool: Rc<dyn Fn(PoolQuery, Vec<String>, ControlPlan<PoolAction>)>,
+    pub connect_pool: PoolControlCallback,
     pub connect_selection: Rc<dyn Fn(PoolQuery)>,
     pub clear_search: Rc<dyn Fn()>,
     /// Show the log page narrowed to one server. Offered from the expanded
@@ -119,12 +120,14 @@ struct SubscriptionBlock {
     sort_generation: Rc<Cell<u64>>,
 }
 
-type BrowseCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+type BrowseCallback = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 /// Set on every rebuild, read long afterwards by the filter popover.
 type PoolCallback = Rc<RefCell<Option<Rc<dyn Fn(PoolQuery)>>>>;
 /// Like [`PoolCallback`], plus the ids the query resolved to.
-type ResolvedPoolCallback =
-    Rc<RefCell<Option<Rc<dyn Fn(PoolQuery, Vec<String>, ControlPlan<PoolAction>)>>>>;
+type PoolControlCallback = Rc<dyn Fn(PoolQuery, Vec<String>, ControlPlan<PoolAction>)>;
+type ResolvedPoolCallback = Rc<RefCell<Option<PoolControlCallback>>>;
+type ControlContext = Rc<RefCell<Option<(Vec<ProfileEntry>, SnapshotState)>>>;
+type VisiblePoolPlan = Rc<RefCell<Option<(Vec<String>, ControlPlan<PoolAction>)>>>;
 type PickerRefresh = Rc<RefCell<Option<std::rc::Weak<dyn Fn()>>>>;
 /// Server id to its checkbox, in the order the picker laid them out.
 type PickerChecks = Rc<RefCell<Vec<(String, gtk::CheckButton)>>>;
@@ -279,9 +282,9 @@ pub struct ServersView {
     /// scope change actually replaces, and therefore the only part that fades.
     servers_area: gtk::Box,
     cards: Rc<RefCell<HashMap<String, ServerCard>>>,
-    control_context: Rc<RefCell<Option<(Vec<ProfileEntry>, SnapshotState)>>>,
+    control_context: ControlContext,
     card_plans: Rc<RefCell<HashMap<String, ControlPlan<CardAction>>>>,
-    pool_plan: Rc<RefCell<Option<(Vec<String>, ControlPlan<PoolAction>)>>>,
+    pool_plan: VisiblePoolPlan,
     blocks: Rc<RefCell<Vec<SubscriptionBlock>>>,
     /// Which servers are mid-check, so a repeated state for the same card does
     /// not double-count its block. `set_latency_state` is called for every card
@@ -715,7 +718,7 @@ impl ServersView {
         *self.on_connect_pool.borrow_mut() = Some(callbacks.connect_pool.clone());
         *self.on_connect_selection.borrow_mut() = Some(callbacks.connect_selection.clone());
         let clear_search = callbacks.clear_search.clone();
-        *self.on_clear_search.borrow_mut() = Some(Box::new(move || clear_search()));
+        *self.on_clear_search.borrow_mut() = Some(clear_search);
         *self.latencies.borrow_mut() = latency_states
             .iter()
             .filter_map(|(id, state)| sort_value(*state).map(|value| (id.clone(), value)))
@@ -740,7 +743,8 @@ impl ServersView {
             action.connect_clicked({
                 let callback = self.on_browse_subscriptions.clone();
                 move |_| {
-                    if let Some(callback) = callback.borrow().as_ref() {
+                    let callback = callback.borrow().clone();
+                    if let Some(callback) = callback {
                         callback();
                     }
                 }
@@ -1276,7 +1280,8 @@ impl ServersView {
                 else {
                     return;
                 };
-                if let Some(callback) = view.on_create_pool.borrow().as_ref() {
+                let callback = view.on_create_pool.borrow().clone();
+                if let Some(callback) = callback {
                     callback(query);
                 }
             }
@@ -1702,6 +1707,14 @@ impl ServersView {
         self.control_context.replace(Some((profiles, state)));
         self.sync_card_plans();
         self.sync_connect_bar();
+        let refresh = self
+            .picker_refresh
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade);
+        if let Some(refresh) = refresh {
+            refresh();
+        }
     }
 
     fn sync_card_plans(&self) {
@@ -2111,6 +2124,12 @@ impl ServersView {
                     &view.direct_latencies.borrow(),
                 );
                 let count = matched_ids.len();
+                let context = view.control_context.borrow().clone();
+                let actionable = context.is_some_and(|(_, state)| {
+                    state.poll_error.is_none()
+                        && pool_plan(&state, &matched_ids).action.is_some()
+                        && state.can_start(UiOperationKind::UpProfile)
+                });
                 let options = rotation_options(count);
                 let rot_value = rotation_draft.get();
                 let selected = options
@@ -2138,7 +2157,7 @@ impl ServersView {
                 syncing_rotation.set(false);
                 rotation_row.set_subtitle(&rotation_summary(rot_value, count));
                 rotation_row.set_sensitive(count > 2);
-                connect_now.set_sensitive(count > 0);
+                connect_now.set_sensitive(count > 0 && actionable);
                 while let Some(child) = preview_list.first_child() {
                     preview_list.remove(&child);
                 }
@@ -2615,14 +2634,20 @@ impl ServersView {
                 } else {
                     PoolKind::Rule
                 };
-                if selection_ids(
+                let members = selection_ids(
                     &query,
                     kind,
                     &view.subscriptions.borrow(),
                     &view.direct_latencies.borrow(),
-                )
-                .is_empty()
-                {
+                );
+                let context = view.control_context.borrow().clone();
+                let actionable = context.is_some_and(|(_, mut state)| {
+                    state.selected_profile.clone_from(&query.session);
+                    state.poll_error.is_none()
+                        && pool_plan(&state, &members).action.is_some()
+                        && state.can_start(UiOperationKind::UpProfile)
+                });
+                if members.is_empty() || !actionable {
                     return;
                 }
                 rotation_draft.commit(&view.connect_rotation_value);
@@ -2734,7 +2759,8 @@ impl ServersView {
         self.filter_alive_only.set(draft.alive_only);
         self.filter_max_latency_ms.set(draft.max_latency_ms);
         self.scope_members.borrow_mut().clone_from(&draft.members);
-        if let Some(clear_search) = self.on_clear_search.borrow().as_ref() {
+        let clear_search = self.on_clear_search.borrow().clone();
+        if let Some(clear_search) = clear_search {
             clear_search();
         }
         self.build_chip_bar();
@@ -2780,7 +2806,8 @@ impl ServersView {
                 self.set_filter_values(&PoolQuery::default());
             }
         }
-        if let Some(clear_search) = self.on_clear_search.borrow().as_ref() {
+        let clear_search = self.on_clear_search.borrow().clone();
+        if let Some(clear_search) = clear_search {
             clear_search();
         }
         self.build_chip_bar();
@@ -3098,7 +3125,7 @@ impl ServersView {
 
     /// Wires the "no servers yet" page's action button.
     pub fn connect_browse_subscriptions(&self, callback: impl Fn() + 'static) {
-        *self.on_browse_subscriptions.borrow_mut() = Some(Box::new(callback));
+        *self.on_browse_subscriptions.borrow_mut() = Some(Rc::new(callback));
     }
 
     fn apply_filter(&self) {
