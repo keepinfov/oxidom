@@ -10,6 +10,7 @@ use gtk::glib;
 
 use oxidom_core::APP_ID;
 use oxidom_core::config::Config;
+use oxidom_core::handle::{self as corehandle, HandleMatch};
 use oxidom_core::ipc;
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::logbook::{self, LogSlice};
@@ -24,12 +25,12 @@ use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
 use super::recovery::{Generation, RecoveryState, RetiredWork};
 use super::reduce::{
-    CardAction, Effect, PolledSnapshot, PoolAction, ProbePhase, ProbeWait, SessionRowState,
-    SnapshotState, SwitcherItem, SystemProxyState, about_comments, active_latency_for, card_action,
-    check_can_be_stopped, compact_status_visible, geo_download_prompt, history_chart, human_bytes,
-    latency_states, missing_core_message, other_profiles_message, pool_action, pool_short_label,
-    press_stops, proxy_status_label, reduce, selected_status, session_for, session_rows,
-    stop_report, switcher_items, switcher_visible,
+    CardAction, ControlPlan, Effect, PolledSnapshot, PoolAction, ProbePhase, ProbeWait,
+    SessionAction, SessionRowState, SnapshotState, SwitcherItem, SystemProxyState, about_comments,
+    activation_ids, active_latency_for, card_plan, check_can_be_stopped, compact_status_visible,
+    geo_download_prompt, history_chart, human_bytes, latency_states, missing_core_message,
+    other_profiles_message, pool_plan, pool_short_label, press_stops, proxy_status_label, reduce,
+    selected_status, session_for, session_rows, stop_report, switcher_items, switcher_visible,
 };
 use super::server_card::{self, LatencyState};
 use super::sidebar::{Page, Sidebar};
@@ -104,11 +105,13 @@ fn poll_worker<T>(receiver: &mpsc::Receiver<T>) -> WorkerPoll<T> {
 }
 
 /// The single thing a status strip offers to do about the state it reports.
-/// Absent for `Disconnected`, and for `Connecting` — which resolves on its own
-/// in seconds and has nothing to stop that has started.
+/// Session controls follow the row plan; an unavailable failed session can
+/// still expose its error without offering a mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusAction {
     Disconnect,
+    Connect,
+    Reconnect,
     ShowError,
 }
 
@@ -126,7 +129,7 @@ fn status_action_for(status: &Status) -> Option<StatusAction> {
 struct TrayState {
     generation: Option<Generation>,
     text: String,
-    sessions: Vec<(String, bool)>,
+    sessions: Vec<(String, bool, Option<SessionAction>)>,
     failed: bool,
 }
 
@@ -339,6 +342,7 @@ struct Controller {
     /// What the status action button currently promises, so pressing it does
     /// what its icon said rather than what the state has since become.
     status_action: Cell<Option<StatusAction>>,
+    status_session_action: RefCell<Option<SessionAction>>,
     /// Last (active, connecting) pair pushed to the cards, to avoid an
     /// O(cards) pass on every poll tick.
     applied_connection: RefCell<CardConnection>,
@@ -663,7 +667,8 @@ fn build(
     let settings = SettingsView::new(&initial_config, {
         let callback = settings_callback.clone();
         move |values| {
-            if let Some(callback) = callback.borrow().as_ref() {
+            let callback = callback.borrow().clone();
+            if let Some(callback) = callback {
                 callback(values);
             }
         }
@@ -977,6 +982,7 @@ fn build(
         }),
         system_proxy_failure: RefCell::new(None),
         status_action: Cell::new(None),
+        status_session_action: RefCell::new(None),
         applied_connection: RefCell::new(CardConnection::default()),
         poll: RefCell::new((Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)))),
         recovery_retry: Cell::new(Instant::now()),
@@ -2075,13 +2081,9 @@ impl Controller {
         let callbacks = SessionCallbacks {
             toggle: {
                 let weak = self.bound();
-                Rc::new(move |name, active| {
+                Rc::new(move |action| {
                     if let Some(controller) = weak.upgrade() {
-                        if active {
-                            controller.up_profile(name);
-                        } else {
-                            controller.down_profile(name);
-                        }
+                        controller.activate_session(action);
                     }
                 })
             },
@@ -2335,9 +2337,9 @@ impl Controller {
             },
             activate: {
                 let weak = self.bound();
-                Rc::new(move |id| {
+                Rc::new(move |id, plan| {
                     if let Some(controller) = weak.upgrade() {
-                        controller.activate_server(id);
+                        controller.activate_server(id, plan);
                     }
                 })
             },
@@ -2426,9 +2428,9 @@ impl Controller {
             },
             connect_pool: {
                 let weak = self.bound();
-                Rc::new(move |query, members| {
+                Rc::new(move |query, members, plan| {
                     if let Some(controller) = weak.upgrade() {
-                        controller.connect_pool(query, members);
+                        controller.connect_pool(query, members, plan);
                     }
                 })
             },
@@ -2572,24 +2574,32 @@ impl Controller {
         self.sync_connection_cards();
     }
 
-    fn activate_server(self: &Rc<Self>, server_id: String) {
+    fn activate_server(self: &Rc<Self>, server_id: String, displayed: ControlPlan<CardAction>) {
         if !self.admitted() {
             return;
         }
-        let action = {
+        let current = {
             let state = self.state.borrow();
-            card_action(&state.profiles, &state.ui, &server_id)
+            card_plan(&state.profiles, &state.ui, &server_id)
+        };
+        if current != displayed {
+            return;
+        }
+        let Some(action) = displayed.action else {
+            return;
         };
         match action {
             CardAction::Connect(id) => self.connect_server(id),
             CardAction::Disconnect => self.disconnect(),
-            CardAction::UpProfile(name) => self.up_profile(name),
+            CardAction::UpProfile(name, _) => self.up_profile(name),
             CardAction::DownProfile(name) => self.down_profile(name),
+            CardAction::ReconnectProfile(name, _) => self.reconnect_profile(name),
             CardAction::RepointAndUp {
                 profile,
                 server_id,
                 replaces_pool,
-            } => self.confirm_repoint_and_up(profile, server_id, replaces_pool),
+                saved,
+            } => self.confirm_repoint_and_up(profile, server_id, replaces_pool, saved),
         }
     }
 
@@ -2598,18 +2608,27 @@ impl Controller {
         profile_name: String,
         server_id: String,
         replaces_pool: bool,
+        expected: Box<ProfileEntry>,
     ) {
+        let expected_action = CardAction::RepointAndUp {
+            profile: profile_name.clone(),
+            server_id: server_id.clone(),
+            replaces_pool,
+            saved: expected.clone(),
+        };
         let (profile, server_name) = {
             let state = self.state.borrow();
-            let Some(entry) = state
-                .profiles
-                .iter()
-                .find(|entry| entry.name == profile_name)
-            else {
+            if !super::reduce::saved_entry_matches(&state.profiles, &expected)
+                || card_plan(&state.profiles, &state.ui, &server_id)
+                    .action
+                    .as_ref()
+                    != Some(&expected_action)
+            {
                 drop(state);
-                self.show_message(&format!("Profile “{profile_name}” no longer exists"));
+                self.show_message("Profile or selected action changed - choose the server again");
                 return;
-            };
+            }
+            let entry = &expected;
             let server = state
                 .subscriptions
                 .iter()
@@ -2663,7 +2682,8 @@ impl Controller {
                 .to_string()
         } else {
             format!(
-                "This will rewrite the saved server selection for “{profile_name}” and connect it."
+                "This will rewrite the saved server selection for “{profile_name}” and connect it. \
+                 The running connection will reconnect and existing connections will close."
             )
         };
         let dialog = adw::AlertDialog::new(Some(title.as_str()), Some(body.as_str()));
@@ -2689,6 +2709,20 @@ impl Controller {
                     return;
                 }
                 if let Some(controller) = weak.upgrade() {
+                    let unchanged = {
+                        let state = controller.state.borrow();
+                        super::reduce::saved_entry_matches(&state.profiles, &expected)
+                            && card_plan(&state.profiles, &state.ui, &server_id)
+                                .action
+                                .as_ref()
+                                == Some(&expected_action)
+                    };
+                    if !unchanged {
+                        controller.show_message(
+                            "Profile or selected action changed - choose the server again",
+                        );
+                        return;
+                    }
                     controller.repoint_and_up(profile_name.clone(), profile.clone());
                 }
             }
@@ -2701,13 +2735,32 @@ impl Controller {
     /// Only the selected session is toggled. Its ports and routing apply, but
     /// no profile file is rewritten. The picker's always-labelled Connect uses
     /// `connect_selection` directly rather than this bar's toggle action.
-    fn connect_pool(self: &Rc<Self>, query: PoolQuery, members: Vec<String>) {
+    fn connect_pool(
+        self: &Rc<Self>,
+        query: PoolQuery,
+        members: Vec<String>,
+        displayed: ControlPlan<PoolAction>,
+    ) {
         if !self.admitted() {
             return;
         }
-        let action = {
+        let current = {
             let state = self.state.borrow();
-            pool_action(&state.ui, &members)
+            let selected = if state.ui.selected_profile.is_empty() {
+                super::reduce::GROUP_CONNECT_SESSION
+            } else {
+                &state.ui.selected_profile
+            };
+            if query.session != selected {
+                return;
+            }
+            pool_plan(&state.ui, &members)
+        };
+        if current != displayed {
+            return;
+        }
+        let Some(action) = displayed.action else {
+            return;
         };
         match action {
             // A matching pool elsewhere belongs to that profile's controls.
@@ -2730,6 +2783,27 @@ impl Controller {
         if query.session.is_empty() {
             query.session.clone_from(&profile);
         }
+        if query.session.is_empty() {
+            query.session = super::reduce::GROUP_CONNECT_SESSION.into();
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            if !state.ui.can_start(UiOperationKind::UpProfile) {
+                return;
+            }
+            let ids = activation_ids(&state.subscriptions, &state.ui.readings, &query);
+            let mut target = state.ui.clone();
+            target.selected_profile.clone_from(&query.session);
+            if pool_plan(&target, &ids).action.is_none() {
+                return;
+            }
+            state
+                .ui
+                .pin_pool_resolved(&query.session, &query, ids, Instant::now());
+        }
+        self.sync_connection_cards();
+        self.rebuild_sessions();
+        self.refresh_status();
         let label = if query.name.is_empty() {
             "the selection".to_string()
         } else {
@@ -2741,43 +2815,14 @@ impl Controller {
             move |controller, result| match result {
                 Ok(()) => controller.refresh_status(),
                 Err(error) => {
+                    controller.state.borrow_mut().ui.rollback_pin();
+                    controller.sync_connection_cards();
+                    controller.rebuild_sessions();
+                    controller.refresh_status();
                     controller.show_message(&format!("Could not connect {label}: {error:#}"));
                 }
             },
         );
-    }
-
-    fn disconnect_if_active(self: &Rc<Self>) {
-        if !self.admitted() {
-            return;
-        }
-        let (profile, status) = {
-            let state = self.state.borrow();
-            (
-                state.ui.selected_profile.clone(),
-                selected_status(&state.ui),
-            )
-        };
-        // A connect job still in flight owns the operation slot, so a Disconnect
-        // sent now is refused as busy — and the refusal used to arrive looking
-        // like the tunnel itself had failed. There is nothing to stop yet.
-        if matches!(status, Status::Connecting)
-            && !self
-                .state
-                .borrow()
-                .ui
-                .can_start(UiOperationKind::Disconnect)
-        {
-            self.show_message("Still connecting — wait for it to finish or fail");
-            return;
-        }
-        if matches!(status, Status::Connecting | Status::Connected) {
-            if profile == "default" {
-                self.disconnect();
-            } else {
-                self.down_profile(profile);
-            }
-        }
     }
 
     fn select_server(self: &Rc<Self>, server_id: String) {
@@ -3405,17 +3450,60 @@ impl Controller {
         );
     }
 
+    fn prepare_saved_start(self: &Rc<Self>, entry: &ProfileEntry) -> bool {
+        if !self.admitted() {
+            return false;
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            if !state.ui.can_start(UiOperationKind::UpProfile) {
+                drop(state);
+                self.show_message("Another operation is still running");
+                return false;
+            }
+            let server_id = if entry.pool.is_none() {
+                match corehandle::resolve(
+                    state
+                        .subscriptions
+                        .iter()
+                        .flat_map(|group| group.servers.iter()),
+                    &entry.server,
+                ) {
+                    HandleMatch::One(server) => Some(server.id.clone()),
+                    HandleMatch::None | HandleMatch::Ambiguous(_) => None,
+                }
+            } else {
+                None
+            };
+            let now = Instant::now();
+            state.ui.pin_saved_start(entry, server_id, now);
+            if let Some(query) = &entry.pool {
+                let ids = activation_ids(&state.subscriptions, &state.ui.readings, query);
+                state.ui.pin_pool_resolved(&entry.name, query, ids, now);
+            }
+        }
+        self.sync_connection_cards();
+        self.rebuild_sessions();
+        self.refresh_status();
+        true
+    }
+
     fn up_profile(self: &Rc<Self>, name: String) {
-        if !self
+        let entry = self
             .state
             .borrow()
             .profiles
             .iter()
-            .any(|entry| entry.name == name)
-        {
+            .find(|entry| entry.name == name)
+            .cloned();
+        let Some(entry) = entry else {
             self.show_message("No saved profile - this session can only be stopped here");
             return;
+        };
+        if !self.prepare_saved_start(&entry) {
+            return;
         }
+        let is_pool = entry.pool.is_some();
         let work_name = name.clone();
         let finish_name = name.clone();
         self.client_job(
@@ -3427,7 +3515,7 @@ impl Controller {
                 ))
             },
             move |controller, result| {
-                controller.finish_up_profile(finish_name, result);
+                controller.finish_up_profile(finish_name, is_pool, result);
             },
         );
     }
@@ -3435,6 +3523,21 @@ impl Controller {
     /// Stop and start one profile, for the case where its session is alive but
     /// failed and the reason has just been fixed.
     fn reconnect_profile(self: &Rc<Self>, name: String) {
+        let entry = self
+            .state
+            .borrow()
+            .profiles
+            .iter()
+            .find(|entry| entry.name == name)
+            .cloned();
+        let Some(entry) = entry else {
+            self.show_message("No saved profile - this session can only be stopped here");
+            return;
+        };
+        if !self.prepare_saved_start(&entry) {
+            return;
+        }
+        let is_pool = entry.pool.is_some();
         let work_name = name.clone();
         let finish_name = name.clone();
         self.client_job(
@@ -3448,12 +3551,22 @@ impl Controller {
                 ))
             },
             move |controller, result| {
-                controller.finish_up_profile(finish_name, result);
+                controller.finish_up_profile(finish_name, is_pool, result);
             },
         );
     }
 
     fn repoint_and_up(self: &Rc<Self>, name: String, profile: Profile) {
+        let entry = ProfileEntry {
+            name: name.clone(),
+            server: profile.select.server.clone(),
+            pool: profile.select.pool.clone(),
+            ..ProfileEntry::default()
+        };
+        if !self.prepare_saved_start(&entry) {
+            return;
+        }
+        let is_pool = entry.pool.is_some();
         let work_name = name.clone();
         let finish_name = name.clone();
         self.client_job(
@@ -3469,7 +3582,7 @@ impl Controller {
                 Ok(refresh_profiles_after(client, operation))
             },
             move |controller, result| {
-                controller.finish_up_profile(finish_name, result);
+                controller.finish_up_profile(finish_name, is_pool, result);
             },
         );
     }
@@ -3477,6 +3590,7 @@ impl Controller {
     fn finish_up_profile(
         self: &Rc<Self>,
         name: String,
+        is_pool: bool,
         result: Result<(Result<ipc::UpResult>, Vec<ProfileEntry>)>,
     ) {
         let operation = match result {
@@ -3488,13 +3602,6 @@ impl Controller {
         };
         match operation {
             Ok(result) => {
-                let is_pool = self
-                    .state
-                    .borrow()
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.name == name)
-                    .is_some_and(|profile| profile.pool.is_some());
                 let server_id = (!is_pool).then_some(result.server.id);
                 {
                     let mut state = self.state.borrow_mut();
@@ -3510,12 +3617,6 @@ impl Controller {
                         state.ui.connected_id = None;
                     }
                     state.ui.failed_id = None;
-                    // The pin belongs to the profile that was brought up, not
-                    // to whichever one the header shows: a switch away must
-                    // not carry this transition along.
-                    state
-                        .ui
-                        .pin_target(&name, server_id.clone(), Instant::now());
                 }
                 self.bump_epoch();
                 if let Some(server_id) = server_id {
@@ -3542,13 +3643,16 @@ impl Controller {
                 }
             }
             Err(error) => {
-                // Deliberately neither pinned nor cleared. `UpProfile` refuses
-                // before it touches the tunnel whenever the profile is
-                // unreadable or its handle resolves to nothing or to several
-                // servers, and calling that "disconnected" would blank a
-                // connection that is still carrying traffic. The status this
-                // worker read after the call lands immediately after this
-                // handler and paints whichever of the two it actually is.
+                // A refused start may leave the old tunnel running. Drop the
+                // optimistic target and let the worker's snapshot report the outcome.
+                self.state.borrow_mut().ui.rollback_pin();
+                self.sync_connection_cards();
+                self.rebuild_sessions();
+                if is_busy(&error) {
+                    self.refresh_status();
+                    self.show_message(&format!("Still busy - {error}"));
+                    return;
+                }
                 self.mark_error_notified(&format!("{error:#}"));
                 self.show_error(
                     &format!("Could not bring up “{name}”"),
@@ -3994,6 +4098,9 @@ impl Controller {
         self.subscriptions.set_operation(catalog);
         self.sync_session_rows();
         self.refresh_activity_status();
+        self.sync_connection_cards();
+        let status = selected_status(&self.state.borrow().ui);
+        self.update_tray(&status);
     }
 
     /// Run one daemon call on a worker thread with the operation spinner up.
@@ -4403,9 +4510,13 @@ impl Controller {
         self.refresh_history();
     }
 
-    /// Push the current connection onto the cards, skipping the O(cards)
-    /// pass when nothing changed.
+    /// Refresh control plans even when the usage decoration has not changed.
     fn sync_connection_cards(&self) {
+        let (profiles, context) = {
+            let state = self.state.borrow();
+            (state.profiles.clone(), state.ui.clone())
+        };
+        self.servers.set_control_context(profiles, context);
         let unavailable = self.state.borrow().ui.poll_error.is_some();
         self.servers.root.set_sensitive(!unavailable);
         if unavailable {
@@ -4603,28 +4714,11 @@ impl Controller {
                     self.navigate_to(Page::Servers);
                     self.servers.open_connection_picker();
                 }
-                TrayCommand::Toggle(generation, profile) => {
+                TrayCommand::Toggle(generation, action) => {
                     if !self.state.borrow().recovery.accepts(generation) {
                         continue;
                     }
-                    if !self
-                        .tray_sessions()
-                        .iter()
-                        .any(|(name, _)| name == &profile)
-                    {
-                        continue;
-                    }
-                    // The same rule the page's switch follows, so a checkmark
-                    // and a switch for one profile can never disagree.
-                    let running = self
-                        .tray_sessions()
-                        .into_iter()
-                        .any(|(name, running)| name == profile && running);
-                    if running {
-                        self.down_profile(profile);
-                    } else {
-                        self.up_profile(profile);
-                    }
+                    self.activate_session(action);
                 }
                 // Quitting from the tray must respect the same unsaved-settings
                 // guard as closing the window, or a draft is silently lost.
@@ -4662,19 +4756,38 @@ impl Controller {
         }
     }
 
-    /// One `(profile, running)` pair per profile, taken from the very rows the
+    /// One entry per profile, taken from the very rows the
     /// Profiles page draws so the tray cannot describe a session differently
     /// from the window.
-    fn tray_sessions(&self) -> Vec<(String, bool)> {
+    fn tray_sessions(&self) -> Vec<(String, bool, Option<SessionAction>)> {
         let state = self.state.borrow();
         if state.ui.poll_error.is_some() {
             return Vec::new();
         }
         session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
             .into_iter()
-            .filter(|row| row.state != SessionRowState::Unknown)
-            .map(|row| (row.profile, row.toggle_on))
+            .map(|row| (row.profile, row.toggle_on, row.session_action))
             .collect()
+    }
+
+    fn activate_session(self: &Rc<Self>, action: SessionAction) {
+        if !self.admitted() {
+            return;
+        }
+        let current = {
+            let state = self.state.borrow();
+            session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
+                .into_iter()
+                .any(|row| row.session_action.as_ref() == Some(&action))
+        };
+        if !current {
+            return;
+        }
+        match action {
+            SessionAction::Start(name, _) => self.up_profile(name),
+            SessionAction::Stop(name) => self.down_profile(name),
+            SessionAction::Restart(name, _) => self.reconnect_profile(name),
+        }
     }
 
     /// Mirror the connection into the tray tooltip/menu, skipping no-ops.
@@ -4686,7 +4799,13 @@ impl Controller {
             let state = self.state.borrow();
             let label = match status {
                 Status::Disconnected => "Disconnected".to_string(),
-                Status::Connecting => "Connecting…".to_string(),
+                Status::Connecting => self
+                    .active_pool_name(&state)
+                    .or_else(|| self.active_server_name(&state))
+                    .map_or_else(
+                        || "Connecting…".to_string(),
+                        |name| format!("Connecting · {name}"),
+                    ),
                 Status::Connected => {
                     let name = self
                         .active_pool_name(&state)
@@ -4751,12 +4870,30 @@ impl Controller {
     }
 
     fn active_server_name(&self, state: &AppState) -> Option<String> {
+        if let Some(target) = state.ui.requested_target(&state.ui.selected_profile) {
+            return Some(
+                state
+                    .subscriptions
+                    .iter()
+                    .flat_map(|subscription| &subscription.servers)
+                    .find(|server| server.id == target)
+                    .map(|server| oxidom_core::model::name_without_flag(&server.name).to_string())
+                    .unwrap_or(target),
+            );
+        }
         self.active_server_display(state).map(|(name, _)| name)
     }
 
     /// The pool label comes from one reducer shared by the header, the sidebar
     /// and the tray, so no surface can accidentally name one member as active.
     fn active_pool_name(&self, state: &AppState) -> Option<String> {
+        if state
+            .ui
+            .requested_target(&state.ui.selected_profile)
+            .is_some()
+        {
+            return None;
+        }
         let session = session_for(&state.ui, &state.ui.selected_profile)?;
         if session.selection.kind != "pool" {
             return None;
@@ -4766,7 +4903,10 @@ impl Controller {
 
     /// Display name and country of the connected server.
     fn active_server_display(&self, state: &AppState) -> Option<(String, Option<String>)> {
-        let active = if state.ui.selected_profile == "default" {
+        let requested = state.ui.requested_target(&state.ui.selected_profile);
+        let active = if let Some(target) = requested.as_deref() {
+            Some(target)
+        } else if state.ui.selected_profile == "default" {
             state.ui.connected_id.as_deref()
         } else {
             session_for(&state.ui, &state.ui.selected_profile)
@@ -4821,8 +4961,8 @@ impl Controller {
             .set_visible(compact_status_visible(status, standby, self.compact.get()));
         let pool_name = self.active_pool_name(&state);
         let display = self.active_server_display(&state);
+        let name = self.active_server_name(&state);
         drop(state);
-        let name = display.as_ref().map(|(name, _)| name.clone());
         let country = display.and_then(|(_, country)| country);
         match status {
             Status::Disconnected => {}
@@ -4878,7 +5018,7 @@ impl Controller {
                     .set_tooltip_text(Some("Connection error — show connections"));
             }
         }
-        if standby {
+        if standby && !matches!(status, Status::Connecting) {
             let summary = match status {
                 Status::Disconnected => "Disconnected",
                 Status::Connecting => "Connecting",
@@ -4900,6 +5040,7 @@ impl Controller {
     }
 
     fn update_sidebar_connection_status(&self, state: &AppState) {
+        self.status_session_action.replace(None);
         if state.ui.poll_error.is_some() {
             set_status_tone(&self.sidebar_status, StatusTone::Error);
             self.sidebar_status_icon
@@ -4931,8 +5072,12 @@ impl Controller {
                 set_status_tone(&self.sidebar_status, StatusTone::Working);
                 self.sidebar_status_icon
                     .set_icon_name(Some("network-transmit-receive-symbolic"));
-                self.sidebar_status_label.set_label("Connecting…");
-                "Connecting".to_string()
+                self.active_pool_name(state)
+                    .or_else(|| self.active_server_name(state))
+                    .map_or_else(
+                        || "Connecting…".to_string(),
+                        |name| format!("Connecting · {name}"),
+                    )
             }
             Status::Connected => {
                 set_status_tone(&self.sidebar_status, StatusTone::Connected);
@@ -4965,7 +5110,19 @@ impl Controller {
         // does. The state is already the label an inch to the left.
         self.sidebar_status
             .set_tooltip_text(Some(&format!("{summary} — show connections")));
-        self.set_status_action(status_action_for(&status));
+        let intent = session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
+            .into_iter()
+            .find(|row| row.profile == state.ui.selected_profile)
+            .and_then(|row| row.session_action);
+        let action = match intent.as_ref() {
+            Some(SessionAction::Stop(_)) => Some(StatusAction::Disconnect),
+            Some(SessionAction::Start(_, _)) => Some(StatusAction::Connect),
+            Some(SessionAction::Restart(_, _)) => Some(StatusAction::Reconnect),
+            None if matches!(status, Status::Error(_)) => status_action_for(&status),
+            None => None,
+        };
+        self.status_session_action.replace(intent);
+        self.set_status_action(action);
     }
 
     /// The one thing there is to do about the current state, on both strips.
@@ -4983,6 +5140,8 @@ impl Controller {
         // message — while `help-about-symbolic` is the circled "i" this wants.
         let (icon, tooltip) = match action {
             StatusAction::Disconnect => ("system-shutdown-symbolic", "Disconnect"),
+            StatusAction::Connect => ("media-playback-start-symbolic", "Connect"),
+            StatusAction::Reconnect => ("view-refresh-symbolic", "Reconnect"),
             StatusAction::ShowError => ("help-about-symbolic", "Show the full error"),
         };
         for (button, image) in [
@@ -5044,8 +5203,13 @@ impl Controller {
     /// Does what the button's icon promised when it was painted, rather than
     /// re-deriving an action from a state that may have moved since.
     fn handle_status_action(self: &Rc<Self>) {
+        let intent = self.status_session_action.borrow().clone();
+        if let Some(action) = intent {
+            self.activate_session(action);
+            return;
+        }
         match self.status_action.get() {
-            Some(StatusAction::Disconnect) => self.disconnect_if_active(),
+            Some(StatusAction::Disconnect | StatusAction::Connect | StatusAction::Reconnect) => {}
             Some(StatusAction::ShowError) => {
                 let error = {
                     let state = self.state.borrow();

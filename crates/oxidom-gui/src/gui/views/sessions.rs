@@ -4,16 +4,16 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::gui::operation::{UiOperation, UiOperationKind};
-use crate::gui::reduce::{SessionDetail, SessionRow, SessionRowState};
+use crate::gui::operation::UiOperation;
+use crate::gui::reduce::{SessionAction, SessionDetail, SessionRow, SessionRowState};
 use oxidom_core::ipc::ProfileEntry;
 
 use super::icon_button;
 
 #[derive(Clone)]
 pub struct SessionCallbacks {
-    /// `(profile, active)` — the requested position of the session switch.
-    pub toggle: Rc<dyn Fn(String, bool)>,
+    /// The semantic command from the currently displayed row.
+    pub toggle: Rc<dyn Fn(SessionAction)>,
     /// Open the editor for this profile. The page deliberately does not open
     /// it itself: the entry it holds is as old as the last time this page was
     /// entered, and saving a whole profile from a stale copy silently undoes
@@ -226,15 +226,23 @@ impl SessionsView {
         row.add_suffix(&warning);
 
         let syncing_toggle = Rc::new(Cell::new(false));
+        let applied = Rc::new(RefCell::new(None::<SessionRow>));
         toggle.connect_active_notify({
             let callback = callbacks.toggle.clone();
-            let profile = model.profile.clone();
+            let applied = applied.clone();
             let syncing_toggle = syncing_toggle.clone();
-            move |toggle| {
+            move |_| {
                 if syncing_toggle.get() {
                     return;
                 }
-                callback(profile.clone(), toggle.is_active());
+                // Release the model borrow before dispatch can repaint this row.
+                let action = applied
+                    .borrow()
+                    .as_ref()
+                    .and_then(|row| row.session_action.clone());
+                if let Some(action) = action {
+                    callback(action);
+                }
             }
         });
 
@@ -261,7 +269,7 @@ impl SessionsView {
             edit,
             details: Rc::new(RefCell::new(Vec::new())),
             syncing_toggle,
-            applied: Rc::new(RefCell::new(None)),
+            applied,
         };
         apply_row(&controls, model);
         self.operation_widgets
@@ -279,20 +287,10 @@ impl SessionsView {
             let Some(row) = applied.as_ref() else {
                 continue;
             };
-            let next = if row.toggle_on {
-                UiOperationKind::DownProfile
-            } else {
-                UiOperationKind::UpProfile
-            };
             controls.row.set_sensitive(!row.busy);
             controls.edit.set_sensitive(!busy);
             controls.edit.set_visible(row.saved_profile);
-            controls.toggle.set_sensitive(
-                !row.busy
-                    && row.state != SessionRowState::Unknown
-                    && (row.saved_profile || row.toggle_on)
-                    && operation.as_ref().is_none_or(|op| op.kind.permits(next)),
-            );
+            controls.toggle.set_sensitive(row.session_action.is_some());
             controls.spinner.set_spinning(row.busy);
             controls.spinner.set_visible(row.busy);
         }
@@ -365,9 +363,7 @@ fn apply_row(controls: &RowControls, row: &SessionRow) {
     // A switch asserts a position. Against a state this build cannot read there
     // is no position to assert, and an off switch would claim the session is
     // down. The rest of the row stays usable — Edit profile… still applies.
-    controls
-        .toggle
-        .set_sensitive(row.state != SessionRowState::Unknown);
+    controls.toggle.set_sensitive(row.session_action.is_some());
 }
 
 fn set_details(controls: &RowControls, details: &[SessionDetail]) {
@@ -457,6 +453,7 @@ mod tests {
             warning: None,
             details: Vec::new(),
             toggle_on: false,
+            session_action: None,
             busy: false,
             error: None,
         }

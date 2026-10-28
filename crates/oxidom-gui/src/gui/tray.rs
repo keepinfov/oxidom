@@ -4,19 +4,20 @@
 use std::sync::mpsc::Sender;
 
 use super::recovery::Generation;
+use super::reduce::SessionAction;
 use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayCommand {
     ShowWindow,
     PickConnection(Generation),
-    Toggle(Generation, String),
+    Toggle(Generation, SessionAction),
     Quit,
 }
 
 pub struct OxidomTray {
     pub generation: Option<Generation>,
-    pub sessions: Vec<(String, bool)>,
+    pub sessions: Vec<(String, bool, Option<SessionAction>)>,
     pub status_text: String,
     /// A tunnel is down and said why. Toasts do not reach a hidden window —
     /// they are recorded and dropped — so with a constant icon a tunnel that
@@ -70,17 +71,25 @@ impl ksni::Tray for OxidomTray {
         let mut menu = self
             .sessions
             .iter()
-            .map(|(profile, running)| {
+            .map(|(profile, running, action)| {
                 let profile = profile.clone();
                 let generation = self.generation;
+                let action = action.clone();
+                let verb = match action {
+                    Some(SessionAction::Start(_, _)) => "Connect",
+                    Some(SessionAction::Stop(_)) => "Stop",
+                    Some(SessionAction::Restart(_, _)) => "Reconnect",
+                    None => "Unavailable",
+                };
                 CheckmarkItem {
-                    label: profile.clone(),
+                    label: format!("{verb} · {profile}"),
                     checked: *running,
+                    enabled: generation.is_some() && action.is_some(),
                     activate: Box::new(move |tray: &mut Self| {
-                        if let Some(generation) = generation {
-                            let _ = tray
-                                .commands
-                                .send(TrayCommand::Toggle(generation, profile.clone()));
+                        if let Some(generation) = generation
+                            && let Some(action) = action.clone()
+                        {
+                            let _ = tray.commands.send(TrayCommand::Toggle(generation, action));
                         }
                     }),
                     ..Default::default()

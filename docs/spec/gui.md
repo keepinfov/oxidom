@@ -61,6 +61,32 @@ state must be inspected before repeating it.
 
 ## Layout
 
+### Target And Control Facts (binding)
+
+For each session, show saved selection, pending request and reported selection as separate
+labelled facts in expanded Profiles rows. A pending target takes headline precedence without
+rewriting the saved selection or relabelling reported runtime. An unavailable snapshot labels
+reported facts last-known and cannot authorize mutations. Capture saved starts at admission,
+including resolved single-server identity where available; pool requests retain their query for
+display and separately resolved IDs for acknowledgement. No pool has a representative server.
+
+Primary card, group-bar and session controls derive their label, availability and semantic action
+from the same pure reducer decision. Global usage/highlighting is decoration, not permission to
+disconnect another session. Only the selected session determines the action. Matching connected,
+connecting or held selections offer Stop subject to admission; a retained failed/disconnected
+saved session requires explicit restart sequencing, not an Up that the daemon rejects. Unknown
+states authorize no action. Runtime-only sessions permit Stop, not saving or inventing a profile.
+Revalidate the displayed semantic action before dispatch; a stale Disconnect must not become
+Connect or follow a changed profile. Context-menu revisions also invalidate equal-label actions.
+
+Temporary pool connection changes runtime only. Default single-server Connect is temporary.
+Named single-server card retargeting retains the existing explicit Repoint confirmation, naming
+the saved-file write and runtime interruption; it is never a silent temporary-operation emulation.
+Runtime-only named entries without a saved profile cannot repoint through that path. Explicit
+Save/Profile Repoint remains the only selection-persistence operation. This does not add a new
+named temporary-server RPC or alter existing D-Bus signatures. Full phase/health/protection/retry
+presentation remains P11; target equality is not proof of a new attempt incarnation.
+
 Single-server optimistic starts retain their requested server ID independently of reported
 runtime identity and saved profile configuration. A current poll reporting another server as
 Connecting/Connected cannot acknowledge the request; matching target in the pinned profile,

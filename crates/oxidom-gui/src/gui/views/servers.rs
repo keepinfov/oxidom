@@ -6,17 +6,19 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::glib;
 
-use oxidom_core::ipc::LatencyReading;
+use oxidom_core::ipc::{LatencyReading, ProfileEntry};
 use oxidom_core::model::Subscription;
 use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
 
 use super::super::group::subscription_description;
+use super::super::operation::UiOperationKind;
 use super::super::prefs::{FAVOURITES_ID, GroupKind, GuiPrefs, ServerGroup};
 use super::super::reduce::{
-    FailureReport, FilterOption, GROUP_CONNECT_SESSION, HistoryChart, ServerProfiles,
-    available_countries, available_protocols, available_subscriptions, connect_bar_session_note,
-    connect_button_tooltip, connect_choices, describe_rule, direct_latencies, excludable_servers,
-    filters_to_query, group_member_ids, groups_holding, moved_in_order, ordered_subscriptions,
+    CardAction, ControlPlan, FailureReport, FilterOption, GROUP_CONNECT_SESSION, HistoryChart,
+    PoolAction, ServerProfiles, SnapshotState, available_countries, available_protocols,
+    available_subscriptions, card_plan, connect_bar_session_note, connect_button_tooltip,
+    connect_choices, describe_rule, direct_latencies, excludable_servers, filters_to_query,
+    group_member_ids, groups_holding, moved_in_order, ordered_subscriptions, pool_plan,
     preview_height, profile_selection, query_equals_group, replace_picker_selection,
     rotation_options, selection_ids, selection_query, toggled_member, upsert_group,
 };
@@ -60,7 +62,7 @@ pub struct CardConnection {
 #[derive(Clone)]
 pub struct CardCallbacks {
     pub select: Rc<dyn Fn(String)>,
-    pub activate: Rc<dyn Fn(String)>,
+    pub activate: Rc<dyn Fn(String, ControlPlan<CardAction>)>,
     pub ping: Rc<dyn Fn(String)>,
     /// Look at one server's certificate and decide about it, before anything
     /// has failed.
@@ -80,7 +82,7 @@ pub struct CardCallbacks {
     /// deliberate act. The second argument is the selection already resolved to
     /// server ids, which is how the window recognises a session that is already
     /// running it.
-    pub connect_pool: Rc<dyn Fn(PoolQuery, Vec<String>)>,
+    pub connect_pool: PoolControlCallback,
     pub connect_selection: Rc<dyn Fn(PoolQuery)>,
     pub clear_search: Rc<dyn Fn()>,
     /// Show the log page narrowed to one server. Offered from the expanded
@@ -118,11 +120,14 @@ struct SubscriptionBlock {
     sort_generation: Rc<Cell<u64>>,
 }
 
-type BrowseCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+type BrowseCallback = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 /// Set on every rebuild, read long afterwards by the filter popover.
 type PoolCallback = Rc<RefCell<Option<Rc<dyn Fn(PoolQuery)>>>>;
 /// Like [`PoolCallback`], plus the ids the query resolved to.
-type ResolvedPoolCallback = Rc<RefCell<Option<Rc<dyn Fn(PoolQuery, Vec<String>)>>>>;
+type PoolControlCallback = Rc<dyn Fn(PoolQuery, Vec<String>, ControlPlan<PoolAction>)>;
+type ResolvedPoolCallback = Rc<RefCell<Option<PoolControlCallback>>>;
+type ControlContext = Rc<RefCell<Option<(Vec<ProfileEntry>, SnapshotState)>>>;
+type VisiblePoolPlan = Rc<RefCell<Option<(Vec<String>, ControlPlan<PoolAction>)>>>;
 type PickerRefresh = Rc<RefCell<Option<std::rc::Weak<dyn Fn()>>>>;
 /// Server id to its checkbox, in the order the picker laid them out.
 type PickerChecks = Rc<RefCell<Vec<(String, gtk::CheckButton)>>>;
@@ -277,6 +282,9 @@ pub struct ServersView {
     /// scope change actually replaces, and therefore the only part that fades.
     servers_area: gtk::Box,
     cards: Rc<RefCell<HashMap<String, ServerCard>>>,
+    control_context: ControlContext,
+    card_plans: Rc<RefCell<HashMap<String, ControlPlan<CardAction>>>>,
+    pool_plan: VisiblePoolPlan,
     blocks: Rc<RefCell<Vec<SubscriptionBlock>>>,
     /// Which servers are mid-check, so a repeated state for the same card does
     /// not double-count its block. `set_latency_state` is called for every card
@@ -565,6 +573,9 @@ impl ServersView {
             picker_refresh: Rc::new(RefCell::new(None)),
             on_browse_subscriptions: Rc::new(RefCell::new(None)),
             cards: Rc::new(RefCell::new(HashMap::new())),
+            control_context: Rc::new(RefCell::new(None)),
+            card_plans: Rc::new(RefCell::new(HashMap::new())),
+            pool_plan: Rc::new(RefCell::new(None)),
             blocks: Rc::new(RefCell::new(Vec::new())),
             subscriptions: Rc::new(RefCell::new(subscriptions.unwrap_or_default().to_vec())),
             search_texts: Rc::new(RefCell::new(HashMap::new())),
@@ -707,7 +718,7 @@ impl ServersView {
         *self.on_connect_pool.borrow_mut() = Some(callbacks.connect_pool.clone());
         *self.on_connect_selection.borrow_mut() = Some(callbacks.connect_selection.clone());
         let clear_search = callbacks.clear_search.clone();
-        *self.on_clear_search.borrow_mut() = Some(Box::new(move || clear_search()));
+        *self.on_clear_search.borrow_mut() = Some(clear_search);
         *self.latencies.borrow_mut() = latency_states
             .iter()
             .filter_map(|(id, state)| sort_value(*state).map(|value| (id.clone(), value)))
@@ -732,7 +743,8 @@ impl ServersView {
             action.connect_clicked({
                 let callback = self.on_browse_subscriptions.clone();
                 move |_| {
-                    if let Some(callback) = callback.borrow().as_ref() {
+                    let callback = callback.borrow().clone();
+                    if let Some(callback) = callback {
                         callback();
                     }
                 }
@@ -946,7 +958,13 @@ impl ServersView {
                 let on_activate = {
                     let cb = callbacks.activate.clone();
                     let id = id.clone();
-                    move || cb(id.clone())
+                    let plans = self.card_plans.clone();
+                    move || {
+                        let plan = plans.borrow().get(&id).cloned();
+                        if let Some(plan) = plan.filter(|plan| plan.action.is_some()) {
+                            cb(id.clone(), plan);
+                        }
+                    }
                 };
                 let on_set_alias = {
                     let cb = callbacks.set_alias.clone();
@@ -1077,6 +1095,7 @@ impl ServersView {
             self.blocks.borrow_mut().push(block);
         }
         self.sync_probing(latency_states);
+        self.sync_card_plans();
         // Last child, so it sits below the blocks it stands in for.
         self.servers_area.append(&self.no_matches);
         self.apply_filter();
@@ -1261,7 +1280,8 @@ impl ServersView {
                 else {
                     return;
                 };
-                if let Some(callback) = view.on_create_pool.borrow().as_ref() {
+                let callback = view.on_create_pool.borrow().clone();
+                if let Some(callback) = callback {
                     callback(query);
                 }
             }
@@ -1515,9 +1535,7 @@ impl ServersView {
 
     // Hand the visible selection to the window as a pool.
     fn connect_active_group(&self) {
-        let Some(query) = self.connect_query() else {
-            return;
-        };
+        let query = self.connect_query();
         // Resolved here, where the subscriptions already are, and for the same
         // reason the bar's count is: what Connect runs is what the page shows.
         let members = selection_ids(
@@ -1526,8 +1544,14 @@ impl ServersView {
             &self.subscriptions.borrow(),
             &self.direct_latencies.borrow(),
         );
-        if let Some(callback) = self.on_connect_pool.borrow().as_ref() {
-            callback(query, members);
+        let displayed = self.pool_plan.borrow().clone();
+        let callback = self.on_connect_pool.borrow().clone();
+        if let Some((shown_members, plan)) = displayed
+            && shown_members == members
+            && plan.action.is_some()
+            && let Some(callback) = callback
+        {
+            callback(query, members, plan);
         }
     }
 
@@ -1556,7 +1580,7 @@ impl ServersView {
     /// group selected the name comes from the rule, and `PoolQuery.name` is a
     /// label only — it takes no part in selection and does not make a session
     /// stale — so an unsaved scope connects on the same footing as a saved one.
-    fn connect_query(&self) -> Option<PoolQuery> {
+    fn connect_query(&self) -> PoolQuery {
         let name = match self.active_group_value() {
             Some(group) => group.name,
             None if self.active_filter_fields() > 0 => {
@@ -1565,16 +1589,6 @@ impl ServersView {
             None => "All".into(),
         };
         let mut query = self.current_filter.borrow().clone();
-        if selection_ids(
-            &query,
-            self.scope_kind.get(),
-            &self.subscriptions.borrow(),
-            &self.direct_latencies.borrow(),
-        )
-        .is_empty()
-        {
-            return None;
-        }
         query.name = name;
         let session = self.selected_profile.borrow().clone();
         query.session = if session.is_empty() {
@@ -1587,7 +1601,7 @@ impl ServersView {
             .map(|choice| choice.strategy)
             .unwrap_or_default();
         query.expected = self.connect_rotation_value.get();
-        Some(query)
+        query
     }
 
     /// The bar appears for a saved chip, and for a filter the user set by hand.
@@ -1640,36 +1654,31 @@ impl ServersView {
         let choice = connect_choices()
             .into_iter()
             .nth(self.connect_strategy.get());
-        self.connect_button.set_sensitive(visible > 0);
         let selected_profile = self.selected_profile.borrow().clone();
         let selected_profile = if selected_profile.is_empty() {
             GROUP_CONNECT_SESSION.to_string()
         } else {
             selected_profile
         };
-        let pool_active = {
-            let connection = self.last_connection.borrow();
-            let active_pool_count = connection
-                .profiles
-                .values()
-                .filter(|profiles| profiles.in_pool.iter().any(|p| p == &selected_profile))
-                .count();
-            visible > 0
-                && active_pool_count == visible
-                && visible_ids.iter().all(|id| {
-                    connection.profiles.get(id).is_some_and(|profiles| {
-                        profiles.in_pool.iter().any(|p| p == &selected_profile)
-                    })
-                })
-        };
-        if pool_active {
-            self.connect_button.set_label("Disconnect");
+        let plan = self
+            .control_context
+            .borrow()
+            .as_ref()
+            .map(|(_, state)| pool_plan(state, &visible_ids))
+            .unwrap_or(ControlPlan {
+                label: "Connect",
+                action: None,
+            });
+        self.connect_button.set_label(plan.label);
+        self.connect_button.set_sensitive(plan.action.is_some());
+        let stopping = matches!(plan.action, Some(PoolAction::Stop(_)));
+        self.pool_plan.replace(Some((visible_ids, plan)));
+        if stopping {
             self.connect_button.remove_css_class("suggested-action");
             self.connect_button.add_css_class("destructive-action");
             self.connect_button
                 .set_tooltip_text(Some("Stop the running group connection"));
         } else {
-            self.connect_button.set_label("Connect");
             self.connect_button.remove_css_class("destructive-action");
             self.connect_button.add_css_class("suggested-action");
             self.connect_button
@@ -1690,6 +1699,39 @@ impl ServersView {
         self.connect_save.set_sensitive(visible > 0);
         self.connect_bar.set_visible(true);
         self.build_rotation_menu();
+    }
+
+    pub fn set_control_context(&self, profiles: Vec<ProfileEntry>, state: SnapshotState) {
+        self.selected_profile
+            .replace(state.selected_profile.clone());
+        self.control_context.replace(Some((profiles, state)));
+        self.sync_card_plans();
+        self.sync_connect_bar();
+        let refresh = self
+            .picker_refresh
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade);
+        if let Some(refresh) = refresh {
+            refresh();
+        }
+    }
+
+    fn sync_card_plans(&self) {
+        let context = self.control_context.borrow();
+        let mut plans = HashMap::new();
+        for (id, card) in self.cards.borrow().iter() {
+            let plan = context
+                .as_ref()
+                .map(|(profiles, state)| card_plan(profiles, state, id))
+                .unwrap_or(ControlPlan {
+                    label: "Unavailable",
+                    action: None,
+                });
+            card.set_control_plan(&plan);
+            plans.insert(id.clone(), plan);
+        }
+        self.card_plans.replace(plans);
     }
 
     /// One editor for what is selected, whether or not it ends up with a name.
@@ -2082,6 +2124,12 @@ impl ServersView {
                     &view.direct_latencies.borrow(),
                 );
                 let count = matched_ids.len();
+                let context = view.control_context.borrow().clone();
+                let actionable = context.is_some_and(|(_, state)| {
+                    state.poll_error.is_none()
+                        && pool_plan(&state, &matched_ids).action.is_some()
+                        && state.can_start(UiOperationKind::UpProfile)
+                });
                 let options = rotation_options(count);
                 let rot_value = rotation_draft.get();
                 let selected = options
@@ -2109,7 +2157,7 @@ impl ServersView {
                 syncing_rotation.set(false);
                 rotation_row.set_subtitle(&rotation_summary(rot_value, count));
                 rotation_row.set_sensitive(count > 2);
-                connect_now.set_sensitive(count > 0);
+                connect_now.set_sensitive(count > 0 && actionable);
                 while let Some(child) = preview_list.first_child() {
                     preview_list.remove(&child);
                 }
@@ -2586,14 +2634,20 @@ impl ServersView {
                 } else {
                     PoolKind::Rule
                 };
-                if selection_ids(
+                let members = selection_ids(
                     &query,
                     kind,
                     &view.subscriptions.borrow(),
                     &view.direct_latencies.borrow(),
-                )
-                .is_empty()
-                {
+                );
+                let context = view.control_context.borrow().clone();
+                let actionable = context.is_some_and(|(_, mut state)| {
+                    state.selected_profile.clone_from(&query.session);
+                    state.poll_error.is_none()
+                        && pool_plan(&state, &members).action.is_some()
+                        && state.can_start(UiOperationKind::UpProfile)
+                });
+                if members.is_empty() || !actionable {
                     return;
                 }
                 rotation_draft.commit(&view.connect_rotation_value);
@@ -2705,7 +2759,8 @@ impl ServersView {
         self.filter_alive_only.set(draft.alive_only);
         self.filter_max_latency_ms.set(draft.max_latency_ms);
         self.scope_members.borrow_mut().clone_from(&draft.members);
-        if let Some(clear_search) = self.on_clear_search.borrow().as_ref() {
+        let clear_search = self.on_clear_search.borrow().clone();
+        if let Some(clear_search) = clear_search {
             clear_search();
         }
         self.build_chip_bar();
@@ -2751,7 +2806,8 @@ impl ServersView {
                 self.set_filter_values(&PoolQuery::default());
             }
         }
-        if let Some(clear_search) = self.on_clear_search.borrow().as_ref() {
+        let clear_search = self.on_clear_search.borrow().clone();
+        if let Some(clear_search) = clear_search {
             clear_search();
         }
         self.build_chip_bar();
@@ -3069,7 +3125,7 @@ impl ServersView {
 
     /// Wires the "no servers yet" page's action button.
     pub fn connect_browse_subscriptions(&self, callback: impl Fn() + 'static) {
-        *self.on_browse_subscriptions.borrow_mut() = Some(Box::new(callback));
+        *self.on_browse_subscriptions.borrow_mut() = Some(Rc::new(callback));
     }
 
     fn apply_filter(&self) {

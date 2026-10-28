@@ -11,7 +11,8 @@ use oxidom_core::ipc::ProbeDetail;
 use oxidom_core::model::Server;
 
 use super::reduce::{
-    CHART_GAP, ChartMark, ChartSlot, FailureReport, HistoryChart, chart_columns, history_legend,
+    CHART_GAP, CardAction, ChartMark, ChartSlot, ControlPlan, FailureReport, HistoryChart,
+    chart_columns, history_legend,
 };
 use super::views::{
     dialog_content, icon_button, set_transient_parent, set_validation, validation_label,
@@ -495,6 +496,9 @@ pub struct ServerCard {
     latency_spinner_pill: gtk::Box,
     status: gtk::Label,
     connect_button: gtk::Button,
+    control_plan: Rc<RefCell<Option<ControlPlan<CardAction>>>>,
+    primary_revision: Rc<Cell<u64>>,
+    context_menu: Rc<RefCell<Option<gtk::Popover>>>,
     /// Held so its icon can say whether pressing it starts a check or stops
     /// one. Built and dropped before this change, which is why the button
     /// looked identical in every state while all the feedback lived in the
@@ -1007,11 +1011,13 @@ impl ServerCard {
         shell.append(&detail_region);
 
         let context_menu: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
+        let primary_revision = Rc::new(Cell::new(0));
         let secondary_click = gtk::GestureClick::new();
         secondary_click.set_button(gtk::gdk::BUTTON_SECONDARY);
         secondary_click.set_propagation_phase(gtk::PropagationPhase::Bubble);
         secondary_click.connect_pressed({
             let context_menu = context_menu.clone();
+            let primary_revision = primary_revision.clone();
             let shell = shell.clone();
             let connect_button = connect_button.clone();
             let favourite_button = favourite_button.clone();
@@ -1038,7 +1044,7 @@ impl ServerCard {
                 };
                 let mut slot = context_menu.borrow_mut();
                 let popover = slot.get_or_insert_with(|| {
-                    let popover = context_popover(&items(&buttons));
+                    let popover = context_popover(&items(&buttons), &primary_revision);
                     popover.set_parent(&shell);
                     popover
                 });
@@ -1066,6 +1072,9 @@ impl ServerCard {
             latency_spinner_pill,
             status,
             connect_button,
+            control_plan: Rc::new(RefCell::new(None)),
+            primary_revision,
+            context_menu,
             ping_button,
             failure,
             failure_reason,
@@ -1341,13 +1350,10 @@ impl ServerCard {
         } else if previous != CardConnectionState::Failed {
             self.latency_predates_failure.set(true);
         }
-        self.connect_button.remove_css_class("suggested-action");
-        self.connect_button.remove_css_class("destructive-action");
         self.status.remove_css_class("status-working");
         self.status.remove_css_class("status-neutral");
         self.status.remove_css_class("status-error");
         self.root.remove_css_class("failed-server");
-        self.connect_button.set_sensitive(true);
         let accessible_status = match state {
             CardConnectionState::Disconnected | CardConnectionState::ConnectedElsewhere => {
                 "Disconnected"
@@ -1363,8 +1369,6 @@ impl ServerCard {
             CardConnectionState::Disconnected => {
                 self.status.set_visible(false);
                 self.latency_display.set_visible(true);
-                self.connect_button.set_label("Connect");
-                self.connect_button.add_css_class("suggested-action");
                 self.root.remove_css_class("active-server");
             }
             CardConnectionState::ConnectedHere => {
@@ -1376,8 +1380,6 @@ impl ServerCard {
                 // connection the user is actually on, and hiding it is why the
                 // active server was the only one you could not see a ping for.
                 self.latency_display.set_visible(true);
-                self.connect_button.set_label("Disconnect");
-                self.connect_button.add_css_class("destructive-action");
                 self.root.add_css_class("active-server");
             }
             CardConnectionState::InPool => {
@@ -1385,15 +1387,11 @@ impl ServerCard {
                 self.status.add_css_class("status-neutral");
                 self.status.set_visible(true);
                 self.latency_display.set_visible(true);
-                self.connect_button.set_label("Use alone");
-                self.connect_button.add_css_class("suggested-action");
                 self.root.remove_css_class("active-server");
             }
             CardConnectionState::ConnectedElsewhere => {
                 self.status.set_visible(false);
                 self.latency_display.set_visible(true);
-                self.connect_button.set_label("Switch");
-                self.connect_button.add_css_class("suggested-action");
                 self.root.remove_css_class("active-server");
             }
             CardConnectionState::Connecting => {
@@ -1401,8 +1399,6 @@ impl ServerCard {
                 self.status.add_css_class("status-working");
                 self.status.set_visible(true);
                 self.latency_display.set_visible(false);
-                self.connect_button.set_label("Connecting…");
-                self.connect_button.set_sensitive(false);
                 self.root.remove_css_class("active-server");
             }
             CardConnectionState::Failed => {
@@ -1416,12 +1412,36 @@ impl ServerCard {
                 // brings the badge straight back.
                 self.latency_display
                     .set_visible(!self.latency_predates_failure.get());
-                self.connect_button.set_label("Reconnect");
-                self.connect_button.add_css_class("suggested-action");
                 self.root.remove_css_class("active-server");
                 self.root.add_css_class("failed-server");
             }
         }
+    }
+
+    pub fn set_control_plan(&self, plan: &ControlPlan<CardAction>) {
+        if self.control_plan.borrow().as_ref() != Some(plan) {
+            self.primary_revision
+                .set(self.primary_revision.get().wrapping_add(1));
+            if let Some(popover) = self.context_menu.borrow_mut().take() {
+                popover.popdown();
+                popover.unparent();
+            }
+            self.control_plan.replace(Some(plan.clone()));
+        }
+        self.connect_button.set_label(plan.label);
+        self.connect_button.set_sensitive(plan.action.is_some());
+        self.connect_button.remove_css_class("suggested-action");
+        self.connect_button.remove_css_class("destructive-action");
+        self.connect_button.add_css_class(
+            if matches!(
+                plan.action,
+                Some(CardAction::Disconnect | CardAction::DownProfile(_))
+            ) {
+                "destructive-action"
+            } else {
+                "suggested-action"
+            },
+        );
     }
 
     pub fn expanded_natural_height(&self, width: i32) -> i32 {
@@ -1961,23 +1981,39 @@ fn items<'a>(buttons: &ContextButtons<'a>) -> Vec<ContextItem<'a>> {
     items
 }
 
-fn context_popover(sources: &[ContextItem<'_>]) -> gtk::Popover {
+fn context_popover(sources: &[ContextItem<'_>], primary_revision: &Rc<Cell<u64>>) -> gtk::Popover {
     let items = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    for (source, _) in sources {
+    for (index, (source, fixed)) in sources.iter().enumerate() {
         let item = gtk::Button::builder()
             .css_classes(["flat", "server-context-item"])
             .child(&gtk::Label::builder().xalign(0.0).build())
             .build();
         item.connect_clicked({
             let source = (*source).clone();
+            let dynamic = fixed.is_none();
+            let primary_revision = primary_revision.clone();
+            let revision = primary_revision.get();
             move |item| {
+                let shown = item
+                    .child()
+                    .and_downcast::<gtk::Label>()
+                    .map(|label| label.text());
+                let current = source
+                    .label()
+                    .filter(|label| !label.is_empty())
+                    .or_else(|| source.tooltip_text());
+                // Identical labels can refer to different profile targets.
+                let stale = (index == 0 && primary_revision.get() != revision)
+                    || (dynamic && shown != current);
                 if let Some(popover) = item
                     .ancestor(gtk::Popover::static_type())
                     .and_downcast::<gtk::Popover>()
                 {
                     popover.popdown();
                 }
-                source.emit_clicked();
+                if !stale && source.is_sensitive() {
+                    source.emit_clicked();
+                }
             }
         });
         items.append(&item);

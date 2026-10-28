@@ -5,6 +5,11 @@ is.
 
 ## Profiles (binding)
 
+GUI saved selection, pending intent and reported runtime selection are independent facts. Control
+plans must pair wording and executable action for the selected session; another session's usage
+does not authorize Stop. Existing explicit confirmed named-profile Repoint persists selection;
+temporary pool/default-server activation does not. No named temporary-server API is implied.
+
 Profiles live in `profiles/<name>.toml` below the daemon's config directory:
 
 ```toml
