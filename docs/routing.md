@@ -42,7 +42,9 @@ address space is routed direct rather than through the tunnel.
 ## GNOME system proxy
 
 Turning on `system_proxy` makes the connected session take over the desktop's
-proxy settings, so ordinary GNOME apps use the tunnel without being told about it.
+proxy settings for applications that honor them. Applications ignoring those settings are
+unaffected. This is not whole-device traffic capture; a TUN interface captures traffic according
+to its configured routes, not merely because it exists.
 
 It is applied by the **GUI**, not the daemon — it is a per-desktop user setting,
 and a system daemon has no business writing it. Under the hood it is `gsettings`
@@ -56,7 +58,9 @@ Only one session may own it at a time:
 the system proxy is already held by profile "work"
 ```
 
-Disconnecting, or the core dying, releases it. If a GUI is killed outright, a
+Disconnecting releases it. After core failure, a held session retains the proxy arrangement
+until reconnect or explicit Stop; release policy permits removal. Logical daemon ownership does
+not independently prove the desktop setting was applied. If a GUI is killed outright, a
 marker file lets the next start undo the proxy it left behind — a stuck system
 proxy does not survive a restart.
 

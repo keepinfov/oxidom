@@ -29,7 +29,7 @@ use super::reduce::{
     SessionAction, SessionRowState, SnapshotState, SwitcherItem, SystemProxyState, about_comments,
     activation_ids, active_latency_for, card_plan, check_can_be_stopped, compact_status_visible,
     geo_download_prompt, history_chart, human_bytes, latency_states, missing_core_message,
-    other_profiles_message, pool_plan, pool_short_label, press_stops, proxy_status_label, reduce,
+    other_profiles_message, pool_plan, pool_short_label, press_stops, reduce, runtime_presentation,
     selected_status, session_for, session_rows, stop_report, switcher_items, switcher_visible,
 };
 use super::server_card::{self, LatencyState};
@@ -129,7 +129,7 @@ fn status_action_for(status: &Status) -> Option<StatusAction> {
 struct TrayState {
     generation: Option<Generation>,
     text: String,
-    sessions: Vec<(String, bool, Option<SessionAction>)>,
+    sessions: Vec<(String, String, bool, Option<SessionAction>)>,
     failed: bool,
 }
 
@@ -4759,14 +4759,21 @@ impl Controller {
     /// One entry per profile, taken from the very rows the
     /// Profiles page draws so the tray cannot describe a session differently
     /// from the window.
-    fn tray_sessions(&self) -> Vec<(String, bool, Option<SessionAction>)> {
+    fn tray_sessions(&self) -> Vec<(String, String, bool, Option<SessionAction>)> {
         let state = self.state.borrow();
         if state.ui.poll_error.is_some() {
             return Vec::new();
         }
         session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
             .into_iter()
-            .map(|row| (row.profile, row.toggle_on, row.session_action))
+            .map(|row| {
+                (
+                    row.profile,
+                    row.runtime.summary,
+                    row.toggle_on,
+                    row.session_action,
+                )
+            })
             .collect()
     }
 
@@ -4797,31 +4804,16 @@ impl Controller {
         };
         let text = {
             let state = self.state.borrow();
-            let label = match status {
-                Status::Disconnected => "Disconnected".to_string(),
-                Status::Connecting => self
-                    .active_pool_name(&state)
-                    .or_else(|| self.active_server_name(&state))
-                    .map_or_else(
-                        || "Connecting…".to_string(),
-                        |name| format!("Connecting · {name}"),
-                    ),
-                Status::Connected => {
-                    let name = self
-                        .active_pool_name(&state)
-                        .or_else(|| self.active_server_name(&state));
-                    match name {
-                        Some(name) => format!("Connected · {name}"),
-                        None => "Connected".to_string(),
-                    }
-                }
-                Status::Error(error) => format!("Error: {error}"),
-            };
-            if state.ui.poll_error.is_some() {
-                "Daemon unavailable - tunnel state unknown".into()
-            } else {
-                proxy_status_label(status, state.ui.standby_proxy, &label)
-            }
+            let presentation = runtime_presentation(&state.ui, &state.ui.selected_profile);
+            let target = self
+                .active_pool_name(&state)
+                .or_else(|| self.active_server_name(&state));
+            format!(
+                "{}{}\n{}",
+                presentation.summary,
+                target.map(|name| format!(" · {name}")).unwrap_or_default(),
+                presentation.detail_text()
+            )
         };
         let sessions = self.tray_sessions();
         // Any session in error, not just the selected profile's: the icon is
@@ -4829,13 +4821,15 @@ impl Controller {
         // down" is worth an attention state whichever one it is.
         let failed = self.state.borrow().ui.poll_error.is_some()
             || matches!(status, Status::Error(_))
-            || self
-                .state
-                .borrow()
-                .ui
-                .sessions
-                .iter()
-                .any(|session| session.state == "error");
+            || self.state.borrow().ui.sessions.iter().any(|session| {
+                session
+                    .runtime
+                    .as_ref()
+                    .map_or(session.state == "error", |runtime| {
+                        runtime.phase == "failed" || runtime.protection.holding == Some(true)
+                    })
+                    || session.holding_traffic
+            });
         let generation = {
             let state = self.state.borrow();
             state.recovery.ready().then(|| state.recovery.generation())
@@ -4952,16 +4946,22 @@ impl Controller {
             self.header_status_icon.set_visible(true);
             self.header_status_label.set_label("State unknown");
             self.header_status_label.set_visible(true);
-            self.header_status
-                .set_tooltip_text(Some("Daemon unavailable - tunnel state unknown"));
+            self.header_status.set_tooltip_text(Some(
+                &runtime_presentation(&state.ui, &state.ui.selected_profile).detail_text(),
+            ));
+            self.header_status_label
+                .set_label(&runtime_presentation(&state.ui, &state.ui.selected_profile).summary);
+            if let Some(ms) = active_latency {
+                self.header_status_label.set_label(&format!(
+                    "{} · {ms} ms (last measurement)",
+                    self.header_status_label.text()
+                ));
+                self.header_status_label.add_css_class("latency-stale");
+            }
             return;
         }
-        let standby = state.ui.standby_proxy;
-        self.header_status
-            .set_visible(compact_status_visible(status, standby, self.compact.get()));
         let pool_name = self.active_pool_name(&state);
         let display = self.active_server_display(&state);
-        let name = self.active_server_name(&state);
         drop(state);
         let country = display.and_then(|(_, country)| country);
         match status {
@@ -4971,12 +4971,6 @@ impl Controller {
                 self.header_status_icon
                     .set_icon_name(Some("network-transmit-receive-symbolic"));
                 self.header_status_icon.set_visible(true);
-                let summary = pool_name.as_deref().or(name.as_deref()).map_or_else(
-                    || "Connecting…".to_string(),
-                    |name| format!("Connecting · {name}"),
-                );
-                self.header_status
-                    .set_tooltip_text(Some(&format!("{summary} — show connections")));
             }
             Status::Connected => {
                 set_status_tone(&self.header_status, StatusTone::Connected);
@@ -4996,15 +4990,6 @@ impl Controller {
                         self.header_status_label.add_css_class("latency-stale");
                     }
                 }
-                // Names the destination, not the state: Disconnect is the
-                // button to the right, and a chip that promised it was how one
-                // click came to mean three different things.
-                let summary = pool_name
-                    .as_deref()
-                    .or(name.as_deref())
-                    .unwrap_or("Connected");
-                self.header_status
-                    .set_tooltip_text(Some(&format!("{summary} — show connections")));
             }
             // The text is not put in the tooltip any more: it was the only
             // place it lived, and a tooltip is unreachable by keyboard. The
@@ -5018,25 +5003,34 @@ impl Controller {
                     .set_tooltip_text(Some("Connection error — show connections"));
             }
         }
-        if standby && !matches!(status, Status::Connecting) {
-            let summary = match status {
-                Status::Disconnected => "Disconnected",
-                Status::Connecting => "Connecting",
-                Status::Connected => "Connected",
-                Status::Error(_) => "Connection error",
-            };
-            let label = proxy_status_label(status, true, summary);
-            self.header_status_label.set_label(&label);
-            self.header_status_label.set_visible(true);
-            let detail = match status {
-                Status::Error(error) => format!("Error: {error}"),
-                _ => summary.into(),
-            };
-            self.header_status.set_tooltip_text(Some(&format!(
-                "{} — show connections",
-                proxy_status_label(status, true, &detail)
-            )));
+        let state = self.state.borrow();
+        let presentation = runtime_presentation(&state.ui, &state.ui.selected_profile);
+        self.header_status.set_visible(
+            compact_status_visible(status, state.ui.standby_proxy, self.compact.get())
+                || (self.compact.get()
+                    && (presentation.phase.starts_with("Unknown")
+                        || session_for(&state.ui, &state.ui.selected_profile).is_some())),
+        );
+        self.header_status_label.remove_css_class("latency-stale");
+        let target = self
+            .active_pool_name(&state)
+            .or_else(|| self.active_server_name(&state));
+        self.header_status_label.set_label(&format!(
+            "{}{}",
+            presentation.summary,
+            target.map(|name| format!(" · {name}")).unwrap_or_default()
+        ));
+        if let Some(ms) = active_latency {
+            self.header_status_label
+                .set_label(&format!("{} · {ms} ms", self.header_status_label.text()));
+            if latency_stale {
+                self.header_status_label.add_css_class("latency-stale");
+            }
         }
+        self.header_status_label.set_visible(true);
+        self.header_status
+            .set_tooltip_text(Some(&presentation.detail_text()));
+        set_status_tone(&self.header_status, runtime_tone(presentation.tone));
     }
 
     fn update_sidebar_connection_status(&self, state: &AppState) {
@@ -5047,69 +5041,70 @@ impl Controller {
                 .set_icon_name(Some("dialog-warning-symbolic"));
             self.sidebar_status_label.remove_css_class("latency-stale");
             self.sidebar_status_label.set_label("State unknown");
-            self.sidebar_status
-                .set_tooltip_text(Some("Daemon unavailable - tunnel state unknown"));
+            self.sidebar_status.set_tooltip_text(Some(
+                &runtime_presentation(&state.ui, &state.ui.selected_profile).detail_text(),
+            ));
+            self.sidebar_status_label
+                .set_label(&runtime_presentation(&state.ui, &state.ui.selected_profile).summary);
+            if let (Some(ms), _) = active_latency_for(&state.ui) {
+                self.sidebar_status_label.set_label(&format!(
+                    "{} · {ms} ms (last measurement)",
+                    self.sidebar_status_label.text()
+                ));
+                self.sidebar_status_label.add_css_class("latency-stale");
+            }
             self.set_status_action(None);
             return;
         }
         let status = selected_status(&state.ui);
-        let (active_latency, latency_stale) = active_latency_for(&state.ui);
         self.sidebar_status_label.remove_css_class("latency-stale");
         // The strip is always sensitive because it always does the same thing.
         // It used to be insensitive except when connected, which is how the
         // "show the failure" branch below became unreachable: the one state
         // that needed the click was the one that could not be clicked.
-        let summary = match status {
+        match status {
             Status::Disconnected => {
                 set_status_tone(&self.sidebar_status, StatusTone::Neutral);
                 self.sidebar_status_icon
                     .set_icon_name(Some("network-vpn-symbolic"));
-                let label = "Disconnected";
-                self.sidebar_status_label.set_label(label);
-                label.to_string()
             }
             Status::Connecting => {
                 set_status_tone(&self.sidebar_status, StatusTone::Working);
                 self.sidebar_status_icon
                     .set_icon_name(Some("network-transmit-receive-symbolic"));
-                self.active_pool_name(state)
-                    .or_else(|| self.active_server_name(state))
-                    .map_or_else(
-                        || "Connecting…".to_string(),
-                        |name| format!("Connecting · {name}"),
-                    )
             }
             Status::Connected => {
                 set_status_tone(&self.sidebar_status, StatusTone::Connected);
                 self.sidebar_status_icon
                     .set_icon_name(Some("network-vpn-symbolic"));
-                let name = self
-                    .active_pool_name(state)
-                    .or_else(|| self.active_server_name(state))
-                    .unwrap_or_else(|| "Connected".to_string());
-                let label = active_latency
-                    .map(|ms| format!("{name} · {ms} ms"))
-                    .unwrap_or(name);
-                self.sidebar_status_label.set_label(&label);
-                if active_latency.is_some() && latency_stale {
-                    self.sidebar_status_label.add_css_class("latency-stale");
-                }
-                label
             }
             Status::Error(_) => {
                 set_status_tone(&self.sidebar_status, StatusTone::Error);
                 self.sidebar_status_icon
                     .set_icon_name(Some("dialog-warning-symbolic"));
-                self.sidebar_status_label.set_label("Connection error");
-                "Connection error".to_string()
             }
         };
-        let summary = proxy_status_label(&status, state.ui.standby_proxy, &summary);
-        self.sidebar_status_label.set_label(&summary);
-        // Names the destination, not the state, because that is what the click
-        // does. The state is already the label an inch to the left.
+        let presentation = runtime_presentation(&state.ui, &state.ui.selected_profile);
+        let target = self
+            .active_pool_name(state)
+            .or_else(|| self.active_server_name(state));
+        self.sidebar_status_label.remove_css_class("latency-stale");
+        self.sidebar_status_label.set_label(&format!(
+            "{}{}",
+            presentation.summary,
+            target.map(|name| format!(" · {name}")).unwrap_or_default()
+        ));
+        let (latency, stale) = active_latency_for(&state.ui);
+        if let Some(ms) = latency {
+            self.sidebar_status_label
+                .set_label(&format!("{} · {ms} ms", self.sidebar_status_label.text()));
+            if stale {
+                self.sidebar_status_label.add_css_class("latency-stale");
+            }
+        }
         self.sidebar_status
-            .set_tooltip_text(Some(&format!("{summary} — show connections")));
+            .set_tooltip_text(Some(&presentation.detail_text()));
+        set_status_tone(&self.sidebar_status, runtime_tone(presentation.tone));
         let intent = session_rows(&state.profiles, &state.ui, ipc::now_unix_ms())
             .into_iter()
             .find(|row| row.profile == state.ui.selected_profile)
@@ -5921,6 +5916,15 @@ fn session_row_tone(state: SessionRowState) -> StatusTone {
         SessionRowState::Connected => StatusTone::Connected,
         SessionRowState::Error => StatusTone::Error,
         SessionRowState::Unknown => StatusTone::Neutral,
+    }
+}
+
+fn runtime_tone(tone: super::reduce::RuntimeTone) -> StatusTone {
+    match tone {
+        super::reduce::RuntimeTone::Working => StatusTone::Working,
+        super::reduce::RuntimeTone::Running => StatusTone::Connected,
+        super::reduce::RuntimeTone::Failed => StatusTone::Error,
+        _ => StatusTone::Neutral,
     }
 }
 

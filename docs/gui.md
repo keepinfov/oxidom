@@ -25,6 +25,23 @@ With older daemons that
 do not expose `DaemonInfo`, optional geo-download and probe-cancel controls are disabled rather
 than tested by issuing cancellation requests. Ordinary existing daemon operations remain available.
 
+## Reading session status
+
+Phase, last health observation, traffic scope and automatic retry are separate facts. A session
+can be verifying a replacement while holding its assigned traffic, or running after a negative
+synthetic check. Running is not a promise that every destination is currently reachable.
+
+Profiles details show the last observation with source and UTC timestamp, recorded exit policy,
+interface and route scope, logical desktop-proxy ownership, traffic hold and retry state.
+Backoff shows the remaining delay; attempting means an automatic retry has started. Idle means
+there is no retry episode, not that automatic recovery is disabled. Header, sidebar and tray
+use the same phase/retry/hold summary. A local start or stop is labelled as intent until reported.
+
+Missing facts from older daemons say not reported. Poll failures leave last-known details
+inspectable but state unknown, including a previously reported direct standby proxy. Logical
+proxy ownership does not prove successful desktop-setting application, and neither proxy nor
+TUN bookkeeping proves whole-device protection. A hold concerns traffic assigned to that session.
+
 ## The five pages
 
 Expanded Profiles rows distinguish **Saved selection**, **Pending request** and **Reported
@@ -415,7 +432,7 @@ repointing it.
 | **Appearance** | Follow the system, Light, or Dark. Applies as you pick it — there is nothing to Apply, because it belongs to this window rather than to the daemon. A choice other than "follow the system" overrides the desktop, which is the point on a desktop that offers no such setting. Stored in `gui_prefs.toml`. |
 | **Local proxy** — SOCKS and HTTP ports | Locked, with an explanation, when the daemon's unit pinned them. |
 | **Answer on local ports while disconnected** | Off by default. Serve a **direct**, unprotected connection on `127.0.0.1` at the configured SOCKS/HTTP ports only while no profile session is connected, connecting or holding traffic. Starting any session closes the standby listeners and existing direct connections first. |
-| **System proxy** | "Send the whole desktop's traffic through oxidom while connected (GNOME)". See [routing.md](routing.md#gnome-system-proxy). |
+| **System proxy** | Use oxidom for applications that honor GNOME desktop proxy settings while connected. Applications ignoring those settings are unaffected. See [routing.md](routing.md#gnome-system-proxy). |
 | **Reconnect automatically** | "Reconnect only when Xray exits unexpectedly, never after Disconnect". |
 | **Tunnel watchdog** | Off, Conservative (default), or Aggressive. Conservative reports repeated failed checks without killing a live core; Aggressive may interrupt traffic to restart it. Applies to automatically recovered sessions, including `oxidom run`. Process-exit supervision remains active in every mode. Disabled against an older daemon that does not support the setting. |
 | **Hold traffic if Xray exits** | On by default. The routes stay when the core dies, so the tunnel's traffic is dropped until it comes back rather than falling back to your ordinary connection with your own address. A profile can answer for itself, in the profile editor under Interface. See [when the core dies](routing.md#when-the-core-dies). |

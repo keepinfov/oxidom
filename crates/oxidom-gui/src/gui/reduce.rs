@@ -112,6 +112,7 @@ pub(super) struct SnapshotState {
     pending_since: Instant,
     /// Latest status reported by the daemon.
     pub daemon_status: Status,
+    daemon_state: String,
     /// A failed poll says nothing about whether the last known tunnels survived.
     pub poll_error: Option<String>,
     /// True while the daemon is serving a direct standby proxy on `default`'s
@@ -227,6 +228,7 @@ impl SnapshotState {
             pending_profile: "default".to_string(),
             pending_since: Instant::now(),
             daemon_status: status.to_status(),
+            daemon_state: status.state.clone(),
             poll_error: None,
             standby_proxy: status.standby_proxy,
             failed_id: None,
@@ -578,6 +580,7 @@ pub(super) fn reduce(
     let mut toast_not_run = false;
     let mut new_error: Option<String> = None;
     state.daemon_status = snapshot.status.to_status();
+    state.daemon_state.clone_from(&snapshot.status.state);
     state.reported_id = snapshot.status.active_id.clone();
     state.standby_proxy = snapshot.status.standby_proxy;
     state.active_profile = snapshot.status.active_profile.clone();
@@ -803,8 +806,8 @@ pub(super) fn reduce(
         .is_none_or(|op| op.kind.is_subscription_fetch())
     {
         let reported_status = reported_status_for(state, &state.pending_profile);
-        let reported_known = session_row_state(session_for(state, &state.pending_profile))
-            != SessionRowState::Unknown;
+        let reported_known =
+            profile_lifecycle(state, &state.pending_profile) != SessionRowState::Unknown;
         let contradicted = match &state.pending_status {
             None => false,
             // Optimistic: the user asked to go up. Anything but the old
@@ -1479,6 +1482,18 @@ fn status_from_session(session: Option<&SessionInfo>) -> Status {
 }
 
 fn reported_status_for(state: &SnapshotState, profile: &str) -> Status {
+    if session_for(state, profile).is_some_and(|session| session.runtime.is_some()) {
+        return match profile_lifecycle(state, profile) {
+            SessionRowState::Connected => Status::Connected,
+            SessionRowState::Connecting => Status::Connecting,
+            SessionRowState::Error => Status::Error(
+                session_for(state, profile)
+                    .and_then(|session| session.error.clone())
+                    .unwrap_or_default(),
+            ),
+            _ => Status::Disconnected,
+        };
+    }
     if profile == "default" {
         state.daemon_status.clone()
     } else {
@@ -1502,6 +1517,247 @@ pub(super) fn selected_status(state: &SnapshotState) -> Status {
         .unwrap_or_else(|| reported_status_for(state, &state.selected_profile))
 }
 
+/// Presentation only: local intent never rewrites the daemon's independent facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RuntimePresentation {
+    pub phase: String,
+    pub tone: RuntimeTone,
+    pub summary: String,
+    pub details: Vec<SessionDetail>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuntimeTone {
+    Neutral,
+    Working,
+    Running,
+    Failed,
+    Unknown,
+}
+
+impl RuntimePresentation {
+    pub fn detail_text(&self) -> String {
+        self.details
+            .iter()
+            .map(|detail| format!("{}: {}", detail.label, detail.value))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+pub(super) fn runtime_presentation(state: &SnapshotState, profile: &str) -> RuntimePresentation {
+    let session = session_for(state, profile);
+    let runtime = session.and_then(|session| session.runtime.as_ref());
+    let unknown = |value: &str| {
+        format!(
+            "Unknown ({})",
+            if value.is_empty() {
+                "not reported"
+            } else {
+                value
+            }
+        )
+    };
+    let phase = if let Some(runtime) = runtime {
+        match runtime.phase.as_str() {
+            "stopped" => "Stopped".into(),
+            "starting" => "Starting".into(),
+            "verifying" => "Verifying".into(),
+            "running" => "Running".into(),
+            "failed" => "Failed".into(),
+            value => unknown(value),
+        }
+    } else {
+        let legacy = session
+            .map(|session| session.state.as_str())
+            .or_else(|| (profile == "default").then_some(state.daemon_state.as_str()));
+        match legacy {
+            Some("disconnected") | None => "Stopped".into(),
+            Some("connecting") => "Starting".into(),
+            Some("connected") => "Running".into(),
+            Some("error") => "Failed".into(),
+            Some(value) => unknown(value),
+        }
+    };
+    let mut details = vec![SessionDetail::new("Phase", phase.clone())];
+    let holding = session.is_some_and(|session| session.holding_traffic)
+        || runtime.is_some_and(|runtime| runtime.protection.holding == Some(true));
+    let retry = if let Some(runtime) = runtime {
+        let observation = runtime.health.as_ref().map_or_else(
+            || "No observation reported".into(),
+            |health| {
+                let outcome = match health.outcome.as_str() {
+                    "reachable" => "Reachable".into(),
+                    "timeout" => "Timeout".into(),
+                    "unreachable" => "Unreachable".into(),
+                    "no_network" => "No network".into(),
+                    "internal" => "Internal failure".into(),
+                    value => unknown(value),
+                };
+                let source = match health.source.as_str() {
+                    "confirmation" | "active" | "watchdog" => health.source.clone(),
+                    value => unknown(value),
+                };
+                let measured = if health.measured_at.is_empty() {
+                    "timestamp not reported"
+                } else {
+                    &health.measured_at
+                };
+                format!("{outcome}; {source}; {measured}")
+            },
+        );
+        details.push(SessionDetail::new("Last observation", observation));
+        let protection = &runtime.protection;
+        let policy = match protection.on_core_exit.as_str() {
+            "hold" => "Hold".into(),
+            "release" => "Release".into(),
+            value => unknown(value),
+        };
+        details.push(SessionDetail::new("On core exit", policy));
+        details.push(SessionDetail::new(
+            "Recorded scope",
+            format!(
+                "Interface {}; route mode: {}. Session-scoped routes, not whole-device protection",
+                match protection.interface_up {
+                    Some(true) => "up",
+                    Some(false) => "down",
+                    None => "not reported",
+                },
+                protection.route_mode.as_deref().unwrap_or("not reported")
+            ),
+        ));
+        details.push(SessionDetail::new(
+            "Desktop proxy ownership",
+            match protection.desktop_proxy_owner {
+                Some(true) => {
+                    "Logical owner; not proof the desktop setting was successfully applied"
+                }
+                Some(false) => {
+                    "Not the logical owner; application of desktop settings is a separate fact"
+                }
+                None => "Not reported by daemon",
+            },
+        ));
+        let retry = &runtime.retry;
+        match retry.state.as_str() {
+            "idle" => "Idle".into(),
+            "backoff" => format!("Retry #{} in backoff", retry.ordinal),
+            "attempting" => format!("Retry #{} attempting", retry.ordinal),
+            value => unknown(value),
+        }
+    } else {
+        details.push(SessionDetail::new("Runtime", "Not reported by daemon"));
+        details.push(SessionDetail::new("On core exit", "Not reported by daemon"));
+        details.push(SessionDetail::new(
+            "Last observation",
+            "Not reported by daemon",
+        ));
+        details.push(SessionDetail::new(
+            "Recorded scope",
+            "Not reported by daemon; no whole-device protection claim",
+        ));
+        if session.is_some_and(|session| session.owns_system_proxy) {
+            details.push(SessionDetail::new(
+                "Desktop proxy ownership",
+                "Legacy logical owner; not proof the desktop setting was successfully applied",
+            ));
+        }
+        "Not reported by daemon".into()
+    };
+    details.push(SessionDetail::new(
+        "Traffic hold",
+        if holding {
+            "Recorded scoped hold; not a claim that traffic is currently dropped"
+        } else if runtime.is_some_and(|runtime| runtime.protection.holding == Some(false)) {
+            "Not holding"
+        } else if runtime.is_some() {
+            "Not reported by daemon"
+        } else {
+            "No legacy hold reported; runtime protection not reported"
+        },
+    ));
+    details.push(SessionDetail::new("Retry", retry.clone()));
+    let mut summary = if state.poll_error.is_some() {
+        details.insert(
+            0,
+            SessionDetail::new(
+                "Status",
+                "Unknown - daemon polling failed; details are the last reported facts",
+            ),
+        );
+        "Unknown - daemon polling failed".into()
+    } else {
+        match operation_kind_for(state, profile) {
+            Some(UiOperationKind::UpProfile) => "Starting (local intent)".into(),
+            Some(UiOperationKind::DownProfile | UiOperationKind::Disconnect) => {
+                "Stopping (local intent)".into()
+            }
+            _ => match state.pending_status_for(profile) {
+                Some(Status::Connecting) => "Starting (local intent)".into(),
+                Some(Status::Connected) => "Running (local intent)".into(),
+                Some(Status::Disconnected) => "Stopped (local intent)".into(),
+                Some(Status::Error(_)) => "Failed (local intent)".into(),
+                None => phase.clone(),
+            },
+        }
+    };
+    let tone = if state.poll_error.is_some() {
+        RuntimeTone::Unknown
+    } else if summary.starts_with("Starting")
+        || summary.starts_with("Stopping")
+        || summary.starts_with("Verifying")
+    {
+        RuntimeTone::Working
+    } else if summary.starts_with("Running") {
+        RuntimeTone::Running
+    } else if summary.starts_with("Failed") {
+        RuntimeTone::Failed
+    } else if summary.starts_with("Unknown") {
+        RuntimeTone::Unknown
+    } else {
+        RuntimeTone::Neutral
+    };
+    if let Some(runtime) = runtime {
+        let compact_retry = if runtime.retry.state == "backoff" {
+            runtime.retry.remaining_ms.map_or_else(
+                || format!("{retry}; delay not reported"),
+                |ms| {
+                    format!(
+                        "Retry #{} in {} s",
+                        runtime.retry.ordinal,
+                        ms.div_ceil(1000)
+                    )
+                },
+            )
+        } else {
+            retry
+        };
+        summary.push_str(&format!(" · {compact_retry}"));
+    }
+    if holding {
+        summary.push_str(if state.poll_error.is_some() {
+            " · Last-known scoped hold"
+        } else {
+            " · Recorded scoped hold"
+        });
+    }
+    if profile == "default" && state.standby_proxy {
+        if state.poll_error.is_some() {
+            summary.push_str(" · last-known standby: direct proxy");
+        } else if tone == RuntimeTone::Unknown {
+            summary.push_str(" · Direct standby proxy");
+        } else {
+            summary = proxy_status_label(&Status::Connected, true, &summary);
+        }
+    }
+    RuntimePresentation {
+        phase,
+        tone,
+        summary,
+        details,
+    }
+}
+
 /// One row on the Profiles page.
 ///
 /// The shape is the fix for what the page had become: every fact about a
@@ -1521,6 +1777,7 @@ pub(super) struct SessionRow {
     /// Profile name; also the row's stable key.
     pub profile: String,
     pub state: SessionRowState,
+    pub runtime: RuntimePresentation,
     /// The one line under the name: what this session is pointed at, and — for
     /// a pool — how much of it is carrying traffic.
     pub headline: String,
@@ -1639,6 +1896,15 @@ pub(super) struct SessionWarning {
 }
 
 fn session_row_state(session: Option<&SessionInfo>) -> SessionRowState {
+    if let Some(runtime) = session.and_then(|session| session.runtime.as_ref()) {
+        return match runtime.phase.as_str() {
+            "stopped" => SessionRowState::Stopped,
+            "starting" | "verifying" => SessionRowState::Connecting,
+            "running" => SessionRowState::Connected,
+            "failed" => SessionRowState::Error,
+            _ => SessionRowState::Unknown,
+        };
+    }
     match session.map(|session| session.state.as_str()) {
         Some("connected") => SessionRowState::Connected,
         Some("connecting") => SessionRowState::Connecting,
@@ -1651,6 +1917,31 @@ fn session_row_state(session: Option<&SessionInfo>) -> SessionRowState {
         Some("disconnected") | None => SessionRowState::Stopped,
         Some(_) => SessionRowState::Unknown,
     }
+}
+
+/// Reported lifecycle, without optimistic intent: also gates pin acknowledgement.
+fn profile_lifecycle(state: &SnapshotState, profile: &str) -> SessionRowState {
+    if let Some(session) = session_for(state, profile) {
+        return session_row_state(Some(session));
+    }
+    if profile == "default" {
+        return match state.daemon_state.as_str() {
+            "connected" => SessionRowState::Connected,
+            "connecting" => SessionRowState::Connecting,
+            "error" => SessionRowState::Error,
+            "disconnected" => SessionRowState::Stopped,
+            _ => SessionRowState::Unknown,
+        };
+    }
+    SessionRowState::Stopped
+}
+
+fn session_holds(session: &SessionInfo) -> bool {
+    session.holding_traffic
+        || session
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.protection.holding == Some(true))
 }
 
 fn route_mode_label(mode: RouteMode) -> &'static str {
@@ -1812,7 +2103,7 @@ pub(super) fn session_rows(
                     Some(Status::Connected) => SessionRowState::Connected,
                     Some(Status::Disconnected) => SessionRowState::Stopped,
                     Some(Status::Error(_)) => SessionRowState::Error,
-                    None => session_row_state(session),
+                    None => profile_lifecycle(state, &entry.name),
                 },
             };
             let running_pool = session
@@ -1823,7 +2114,7 @@ pub(super) fn session_rows(
                 .and(state.pending_pool.as_ref());
             let is_pool = pending_pool.is_some() || running_pool.is_some() || entry.pool.is_some();
 
-            let holding = session.is_some_and(|session| session.holding_traffic);
+            let holding = session.is_some_and(session_holds);
 
             // The warnings that have to survive the row being collapsed. Holding
             // comes first and displaces the other: a stale pool is a tunnel
@@ -1832,13 +2123,12 @@ pub(super) fn session_rows(
             // the more consequential fact.
             let warning = if holding {
                 Some(SessionWarning {
-                    text: "holding traffic".to_string(),
-                    tooltip: Some(
-                        "The core exited. This tunnel's routes are still in place, so its \
-                         traffic is dropped instead of leaving with your own address. \
-                         Reconnect, or stop the session to release it."
-                            .to_string(),
-                    ),
+                    text: if state.poll_error.is_some() { "last-known hold" } else { "holding traffic" }.to_string(),
+                    tooltip: Some(if state.poll_error.is_some() {
+                        "Last-known recorded scoped hold; current traffic behavior is unknown while the daemon is unavailable"
+                    } else {
+                        "A recorded scoped hold remains in place. Traffic may pass during live verification; this is not a current drop claim. Stop the session to release its scope."
+                    }.to_string()),
                 })
             } else {
                 running_pool
@@ -1878,7 +2168,8 @@ pub(super) fn session_rows(
             let (latency, latency_detail) =
                 latency_parts(state.proxied.get(&entry.name), now_unix_ms);
 
-            let mut details = Vec::new();
+            let runtime = runtime_presentation(state, &entry.name);
+            let mut details = runtime.details.clone();
             if !saved_profile {
                 details.push(SessionDetail::new(
                     "Profile",
@@ -1891,14 +2182,6 @@ pub(super) fn session_rows(
             // report was the one thing unreachable.
             if let Some(error) = session.and_then(|session| session.error.as_ref()) {
                 details.push(SessionDetail::new("Error", error.clone()).copyable());
-            }
-            // Directly below the failure, because it is the half of the failure
-            // that decides whether anything is leaving this machine unprotected.
-            if holding {
-                details.push(SessionDetail::new(
-                    "Traffic",
-                    "Held — the routes stay until this reconnects or is stopped",
-                ));
             }
             if saved_profile {
                 let saved_target = entry
@@ -2013,9 +2296,6 @@ pub(super) fn session_rows(
                 details.push(SessionDetail::new("Strategy", selection.strategy.clone()));
             }
             details.extend(latency_detail);
-            if session.is_some_and(|session| session.owns_system_proxy) {
-                details.push(SessionDetail::new("System proxy", "Set by this connection"));
-            }
             if !entry.description.is_empty() {
                 details.push(SessionDetail::new("Description", entry.description.clone()));
             }
@@ -2055,7 +2335,7 @@ pub(super) fn session_rows(
             let session_action = intent.filter(|action| {
                 state.poll_error.is_none()
                     && in_flight.is_none()
-                    && session_row_state(session) != SessionRowState::Unknown
+                    && profile_lifecycle(state, &entry.name) != SessionRowState::Unknown
                     && state.can_start(match action {
                         SessionAction::Stop(_) => UiOperationKind::DownProfile,
                         SessionAction::Start(_, _) | SessionAction::Restart(_, _) => {
@@ -2067,6 +2347,7 @@ pub(super) fn session_rows(
                 saved_profile,
                 profile: entry.name.clone(),
                 state: row_state,
+                runtime,
                 headline: if pending_target.is_some() {
                     selection
                 } else if saved_profile {
@@ -2090,12 +2371,7 @@ pub(super) fn session_rows(
                 row.state = SessionRowState::Unknown;
                 row.headline = "Tunnel state unknown - daemon polling failed".into();
                 row.latency = None;
-                row.warning = None;
                 row.busy = true;
-                row.details.insert(
-                    0,
-                    SessionDetail::new("Status", "Last known daemon snapshot"),
-                );
             }
             row
         })
@@ -2148,7 +2424,7 @@ pub(super) fn switcher_items(
             state: if state.poll_error.is_some() {
                 SessionRowState::Unknown
             } else {
-                session_row_state(session_for(state, &entry.name))
+                profile_lifecycle(state, &entry.name)
             },
             selected: entry.name == state.selected_profile,
         })
@@ -2203,7 +2479,7 @@ pub(super) fn card_action(
         && session_for(state, &selected).is_some_and(|session| {
             session.selection.kind != "pool"
                 && session.server_id.as_deref() == Some(server_id)
-                && session.holding_traffic
+                && session_holds(session)
         })
     {
         return CardAction::Disconnect;
@@ -2213,10 +2489,18 @@ pub(super) fn card_action(
         // Default card clicks intentionally use temporary ConnectServer, even
         // with a saved or running pool; they never rewrite the saved profile.
         // A reported pool member is not an exact single-server connection.
-        if matches!(
-            state.current_status(),
-            Status::Connected | Status::Connecting
-        ) && state.connected_id.as_deref() == Some(server_id)
+        if state.pending_status_for(&selected).map_or_else(
+            || {
+                matches!(
+                    profile_lifecycle(state, &selected),
+                    SessionRowState::Connected | SessionRowState::Connecting
+                )
+            },
+            |status| matches!(status, Status::Connected | Status::Connecting),
+        ) && (session_for(state, &selected)
+            .and_then(|session| session.server_id.as_deref())
+            .or(state.connected_id.as_deref())
+            == Some(server_id))
             && session_for(state, &selected).is_none_or(|session| session.selection.kind != "pool")
         {
             return CardAction::Disconnect;
@@ -2226,8 +2510,10 @@ pub(super) fn card_action(
 
     if session_for(state, &selected).is_some_and(|session| {
         session.server_id.as_deref() == Some(server_id)
-            && (matches!(session.state.as_str(), "connected" | "connecting")
-                || session.holding_traffic)
+            && (matches!(
+                profile_lifecycle(state, &selected),
+                SessionRowState::Connected | SessionRowState::Connecting
+            ) || session_holds(session))
     }) {
         return CardAction::DownProfile(selected);
     }
@@ -2278,8 +2564,9 @@ pub(super) fn card_plan(
         CardAction::DownProfile(_) => ("Disconnect", UiOperationKind::DownProfile),
         CardAction::Connect(_) => {
             let failed_match = session.is_some_and(|session| {
-                session.state == "error" && session.server_id.as_deref() == Some(server_id)
-            }) || (matches!(state.current_status(), Status::Error(_))
+                profile_lifecycle(state, selected) == SessionRowState::Error
+                    && session.server_id.as_deref() == Some(server_id)
+            }) || (profile_lifecycle(state, selected) == SessionRowState::Error
                 && state.failed_id.as_deref() == Some(server_id));
             (
                 if failed_match { "Reconnect" } else { "Connect" },
@@ -2293,7 +2580,7 @@ pub(super) fn card_plan(
     ControlPlan {
         label,
         action: (state.poll_error.is_none()
-            && session_row_state(session) != SessionRowState::Unknown
+            && profile_lifecycle(state, selected) != SessionRowState::Unknown
             && state.can_start(kind))
         .then_some(action),
     }
@@ -2420,8 +2707,8 @@ pub(super) fn pool_action(state: &SnapshotState, members: &[String]) -> PoolActi
             // and Stop on it would tear down a corpse instead of connecting.
             // A session holding traffic still owns routes, so stopping it
             // must stay reachable.
-            && (matches!(session.state.as_str(), "connected" | "connecting")
-                || session.holding_traffic)
+            && (matches!(profile_lifecycle(state, &session.profile), SessionRowState::Connected | SessionRowState::Connecting)
+                || session_holds(session))
     };
     let selected = if state.selected_profile.is_empty() {
         GROUP_CONNECT_SESSION
@@ -2452,7 +2739,7 @@ pub(super) fn pool_plan(state: &SnapshotState, members: &[String]) -> ControlPla
     ControlPlan {
         label,
         action: (state.poll_error.is_none()
-            && session_row_state(session_for(state, selected)) != SessionRowState::Unknown
+            && profile_lifecycle(state, selected) != SessionRowState::Unknown
             && (!members.is_empty() || matches!(action, PoolAction::Stop(_)))
             && state.can_start(kind))
         .then_some(action),
@@ -4257,6 +4544,7 @@ mod tests {
             active_id: Some("node".into()),
             sessions: vec![SessionInfo {
                 owns_system_proxy: true,
+                runtime: None,
                 ..session("work", "connected", "node")
             }],
             ..StatusInfo::default()
@@ -4348,6 +4636,378 @@ mod tests {
             http_port: 10809,
             ..SessionInfo::default()
         }
+    }
+
+    #[test]
+    fn runtime_axes_remain_independent_and_health_is_a_dated_observation() {
+        use oxidom_core::ipc::{
+            RuntimeHealth, RuntimeProtection, RuntimeRetry, RuntimeSessionInfo,
+        };
+        let mut state = SnapshotState::new(&StatusInfo::default());
+        let mut reported = session("work", "error", "old");
+        reported.runtime = Some(RuntimeSessionInfo {
+            phase: "running".into(),
+            health: Some(RuntimeHealth {
+                outcome: "timeout".into(),
+                source: "watchdog".into(),
+                measured_at: "2026-10-28T12:00:00Z".into(),
+            }),
+            protection: RuntimeProtection {
+                on_core_exit: "hold".into(),
+                holding: Some(true),
+                interface_up: Some(true),
+                route_mode: Some("list".into()),
+                desktop_proxy_owner: Some(true),
+            },
+            retry: RuntimeRetry {
+                state: "backoff".into(),
+                ordinal: 3,
+                remaining_ms: Some(1250),
+            },
+        });
+        state.sessions.push(reported);
+        let shown = runtime_presentation(&state, "work");
+        assert_eq!(shown.phase, "Running");
+        assert!(shown.summary.contains("Retry #3 in 2 s"));
+        assert!(shown.summary.contains("Recorded scoped hold"));
+        let detail = shown.detail_text();
+        assert!(detail.contains("Last observation: Timeout; watchdog; 2026-10-28T12:00:00Z"));
+        assert!(detail.contains("route mode: list"));
+        assert!(detail.contains("Logical owner"));
+        assert!(detail.contains("not proof"));
+        // A new local target must not turn a recorded backoff into a retry attempt.
+        state.pin_target("work", Some("new".into()), Instant::now());
+        let pending = runtime_presentation(&state, "work");
+        assert!(pending.summary.starts_with("Starting (local intent)"));
+        assert!(pending.summary.contains("Retry #3 in 2 s"));
+        assert!(pending.detail_text().contains("Phase: Running"));
+        assert_eq!(state.requested_target("work").as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn unknown_runtime_and_poll_failure_never_claim_stopped() {
+        use oxidom_core::ipc::RuntimeSessionInfo;
+        let mut state = SnapshotState::new(&StatusInfo::default());
+        let mut reported = session("work", "disconnected", "old");
+        reported.runtime = Some(RuntimeSessionInfo {
+            phase: "future-phase".into(),
+            ..Default::default()
+        });
+        state.sessions.push(reported);
+        assert_eq!(
+            session_row_state(session_for(&state, "work")),
+            SessionRowState::Unknown
+        );
+        let shown = runtime_presentation(&state, "work");
+        assert_eq!(shown.phase, "Unknown (future-phase)");
+        assert!(
+            shown
+                .detail_text()
+                .contains("Retry: Unknown (not reported)")
+        );
+        state.poll_error = Some("offline".into());
+        state.pin_target("work", Some("new".into()), Instant::now());
+        assert!(
+            runtime_presentation(&state, "work")
+                .summary
+                .starts_with("Unknown - daemon polling failed")
+        );
+    }
+
+    #[test]
+    fn an_unknown_legacy_default_phase_is_not_a_known_stop() {
+        let state = SnapshotState::new(&StatusInfo {
+            state: "future-state".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            runtime_presentation(&state, "default").phase,
+            "Unknown (future-state)"
+        );
+        let rows = session_rows(&[profile("default", "old")], &state, 0);
+        assert_eq!(rows[0].state, SessionRowState::Unknown);
+        assert!(rows[0].session_action.is_none());
+    }
+
+    #[test]
+    fn every_reported_phase_is_independent_of_retry_and_health() {
+        use oxidom_core::ipc::{RuntimeRetry, RuntimeSessionInfo};
+        for (phase, label) in [
+            ("stopped", "Stopped"),
+            ("starting", "Starting"),
+            ("verifying", "Verifying"),
+            ("running", "Running"),
+            ("failed", "Failed"),
+        ] {
+            for retry in ["idle", "backoff", "attempting", "future-retry"] {
+                let mut state = state();
+                let mut reported = session("work", "connected", "old");
+                reported.runtime = Some(RuntimeSessionInfo {
+                    phase: phase.into(),
+                    retry: RuntimeRetry {
+                        state: retry.into(),
+                        ordinal: 2,
+                        remaining_ms: None,
+                    },
+                    ..Default::default()
+                });
+                state.sessions.push(reported);
+                let shown = runtime_presentation(&state, "work");
+                assert_eq!(shown.phase, label);
+                assert!(shown.detail_text().contains("No observation reported"));
+                assert_eq!(
+                    session_rows(&[profile("work", "old")], &state, 0)[0].runtime,
+                    shown
+                );
+                if retry == "future-retry" {
+                    assert!(shown.detail_text().contains("Unknown (future-retry)"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_hold_and_missing_runtime_are_facts_not_health_or_retry() {
+        let mut state = SnapshotState::new(&StatusInfo::default());
+        let mut reported = session("work", "error", "old");
+        reported.holding_traffic = true;
+        reported.error = Some("retrying; healthy".into());
+        state.sessions.push(reported);
+        state.proxied.insert("work".into(), proxied(42, NOW_MS));
+        let shown = runtime_presentation(&state, "work");
+        assert_eq!(shown.phase, "Failed");
+        assert!(shown.summary.contains("Recorded scoped hold"));
+        assert!(
+            shown
+                .detail_text()
+                .contains("Runtime: Not reported by daemon")
+        );
+        assert!(
+            shown
+                .detail_text()
+                .contains("Last observation: Not reported by daemon")
+        );
+        assert!(
+            shown
+                .detail_text()
+                .contains("Retry: Not reported by daemon")
+        );
+        assert!(!shown.detail_text().contains("healthy"));
+        state.sessions[0].state = "future-state".into();
+        assert_eq!(
+            runtime_presentation(&state, "work").phase,
+            "Unknown (future-state)"
+        );
+    }
+
+    #[test]
+    fn reachable_observation_does_not_imply_running_or_retrying() {
+        use oxidom_core::ipc::{RuntimeHealth, RuntimeRetry, RuntimeSessionInfo};
+        let mut state = SnapshotState::new(&StatusInfo::default());
+        let mut reported = session("work", "connected", "old");
+        reported.runtime = Some(RuntimeSessionInfo {
+            phase: "failed".into(),
+            health: Some(RuntimeHealth {
+                outcome: "reachable".into(),
+                source: "confirmation".into(),
+                measured_at: "2026-10-28T11:00:00Z".into(),
+            }),
+            retry: RuntimeRetry {
+                state: "idle".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        state.sessions.push(reported);
+        let shown = runtime_presentation(&state, "work");
+        assert_eq!(shown.phase, "Failed");
+        assert!(
+            shown
+                .detail_text()
+                .contains("Reachable; confirmation; 2026-10-28T11:00:00Z")
+        );
+        assert!(shown.detail_text().contains("Retry: Idle"));
+        assert!(!shown.summary.contains("Reachable"));
+    }
+
+    #[test]
+    fn missing_observation_metadata_and_future_values_are_explicit() {
+        use oxidom_core::ipc::{RuntimeHealth, RuntimeSessionInfo};
+        let mut state = state();
+        let mut reported = session("work", "connected", "old");
+        reported.runtime = Some(RuntimeSessionInfo {
+            phase: "running".into(),
+            health: Some(RuntimeHealth {
+                outcome: "future-outcome".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        state.sessions.push(reported);
+        let shown = runtime_presentation(&state, "work");
+        assert!(
+            shown.detail_text().contains(
+                "Unknown (future-outcome); Unknown (not reported); timestamp not reported"
+            )
+        );
+        assert!(
+            shown
+                .detail_text()
+                .contains("On core exit: Unknown (not reported)")
+        );
+    }
+
+    #[test]
+    fn unknown_wins_over_standby_and_unavailable_standby_is_last_known() {
+        let mut state = SnapshotState::new(&StatusInfo {
+            state: "future".into(),
+            standby_proxy: true,
+            ..Default::default()
+        });
+        assert!(
+            runtime_presentation(&state, "default")
+                .summary
+                .starts_with("Unknown")
+        );
+        state.poll_error = Some("offline".into());
+        let shown = runtime_presentation(&state, "default");
+        assert!(shown.summary.starts_with("Unknown"));
+        assert!(shown.summary.contains("last-known standby"));
+        assert_eq!(shown.tone, RuntimeTone::Unknown);
+    }
+
+    #[test]
+    fn partial_protection_does_not_assert_negative_facts() {
+        let mut state = state();
+        let mut reported = session("work", "connected", "old");
+        reported.runtime = Some(Default::default());
+        state.sessions.push(reported);
+        let text = runtime_presentation(&state, "work").detail_text();
+        assert!(text.contains("Interface not reported"));
+        assert!(text.contains("Desktop proxy ownership: Not reported"));
+        assert!(text.contains("Traffic hold: Not reported"));
+        assert!(!text.contains("Not holding"));
+        assert!(!text.contains("Not the logical owner"));
+    }
+
+    #[test]
+    fn pending_tone_and_stable_retry_details_do_not_rewrite_reported_phase() {
+        use oxidom_core::ipc::{RuntimeRetry, RuntimeSessionInfo};
+        let mut state = state();
+        let mut reported = session("work", "error", "old");
+        reported.runtime = Some(RuntimeSessionInfo {
+            phase: "failed".into(),
+            retry: RuntimeRetry {
+                state: "backoff".into(),
+                ordinal: 3,
+                remaining_ms: Some(2500),
+            },
+            ..Default::default()
+        });
+        state.sessions.push(reported);
+        state.pin_target("work", Some("new".into()), Instant::now());
+        let before = runtime_presentation(&state, "work");
+        assert_eq!(before.tone, RuntimeTone::Working);
+        assert_eq!(before.phase, "Failed");
+        assert!(before.summary.contains("in 3 s"));
+        state.sessions[0]
+            .runtime
+            .as_mut()
+            .unwrap()
+            .retry
+            .remaining_ms = Some(1500);
+        let after = runtime_presentation(&state, "work");
+        assert_ne!(before.summary, after.summary);
+        assert_eq!(before.details, after.details);
+        state.poll_error = Some("offline".into());
+        assert_eq!(
+            runtime_presentation(&state, "work").tone,
+            RuntimeTone::Unknown
+        );
+    }
+
+    #[test]
+    fn runtime_verification_invalidates_restart_and_pool_connect_intents() {
+        use oxidom_core::ipc::RuntimeSessionInfo;
+        let mut state = state();
+        state.selected_profile = "work".into();
+        let profiles = [profile("work", "same")];
+        let mut live = session("work", "error", "same");
+        live.runtime = Some(RuntimeSessionInfo {
+            phase: "failed".into(),
+            ..Default::default()
+        });
+        state.sessions.push(live);
+        let restart = card_plan(&profiles, &state, "same");
+        state.sessions[0].runtime.as_mut().unwrap().phase = "verifying".into();
+        let verifying = card_plan(&profiles, &state, "same");
+        assert_ne!(restart.action, verifying.action);
+        assert_eq!(
+            verifying.action,
+            Some(CardAction::DownProfile("work".into()))
+        );
+        state.sessions[0].selection = SelectionInfo {
+            kind: "pool".into(),
+            members: vec![PoolMember {
+                server_id: "same".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            pool_plan(&state, &["same".into()]).action,
+            Some(PoolAction::Stop("work".into()))
+        );
+    }
+
+    #[test]
+    fn unknown_default_without_a_session_disables_all_connection_controls_and_pin_ack() {
+        let mut state = SnapshotState::new(&StatusInfo {
+            state: "future".into(),
+            ..Default::default()
+        });
+        let profiles = [profile("default", "same")];
+        assert!(card_plan(&profiles, &state, "same").action.is_none());
+        assert!(pool_plan(&state, &["same".into()]).action.is_none());
+        assert!(
+            session_rows(&profiles, &state, 0)[0]
+                .session_action
+                .is_none()
+        );
+        let now = Instant::now();
+        state.pin_status("default", Status::Disconnected, now);
+        let update = snapshot(
+            StatusInfo {
+                state: "future".into(),
+                ..Default::default()
+            },
+            idle(),
+        );
+        fold(&mut state, &update, now, true);
+        assert!(state.is_pinned());
+    }
+
+    #[test]
+    fn a_recorded_hold_during_verification_makes_no_current_drop_claim() {
+        use oxidom_core::ipc::RuntimeSessionInfo;
+        let mut state = state();
+        let mut live = session("work", "error", "same");
+        live.holding_traffic = true;
+        live.runtime = Some(RuntimeSessionInfo {
+            phase: "verifying".into(),
+            ..Default::default()
+        });
+        state.sessions.push(live);
+        let profiles = [profile("work", "same")];
+        let rows = session_rows(&profiles, &state, 0);
+        let warning = rows[0].warning.as_ref().unwrap();
+        assert!(warning.tooltip.as_ref().unwrap().contains("recorded"));
+        assert!(!warning.tooltip.as_ref().unwrap().contains("dropped"));
+        state.poll_error = Some("offline".into());
+        let rows = session_rows(&profiles, &state, 0);
+        let warning = rows[0].warning.as_ref().unwrap();
+        assert!(warning.text.contains("last-known"));
+        assert!(warning.tooltip.as_ref().unwrap().contains("Last-known"));
     }
 
     fn filter_group(id: &str, name: &str, links: &[(&str, &str, Option<&str>)]) -> Subscription {
@@ -5222,6 +5882,7 @@ mod tests {
         let now = Instant::now();
         state.sessions = vec![SessionInfo {
             error: Some("work failed".to_string()),
+            runtime: None,
             ..session("work", "error", "same")
         }];
         state.pin_status("work", Status::Connecting, now);
@@ -5314,24 +5975,46 @@ mod tests {
                 .map(|detail| (detail.label.as_str(), detail.value.as_str()))
                 .collect::<Vec<_>>(),
             vec![
+                ("Phase", "Running"),
+                ("Runtime", "Not reported by daemon"),
+                ("On core exit", "Not reported by daemon"),
+                ("Last observation", "Not reported by daemon"),
+                (
+                    "Recorded scope",
+                    "Not reported by daemon; no whole-device protection claim"
+                ),
+                (
+                    "Desktop proxy ownership",
+                    "Legacy logical owner; not proof the desktop setting was successfully applied"
+                ),
+                (
+                    "Traffic hold",
+                    "No legacy hold reported; runtime protection not reported"
+                ),
+                ("Retry", "Not reported by daemon"),
                 ("Saved target", "shared"),
                 ("Reported target", "shared"),
                 ("Reported status", "connected"),
                 ("Proxy", "127.91.37.1:10808"),
                 ("Interface", "oxi-work · 198.18.7.1 · manual"),
                 ("Latency", "71 ms · measured 3 min ago"),
-                ("System proxy", "Set by this connection"),
                 ("Description", "Office"),
             ]
         );
         // The address is the one thing here someone pastes elsewhere.
-        assert!(rows[0].details[3].copyable);
         assert!(
             rows[0]
                 .details
                 .iter()
-                .enumerate()
-                .all(|(index, detail)| index == 3 || !detail.copyable)
+                .find(|detail| detail.label == "Proxy")
+                .unwrap()
+                .copyable
+        );
+        assert!(
+            rows[0]
+                .details
+                .iter()
+                .all(|detail| detail.label == "Proxy" || !detail.copyable)
         );
 
         assert_eq!(rows[1].state, SessionRowState::Connecting);
@@ -5346,6 +6029,19 @@ mod tests {
                 .map(|detail| (detail.label.as_str(), detail.value.as_str()))
                 .collect::<Vec<_>>(),
             vec![
+                ("Phase", "Starting"),
+                ("Runtime", "Not reported by daemon"),
+                ("On core exit", "Not reported by daemon"),
+                ("Last observation", "Not reported by daemon"),
+                (
+                    "Recorded scope",
+                    "Not reported by daemon; no whole-device protection claim"
+                ),
+                (
+                    "Traffic hold",
+                    "No legacy hold reported; runtime protection not reported"
+                ),
+                ("Retry", "Not reported by daemon"),
                 ("Saved target", "shared"),
                 ("Reported target", "Shared server"),
                 ("Reported status", "connecting"),
@@ -5536,6 +6232,7 @@ mod tests {
             rows[0]
                 .details
                 .iter()
+                .filter(|detail| matches!(detail.label.as_str(), "Saved target" | "Interface"))
                 .map(|detail| (detail.label.as_str(), detail.value.as_str()))
                 .collect::<Vec<_>>(),
             vec![("Saved target", "shared"), ("Interface", "oxi-work · list")]
@@ -5656,14 +6353,16 @@ mod tests {
             warning
                 .tooltip
                 .as_deref()
-                .is_some_and(|tooltip| tooltip.contains("dropped")),
-            "the pill has to say what holding does, not only that it happens"
+                .is_some_and(|tooltip| tooltip.contains("recorded scoped hold")
+                    && !tooltip.contains("dropped")),
+            "the pill describes the recorded scope without promising a current drop"
         );
         assert!(
             rows[0]
                 .details
                 .iter()
-                .any(|detail| detail.label == "Traffic"),
+                .any(|detail| detail.label == "Traffic hold"
+                    && detail.value.contains("Recorded scoped hold")),
             "and the expanded row explains it"
         );
     }
@@ -5684,7 +6383,8 @@ mod tests {
             rows[0]
                 .details
                 .iter()
-                .all(|detail| detail.label != "Traffic")
+                .all(|detail| detail.label != "Traffic hold"
+                    || !detail.value.contains("Recorded scoped hold"))
         );
     }
 

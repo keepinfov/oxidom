@@ -21,7 +21,7 @@ session keep their **3-second** budget. Separate watchdog requests use the polic
 confirmation retains its bounded confirmation window, using the cold-start request budget
 within it rather than treating an unready balancer as a successful connection.
 
-All public status surfaces report `connecting` until the SOCKS-path confirmation succeeds and
+All legacy lifecycle status surfaces report `connecting` until the SOCKS-path confirmation succeeds and
 the requested interface has started. Starting a process or binding its listener is insufficient.
 An adopted running pool is not a fresh attempt. Internal process status remains usable by probes
 and exit supervision while confirmation is pending; terminal errors are not masked by the pending
@@ -30,6 +30,22 @@ Automatic recovery also revalidates the confirmed incarnation when consuming a d
 receipt, before clearing the reconnect override. A core that died in that gap must leave recovery
 pending, not be reported as recovered. Settings-driven restarts claim their probe job with the
 engine transition, before diagnostic persistence can delay background confirmation.
+
+### Runtime health facts (binding)
+
+The optional `SessionInfo.runtime.health` is application-owned, not a projection of probe-cache
+latency or persistent diagnostic history. Accepted confirmation, periodic active-session and
+watchdog outcomes record `outcome`, `source` and RFC3339 UTC `measured_at` at acceptance. Outcomes
+are `reachable`, `unreachable`, `timeout`, `no_network`, `internal`; sources are `confirmation`,
+`active`, `watchdog`. An inbound-not-ready confirmation records a timeout from confirmation.
+Missing observations do not invent health. Watchdog acceptance also validates its policy epoch.
+
+The captured profile, cancellation generation, core incarnation and spawn watermark must still
+identify the measured subject under the engine lock. A replacement clears the previous health,
+including replacement within one automatic-retry generation. An adopted core starts without
+health until measured. A retained observation describes evidence at its timestamp, not a fresh
+claim that a failed process still carries traffic. This additive object leaves the existing
+Unix-millisecond latency reading schema, lifecycle/error projection and probe semantics unchanged.
 
 ## Tunnel watchdog (binding)
 

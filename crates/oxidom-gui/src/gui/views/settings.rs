@@ -23,13 +23,13 @@ use crate::gui::reduce::{self, GeoOffer};
 /// Restored by [`SettingsView::set_system_proxy_failure`], so the row has one
 /// place that owns its normal wording.
 const SYSTEM_PROXY_SUBTITLE: &str =
-    "Send the whole desktop's traffic through oxidom while connected (GNOME)";
+    "Configure the GNOME proxy setting for apps that use it; other traffic is unaffected";
 
 /// Says what the *other* setting would do, because "hold" only means something
 /// against the alternative — and the alternative is the one with a consequence
 /// worth spelling out.
-const HOLD_TRAFFIC_SUBTITLE: &str = "Traffic is dropped until the tunnel reconnects. Turned off, apps fall back to your \
-     ordinary connection — with your own address — until it does";
+const HOLD_TRAFFIC_SUBTITLE: &str = "Hold this session's scoped routes and proxy traffic after a core exit. \
+     Other traffic is unaffected. Turned off, the session releases its routing and proxy setting";
 
 const STANDBY_PROXY_SUBTITLE: &str = "Keep the SOCKS and HTTP ports answering with a direct connection when disconnected \
       (never used while a crashed tunnel is holding traffic)";
@@ -1480,6 +1480,16 @@ fn validate(values: &SettingsValues) -> SettingsValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_proxy_copy_limits_the_claim_to_apps_that_use_the_setting() {
+        assert_eq!(
+            SYSTEM_PROXY_SUBTITLE,
+            "Configure the GNOME proxy setting for apps that use it; other traffic is unaffected"
+        );
+        assert!(HOLD_TRAFFIC_SUBTITLE.contains("scoped"));
+        assert!(!HOLD_TRAFFIC_SUBTITLE.contains("whole-device"));
+    }
 
     #[test]
     fn rehydration_updates_clean_drafts_but_preserves_unsubmitted_edits() {

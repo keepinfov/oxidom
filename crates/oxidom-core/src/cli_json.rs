@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core_options::{CoreOptions, Origin};
-use crate::ipc::{InterfaceInfo, ProfileEntry, SelectionInfo, SessionInfo};
+use crate::ipc::{InterfaceInfo, ProfileEntry, RuntimeSessionInfo, SelectionInfo, SessionInfo};
 use crate::model::{Server, Subscription, UserInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +22,8 @@ pub struct StatusOutput {
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<SelectionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeSessionInfo>,
 }
 
 impl StatusOutput {
@@ -35,6 +37,7 @@ impl StatusOutput {
             error: session.error.clone(),
             address: session.address.clone(),
             selection: (session.selection.kind == "pool").then(|| session.selection.clone()),
+            runtime: session.runtime.clone(),
         }
     }
 }
@@ -53,12 +56,14 @@ pub struct SessionOutput {
     pub error: Option<String>,
     pub owns_system_proxy: bool,
     /// The core is gone and this session is still holding its routes, so its
-    /// traffic is dropped rather than sent out unprotected. A script deciding
-    /// whether the machine is exposed reads this, not `state`.
+    /// traffic aimed at its recorded routing scope is dropped rather than
+    /// released. This does not assert protection of all machine traffic.
     pub holding_traffic: bool,
     pub interface: Option<InterfaceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<SelectionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeSessionInfo>,
 }
 
 impl SessionOutput {
@@ -78,6 +83,7 @@ impl SessionOutput {
             holding_traffic: session.holding_traffic,
             interface: session.interface.clone(),
             selection: (session.selection.kind == "pool").then(|| session.selection.clone()),
+            runtime: session.runtime.clone(),
         }
     }
 }
@@ -555,6 +561,92 @@ mod tests {
             serde_json::to_string(&output).unwrap(),
             r#"{"state":"connected","server":{"id":"0123456789abcdef","alias":"ch-trojan","name":"🇨🇭 Trojan","address":"203.0.113.7","port":443,"protocol":"trojan"},"socks_port":10808,"http_port":10809,"latency_ms":84,"error":null,"address":"127.0.0.1"}"#
         );
+    }
+
+    #[test]
+    fn full_cli_runtime_payloads_preserve_every_legacy_field() {
+        let session: SessionInfo = serde_json::from_str(r#"{"profile":"work","state":"connected","address":"127.0.0.1","socks_port":10808,"http_port":10809,"runtime":{"phase":"running","health":null,"protection":{"on_core_exit":"hold","holding":false,"interface_up":false,"route_mode":null,"desktop_proxy_owner":false},"retry":{"state":"idle","ordinal":0,"remaining_ms":null}}}"#).unwrap();
+        let status_literal = r#"{"state":"connected","server":null,"socks_port":10808,"http_port":10809,"latency_ms":null,"error":null,"address":"127.0.0.1","runtime":{"phase":"running","health":null,"protection":{"on_core_exit":"hold","holding":false,"interface_up":false,"route_mode":null,"desktop_proxy_owner":false},"retry":{"state":"idle","ordinal":0,"remaining_ms":null}}}"#;
+        let session_literal = r#"{"profile":"work","state":"connected","server_id":null,"server_alias":null,"server_name":null,"address":"127.0.0.1","socks_port":10808,"http_port":10809,"latency_ms":null,"error":null,"owns_system_proxy":false,"holding_traffic":false,"interface":null,"runtime":{"phase":"running","health":null,"protection":{"on_core_exit":"hold","holding":false,"interface_up":false,"route_mode":null,"desktop_proxy_owner":false},"retry":{"state":"idle","ordinal":0,"remaining_ms":null}}}"#;
+        assert_eq!(
+            serde_json::to_string(&StatusOutput::new(&session, None, None)).unwrap(),
+            status_literal
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionOutput::new(&session, None)).unwrap(),
+            session_literal
+        );
+        #[derive(Serialize, Deserialize)]
+        struct LegacyStatus {
+            state: String,
+            server: Option<ActiveServerOutput>,
+            socks_port: u16,
+            http_port: u16,
+            latency_ms: Option<u32>,
+            error: Option<String>,
+            address: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            selection: Option<SelectionInfo>,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct LegacySession {
+            profile: String,
+            state: String,
+            server_id: Option<String>,
+            server_alias: Option<String>,
+            server_name: Option<String>,
+            address: String,
+            socks_port: u16,
+            http_port: u16,
+            latency_ms: Option<u32>,
+            error: Option<String>,
+            owns_system_proxy: bool,
+            holding_traffic: bool,
+            interface: Option<InterfaceInfo>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            selection: Option<SelectionInfo>,
+        }
+        let old_status: LegacyStatus = serde_json::from_str(status_literal).unwrap();
+        let old_session: LegacySession = serde_json::from_str(session_literal).unwrap();
+        for (literal, old) in [
+            (status_literal, serde_json::to_value(old_status).unwrap()),
+            (session_literal, serde_json::to_value(old_session).unwrap()),
+        ] {
+            let mut expected = serde_json::from_str::<serde_json::Value>(literal).unwrap();
+            expected.as_object_mut().unwrap().remove("runtime");
+            assert_eq!(old, expected);
+        }
+    }
+
+    #[test]
+    fn cli_runtime_is_an_independent_literal_addition_to_both_outputs() {
+        let runtime = r#"{"phase":"verifying","health":{"outcome":"timeout","source":"confirmation","measured_at":"2026-10-28T01:02:03Z"},"protection":{"on_core_exit":"hold","holding":true,"interface_up":true,"route_mode":"manual","desktop_proxy_owner":false},"retry":{"state":"attempting","ordinal":2,"remaining_ms":null}}"#;
+        let session = SessionInfo {
+            state: "error".into(),
+            error: Some("legacy reconnect message".into()),
+            runtime: Some(serde_json::from_str(runtime).unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(session.runtime.as_ref().unwrap()).unwrap(),
+            runtime
+        );
+        for value in [
+            serde_json::to_value(StatusOutput::new(&session, None, Some(42))).unwrap(),
+            serde_json::to_value(SessionOutput::new(&session, Some(42))).unwrap(),
+        ] {
+            assert_eq!(
+                value["runtime"],
+                serde_json::from_str::<serde_json::Value>(runtime).unwrap()
+            );
+            assert_eq!(value["state"], "error");
+            assert_eq!(value["error"], "legacy reconnect message");
+            assert_eq!(value["latency_ms"], 42);
+        }
+        let old: StatusOutput = serde_json::from_str(r#"{"state":"connected","server":null,"socks_port":1,"http_port":2,"latency_ms":null,"error":null,"address":"127.0.0.1"}"#).unwrap();
+        assert!(old.runtime.is_none());
+        let old: SessionOutput = serde_json::from_str(r#"{"profile":"work","state":"error","server_id":null,"server_alias":null,"server_name":null,"address":"127.0.0.1","socks_port":1,"http_port":2,"latency_ms":null,"error":null,"owns_system_proxy":false,"holding_traffic":true,"interface":null}"#).unwrap();
+        assert!(old.runtime.is_none());
     }
 
     #[test]

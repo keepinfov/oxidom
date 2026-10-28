@@ -84,8 +84,32 @@ Named single-server card retargeting retains the existing explicit Repoint confi
 the saved-file write and runtime interruption; it is never a silent temporary-operation emulation.
 Runtime-only named entries without a saved profile cannot repoint through that path. Explicit
 Save/Profile Repoint remains the only selection-persistence operation. This does not add a new
-named temporary-server RPC or alter existing D-Bus signatures. Full phase/health/protection/retry
-presentation remains P11; target equality is not proof of a new attempt incarnation.
+named temporary-server RPC or alter existing D-Bus signatures. Target equality is not proof of a
+new attempt incarnation.
+
+### Runtime Dimensions (binding)
+
+Profiles, header, sidebar and tray share a pure presentation of independent runtime dimensions.
+Phase is stopped, starting, verifying, running or failed. Running is accepted lifecycle state,
+not a guarantee of continuous reachability. Local Start/Stop intent has summary and tone
+precedence; reported phase remains a separate labelled detail. Unknown wire phase and unavailable
+polls remain unknown, including when the last snapshot reported direct standby.
+
+Health is the last attributable confirmation, active or watchdog observation, with outcome,
+source and UTC timestamp. Missing health means no observation reported, not healthy. Negative
+synthetic observations do not themselves change phase or authorize switching targets. Pool
+rotation and profile-keyed latency are not substitutes for current-core health attribution.
+
+Protection shows recorded exit policy, scoped traffic hold, interface/up/route mode and logical
+desktop-proxy ownership independently. Neither logical ownership nor interface bookkeeping
+proves desktop-setting application or whole-device protection. Missing fields mean not reported;
+held traffic concerns this session's assigned traffic, not every application on the machine.
+
+Retry is idle, backoff or attempting, independently of phase and hold. Backoff uses the daemon's
+remaining monotonic delay; the changing countdown must not rebuild expanded selectable details.
+Idle means no active retry episode, not disabled policy. Older daemons retain known legacy phase
+and hold but do not fabricate health, policy or retry facts. Existing semantic control admission,
+saved-target checks and binding-generation fences remain in force.
 
 Single-server optimistic starts retain their requested server ID independently of reported
 runtime identity and saved profile configuration. A current poll reporting another server as

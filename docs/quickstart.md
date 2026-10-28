@@ -27,8 +27,10 @@ From nothing to a verified tunnel. Assumes oxidom is
    The card shows a latency once measured. oxidom verifies the tunnel actually
    carries traffic before reporting success, so "connected" means connected.
 
-4. **Use it.** The tunnel is a local SOCKS5 + HTTP proxy. To send the whole
-   desktop through it, turn on *Settings › System proxy* (GNOME).
+4. **Use it.** The tunnel is a local SOCKS5 + HTTP proxy. For applications that
+   honor GNOME desktop proxy settings, turn on *Settings › System proxy*.
+   Applications ignoring those settings are unaffected. TUN captures traffic
+   according to its configured routes, not automatically every device connection.
 
 Closing the window does **not** disconnect — the daemon owns the tunnel. Use
 **Disconnect**, or `oxidom down`.

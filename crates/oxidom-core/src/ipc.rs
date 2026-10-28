@@ -163,6 +163,46 @@ pub struct SessionInfo {
     /// Additive selection detail. Legacy server fields above keep their exact
     /// meaning; a pool never fills them with an arbitrary member.
     pub selection: SelectionInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeSessionInfo>,
+}
+
+/// Independent application facts, not an interpretation of legacy error text.
+/// Strings are open vocabularies: clients must tolerate unknown values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RuntimeSessionInfo {
+    pub phase: String,
+    pub health: Option<RuntimeHealth>,
+    pub protection: RuntimeProtection,
+    pub retry: RuntimeRetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RuntimeHealth {
+    pub outcome: String,
+    pub source: String,
+    /// RFC3339 UTC instant at which the application accepted the observation.
+    pub measured_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RuntimeProtection {
+    pub on_core_exit: String,
+    pub holding: Option<bool>,
+    pub interface_up: Option<bool>,
+    pub route_mode: Option<String>,
+    pub desktop_proxy_owner: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RuntimeRetry {
+    pub state: String,
+    pub ordinal: u32,
+    pub remaining_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -964,6 +1004,64 @@ mod tests {
 
         let empty: StatusInfo = serde_json::from_str("{}").unwrap();
         assert!(matches!(empty.to_status(), Status::Disconnected));
+    }
+
+    #[test]
+    fn a_full_runtime_session_payload_keeps_the_entire_legacy_shape_readable() {
+        let literal = r#"{"profile":"work","state":"connected","error":null,"server_id":null,"server_alias":null,"server_name":null,"address":"127.0.0.1","socks_port":10808,"http_port":10809,"owns_system_proxy":false,"holding_traffic":false,"interface":null,"selection":{"kind":"","name":"","strategy":"","members":[],"endpoints":0,"selecting":null,"stale":false},"runtime":{"phase":"running","health":null,"protection":{"on_core_exit":"hold","holding":false,"interface_up":false,"route_mode":null,"desktop_proxy_owner":false},"retry":{"state":"idle","ordinal":0,"remaining_ms":null}}}"#;
+        let session: SessionInfo = serde_json::from_str(literal).unwrap();
+        assert_eq!(serde_json::to_string(&session).unwrap(), literal);
+        #[derive(Serialize, Deserialize)]
+        struct LegacySession {
+            profile: String,
+            state: String,
+            error: Option<String>,
+            server_id: Option<String>,
+            server_alias: Option<String>,
+            server_name: Option<String>,
+            address: String,
+            socks_port: u16,
+            http_port: u16,
+            owns_system_proxy: bool,
+            holding_traffic: bool,
+            interface: Option<InterfaceInfo>,
+            selection: SelectionInfo,
+        }
+        let legacy: LegacySession = serde_json::from_str(literal).unwrap();
+        let mut expected = serde_json::from_str::<serde_json::Value>(literal).unwrap();
+        expected.as_object_mut().unwrap().remove("runtime");
+        assert_eq!(serde_json::to_value(legacy).unwrap(), expected);
+        let partial: SessionInfo = serde_json::from_str(r#"{"runtime":{}}"#).unwrap();
+        let protection = partial.runtime.unwrap().protection;
+        assert_eq!(protection.holding, None);
+        assert_eq!(protection.interface_up, None);
+        assert_eq!(protection.desktop_proxy_owner, None);
+    }
+
+    #[test]
+    fn runtime_is_optional_defaulted_and_accepts_future_vocabulary() {
+        let old: SessionInfo =
+            serde_json::from_str(r#"{"profile":"work","state":"error","error":"legacy"}"#).unwrap();
+        assert!(old.runtime.is_none());
+        assert!(!serde_json::to_string(&old).unwrap().contains("runtime"));
+        let new: SessionInfo = serde_json::from_str(r#"{"profile":"work","state":"error","runtime":{"phase":"future-phase","health":{"outcome":"future-outcome","source":"future-source","measured_at":"2026-10-28T01:02:03Z","future":true},"protection":{"on_core_exit":"future-policy","holding":true,"interface_up":false,"route_mode":"future-routes","desktop_proxy_owner":false},"retry":{"state":"future-retry","ordinal":7,"remaining_ms":25},"future":true}}"#).unwrap();
+        let runtime = new.runtime.unwrap();
+        assert_eq!(runtime.phase, "future-phase");
+        assert_eq!(runtime.health.unwrap().outcome, "future-outcome");
+        assert_eq!(runtime.retry.state, "future-retry");
+        let partial: SessionInfo = serde_json::from_str(r#"{"runtime":{}}"#).unwrap();
+        assert_eq!(partial.runtime, Some(RuntimeSessionInfo::default()));
+        let null: SessionInfo = serde_json::from_str(r#"{"runtime":null}"#).unwrap();
+        assert!(null.runtime.is_none());
+        #[derive(Deserialize)]
+        struct LegacySession {
+            state: String,
+        }
+        let legacy: LegacySession = serde_json::from_str(
+            r#"{"state":"connected","runtime":{"phase":"running","future":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.state, "connected");
     }
 
     #[test]
