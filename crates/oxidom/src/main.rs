@@ -265,7 +265,14 @@ fn status(profile: Option<&str>, json: bool) -> CliResult {
         if json {
             return print_json(&output);
         }
-        return print_text(pool_status(&session, latency_ms));
+        let mut text = pool_status(&session, latency_ms);
+        if let Some(runtime) = &session.runtime {
+            text.push_str(&format!(
+                "runtime  {}\n",
+                runtime_columns(runtime).join("  ")
+            ));
+        }
+        return print_text(text);
     }
 
     let server = servers_for_session(&client, &session)?
@@ -283,8 +290,18 @@ fn status(profile: Option<&str>, json: bool) -> CliResult {
             .map(|value| format!("{value} ms"))
             .unwrap_or_else(|| "—".to_string());
         print_line(format!(
-            "{}  {}  {}  socks {}:{}  {}",
-            output.state, handle, server.name, output.address, output.socks_port, latency
+            "{}  {}  {}  socks {}:{}  {}{}",
+            output.state,
+            handle,
+            server.name,
+            output.address,
+            output.socks_port,
+            latency,
+            output
+                .runtime
+                .as_ref()
+                .map(|runtime| format!("  runtime {}", runtime_columns(runtime).join("  ")))
+                .unwrap_or_default()
         ))
     }
 }
@@ -509,6 +526,8 @@ fn direct_status(output: &StatusOutput) -> String {
 
 fn session_table(sessions: &[SessionOutput]) -> String {
     let show_device = sessions.iter().any(|session| session.interface.is_some());
+    let show_runtime = sessions.iter().any(|session| session.runtime.is_some());
+    let show_holding = !show_runtime && sessions.iter().any(|session| session.holding_traffic);
     let mut rows = Vec::with_capacity(sessions.len() + 1);
     let mut header = vec![
         "PROFILE".to_string(),
@@ -520,19 +539,16 @@ fn session_table(sessions: &[SessionOutput]) -> String {
         header.push("DEVICE".to_string());
     }
     header.push("LATENCY".to_string());
+    if show_runtime {
+        header.extend(["PHASE", "HEALTH", "PROTECTION", "RETRY"].map(str::to_string));
+    } else if show_holding {
+        header.push("HOLDING".to_string());
+    }
     rows.push(header);
     rows.extend(sessions.iter().map(|session| {
         let mut row = vec![
             session.profile.clone(),
-            // A held session is in `error` — its core is gone — but saying only
-            // that invites the reading that traffic is flowing some other way.
-            // It is not: the routes are still installed and the traffic is being
-            // dropped, which is a different thing to know.
-            if session.holding_traffic {
-                "holding".to_string()
-            } else {
-                session.state.clone()
-            },
+            session.state.clone(),
             session
                 .server_alias
                 .clone()
@@ -561,6 +577,24 @@ fn session_table(sessions: &[SessionOutput]) -> String {
                 .map(|latency| format!("{latency}ms"))
                 .unwrap_or_else(|| "—".to_string()),
         );
+        if show_runtime {
+            row.extend(
+                session
+                    .runtime
+                    .as_ref()
+                    .map(runtime_columns)
+                    .unwrap_or_else(|| {
+                        [
+                            "unknown".to_string(),
+                            "unknown".to_string(),
+                            format!("holding={}", session.holding_traffic),
+                            "unknown".to_string(),
+                        ]
+                    }),
+            );
+        } else if show_holding {
+            row.push(session.holding_traffic.to_string());
+        }
         row
     }));
     let mut widths = vec![0usize; rows[0].len()];
@@ -581,6 +615,50 @@ fn session_table(sessions: &[SessionOutput]) -> String {
         table.push('\n');
     }
     table
+}
+
+fn runtime_columns(runtime: &oxidom_core::ipc::RuntimeSessionInfo) -> [String; 4] {
+    let protection = &runtime.protection;
+    let retry = &runtime.retry;
+    [
+        runtime.phase.clone(),
+        runtime
+            .health
+            .as_ref()
+            .map(|health| {
+                format!(
+                    "{}/{}@{}",
+                    health.outcome, health.source, health.measured_at
+                )
+            })
+            .unwrap_or_else(|| "unknown".to_string()),
+        format!(
+            "on-exit={},holding={},interface={},routes={},desktop-proxy={}",
+            protection.on_core_exit,
+            protection
+                .holding
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            protection
+                .interface_up
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            protection.route_mode.as_deref().unwrap_or("none"),
+            protection
+                .desktop_proxy_owner
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ),
+        format!(
+            "{}#{}{}",
+            retry.state,
+            retry.ordinal,
+            retry
+                .remaining_ms
+                .map(|ms| format!("({ms}ms)"))
+                .unwrap_or_default()
+        ),
+    ]
 }
 
 fn list_servers(client: &DaemonClient, json: bool) -> CliResult {
@@ -1441,6 +1519,7 @@ mod tests {
                 holding_traffic: false,
                 interface: None,
                 selection: None,
+                runtime: None,
             },
             SessionOutput {
                 profile: "work".to_string(),
@@ -1457,6 +1536,7 @@ mod tests {
                 holding_traffic: false,
                 interface: None,
                 selection: None,
+                runtime: None,
             },
         ];
 
@@ -1466,6 +1546,58 @@ mod tests {
              default  connected  ch-trojan  127.0.0.1:10808    84ms\n\
              work     connected  nl-vless   127.72.14.1:10808  112ms\n"
         );
+    }
+
+    #[test]
+    fn missing_protection_booleans_are_unknown_in_text() {
+        let runtime: oxidom_core::ipc::RuntimeSessionInfo = serde_json::from_str("{}").unwrap();
+        let columns = runtime_columns(&runtime);
+        assert!(columns[2].contains("holding=unknown"));
+        assert!(columns[2].contains("interface=unknown"));
+        assert!(columns[2].contains("desktop-proxy=unknown"));
+    }
+
+    #[test]
+    fn runtime_columns_do_not_replace_lifecycle_with_holding_or_latency_with_health() {
+        let session = SessionInfo {
+            state: "error".into(),
+            holding_traffic: true,
+            runtime: Some(oxidom_core::ipc::RuntimeSessionInfo {
+                phase: "verifying".into(),
+                protection: oxidom_core::ipc::RuntimeProtection {
+                    holding: Some(true),
+                    ..Default::default()
+                },
+                retry: oxidom_core::ipc::RuntimeRetry {
+                    state: "backoff".into(),
+                    ordinal: 3,
+                    remaining_ms: Some(25),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let output = SessionOutput::new(&session, Some(42));
+        let table = session_table(&[output]);
+        assert!(
+            table.contains("PHASE")
+                && table.contains("HEALTH")
+                && table.contains("PROTECTION")
+                && table.contains("RETRY")
+        );
+        assert!(table.contains("error") && table.contains("verifying"));
+        assert!(table.contains("42ms") && table.contains("unknown"));
+        assert!(table.contains("holding=true") && table.contains("backoff#3(25ms)"));
+        let old = SessionOutput::new(
+            &SessionInfo {
+                state: "error".into(),
+                holding_traffic: true,
+                ..Default::default()
+            },
+            None,
+        );
+        let table = session_table(&[old]);
+        assert!(table.contains("STATE") && table.contains("HOLDING") && table.contains("error"));
     }
 
     #[test]
@@ -1489,6 +1621,7 @@ mod tests {
                     ..Default::default()
                 }),
                 selection: None,
+                runtime: None,
             },
             SessionOutput {
                 profile: "work".to_string(),
@@ -1505,6 +1638,7 @@ mod tests {
                 holding_traffic: false,
                 interface: None,
                 selection: None,
+                runtime: None,
             },
         ];
 

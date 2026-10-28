@@ -347,6 +347,24 @@ fn apply_row(controls: &RowControls, row: &SessionRow) {
         None => controls.latency.set_visible(false),
     }
     set_state_label(&controls.state, row.state);
+    for class in [
+        "status-neutral",
+        "status-working",
+        "status-connected",
+        "status-error",
+    ] {
+        controls.state.remove_css_class(class);
+    }
+    controls.state.add_css_class(match row.runtime.tone {
+        crate::gui::reduce::RuntimeTone::Working => "status-working",
+        crate::gui::reduce::RuntimeTone::Running => "status-connected",
+        crate::gui::reduce::RuntimeTone::Failed => "status-error",
+        _ => "status-neutral",
+    });
+    controls.state.set_label(&row.runtime.summary);
+    controls
+        .state
+        .set_tooltip_text(Some(&row.runtime.detail_text()));
 
     // Detail rows are rebuilt only when they actually changed: the page polls
     // twice a second, and removing and re-adding rows under the pointer makes
@@ -447,6 +465,12 @@ mod tests {
             saved_profile: true,
             profile: "work".to_string(),
             state,
+            runtime: crate::gui::reduce::RuntimePresentation {
+                phase: "Unknown".into(),
+                tone: crate::gui::reduce::RuntimeTone::Unknown,
+                summary: "Unknown".into(),
+                details: Vec::new(),
+            },
             headline: "ch-trojan".to_string(),
             pool: false,
             latency: None,

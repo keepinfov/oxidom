@@ -179,7 +179,7 @@ When [direct standby](configuration.md#direct-standby) is actually serving, the
 unscoped listing explicitly shows `default` as `direct` on `127.0.0.1` at the
 configured ports, even if a failed default session remains recorded. That means
 ordinary, unprotected traffic, not a connected tunnel. A session holding traffic
-prevents standby in every profile and is reported as `holding` instead.
+prevents standby in every profile; its lifecycle remains visible alongside separate holding facts.
 
 `oxidom status default` also reports this as `direct`, naming both local ports. Any previous
 default-session failure remains in the JSON `error` field and is printed as `previous error`
@@ -247,11 +247,28 @@ when at least one session has an interface; missing values render as `—`.
 `connecting` includes verification: the process must carry an HTTP request through SOCKS,
 and any requested interface must be ready, before status becomes `connected`.
 
-`STATE` reads `holding` for a session whose core exited while it kept its routes:
-its traffic is being dropped rather than sent out unprotected. See
-[when the core dies](routing.md#when-the-core-dies). In `--json` that is the
-`holding_traffic` field, which is what a script checking whether the machine is
-exposed should read — `state` still says `error`, because the core is still gone.
+`STATE` always retains lifecycle, including `error` for a failed core. A daemon reporting runtime
+facts adds `PHASE HEALTH PROTECTION RETRY`. `PHASE` separates process startup (`starting`),
+SOCKS-path confirmation (`verifying`), confirmed operation (`running`), failure (`failed`) and
+stopped state (`stopped`). It is independent of legacy error wording and route holding.
+
+`HEALTH` is the latest accepted session observation as outcome/source/time, or `unknown` until
+measured. Its UTC timestamp is evidence of when it was observed, not a guarantee of reachability
+now. Direct server-list latency and diagnostic history never supply this value.
+
+`PROTECTION` labels the snapshotted exit policy, recorded hold, interface-up flag, route mode and
+desktop-proxy ownership. These describe this session's routing scope, not protection of every
+application or all traffic. A manual interface or proxy-only session does not cover the entire
+machine. See [when the core dies](routing.md#when-the-core-dies). Older daemons without runtime
+facts get a separate `HOLDING` column when needed, without replacing `STATE`.
+Missing or null protection booleans mean unknown and are printed as `unknown`, not `false`.
+
+`RETRY` shows `idle`, `backoff` or `attempting`, a zero-based ordinal, and the remaining monotonic
+backoff milliseconds when waiting. Replacement/cancellation/recovery returns it to idle.
+Disabling automatic recovery cancels its pending episode; enabling it again does not restart an
+old waiter. An attempt that already started may finish verification, but will not retry again if
+it fails, even if recovery is re-enabled before it finishes. Bring the profile up explicitly to
+begin a fresh connection after cancellation.
 
 `STATE` reads `direct` for active standby service on the configured local ports.
 It has no remote server, tunnel latency or interface, and does not own the system
@@ -567,6 +584,20 @@ deliberately excluded from every one of them.
 ```
 
 `server` is `null` for a pool session, and a `selection` object appears instead.
+
+Both status and session-list JSON may additionally contain a `runtime` object:
+
+```json
+{"phase":"running","health":{"outcome":"reachable","source":"active","measured_at":"2026-10-28T01:02:03Z"},"protection":{"on_core_exit":"hold","holding":false,"interface_up":false,"route_mode":null,"desktop_proxy_owner":true},"retry":{"state":"idle","ordinal":0,"remaining_ms":null}}
+```
+
+`health` is null until this generation/core has an accepted observation, including after adopting
+an existing core. Replacing the core clears old health. `source` is `confirmation`, `active` or
+`watchdog`; outcomes distinguish `reachable`, `unreachable`, `timeout`, `no_network` and `internal`.
+Unknown string values must be tolerated. Older daemons omit `runtime`, and synthetic direct
+standby rows omit it too. Existing `state`, `error`, latency fields and exit codes are unchanged;
+profile-specific status still requires a connected session. Text status appends runtime facts
+when available.
 
 **`status --json`, `list sessions --json`** — an array of session objects, adding
 `profile`, `owns_system_proxy`, and `interface` (`null` when the profile has none):

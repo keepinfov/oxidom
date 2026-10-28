@@ -68,8 +68,61 @@ wins. `oxidom env` prints POSIX `export` statements for both SOCKS and HTTP endp
 Data goes only to stdout; warnings, errors, and ambiguous-handle candidates go to stderr. JSON
 uses the fixed DTOs in `oxidom-core/src/cli_json.rs`. `SessionOutput` carries `holding_traffic`
 beside `state`: a session whose core exited while it kept its routes is in `error` and dropping
-traffic, which is a different claim from `error` alone, and the sessions table prints its `STATE`
-as `holding`.
+traffic, which is a different claim from `error` alone. The sessions table keeps `STATE` as the
+legacy lifecycle and shows holding separately, never as a replacement lifecycle.
+
+### Runtime session facts (binding)
+
+`SessionInfo` has an additive `runtime: Option<RuntimeSessionInfo>`, serde-defaulted and omitted
+when absent. Both CLI JSON DTOs forward it unchanged. Old payloads retain their shape when it is
+absent, unknown fields are ignored, and all string vocabularies below are open: clients must
+degrade gracefully for unknown values. No D-Bus method signature, legacy `state`/`error`, or exit
+code changes. Profile-specific status retains its existing connected-session requirement.
+
+```json
+{"phase":"verifying","health":{"outcome":"timeout","source":"confirmation","measured_at":"2026-10-28T01:02:03Z"},"protection":{"on_core_exit":"hold","holding":true,"interface_up":true,"route_mode":"manual","desktop_proxy_owner":false},"retry":{"state":"attempting","ordinal":2,"remaining_ms":null}}
+```
+
+Every runtime struct is serde-defaulted. `phase` is derived only from raw process lifecycle and
+confirmation pending: disconnected -> `stopped`, connecting -> `starting`, connected/pending ->
+`verifying`, connected/confirmed -> `running`, error -> `failed`. Legacy error overrides do not
+infer phase. Holding and retry do not replace lifecycle.
+
+`health` is null until an attributable application-owned session observation is accepted; it is
+never copied from profile latency or diagnostic records. It contains `outcome` (`reachable`,
+`unreachable`, `timeout`, `no_network`, `internal`), `source` (`confirmation`, `active`, `watchdog`)
+and RFC3339 UTC `measured_at`. Its generation, core incarnation and spawn watermark must match
+the current subject. Replacement resets it; adoption has no health until measured. An observation
+is evidence at its timestamp, not a perpetual claim of current reachability.
+
+`protection` reports only recorded scope: snapshotted `on_core_exit` (`hold`/`release`), `holding`,
+`interface_up`, optional `route_mode` (`manual`/`list`/`default`) and `desktop_proxy_owner`. These
+facts do not assert that all machine traffic is protected, nor verify external routing state.
+The `holding`, `interface_up` and `desktop_proxy_owner` fields are optional booleans: missing or
+null means unknown, never false. Current daemon projections always emit a measured/recorded
+boolean (`Some(true)` or `Some(false)`); a defaulted `runtime: {}` asserts no negative facts.
+
+`retry` is an application-owned generation-scoped episode, independent of optional diagnostics:
+`state` is `idle`, `backoff` or `attempting`; `ordinal` is the zero-based attempt ordinal;
+`remaining_ms` is present only in backoff, computed from the actual monotonic wait deadline,
+saturating at zero and rounded up to milliseconds. Attempting begins at the actual start
+transition, not when a timer expires. Cancellation, replacement and confirmed recovery clear the
+episode to idle (ordinal zero, remaining null).
+Disabling resilience cancels only an owned retry episode, invalidating its generation and
+removing its reconnect override together if it is still waiting; manual generations are unaffected.
+An already-started automatic attempt retains ownership through confirmation, but further retries
+for that episode are permanently disabled. Its live confirmed success can clear the reconnect
+override without resilience still enabled; failure uses existing cleanup and retires the episode.
+Re-enabling does not revive a cancelled waiter or rearm a disabled in-flight episode.
+A new explicit connection claims its own generation. Automatic
+starts validate current resilience, generation, matching reconnect override and live backoff
+episode under the engine lock before changing the episode to attempting or starting a core.
+
+The text session table adds `PHASE HEALTH PROTECTION RETRY` when any row has runtime facts.
+Health includes outcome/source/timestamp, protection labels each recorded fact, and retry includes
+state/ordinal/countdown. Missing runtime rows render unknown rather than inventing facts. Older
+payloads with holding add a separate `HOLDING` column. Successful profile-specific text status
+appends the same runtime facts. Synthetic direct standby rows carry no runtime object.
 
 `status` (without a profile) and `list sessions`, including their JSON forms, report active
 standby service as a `default` row with `state = "direct"`, address `127.0.0.1`, and the daemon's
@@ -77,7 +130,7 @@ configured SOCKS/HTTP ports. This is direct service, not a tunnel or a new persi
 It must remain visible even if a failed default session is still recorded. Its server fields,
 latency and interface are null, `owns_system_proxy` and `holding_traffic` are false, and no pool
 selection is attached. A session holding routes instead remains `error` with
-`holding_traffic = true` in JSON and `holding` in the table; direct standby is forbidden while
+`holding_traffic = true` in JSON and separate holding facts in the table; direct standby is forbidden while
 any session holds traffic, connects or is connected. The D-Bus status flag underlying this
 presentation is specified in [storage.md](storage.md#standby-over-d-bus-binding).
 

@@ -29,7 +29,7 @@ New here? Start with [installation.md](installation.md), then
 | install it on another distro | [installation.md § From source](installation.md#from-source) |
 | add my subscription | [quickstart.md](quickstart.md) |
 | find out why my servers disappeared | [troubleshooting.md](troubleshooting.md#my-servers-vanished) |
-| send my whole desktop through the tunnel | [routing.md § GNOME system proxy](routing.md#gnome-system-proxy) |
+| use the tunnel in desktop proxy-aware applications | [routing.md § GNOME system proxy](routing.md#gnome-system-proxy) |
 | send *one program* through the tunnel | [routing.md § Per-process routing](routing.md#per-process-routing) |
 | run several tunnels at once | [profiles-and-pools.md](profiles-and-pools.md) |
 | spread traffic across many servers | [profiles-and-pools.md § Pools](profiles-and-pools.md#pools) |

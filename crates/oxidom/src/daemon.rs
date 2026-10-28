@@ -36,6 +36,7 @@ use oxidom_core::profile::{self, MAX_POOL_MEMBERS, Profile, RouteMode};
 use oxidom_core::xray::core::Status;
 
 mod lifecycle;
+mod runtime;
 mod trace;
 use trace::{Facts, Identities};
 
@@ -439,6 +440,7 @@ pub(crate) struct Shared {
     /// in-flight confirmation.
     connect_generation: Arc<AtomicU64>,
     current_generations: Arc<Mutex<HashMap<String, u64>>>,
+    runtime_facts: Arc<Mutex<runtime::RuntimeFacts>>,
     /// Ports pinned by `--socks-port`/`--http-port`, i.e. by the service unit.
     socks_port_locked: bool,
     http_port_locked: bool,
@@ -683,6 +685,7 @@ impl Shared {
             // while retaining the same cancellation rules as a fresh `up`.
             connect_generation: Arc::new(AtomicU64::new(generation)),
             current_generations: Arc::new(Mutex::new(current_generations)),
+            runtime_facts: Arc::new(Mutex::new(runtime::RuntimeFacts::default())),
             socks_port_locked,
             http_port_locked,
             system_bus,
@@ -791,6 +794,7 @@ impl Shared {
     fn next_connect_generation(&self, profile: &str) -> u64 {
         let generation = self.connect_generation.fetch_add(1, Ordering::SeqCst) + 1;
         oxidom_core::sync::lock(&self.current_generations).insert(profile.to_string(), generation);
+        oxidom_core::sync::lock(&self.runtime_facts).reset(profile);
         generation
     }
 
@@ -818,10 +822,12 @@ impl Shared {
 
     fn invalidate_generation(&self, profile: &str) {
         oxidom_core::sync::lock(&self.current_generations).remove(profile);
+        oxidom_core::sync::lock(&self.runtime_facts).reset(profile);
     }
 
     fn invalidate_all_generations(&self) {
         oxidom_core::sync::lock(&self.current_generations).clear();
+        oxidom_core::sync::lock(&self.runtime_facts).clear();
     }
 
     fn capture_confirmation(
@@ -859,6 +865,25 @@ impl Shared {
                     && session.core.incarnation() == snapshot.core
                     && session.core.spawn_seq() == snapshot.spawn_seq
             })
+    }
+
+    fn accept_runtime_health(
+        &self,
+        engine: &Engine,
+        profile: &str,
+        subject: Confirmation,
+        outcome: &probe::ProbeOutcome,
+        source: &str,
+    ) {
+        if self.confirmation_is_current(engine, profile, subject) {
+            oxidom_core::sync::lock(&self.runtime_facts).observe(
+                profile,
+                subject,
+                outcome,
+                source,
+                runtime::measured_at(),
+            );
+        }
     }
 
     fn record_finished(
@@ -1008,6 +1033,12 @@ impl Shared {
             0,
             &mut facts,
         );
+        oxidom_core::sync::lock(&self.runtime_facts).backoff(
+            profile,
+            generation,
+            0,
+            Instant::now(),
+        );
         drop(engine);
         drop(order);
         facts.emit(&self.recorder);
@@ -1045,11 +1076,9 @@ impl Shared {
         ordinal: u32,
     ) -> bool {
         let order = oxidom_core::sync::lock(&self.diagnostic_order);
-        if !self.reconnect_is_pending(profile, target, snapshot.generation) {
-            return false;
-        }
         let mut engine = oxidom_core::sync::lock(&self.engine);
-        if !self.confirmation_is_current(&engine, profile, snapshot)
+        if !self.retry_receipt_is_current(profile, target, snapshot.generation)
+            || !self.confirmation_is_current(&engine, profile, snapshot)
             || !engine.sessions.get_mut(profile).is_some_and(|session| {
                 session.selection.as_ref() == Some(&target.selection())
                     && session.reported_status() == Status::Connected
@@ -1059,6 +1088,7 @@ impl Shared {
             return false;
         }
         self.clear_reconnect_override(profile, target);
+        oxidom_core::sync::lock(&self.runtime_facts).idle(profile, snapshot.generation);
         let mut facts = Facts::default();
         oxidom_core::sync::lock(&self.identities).retry(
             profile,
@@ -1083,18 +1113,31 @@ impl Shared {
         let mut attempt = 0;
         loop {
             if !self.reconnect_is_pending(&profile, &target, generation) {
+                self.cancel_runtime_retry(&profile, generation);
                 self.retry_fact(&profile, trigger, RetryState::Cancelled, attempt);
                 return;
             }
-            if !self.lifecycle.wait(reconnect_delay(attempt)) {
+            let delay = oxidom_core::sync::lock(&self.runtime_facts).wait(
+                &profile,
+                generation,
+                Instant::now(),
+            );
+            let Some(delay) = delay else {
+                self.cancel_runtime_retry(&profile, generation);
+                self.retry_fact(&profile, trigger, RetryState::Cancelled, attempt);
+                return;
+            };
+            if !self.lifecycle.wait(delay) {
                 return;
             }
             if !self.reconnect_is_pending(&profile, &target, generation) {
+                self.cancel_runtime_retry(&profile, generation);
                 self.retry_fact(&profile, trigger, RetryState::Cancelled, attempt);
                 return;
             }
 
             let Some(result) = self.start_reconnect_attempt(&profile, &target, generation) else {
+                self.cancel_runtime_retry(&profile, generation);
                 self.retry_fact(&profile, trigger, RetryState::Cancelled, attempt);
                 return;
             };
@@ -1112,6 +1155,16 @@ impl Shared {
             }
             attempt = attempt.saturating_add(1);
             if self.reconnect_is_pending(&profile, &target, generation) {
+                let engine = oxidom_core::sync::lock(&self.engine);
+                if self.retry_is_current(&engine, &profile, &target, generation) {
+                    oxidom_core::sync::lock(&self.runtime_facts).backoff(
+                        &profile,
+                        generation,
+                        attempt,
+                        Instant::now(),
+                    );
+                }
+                drop(engine);
                 self.retry_fact(&profile, trigger, RetryState::Pending, attempt);
             }
         }
@@ -1123,24 +1176,100 @@ impl Shared {
         target: &ConnectionTarget,
         generation: u64,
     ) -> bool {
+        let engine = oxidom_core::sync::lock(&self.engine);
+        let pending = self.retry_is_current(&engine, profile, target, generation);
+        if !pending {
+            self.cancel_retry_locked(profile, generation);
+        }
+        pending
+    }
+
+    fn retry_is_current(
+        &self,
+        engine: &Engine,
+        profile: &str,
+        target: &ConnectionTarget,
+        generation: u64,
+    ) -> bool {
+        self.generation_is_current(profile, generation)
+            && resilient(engine, profile)
+            && oxidom_core::sync::lock(&self.runtime_facts).retry_allowed(profile, generation)
+            && self.retry_receipt_is_current(profile, target, generation)
+    }
+
+    fn retry_receipt_is_current(
+        &self,
+        profile: &str,
+        target: &ConnectionTarget,
+        generation: u64,
+    ) -> bool {
+        self.generation_is_current(profile, generation)
+            && oxidom_core::sync::lock(&self.runtime_facts).has_retry(profile, generation)
+            && matches!(
+                oxidom_core::sync::lock(&self.override_status).get(profile),
+                Some(ErrorOverride {
+                    status: Status::Error(message),
+                    selection,
+                }) if message == RECONNECTING_MESSAGE && selection == &target.selection()
+            )
+    }
+
+    fn cancel_runtime_retry(&self, profile: &str, generation: u64) {
+        let _engine = oxidom_core::sync::lock(&self.engine);
+        self.cancel_retry_locked(profile, generation);
+    }
+
+    /// The engine lock serializes cancellation with both explicit and automatic starts.
+    fn cancel_retry_locked(&self, profile: &str, generation: u64) {
         if !self.generation_is_current(profile, generation) {
-            return false;
+            return;
         }
-        let is_resilient = {
-            let engine = oxidom_core::sync::lock(&self.engine);
-            resilient(&engine, profile)
-        };
-        if !is_resilient {
-            self.clear_reconnect_override(profile, target);
-            return false;
+        let mut overrides = oxidom_core::sync::lock(&self.override_status);
+        let reconnecting = overrides.get(profile).is_some_and(|failure| matches!(&failure.status, Status::Error(message) if message == RECONNECTING_MESSAGE));
+        if !reconnecting
+            && !oxidom_core::sync::lock(&self.runtime_facts).has_retry(profile, generation)
+        {
+            return;
         }
-        matches!(
-            oxidom_core::sync::lock(&self.override_status).get(profile),
-            Some(ErrorOverride {
-                status: Status::Error(message),
-                selection,
-            }) if message == RECONNECTING_MESSAGE && selection == &target.selection()
-        )
+        self.invalidate_generation(profile);
+        if reconnecting {
+            overrides.remove(profile);
+        }
+    }
+
+    fn cancel_disabled_retries(&self, engine: &Engine) {
+        for (profile, _) in engine.sessions.iter() {
+            if resilient(engine, profile) {
+                continue;
+            }
+            let Some(generation) = self.current_generation(profile) else {
+                continue;
+            };
+            let confirming =
+                oxidom_core::sync::lock(&self.runtime_facts).disable_attempt(profile, generation);
+            if !confirming {
+                self.cancel_retry_locked(profile, generation);
+            }
+        }
+    }
+
+    fn projected_session_info(
+        &self,
+        engine: &Engine,
+        profile: &str,
+        session: &oxidom_core::engine::Session,
+        failure: Option<&ErrorOverride>,
+    ) -> SessionInfo {
+        let mut info = session_info(engine, profile, session, failure);
+        let generation = self.current_generation(profile);
+        let subject = generation
+            .map(|generation| self.capture_confirmation(engine, profile, generation, None));
+        let facts = oxidom_core::sync::lock(&self.runtime_facts);
+        if let Some(runtime) = &mut info.runtime {
+            runtime.health = facts.health(profile, subject);
+            runtime.retry = facts.retry(profile, generation, Instant::now());
+        }
+        info
     }
 
     fn clear_reconnect_override(&self, profile: &str, target: &ConnectionTarget) {
@@ -1186,7 +1315,7 @@ impl Shared {
             .sessions
             .iter()
             .map(|(profile, session)| {
-                session_info(&engine, profile, session, overrides.get(profile))
+                self.projected_session_info(&engine, profile, session, overrides.get(profile))
             })
             .collect::<Vec<_>>();
         let Some(session) = engine.default_session() else {
@@ -1218,7 +1347,7 @@ impl Shared {
             .sessions
             .iter()
             .map(|(profile, session)| {
-                session_info(&engine, profile, session, overrides.get(profile))
+                self.projected_session_info(&engine, profile, session, overrides.get(profile))
             })
             .collect()
     }
@@ -1227,12 +1356,7 @@ impl Shared {
         let engine = oxidom_core::sync::lock(&self.engine);
         let overrides = oxidom_core::sync::lock(&self.override_status);
         let session = engine.sessions.get(profile)?;
-        Some(session_info(
-            &engine,
-            profile,
-            session,
-            overrides.get(profile),
-        ))
+        Some(self.projected_session_info(&engine, profile, session, overrides.get(profile)))
     }
 
     fn runtime_info(&self) -> RuntimeInfo {
@@ -1829,6 +1953,14 @@ impl Shared {
         timeout: Duration,
         expected: Option<Confirmation>,
     ) -> (Option<u32>, Option<probe::ProbeOutcome>) {
+        // Capture before I/O even for periodic probes, which have no confirmation token.
+        let subject = {
+            let engine = oxidom_core::sync::lock(&self.engine);
+            expected.or_else(|| {
+                generation
+                    .map(|generation| self.capture_confirmation(&engine, profile, generation, None))
+            })
+        };
         let outcome = if let Some(expected) = expected {
             self.session_probe_outcome_for(profile, timeout, Some(expected))
         } else {
@@ -1859,6 +1991,19 @@ impl Shared {
         };
         if still_current {
             oxidom_core::sync::lock(&self.proxied).insert(profile.to_string(), reading);
+            if let (Some(subject), Some((outcome, _))) = (subject, &outcome) {
+                self.accept_runtime_health(
+                    &engine,
+                    profile,
+                    subject,
+                    outcome,
+                    if expected.is_some() {
+                        "confirmation"
+                    } else {
+                        "active"
+                    },
+                );
+            }
         }
         (value, outcome.map(|(outcome, _)| outcome))
     }
@@ -1905,11 +2050,6 @@ impl Shared {
             }
             return Ok(None);
         }
-        oxidom_core::sync::lock(&self.proxied).remove(profile);
-        // A fresh attempt starts the death streak over, so a couple of misses
-        // remembered from before an explicit reconnect cannot cut the new
-        // tunnel's grace short.
-        oxidom_core::sync::lock(&self.tunnel_failures).remove(profile);
         let probe_label = target.probe_label(profile);
         let probe_job = oxidom_core::sync::lock(&self.probes).start_now(
             profile,
@@ -1922,10 +2062,24 @@ impl Shared {
         let mut snapshot = None;
         let connect_result = {
             let mut engine = oxidom_core::sync::lock(&self.engine);
-            if !self.generation_is_current(profile, generation) {
+            let accepted = self.generation_is_current(profile, generation)
+                && (origin != ConnectionOrigin::Reconnect
+                    || (self.retry_is_current(&engine, profile, target, generation)
+                        && oxidom_core::sync::lock(&self.runtime_facts)
+                            .attempting(profile, generation)));
+            if !accepted {
+                if origin == ConnectionOrigin::Reconnect {
+                    self.cancel_retry_locked(profile, generation);
+                }
                 None
             } else {
+                oxidom_core::sync::lock(&self.proxied).remove(profile);
+                // Only an accepted start may reset the current subject's observations.
+                oxidom_core::sync::lock(&self.tunnel_failures).remove(profile);
                 self.stop_standby();
+                let mut runtime = oxidom_core::sync::lock(&self.runtime_facts);
+                runtime.clear_health(profile);
+                drop(runtime);
                 let context = oxidom_core::sync::lock(&self.identities).start(
                     &self.recorder,
                     profile,
@@ -2197,6 +2351,13 @@ impl Shared {
                 let (_, attempted_method) = pool_probe_method(method);
                 let engine = oxidom_core::sync::lock(&shared.engine);
                 if shared.confirmation_is_current(&engine, &profile, snapshot) {
+                    shared.accept_runtime_health(
+                        &engine,
+                        &profile,
+                        snapshot,
+                        &probe::ProbeOutcome::Timeout,
+                        "confirmation",
+                    );
                     oxidom_core::sync::lock(&shared.proxied).insert(
                         profile.clone(),
                         LatencyReading::failed(
@@ -2271,6 +2432,12 @@ impl Shared {
                 let mut facts = Facts::default();
                 if origin == ConnectionOrigin::Explicit {
                     oxidom_core::sync::lock(&self.identities).prune(&engine, &mut facts);
+                }
+                if origin == ConnectionOrigin::Reconnect
+                    && !oxidom_core::sync::lock(&self.runtime_facts)
+                        .retry_allowed(profile, snapshot.generation)
+                {
+                    self.cancel_retry_locked(profile, snapshot.generation);
                 }
                 drop(engine);
                 drop(order);
@@ -2370,6 +2537,12 @@ impl Shared {
         let mut facts = Facts::default();
         if origin == ConnectionOrigin::Explicit {
             oxidom_core::sync::lock(&self.identities).prune(&engine, &mut facts);
+        }
+        if origin == ConnectionOrigin::Reconnect
+            && !oxidom_core::sync::lock(&self.runtime_facts)
+                .retry_allowed(profile, snapshot.generation)
+        {
+            self.cancel_retry_locked(profile, snapshot.generation);
         }
         drop(engine);
         drop(order);
@@ -2539,6 +2712,9 @@ impl Shared {
         let Some((_, _, threshold)) = watchdog_policy(mode) else {
             return false;
         };
+        if let Some(outcome) = outcome {
+            self.accept_runtime_health(&engine, profile, attempt.subject(), outcome, "watchdog");
+        }
         let mut failures = oxidom_core::sync::lock(&self.tunnel_failures);
         let had_streak = failures.contains_key(profile);
         let negative = matches!(
@@ -3180,6 +3356,34 @@ fn session_info_with_status(
             up: interface.up,
         }),
         selection: selection_info(engine, session, selection.as_ref()),
+        runtime: Some(oxidom_core::ipc::RuntimeSessionInfo {
+            phase: runtime::phase(&session.status(), session.confirmation_pending).to_string(),
+            health: None,
+            protection: oxidom_core::ipc::RuntimeProtection {
+                on_core_exit: if session.holds_traffic {
+                    "hold"
+                } else {
+                    "release"
+                }
+                .to_string(),
+                holding: Some(session.holding_traffic),
+                interface_up: Some(
+                    session
+                        .interface
+                        .as_ref()
+                        .is_some_and(|interface| interface.up),
+                ),
+                route_mode: session
+                    .interface
+                    .as_ref()
+                    .map(|interface| interface.route_mode().to_string()),
+                desktop_proxy_owner: Some(engine.sessions.owner_of_system_proxy() == Some(profile)),
+            },
+            retry: oxidom_core::ipc::RuntimeRetry {
+                state: "idle".to_string(),
+                ..Default::default()
+            },
+        }),
     }
 }
 
@@ -4293,6 +4497,7 @@ impl Service {
             oxidom_core::sync::lock(&self.shared.identities).flush_all(&mut facts);
         }
         engine.registry.config = config;
+        self.shared.cancel_disabled_retries(&engine);
         let socks_port = engine.registry.config.socks_port;
         let http_port = engine.registry.config.http_port;
         let xray_binary = engine.registry.config.xray_binary.clone();
@@ -5443,6 +5648,23 @@ mod tests {
             let socks = engine.registry.config.socks_port;
             let http = engine.registry.config.http_port;
             engine.prepare_session(profile, address, socks, http)?;
+            if let Some(generation) = retry_generation {
+                // A synthetic automatic start must own the same episode as a real waiter.
+                engine.registry.config.reconnect = true;
+                oxidom_core::sync::lock(&service.shared.runtime_facts).backoff(
+                    profile,
+                    generation,
+                    0,
+                    Instant::now(),
+                );
+                oxidom_core::sync::lock(&service.shared.override_status).insert(
+                    profile.to_string(),
+                    ErrorOverride {
+                        status: Status::Error(RECONNECTING_MESSAGE.to_string()),
+                        selection: SessionSelection::Server(server.to_string()),
+                    },
+                );
+            }
             retry_generation.unwrap_or_else(|| service.shared.next_connect_generation(profile))
         };
         assert!(
@@ -5514,6 +5736,11 @@ mod tests {
                 .is_none()
         );
         let target = ConnectionTarget::Server(server);
+        assert!(
+            service
+                .shared
+                .complete_reconnect("default", &target, b, a.context, 0,)
+        );
         assert!(!service.shared.apply_confirmation_success(
             "default",
             &target,
@@ -5786,6 +6013,23 @@ mod tests {
                 Some(&probe::ProbeOutcome::Timeout)
             ));
         }
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.config.reconnect = true;
+            oxidom_core::sync::lock(&service.shared.runtime_facts).backoff(
+                "default",
+                snapshot.generation,
+                0,
+                Instant::now(),
+            );
+            oxidom_core::sync::lock(&service.shared.override_status).insert(
+                "default".into(),
+                ErrorOverride {
+                    status: Status::Error(RECONNECTING_MESSAGE.into()),
+                    selection: SessionSelection::Server("invented-missing-server".into()),
+                },
+            );
+        }
         assert!(
             service
                 .shared
@@ -5903,6 +6147,23 @@ mod tests {
             .id
             .clone();
         let a = start_attributed_fake_session(&service, "default", &server, None)?;
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.config.reconnect = true;
+            oxidom_core::sync::lock(&service.shared.runtime_facts).backoff(
+                "default",
+                a.generation,
+                0,
+                Instant::now(),
+            );
+            oxidom_core::sync::lock(&service.shared.override_status).insert(
+                "default".into(),
+                ErrorOverride {
+                    status: Status::Error(RECONNECTING_MESSAGE.into()),
+                    selection: SessionSelection::Server("invented-missing-server".into()),
+                },
+            );
+        }
         assert!(
             service
                 .shared
@@ -6741,16 +7002,57 @@ mod tests {
             Event::Retry { context, state: RetryState::Recovered, .. }
                 if Some(*context) == trigger.context))
         );
+        {
+            let engine = oxidom_core::sync::lock(&service.shared.engine);
+            assert!(
+                service
+                    .shared
+                    .retry_is_current(&engine, &profile, &target, first.generation)
+            );
+            oxidom_core::sync::lock(&service.shared.runtime_facts).backoff(
+                &profile,
+                first.generation,
+                1,
+                Instant::now(),
+            );
+        }
         let (answer, current) = service
             .shared
             .start_reconnect_attempt(&profile, &target, first.generation)
             .context("retry still owned")??;
         assert!(answer.recv_timeout(Duration::from_secs(5))?);
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.config.reconnect = false;
+            service.shared.cancel_disabled_retries(&engine);
+            assert!(
+                service
+                    .shared
+                    .confirmation_is_current(&engine, &profile, current)
+            );
+        }
         assert!(
             service
                 .shared
                 .complete_reconnect(&profile, &target, current, trigger.context, 1,)
         );
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            engine.registry.config.reconnect = true;
+            assert_eq!(
+                engine
+                    .sessions
+                    .get(&profile)
+                    .context("session")?
+                    .reported_status(),
+                Status::Connected
+            );
+            assert!(
+                !service
+                    .shared
+                    .retry_receipt_is_current(&profile, &target, first.generation)
+            );
+        }
         service.stop_all_profiles()?;
         Ok(())
     }
@@ -8991,6 +9293,321 @@ mod tests {
         assert_eq!(status.active_profile.as_deref(), Some("home"));
         assert_eq!(status.active_id.as_deref(), Some("home-server"));
         assert_eq!(status.sessions.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn disabling_future_retries_does_not_discard_inflight_confirmation_or_revive_its_episode()
+    -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("inflight-retry-disable")?;
+        for success in [true, false] {
+            let service = for_test();
+            let shared = &service.shared;
+            let target = ConnectionTarget::Server("invented-server".into());
+            let snapshot = {
+                let mut engine = oxidom_core::sync::lock(&shared.engine);
+                mark_active(&mut engine, "work", "invented-server")?;
+                engine.registry.config.system_proxy = false;
+                engine.registry.config.reconnect = true;
+                let generation = shared.next_connect_generation("work");
+                let session = engine.sessions.get_mut("work").context("work")?;
+                *oxidom_core::sync::lock(&session.core.status) = Status::Connected;
+                session.confirmation_pending = true;
+                let mut runtime = oxidom_core::sync::lock(&shared.runtime_facts);
+                runtime.backoff("work", generation, 0, Instant::now());
+                assert!(runtime.attempting("work", generation));
+                drop(runtime);
+                oxidom_core::sync::lock(&shared.override_status).insert(
+                    "work".into(),
+                    ErrorOverride {
+                        status: Status::Error(RECONNECTING_MESSAGE.into()),
+                        selection: target.selection(),
+                    },
+                );
+                engine.registry.config.reconnect = false;
+                shared.cancel_disabled_retries(&engine);
+                let snapshot = shared.capture_confirmation(&engine, "work", generation, None);
+                assert!(shared.confirmation_is_current(&engine, "work", snapshot));
+                assert!(shared.retry_receipt_is_current("work", &target, generation));
+                assert!(!shared.retry_is_current(&engine, "work", &target, generation));
+                // Re-enabling before the receipt arrives must not reopen future retries.
+                engine.registry.config.reconnect = true;
+                assert!(!shared.retry_is_current(&engine, "work", &target, generation));
+                snapshot
+            };
+            if success {
+                assert!(shared.apply_confirmation_success(
+                    "work",
+                    &target,
+                    ConnectionOrigin::Reconnect,
+                    snapshot
+                ));
+                let engine = oxidom_core::sync::lock(&shared.engine);
+                assert_eq!(
+                    engine
+                        .sessions
+                        .get("work")
+                        .context("work")?
+                        .reported_status(),
+                    Status::Connected
+                );
+                assert!(
+                    !engine
+                        .sessions
+                        .get("work")
+                        .context("work")?
+                        .confirmation_pending
+                );
+                assert!(shared.retry_receipt_is_current("work", &target, snapshot.generation));
+            } else {
+                shared.apply_confirmation_failure(
+                    "work",
+                    &target,
+                    ConnectionOrigin::Reconnect,
+                    snapshot,
+                    ConfirmationEnd::Measured,
+                    Some(&probe::ProbeOutcome::Timeout),
+                );
+                let engine = oxidom_core::sync::lock(&shared.engine);
+                let session = engine.sessions.get("work").context("work")?;
+                assert!(!session.confirmation_pending);
+                assert_ne!(session.reported_status(), Status::Connecting);
+                assert!(!shared.retry_receipt_is_current("work", &target, snapshot.generation));
+            }
+            // No live child exists in this deterministic fixture: a late receipt must not
+            // claim recovery, and the disabled episode must never schedule another start.
+            assert!(!shared.complete_reconnect("work", &target, snapshot, None, 0));
+            assert!(!shared.reconnect_is_pending("work", &target, snapshot.generation));
+            assert!(
+                shared
+                    .start_reconnect_attempt("work", &target, snapshot.generation)
+                    .is_none()
+            );
+            assert!(!oxidom_core::sync::lock(&shared.override_status).contains_key("work"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disabling_retry_cancels_only_its_generation_and_a_waiter_cannot_restart_it() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("runtime-retry-cancellation")?;
+        let service = for_test();
+        let shared = &service.shared;
+        let target = ConnectionTarget::Server("invented-server".into());
+        let generation = {
+            let mut engine = oxidom_core::sync::lock(&shared.engine);
+            mark_active(&mut engine, "work", "invented-server")?;
+            mark_active(&mut engine, "manual", "invented-manual-server")?;
+            engine.registry.config.reconnect = true;
+            let generation = shared.next_connect_generation("work");
+            let manual = shared.next_connect_generation("manual");
+            oxidom_core::sync::lock(&shared.runtime_facts).backoff(
+                "work",
+                generation,
+                0,
+                Instant::now(),
+            );
+            oxidom_core::sync::lock(&shared.override_status).insert(
+                "work".into(),
+                ErrorOverride {
+                    status: Status::Error(RECONNECTING_MESSAGE.into()),
+                    selection: target.selection(),
+                },
+            );
+            engine.registry.config.reconnect = false;
+            shared.cancel_disabled_retries(&engine);
+            assert_eq!(shared.current_generation("manual"), Some(manual));
+            assert_eq!(shared.current_generation("work"), None);
+            assert!(!oxidom_core::sync::lock(&shared.override_status).contains_key("work"));
+            assert_eq!(
+                oxidom_core::sync::lock(&shared.runtime_facts)
+                    .retry("work", Some(generation), Instant::now())
+                    .state,
+                "idle"
+            );
+            engine.registry.config.reconnect = true;
+            generation
+        };
+        assert!(
+            shared
+                .start_reconnect_attempt("work", &target, generation)
+                .is_none()
+        );
+        let replacement = {
+            let _engine = oxidom_core::sync::lock(&shared.engine);
+            let replacement = shared.next_connect_generation("work");
+            oxidom_core::sync::lock(&shared.runtime_facts).backoff(
+                "work",
+                replacement,
+                0,
+                Instant::now(),
+            );
+            replacement
+        };
+        shared.cancel_runtime_retry("work", generation);
+        assert_eq!(shared.current_generation("work"), Some(replacement));
+        assert_eq!(
+            oxidom_core::sync::lock(&shared.runtime_facts)
+                .retry("work", Some(replacement), Instant::now())
+                .state,
+            "backoff"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconnect_start_refuses_idle_and_disabled_episodes_without_starting_a_core() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("runtime-retry-start-guard")?;
+        let service = for_test();
+        let shared = &service.shared;
+        let target = ConnectionTarget::Server("invented-server".into());
+        let generation = {
+            let mut engine = oxidom_core::sync::lock(&shared.engine);
+            mark_active(&mut engine, "work", "invented-server")?;
+            engine.registry.config.reconnect = true;
+            shared.next_connect_generation("work")
+        };
+        assert!(
+            shared
+                .start_reconnect_attempt("work", &target, generation)
+                .is_none()
+        );
+        {
+            let mut engine = oxidom_core::sync::lock(&shared.engine);
+            oxidom_core::sync::lock(&shared.runtime_facts).backoff(
+                "work",
+                generation,
+                0,
+                Instant::now(),
+            );
+            oxidom_core::sync::lock(&shared.override_status).insert(
+                "work".into(),
+                ErrorOverride {
+                    status: Status::Error(RECONNECTING_MESSAGE.into()),
+                    selection: target.selection(),
+                },
+            );
+            engine.registry.config.reconnect = false;
+        }
+        assert!(
+            shared
+                .start_reconnect_attempt("work", &target, generation)
+                .is_none()
+        );
+        let engine = oxidom_core::sync::lock(&shared.engine);
+        assert_eq!(
+            engine
+                .sessions
+                .get("work")
+                .context("work")?
+                .core
+                .spawn_seq(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_projects_lifecycle_health_protection_and_retry_independently() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("runtime-facts-projection")?;
+        let service = for_test();
+        let shared = &service.shared;
+        let mut engine = oxidom_core::sync::lock(&shared.engine);
+        mark_active(&mut engine, "work", "invented-server")?;
+        *oxidom_core::sync::lock(&engine.sessions.get("work").context("work")?.core.status) =
+            Status::Connected;
+        let generation = shared.next_connect_generation("work");
+        let subject = shared.capture_confirmation(&engine, "work", generation, None);
+        let replacement_generation = shared.next_connect_generation("work");
+        shared.accept_runtime_health(
+            &engine,
+            "work",
+            subject,
+            &probe::ProbeOutcome::Timeout,
+            "active",
+        );
+        assert!(
+            oxidom_core::sync::lock(&shared.runtime_facts)
+                .health("work", Some(subject))
+                .is_none()
+        );
+        let generation = replacement_generation;
+        let subject = shared.capture_confirmation(&engine, "work", generation, None);
+        let mut stale_core = subject;
+        stale_core.spawn_seq = stale_core.spawn_seq.saturating_add(1);
+        shared.accept_runtime_health(
+            &engine,
+            "work",
+            stale_core,
+            &probe::ProbeOutcome::Timeout,
+            "active",
+        );
+        assert!(
+            oxidom_core::sync::lock(&shared.runtime_facts)
+                .health("work", Some(subject))
+                .is_none()
+        );
+        let failure = ErrorOverride {
+            status: Status::Error("legacy failure".into()),
+            selection: SessionSelection::Server("invented-server".into()),
+        };
+        for (pending, holding, policy, expected) in [
+            (true, false, false, "verifying"),
+            (false, false, true, "running"),
+            (true, true, true, "verifying"),
+        ] {
+            let session = engine.sessions.get_mut("work").context("work")?;
+            session.confirmation_pending = pending;
+            session.holding_traffic = holding;
+            session.holds_traffic = policy;
+            let session = engine.sessions.get("work").context("work")?;
+            let info = shared.projected_session_info(&engine, "work", session, Some(&failure));
+            assert_eq!(info.state, "error");
+            assert_eq!(info.error.as_deref(), Some("legacy failure"));
+            let runtime = info.runtime.context("runtime")?;
+            assert_eq!(runtime.phase, expected);
+            assert!(
+                runtime.health.is_none(),
+                "no probe means no health, even for an adopted core"
+            );
+            assert_eq!(runtime.protection.holding, Some(holding));
+            assert_eq!(
+                runtime.protection.on_core_exit,
+                if policy { "hold" } else { "release" }
+            );
+            assert_eq!(runtime.protection.interface_up, Some(false));
+            assert!(runtime.protection.route_mode.is_none());
+            assert_eq!(runtime.protection.desktop_proxy_owner, Some(false));
+        }
+        shared.accept_runtime_health(
+            &engine,
+            "work",
+            subject,
+            &probe::ProbeOutcome::NoNetwork,
+            "watchdog",
+        );
+        {
+            let mut facts = oxidom_core::sync::lock(&shared.runtime_facts);
+            facts.backoff("work", generation, 2, Instant::now());
+        }
+        let session = engine.sessions.get("work").context("work")?;
+        let runtime = shared
+            .projected_session_info(&engine, "work", session, None)
+            .runtime
+            .context("runtime")?;
+        assert_eq!(runtime.health.context("health")?.outcome, "no_network");
+        assert_eq!(runtime.retry.state, "backoff");
+        shared.next_connect_generation("work");
+        let runtime = shared
+            .projected_session_info(&engine, "work", session, None)
+            .runtime
+            .context("runtime")?;
+        assert!(runtime.health.is_none());
+        assert_eq!(runtime.retry.state, "idle");
         Ok(())
     }
 

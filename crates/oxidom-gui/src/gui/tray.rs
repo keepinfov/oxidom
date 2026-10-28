@@ -17,7 +17,7 @@ pub enum TrayCommand {
 
 pub struct OxidomTray {
     pub generation: Option<Generation>,
-    pub sessions: Vec<(String, bool, Option<SessionAction>)>,
+    pub sessions: Vec<(String, String, bool, Option<SessionAction>)>,
     pub status_text: String,
     /// A tunnel is down and said why. Toasts do not reach a hidden window —
     /// they are recorded and dropped — so with a constant icon a tunnel that
@@ -71,7 +71,7 @@ impl ksni::Tray for OxidomTray {
         let mut menu = self
             .sessions
             .iter()
-            .map(|(profile, running, action)| {
+            .map(|(profile, summary, running, action)| {
                 let profile = profile.clone();
                 let generation = self.generation;
                 let action = action.clone();
@@ -82,7 +82,7 @@ impl ksni::Tray for OxidomTray {
                     None => "Unavailable",
                 };
                 CheckmarkItem {
-                    label: format!("{verb} · {profile}"),
+                    label: format!("{verb} · {profile} · {summary}"),
                     checked: *running,
                     enabled: generation.is_some() && action.is_some(),
                     activate: Box::new(move |tray: &mut Self| {
