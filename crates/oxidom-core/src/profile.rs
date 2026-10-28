@@ -448,7 +448,7 @@ future_key = "ignored"
         assert_eq!(serde_json::to_string(&profile.failover)?, literal);
         let encoded = profile.to_toml()?;
         assert!(encoded.ends_with(
-            "[failover]\nenabled = true\nmembers = [\"canonical-a\", \"canonical-b\"]\nmax_attempts = 3\ncooldown_secs = 30\n"
+            "[failover]\nenabled = true\nmembers = [\n    \"canonical-a\",\n    \"canonical-b\",\n]\nmax_attempts = 3\ncooldown_secs = 30\n"
         ), "{encoded}");
         assert_eq!(Profile::from_toml(&encoded)?, profile);
         let decoded: Profile = serde_json::from_str(
