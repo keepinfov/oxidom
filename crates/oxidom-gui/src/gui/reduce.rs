@@ -1387,6 +1387,33 @@ pub(super) fn selection_ids(
     filtered_ids_with_latencies(query, groups, latencies)
 }
 
+/// Membership at activation, ranked and capped exactly as the daemon resolves it.
+pub(super) fn activation_ids(
+    subscriptions: &[Subscription],
+    readings: &HashMap<String, LatencyReading>,
+    query: &PoolQuery,
+) -> Vec<String> {
+    use oxidom_core::pool::Known;
+
+    oxidom_core::pool::resolve_ranked(query, subscriptions, |server| {
+        let Some(reading) = readings
+            .get(&server.id)
+            .filter(|reading| reading.route == ProbeRoute::Direct)
+        else {
+            return Known::Unmeasured;
+        };
+        match (reading.value, reading.failure) {
+            (Some(ms), _) => Known::Reachable(ms),
+            (None, Some(ProbeFailure::Unreachable | ProbeFailure::Timeout)) => Known::Unreachable,
+            (None, _) => Known::Unmeasured,
+        }
+    })
+    .unwrap_or_default()
+    .into_iter()
+    .map(|server| server.id.clone())
+    .collect()
+}
+
 pub(super) fn profile_selection(query: &PoolQuery, kind: PoolKind) -> Option<PoolQuery> {
     // The profile's wire format cannot carry the separate empty-list kind.
     (!(kind == PoolKind::List && query.members.is_empty())).then(|| query.clone())
@@ -2135,9 +2162,9 @@ pub(super) enum CardAction {
     /// The pre-sessions path, unchanged: `Disconnect` on the daemon.
     Disconnect,
     /// The selected profile already points here; just bring it up/down.
-    UpProfile(String),
+    UpProfile(String, Box<ProfileEntry>),
     DownProfile(String),
-    ReconnectProfile(String),
+    ReconnectProfile(String, Box<ProfileEntry>),
     /// The selected profile points somewhere else. The widget layer must ask
     /// before doing this: it rewrites `profiles/<name>.toml`.
     RepointAndUp {
@@ -2199,18 +2226,13 @@ pub(super) fn card_action(
     }) {
         return CardAction::DownProfile(selected);
     }
-    if selected_entry.is_some_and(|entry| {
-        entry.pool.is_none() && profile_points_to_server(entry, state, server_id)
-    }) && session_for(state, &selected).is_some()
+    if let Some(entry) =
+        selected_entry.filter(|entry| profile_points_to_server(entry, state, server_id))
     {
-        return CardAction::ReconnectProfile(selected);
-    }
-    if profiles
-        .iter()
-        .find(|entry| entry.name == selected)
-        .is_some_and(|entry| profile_points_to_server(entry, state, server_id))
-    {
-        return CardAction::UpProfile(selected);
+        if entry.pool.is_none() && session_for(state, &selected).is_some() {
+            return CardAction::ReconnectProfile(selected, Box::new(entry.clone()));
+        }
+        return CardAction::UpProfile(selected, Box::new(entry.clone()));
     }
     CardAction::RepointAndUp {
         profile: selected,
@@ -2257,8 +2279,8 @@ pub(super) fn card_plan(
                 UiOperationKind::Connect,
             )
         }
-        CardAction::UpProfile(_) => ("Connect", UiOperationKind::UpProfile),
-        CardAction::ReconnectProfile(_) => ("Reconnect", UiOperationKind::UpProfile),
+        CardAction::UpProfile(..) => ("Connect", UiOperationKind::UpProfile),
+        CardAction::ReconnectProfile(..) => ("Reconnect", UiOperationKind::UpProfile),
         CardAction::RepointAndUp { .. } => ("Switch", UiOperationKind::UpProfile),
     };
     ControlPlan {
@@ -3422,20 +3444,23 @@ mod tests {
             card_plan(&profiles, &state, "same"),
             ControlPlan {
                 label: "Connect",
-                action: Some(CardAction::UpProfile("work".into())),
+                action: Some(CardAction::UpProfile(
+                    "work".into(),
+                    Box::new(profiles[0].clone()),
+                )),
             }
         );
         for (wire, held, expected, label) in [
             (
                 "error",
                 false,
-                CardAction::ReconnectProfile("work".into()),
+                CardAction::ReconnectProfile("work".into(), Box::new(profiles[0].clone())),
                 "Reconnect",
             ),
             (
                 "disconnected",
                 false,
-                CardAction::ReconnectProfile("work".into()),
+                CardAction::ReconnectProfile("work".into(), Box::new(profiles[0].clone())),
                 "Reconnect",
             ),
             (
@@ -3479,6 +3504,105 @@ mod tests {
         );
         state.poll_error = Some("offline".into());
         assert!(card_plan(&profiles, &state, "same").action.is_none());
+    }
+
+    #[test]
+    fn saved_card_starts_are_invalidated_by_core_or_port_edits() {
+        let saved = profile("work", "same");
+        let mut state = state();
+        state.selected_profile = "work".into();
+        for wire in [None, Some("error"), Some("disconnected")] {
+            state.sessions = wire
+                .map(|wire| vec![session("work", wire, "same")])
+                .unwrap_or_default();
+            let displayed = card_plan(std::slice::from_ref(&saved), &state, "same");
+            assert!(displayed.action.is_some());
+            for edit in 0..3 {
+                let mut changed = saved.clone();
+                match edit {
+                    0 => changed.socks_port += 1,
+                    1 => changed.http_port += 1,
+                    _ => changed.core.pool_probe_url = Some("https://probe.example.test/".into()),
+                }
+                let current = card_plan(&[changed], &state, "same");
+                assert_eq!(current.label, displayed.label);
+                assert_ne!(current, displayed, "{wire:?}, edit {edit}");
+            }
+        }
+    }
+
+    #[test]
+    fn activation_ranks_and_filters_before_spending_the_membership_cap() {
+        let groups = [filter_group(
+            "main",
+            "Main",
+            &[
+                ("dead", "trojan://invented@dead.example:443#Dead", None),
+                ("slow", "trojan://invented@slow.example:443#Slow", None),
+                ("fast", "trojan://invented@fast.example:443#Fast", None),
+            ],
+        )];
+        let readings = HashMap::from([
+            ("dead".into(), reading(None)),
+            ("slow".into(), reading(Some(200))),
+            ("fast".into(), reading(Some(20))),
+        ]);
+        let mut query = PoolQuery {
+            max: 1,
+            ..PoolQuery::default()
+        };
+        assert_eq!(activation_ids(&groups, &readings, &query), ["fast"]);
+        query.alive_only = true;
+        assert_eq!(activation_ids(&groups, &readings, &query), ["fast"]);
+        query.max_latency_ms = Some(50);
+        assert_eq!(activation_ids(&groups, &readings, &query), ["fast"]);
+    }
+
+    #[test]
+    fn activation_does_not_rank_tunnel_or_local_failures_as_server_failures() {
+        let groups = [filter_group(
+            "main",
+            "Main",
+            &[
+                ("first", "trojan://invented@first.example:443#First", None),
+                ("dead", "trojan://invented@dead.example:443#Dead", None),
+                (
+                    "unknown",
+                    "trojan://invented@unknown.example:443#Unknown",
+                    None,
+                ),
+            ],
+        )];
+        let query = PoolQuery::default();
+        for route in [ProbeRoute::Direct, ProbeRoute::Proxied] {
+            for failure in [
+                ProbeFailure::NoNetwork,
+                ProbeFailure::Unknown,
+                ProbeFailure::Timeout,
+                ProbeFailure::Unreachable,
+            ] {
+                let readings = HashMap::from([
+                    (
+                        "first".into(),
+                        LatencyReading::failed(failure, route, LatencyMethod::HttpGet),
+                    ),
+                    ("dead".into(), reading(None)),
+                ]);
+                let expected = if route == ProbeRoute::Direct
+                    && matches!(failure, ProbeFailure::Timeout | ProbeFailure::Unreachable)
+                {
+                    ["unknown", "first", "dead"]
+                } else {
+                    ["first", "unknown", "dead"]
+                };
+                assert_eq!(activation_ids(&groups, &readings, &query), expected);
+            }
+        }
+        let readings = HashMap::from([("dead".into(), proxied(1, NOW_MS))]);
+        assert_eq!(
+            activation_ids(&groups, &readings, &query),
+            ["first", "dead", "unknown"]
+        );
     }
 
     #[test]
@@ -5587,7 +5711,7 @@ mod tests {
         state.sessions = vec![alias_source];
         assert_eq!(
             card_action(&[work.clone()], &state, "same"),
-            CardAction::UpProfile("work".to_string())
+            CardAction::UpProfile("work".to_string(), Box::new(work.clone()))
         );
 
         work.server = "other".to_string();

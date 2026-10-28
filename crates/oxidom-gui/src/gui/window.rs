@@ -27,11 +27,10 @@ use super::recovery::{Generation, RecoveryState, RetiredWork};
 use super::reduce::{
     CardAction, ControlPlan, Effect, PolledSnapshot, PoolAction, ProbePhase, ProbeWait,
     SessionAction, SessionRowState, SnapshotState, SwitcherItem, SystemProxyState, about_comments,
-    active_latency_for, card_plan, check_can_be_stopped, compact_status_visible, direct_latencies,
+    activation_ids, active_latency_for, card_plan, check_can_be_stopped, compact_status_visible,
     geo_download_prompt, history_chart, human_bytes, latency_states, missing_core_message,
     other_profiles_message, pool_plan, pool_short_label, press_stops, proxy_status_label, reduce,
-    selected_status, selection_ids, session_for, session_rows, stop_report, switcher_items,
-    switcher_visible,
+    selected_status, session_for, session_rows, stop_report, switcher_items, switcher_visible,
 };
 use super::server_card::{self, LatencyState};
 use super::sidebar::{Page, Sidebar};
@@ -2592,9 +2591,9 @@ impl Controller {
         match action {
             CardAction::Connect(id) => self.connect_server(id),
             CardAction::Disconnect => self.disconnect(),
-            CardAction::UpProfile(name) => self.up_profile(name),
+            CardAction::UpProfile(name, _) => self.up_profile(name),
             CardAction::DownProfile(name) => self.down_profile(name),
-            CardAction::ReconnectProfile(name) => self.reconnect_profile(name),
+            CardAction::ReconnectProfile(name, _) => self.reconnect_profile(name),
             CardAction::RepointAndUp {
                 profile,
                 server_id,
@@ -2768,12 +2767,7 @@ impl Controller {
             if !state.ui.can_start(UiOperationKind::UpProfile) {
                 return;
             }
-            let ids = selection_ids(
-                &query,
-                query.kind(),
-                &state.subscriptions,
-                &direct_latencies(&state.ui.readings),
-            );
+            let ids = activation_ids(&state.subscriptions, &state.ui.readings, &query);
             let mut target = state.ui.clone();
             target.selected_profile.clone_from(&query.session);
             if pool_plan(&target, &ids).action.is_none() {
@@ -3460,12 +3454,7 @@ impl Controller {
             let now = Instant::now();
             state.ui.pin_saved_start(entry, server_id, now);
             if let Some(query) = &entry.pool {
-                let ids = selection_ids(
-                    query,
-                    query.kind(),
-                    &state.subscriptions,
-                    &direct_latencies(&state.ui.readings),
-                );
+                let ids = activation_ids(&state.subscriptions, &state.ui.readings, query);
                 state.ui.pin_pool_resolved(&entry.name, query, ids, now);
             }
         }
@@ -5005,7 +4994,7 @@ impl Controller {
                     .set_tooltip_text(Some("Connection error — show connections"));
             }
         }
-        if standby {
+        if standby && !matches!(status, Status::Connecting) {
             let summary = match status {
                 Status::Disconnected => "Disconnected",
                 Status::Connecting => "Connecting",
