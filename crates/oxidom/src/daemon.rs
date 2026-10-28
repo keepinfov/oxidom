@@ -1239,14 +1239,16 @@ impl Shared {
 
     fn cancel_disabled_retries(&self, engine: &Engine) {
         for (profile, _) in engine.sessions.iter() {
-            if !resilient(engine, profile)
-                && let Some(generation) = self.current_generation(profile)
-            {
-                if !oxidom_core::sync::lock(&self.runtime_facts)
-                    .disable_attempt(profile, generation)
-                {
-                    self.cancel_retry_locked(profile, generation);
-                }
+            if resilient(engine, profile) {
+                continue;
+            }
+            let Some(generation) = self.current_generation(profile) else {
+                continue;
+            };
+            let confirming =
+                oxidom_core::sync::lock(&self.runtime_facts).disable_attempt(profile, generation);
+            if !confirming {
+                self.cancel_retry_locked(profile, generation);
             }
         }
     }
@@ -5734,6 +5736,11 @@ mod tests {
                 .is_none()
         );
         let target = ConnectionTarget::Server(server);
+        assert!(
+            service
+                .shared
+                .complete_reconnect("default", &target, b, a.context, 0,)
+        );
         assert!(!service.shared.apply_confirmation_success(
             "default",
             &target,
