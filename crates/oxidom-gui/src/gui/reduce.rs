@@ -2476,6 +2476,7 @@ pub(super) fn card_action(
         || session_for(state, &selected).is_some_and(|session| session.selection.kind == "pool");
 
     if selected == "default"
+        && state.requested_target(&selected).is_none()
         && session_for(state, &selected).is_some_and(|session| {
             session.selection.kind != "pool"
                 && session.server_id.as_deref() == Some(server_id)
@@ -2489,6 +2490,12 @@ pub(super) fn card_action(
         // Default card clicks intentionally use temporary ConnectServer, even
         // with a saved or running pool; they never rewrite the saved profile.
         // A reported pool member is not an exact single-server connection.
+        let requested = state.requested_target(&selected);
+        let target = requested.as_deref().or_else(|| {
+            session_for(state, &selected)
+                .and_then(|session| session.server_id.as_deref())
+                .or(state.connected_id.as_deref())
+        });
         if state.pending_status_for(&selected).map_or_else(
             || {
                 matches!(
@@ -2497,11 +2504,10 @@ pub(super) fn card_action(
                 )
             },
             |status| matches!(status, Status::Connected | Status::Connecting),
-        ) && (session_for(state, &selected)
-            .and_then(|session| session.server_id.as_deref())
-            .or(state.connected_id.as_deref())
-            == Some(server_id))
-            && session_for(state, &selected).is_none_or(|session| session.selection.kind != "pool")
+        ) && target == Some(server_id)
+            && (requested.is_some()
+                || session_for(state, &selected)
+                    .is_none_or(|session| session.selection.kind != "pool"))
         {
             return CardAction::Disconnect;
         }
