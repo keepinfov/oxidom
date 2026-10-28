@@ -59,6 +59,8 @@ pub(super) struct SnapshotState {
     pub selected_profile: String,
     /// Server the tunnel is (optimistically) running for; drives the highlight.
     pub connected_id: Option<String>,
+    reported_id: Option<String>,
+    pending_target: Option<String>,
     /// Profile that brought the tunnel up, as reported by the daemon.
     pub active_profile: Option<String>,
     /// Every runtime session. The compatibility fields above still drive the
@@ -202,6 +204,8 @@ impl SnapshotState {
         Self {
             selected_profile: "default".to_string(),
             connected_id: status.active_id.clone(),
+            reported_id: status.active_id.clone(),
+            pending_target: None,
             active_profile: status.active_profile.clone(),
             sessions: status.sessions.clone(),
             connected_profiles: connected_profiles(status),
@@ -280,9 +284,25 @@ impl SnapshotState {
     /// user's action is in flight, or as the outcome a completion handler
     /// already knows and the daemon has not caught up with yet.
     pub fn pin_status(&mut self, profile: &str, status: Status, now: Instant) {
+        self.pending_target =
+            if profile == "default" && matches!(status, Status::Connecting | Status::Connected) {
+                self.connected_id.clone()
+            } else {
+                None
+            };
         self.pending_profile = profile.to_string();
         self.pending_status = Some(status);
         self.pending_since = now;
+    }
+
+    pub fn pin_target(&mut self, profile: &str, target: Option<String>, now: Instant) {
+        self.pin_status(profile, Status::Connecting, now);
+        self.pending_target = target;
+    }
+
+    pub fn rollback_pin(&mut self) {
+        self.clear_pin();
+        self.connected_id = self.reported_id.clone();
     }
 
     fn pending_status_for(&self, profile: &str) -> Option<&Status> {
@@ -379,6 +399,7 @@ impl SnapshotState {
     /// carried out, and holding it would show a transition that never happened.
     pub fn clear_pin(&mut self) {
         self.pending_status = None;
+        self.pending_target = None;
     }
 
     /// Return true only for a new, current polling failure.
@@ -497,6 +518,7 @@ pub(super) fn reduce(
     let mut toast_not_run = false;
     let mut new_error: Option<String> = None;
     state.daemon_status = snapshot.status.to_status();
+    state.reported_id = snapshot.status.active_id.clone();
     state.standby_proxy = snapshot.status.standby_proxy;
     state.active_profile = snapshot.status.active_profile.clone();
     state.sessions.clone_from(&snapshot.status.sessions);
@@ -726,7 +748,18 @@ pub(super) fn reduce(
             // Optimistic: the user asked to go up. Anything but the old
             // "disconnected" means the daemon has begun to agree.
             Some(Status::Connecting | Status::Connected) => {
+                let reported_target = if state.pending_profile == "default" {
+                    snapshot.status.active_id.as_deref()
+                } else {
+                    session_for(state, &state.pending_profile)
+                        .and_then(|session| session.server_id.as_deref())
+                };
                 !matches!(reported_status, Status::Disconnected)
+                    && (matches!(reported_status, Status::Error(_))
+                        || state
+                            .pending_target
+                            .as_deref()
+                            .is_none_or(|target| reported_target == Some(target)))
             }
             // Terminal: a completion pinned the outcome, or the user asked to
             // go down. Anything but the old "up" means the daemon has caught up.
@@ -735,7 +768,7 @@ pub(super) fn reduce(
             }
         };
         if contradicted || now.duration_since(state.pending_since) > PENDING_STATUS_DEADLINE {
-            state.pending_status = None;
+            state.clear_pin();
         }
     }
     // Key off the daemon's own view, not `current_status`: the latter prefers
@@ -4822,6 +4855,78 @@ mod tests {
     /// The optimistic "Connecting…" has to survive the daemon still reporting
     /// the world as it was before the click — that lag is the whole reason the
     /// pin exists.
+    #[test]
+    fn a_connected_previous_server_does_not_retire_the_pending_target() {
+        let mut state = SnapshotState::new(&StatusInfo::from_status(
+            &Status::Connected,
+            Some("a".into()),
+        ));
+        let now = Instant::now();
+        state.connected_id = Some("b".into());
+        state.pin_status("default", Status::Connecting, now);
+        fold(
+            &mut state,
+            &snapshot(
+                StatusInfo::from_status(&Status::Connected, Some("a".into())),
+                idle(),
+            ),
+            now,
+            true,
+        );
+        assert!(state.is_pinned());
+        assert_eq!(state.current_status(), Status::Connecting);
+        assert_eq!(state.connected_id.as_deref(), Some("b"));
+        fold(
+            &mut state,
+            &snapshot(
+                StatusInfo::from_status(&Status::Connected, Some("b".into())),
+                idle(),
+            ),
+            now,
+            true,
+        );
+        assert!(!state.is_pinned());
+    }
+
+    #[test]
+    fn rollback_restores_latest_reported_identity_not_the_optimistic_target() {
+        let mut state = SnapshotState::new(&StatusInfo::from_status(
+            &Status::Connected,
+            Some("a".into()),
+        ));
+        let now = Instant::now();
+        state.connected_id = Some("b".into());
+        state.pin_target("default", Some("b".into()), now);
+        fold(
+            &mut state,
+            &snapshot(
+                StatusInfo::from_status(&Status::Connected, Some("c".into())),
+                idle(),
+            ),
+            now,
+            true,
+        );
+        assert_eq!(state.connected_id.as_deref(), Some("b"));
+        state.rollback_pin();
+        assert_eq!(state.connected_id.as_deref(), Some("c"));
+        assert!(!state.is_pinned());
+    }
+
+    #[test]
+    fn named_pending_target_cannot_be_acknowledged_by_another_session() {
+        let mut state = state();
+        let now = Instant::now();
+        state.selected_profile = "work".into();
+        state.pin_target("work", Some("b".into()), now);
+        let mut status = StatusInfo::from_status(&Status::Connected, Some("b".into()));
+        status.sessions = vec![session("work", "connected", "a")];
+        fold(&mut state, &snapshot(status.clone(), idle()), now, true);
+        assert!(state.is_pinned());
+        status.sessions[0].server_id = Some("b".into());
+        fold(&mut state, &snapshot(status, idle()), now, true);
+        assert!(!state.is_pinned());
+    }
+
     #[test]
     fn an_optimistic_status_outlives_a_daemon_that_has_not_caught_up() {
         let mut state = state();
