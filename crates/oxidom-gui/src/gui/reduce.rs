@@ -5119,13 +5119,11 @@ mod tests {
         })
     }
 
-    /// The compatibility selection must call the old status and latency paths,
-    /// and must preserve both branches of the old card activation decision.
     #[test]
     fn pending_default_target_owns_the_disconnect_action_not_the_previous_report() {
         let mut state = SnapshotState::new(&connected_to("a"));
         state.sessions = vec![session("default", "connected", "a")];
-        state.pin_target("default", "b", Instant::now());
+        state.pin_target("default", Some("b".into()), Instant::now());
         let profiles = vec![profile("default", "a")];
         assert_eq!(card_action(&profiles, &state, "b"), CardAction::Disconnect);
         assert_eq!(
@@ -5134,6 +5132,8 @@ mod tests {
         );
     }
 
+    /// The compatibility selection must call the old status and latency paths,
+    /// and must preserve both branches of the old card activation decision.
     #[test]
     fn default_selection_preserves_the_pre_sessions_paths() {
         let status = connected_to("same").with_active_profile(Some("default".to_string()));
