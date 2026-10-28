@@ -668,6 +668,9 @@ pub struct ProfileEntry {
     /// routed profile to the two rules oxidom installs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<String>,
+    /// Saved authorization carried intact by profile editors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<crate::failover::FailoverPolicy>,
 }
 
 /// The selected server returned after bringing a profile up.
@@ -1072,6 +1075,31 @@ mod tests {
         .unwrap();
         assert_eq!(entry.interface, crate::profile::ProfileInterface::default());
         assert!(entry.pool.is_none());
+        assert!(entry.failover.is_none());
+        assert!(!serde_json::to_string(&entry).unwrap().contains("failover"));
+    }
+
+    #[test]
+    fn profile_entries_carry_optional_failover_without_losing_authorization() {
+        let literal = r#"{"name":"work","failover":{"enabled":true,"members":["a","b"],"max_attempts":3,"cooldown_secs":30,"future":true}}"#;
+        let entry: ProfileEntry = serde_json::from_str(literal).unwrap();
+        let policy = entry.failover.as_ref().unwrap();
+        assert_eq!(policy.members, ["a", "b"]);
+        assert!(policy.enabled);
+        assert_eq!(
+            serde_json::to_string(policy).unwrap(),
+            r#"{"enabled":true,"members":["a","b"],"max_attempts":3,"cooldown_secs":30}"#
+        );
+        let round_trip: ProfileEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(round_trip, entry);
+        let null: ProfileEntry = serde_json::from_str(r#"{"failover":null}"#).unwrap();
+        assert!(null.failover.is_none());
+        let defaulted: ProfileEntry = serde_json::from_str(r#"{"failover":{}}"#).unwrap();
+        assert_eq!(
+            defaulted.failover,
+            Some(crate::failover::FailoverPolicy::default())
+        );
     }
 
     /// A daemon that predates the reading contract sends `latencies` and no

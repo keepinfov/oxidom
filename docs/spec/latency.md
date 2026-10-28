@@ -50,7 +50,8 @@ Unix-millisecond latency reading schema, lifecycle/error projection and probe se
 ## Tunnel watchdog (binding)
 
 This is distinct from the periodic latency display and the one-second process-exit supervisor.
-Only resilient sessions are checked, and initial confirmation is allowed to finish first.
+Only resilient sessions (global reconnect, a bound run cgroup, or armed saved-profile failover)
+are checked, and initial confirmation is allowed to finish first.
 
 | Policy | Gap between sweeps | Request budget | Negative checks | Action |
 |---|---|---|---|---|
@@ -69,8 +70,25 @@ Results and streaks belong to the profile's cancellation generation, core spawn 
 watchdog policy epoch. A replacement core within the same automatic retry generation is a new
 measurement subject. Policy changes, including off-and-on between sweeps, invalidate old checks.
 Before destructive recovery, identity, current aggressive policy, resilience and confirmed state
-are checked again under the engine lock. Recovery preserves the selected server/pool and applies
-the session's existing hold/release policy. This does not add automatic single-node failover.
+are checked again under the engine lock. Ordinary reconnect preserves the selected server/pool
+and applies the existing hold/release policy. Explicit saved-profile authorization can instead
+admit an alternate under [failover.md](failover.md); conservative observations alone never do so.
+
+### Failover evidence (binding)
+
+Only a current measured confirmation `Timeout`/`Unreachable` without a recognized local complaint,
+or unexpected core death after verified operation, may advance authorized failover. A successful
+probe receipt whose core has already died remains eligible for recovery, not confirmed success.
+Death while confirmation is outstanding waits for that result: recognized configuration,
+protocol, geo-asset or certificate complaints take priority and disarm rather than advance.
+`NoNetwork`, `Internal`, cancellation, inbound-not-ready and interface/configuration failures
+do not authorize another candidate. Startup errors are currently untyped and conservatively
+disarm without advancing, even though an admitted automatic start consumed budget.
+
+Direct probes, latency ranking and diagnostic events grant no application authorization.
+Confirmation remains generation/core-attributed and traffic-based. Successful recovery resets
+the episode, but retains activation-wide cooldown. The next automatic admission waits for the
+later of cooldown and bounded reconnect backoff (1, 2, 4, 8, 16, then at most 30 seconds).
 
 ## Probe outcomes (binding)
 

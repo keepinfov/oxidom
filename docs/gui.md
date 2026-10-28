@@ -33,7 +33,9 @@ synthetic check. Running is not a promise that every destination is currently re
 
 Profiles details show the last observation with source and UTC timestamp, recorded exit policy,
 interface and route scope, logical desktop-proxy ownership, traffic hold and retry state.
-Backoff shows the remaining delay; attempting means an automatic retry has started. Idle means
+Backoff shows the remaining delay; attempting means an automatic retry has started. Exhausted
+means bounded saved-profile recovery used its budget or candidates, independently of phase and
+hold; it does not mean infinite same-target reconnect will continue. Idle means
 there is no retry episode, not that automatic recovery is disabled. Header, sidebar and tray
 use the same phase/retry/hold summary. A local start or stop is labelled as intent until reported.
 
@@ -58,6 +60,18 @@ reconnects. A runtime-only named session can be stopped, not silently turned int
 Group membership shown in a profile is an independent copy, not a live link to the Servers-page
 group. The profile dialog preserves that membership; edit an existing profile's list/rule with
 `oxidom profile edit <name>`. Editing a GUI group alone does not rewrite the profile.
+
+Saved-profile [sequential failover](profiles-and-pools.md#sequential-failover) is a separate,
+disabled-by-default authorization. Opt in manually through that existing TOML editor; there are
+no dedicated GUI failover controls yet (P13). Explicit saved-profile activation can arm the grant;
+temporary server/group Connect never inherits it, and the global reconnect switch does not opt in.
+Current editors preserve the policy on unchanged saves. A changed selection or authorization
+revokes the active grant rather than silently enrolling another target; removing the section
+through a current client sends explicit removal. Saved and reported selection can differ after
+automatic recovery because recovery never rewrites the saved initial choice.
+
+Only proxy-only P12 stage 1 is delivered: enabled interfaces are refused. Safe TUN failover is a
+mandatory remaining stage, so P12 is not complete and this feature promises no routing protection.
 
 A session can outlive removal of its saved profile. It remains on Profiles and in the session
 switcher/tray with "No saved profile" and a Stop control. Its settings cannot be edited or started

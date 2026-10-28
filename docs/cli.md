@@ -263,12 +263,24 @@ machine. See [when the core dies](routing.md#when-the-core-dies). Older daemons 
 facts get a separate `HOLDING` column when needed, without replacing `STATE`.
 Missing or null protection booleans mean unknown and are printed as `unknown`, not `false`.
 
-`RETRY` shows `idle`, `backoff` or `attempting`, a zero-based ordinal, and the remaining monotonic
-backoff milliseconds when waiting. Replacement/cancellation/recovery returns it to idle.
-Disabling automatic recovery cancels its pending episode; enabling it again does not restart an
-old waiter. An attempt that already started may finish verification, but will not retry again if
+`RETRY` shows `idle`, `backoff`, `attempting` or `exhausted`, a zero-based ordinal, and the remaining
+monotonic backoff milliseconds when waiting, rounded up (zero once the deadline is reached).
+The first pending and first admitted automatic attempt both have ordinal zero. `exhausted`
+means saved-profile failover reached its budget or candidate limit; it is independent of phase
+and does not fall through to infinite same-server reconnect. Replacement or confirmed recovery
+clears the episode. Revocation prevents further starts but may let admitted confirmation finish.
+For ordinary same-target reconnect, disabling automatic recovery cancels its pending episode;
+enabling it again does not restart an old waiter. An attempt that already started may finish
+verification, but will not retry again if
 it fails, even if recovery is re-enabled before it finishes. Bring the profile up explicitly to
 begin a fresh connection after cancellation.
+
+No dedicated failover command or flag is added. Configure the optional `[failover]` table using
+`oxidom profile edit <name>`, then explicitly `oxidom up <name>` to authorize that saved profile.
+Temporary `connect` or pool activation, `oxidom run`, and global `reconnect` do not authorize
+alternate servers. See [Sequential failover](profiles-and-pools.md#sequential-failover) for an
+invented-ID TOML example. This P12 stage is proxy-only; enabled interfaces are refused and safe
+TUN failover is still mandatory unfinished work. Dedicated CLI/GUI controls remain P13.
 
 `STATE` reads `direct` for active standby service on the configured local ports.
 It has no remote server, tunnel latency or interface, and does not own the system

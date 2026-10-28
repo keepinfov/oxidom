@@ -33,6 +33,29 @@ new writes are refused. `UpProfile` resolves the profile's selection and applies
 ports; unit-pinned ports constrain only `default`. Removing a profile deliberately leaves its
 running session intact so the unit can still stop what it started.
 
+### Authorized sequential failover (binding)
+
+[failover.md](failover.md) governs optional `[failover]` authorization. Only an explicit saved
+`UpProfile` activation snapshots it; temporary `Connect`/`ConnectPool`, global `reconnect` and
+`oxidom run` do not authorize alternates. The initial resolved server must be an authorized
+canonical ID. Ordered exact IDs are neither pool handles nor a rule, subscription or GUI group;
+no alias matching, ranking, health filter or empty-list expansion may enroll candidates.
+Candidates use the current configuration of each authorized ID, not frozen endpoint bytes.
+
+Recovery visits the other members cyclically from the failed member, each at most once per
+episode, and stops at budget or candidate exhaustion. The explicit initial start is outside the
+automatic budget; the episode's initial failed member is excluded. Confirmed recovery resets
+budget and visited members, not the minimum interval between automatic admissions, and never
+automatically fails back or rewrites saved selection. Each profile has at most one start and
+confirmation in flight. A revoked or exhausted grant cannot fall through to infinite same-target
+reconnect. Stop, replacement and shutdown cancel future starts; stale receipts cannot affect a
+replacement. Removal of the profile disarms without implicitly stopping its session. Removal of
+any authorized catalog ID disarms permanently for that activation; readdition cannot rearm it.
+
+This is P12 stage 1, proxy-only: enabled interfaces and pools are refused. Safe TUN failover is
+still a mandatory second stage, so P12 remains open. Dedicated CLI/GUI controls belong to P13;
+the existing `oxidom profile edit <name>` TOML workflow is the current opt-in surface.
+
 A profile selects **either** one server **or** a pool, never both:
 
 ```toml
@@ -207,6 +230,7 @@ A session does not require a profile file. `Connect` runs one server under `defa
 `ConnectPool` runs a selection in `PoolQuery.session`, with an absent or empty string meaning
 `default`. When present, `<session>.toml` supplies interface, `[core]`, routing and core-exit
 policy, plus the ports for a named session; `default` uses the daemon's configured ports.
+Neither temporary call inherits a saved profile's failover authorization.
 Neither call writes a profile file. Connecting a group therefore neither needs a profile nor
 modifies one. Saving a selection is a separate act (`SaveProfile`), and repointing a saved
 profile still rewrites its file. Two named sessions can run the same or different pools on

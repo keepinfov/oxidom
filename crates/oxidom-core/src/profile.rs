@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::core_options::CoreOptions;
 use crate::engine::Engine;
+use crate::failover::FailoverPolicy;
 use crate::pool::{PoolKind, PoolQuery};
 use crate::{fsutil, paths};
 
@@ -73,6 +74,9 @@ pub struct Profile {
     /// A profile-level key cannot reach a probe at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<String>,
+    /// Explicit saved-profile authorization, never inferred from selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<FailoverPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -147,6 +151,19 @@ impl Profile {
     }
 
     pub fn validate(&self, name: &str) -> Result<()> {
+        if let Some(policy) = &self.failover {
+            policy.validate()?;
+            if policy.enabled {
+                if self.select.server.trim().is_empty() || self.select.pool.is_some() {
+                    bail!("enabled [failover] requires a single-server selection, not a pool");
+                }
+                if self.interface.enable {
+                    bail!("enabled [failover] does not support an enabled interface");
+                }
+                // The saved selection may be an alias. The daemon checks the
+                // resolved canonical primary against members at activation.
+            }
+        }
         if !self.select.server.is_empty() && self.select.pool.is_some() {
             bail!("a profile selects either a server or a pool, not both");
         }
@@ -410,6 +427,80 @@ mod tests {
     use crate::pool::{PoolQuery, Strategy};
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn failover_authorization_round_trips_literal_toml_and_json() -> Result<()> {
+        let input = r#"[select]
+server = "primary-alias"
+
+[failover]
+enabled = true
+members = ["canonical-a", "canonical-b"]
+max_attempts = 3
+cooldown_secs = 30
+future_key = "ignored"
+"#;
+        let profile = Profile::from_toml(input)?;
+        // Primary aliases remain legal in saved profiles, but are resolved and
+        // checked against canonical membership by the daemon at activation.
+        profile.validate("work")?;
+        let literal = r#"{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":3,"cooldown_secs":30}"#;
+        assert_eq!(serde_json::to_string(&profile.failover)?, literal);
+        let encoded = profile.to_toml()?;
+        assert!(encoded.ends_with(
+            "[failover]\nenabled = true\nmembers = [\"canonical-a\", \"canonical-b\"]\nmax_attempts = 3\ncooldown_secs = 30\n"
+        ), "{encoded}");
+        assert_eq!(Profile::from_toml(&encoded)?, profile);
+        let decoded: Profile = serde_json::from_str(
+            r#"{"select":{"server":"primary-alias"},"failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":3,"cooldown_secs":30,"future":true}}"#,
+        )?;
+        assert_eq!(decoded, profile);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_null_and_defaulted_failover_never_grant_authorization() -> Result<()> {
+        let old = Profile::from_toml("[select]\nserver = \"legacy\"\n")?;
+        assert!(old.failover.is_none());
+        assert!(!old.to_toml()?.contains("failover"));
+        assert!(!serde_json::to_string(&old)?.contains("failover"));
+        for literal in ["{}", r#"{"failover":null,"future":true}"#] {
+            let profile: Profile = serde_json::from_str(literal)?;
+            assert!(profile.failover.is_none());
+        }
+        let profile = Profile::from_toml("[failover]\nfuture = true\n")?;
+        assert_eq!(
+            profile.failover,
+            Some(crate::failover::FailoverPolicy::default())
+        );
+        profile.validate("work")?;
+        assert!(Profile::from_toml("[failover]\nenabled = \"true\"\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_failover_requires_a_proxy_only_single_server_profile() -> Result<()> {
+        let mut profile = Profile::from_toml(
+            "[select]\nserver = \"primary-alias\"\n[failover]\nenabled = true\nmembers = [\"a\", \"b\"]\n",
+        )?;
+        profile.validate("work")?;
+        profile.interface.enable = true;
+        assert!(
+            profile
+                .validate("work")
+                .unwrap_err()
+                .to_string()
+                .contains("interface")
+        );
+        profile.interface.enable = false;
+        profile.select.server.clear();
+        assert!(profile.validate("work").is_err());
+        profile.select.pool = Some(PoolQuery::default());
+        assert!(profile.validate("work").is_err());
+        profile.failover.as_mut().unwrap().enabled = false;
+        profile.validate("work")?;
+        Ok(())
+    }
 
     struct TestRoot {
         path: std::path::PathBuf,

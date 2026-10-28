@@ -4,7 +4,8 @@ A profile made from a Servers-page group stores an independent copy of its selec
 the group later does not update that profile. The profile dialog preserves membership while
 editing other options; use `oxidom profile edit <name>` to change an existing profile's list or
 rule, substituting its actual name. This does not change a running session until explicitly
-reconnected.
+reconnected. Changing saved selection or failover authorization does, however, revoke the active
+failover grant immediately when saved through the daemon; it does not enroll replacements.
 
 A **profile** is persistent configuration: which server to use, on which ports,
 with or without a network interface. A **session** is the running instance of one
@@ -19,6 +20,7 @@ Subscriptions and servers are global. Profiles only *select* from them.
 - [Naming](#naming)
 - [`[interface]`](#interface)
 - [`[core]`](#core)
+- [Sequential failover](#sequential-failover)
 - [Pools](#pools)
 - [Lists and rules](#lists-and-rules)
 - [Strategies](#strategies)
@@ -58,6 +60,7 @@ enabled = true
 | `proxy.http_port` | `u16` | `10809` | This profile's HTTP inbound. |
 | `interface.*` | table | disabled | [Below](#interface). |
 | `core.*` | table | inherited | Overrides the machine-wide Xray core settings. [Below](#core). |
+| `failover` | table | absent (disabled) | Explicit bounded alternate-server authorization. [Below](#sequential-failover). |
 
 A freshly created profile has `server = ""` and no pool. That is valid to store —
 only `oxidom up` refuses it, with `profile "x" does not name a server yet`.
@@ -139,6 +142,69 @@ Two consequences worth stating plainly:
   server, not to a profile. So a server that connects only because of a
   profile's fragmentation will still measure as unreachable in the list. If it is
   the machine that needs fragmentation, set it in `config.toml`.
+
+## Sequential failover
+
+Sequential failover starts one server at a time, unlike a pool balancing across several.
+It is **disabled by default**. Only explicitly bringing up a saved profile with `oxidom up work`
+authorizes its alternates. Temporary server/group Connect, `oxidom run`, and the global
+`reconnect` setting do not inherit or create that permission.
+
+Use the existing `oxidom profile edit work` workflow to opt in manually. This example uses
+invented IDs, not usable credentials or real catalog entries; substitute exact IDs from
+`oxidom list servers --json`, not aliases or name substrings:
+
+```toml
+[select]
+server = "example-canonical-a"
+
+[interface]
+enable = false
+
+[failover]
+enabled = true
+members = ["example-canonical-a", "example-canonical-b", "example-canonical-c"]
+max_attempts = 3
+cooldown_secs = 30
+```
+
+| Field | Default | Constraint |
+|---|---|---|
+| `enabled` | `false` | Explicit opt-in; an absent section grants nothing. |
+| `members` | `[]` | When enabled, 2..64 unique nonempty exact canonical server IDs. |
+| `max_attempts` | `3` | 1..64 automatic starts per recovery episode. |
+| `cooldown_secs` | `30` | 1..3600 seconds minimum between automatic start admissions. |
+
+The resolved initial server must be in `members`. Every member must currently exist and be a
+single, noncomposite server. Pools, GUI groups, subscription references, aliases in `members`,
+health filters and latency ranking are not authorization. Empty membership never means all.
+Candidates use the current configuration behind those IDs, not frozen endpoint snapshots.
+
+After an eligible current failure, the daemon traverses the other members in cyclic saved order,
+each at most once in that episode. With the example's initial A, the order is B then C; the
+explicit A start does not consume the automatic budget and A is not retried in that episode.
+The earlier of budget or candidate exhaustion stops recovery. Only one start and confirmation
+runs at a time. Admitted starts consume budget even if startup fails. An untyped startup error
+conservatively disarms rather than moving on to another server.
+
+Recovery requires successful traffic confirmation through the current core. Success resets
+budget and visited candidates without automatic failback or changing `[select]`. Cooldown is
+retained across successful episodes, measured between automatic admissions; the next start waits
+for the later of that deadline and bounded backoff (1, 2, 4, 8, 16, then at most 30 seconds).
+Waiting is cancellable. Progress is neither persisted nor resumed after daemon restart.
+
+Stop, replacement and shutdown cancel future starts. Unchanged saves preserve authorization;
+changing selection or policy disarms the active snapshot rather than adding candidates. Removing
+the profile also disarms, but leaves its runtime available to Stop. Removing any authorized
+catalog ID disarms that activation; adding it back cannot rearm it. Direct external file edits
+are reloaded before automatic admission, not observed instantaneously. After fixing a revoked
+or exhausted setup, explicitly stop any retained runtime and bring up the saved profile again.
+
+This is **proxy-only P12 stage 1**. An enabled interface is refused even with `routes = "manual"`.
+Safe TUN failover remains a mandatory second stage, so P12 is still open; this stage makes no
+routing-protection claim. There are no dedicated failover flags or GUI controls yet: those belong
+to P13. See the binding [failover specification](spec/failover.md) and
+[failure diagnosis](troubleshooting.md#failover-does-not-try-another-server).
 
 ## Pools
 

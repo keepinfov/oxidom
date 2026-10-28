@@ -720,6 +720,7 @@ mod tests {
             core: Default::default(),
             on_core_exit: None,
             routing: None,
+            failover: None,
         }];
 
         assert_eq!(

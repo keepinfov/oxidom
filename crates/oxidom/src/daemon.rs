@@ -35,6 +35,7 @@ use oxidom_core::probe;
 use oxidom_core::profile::{self, MAX_POOL_MEMBERS, Profile, RouteMode};
 use oxidom_core::xray::core::Status;
 
+mod failover;
 mod lifecycle;
 mod runtime;
 mod trace;
@@ -351,6 +352,7 @@ impl From<&ConnectionTarget> for ConnectionTarget {
 enum ConnectionOrigin {
     Explicit,
     Reconnect,
+    Failover,
 }
 
 pub struct DaemonOptions {
@@ -441,6 +443,7 @@ pub(crate) struct Shared {
     connect_generation: Arc<AtomicU64>,
     current_generations: Arc<Mutex<HashMap<String, u64>>>,
     runtime_facts: Arc<Mutex<runtime::RuntimeFacts>>,
+    failover: Arc<failover::Activations>,
     /// Ports pinned by `--socks-port`/`--http-port`, i.e. by the service unit.
     socks_port_locked: bool,
     http_port_locked: bool,
@@ -588,6 +591,7 @@ impl Shared {
                 let commit = shared.lifecycle.commit().context("daemon is stopping")?;
                 let before = Identities::selections(&engine);
                 let (result, stopped) = engine.apply_subscription_update(results);
+                shared.failover.reconcile_catalog(&engine);
                 for profile in stopped {
                     shared.invalidate_generation(&profile);
                     shared.clear_override(&profile);
@@ -686,6 +690,7 @@ impl Shared {
             connect_generation: Arc::new(AtomicU64::new(generation)),
             current_generations: Arc::new(Mutex::new(current_generations)),
             runtime_facts: Arc::new(Mutex::new(runtime::RuntimeFacts::default())),
+            failover: Arc::new(failover::Activations::default()),
             socks_port_locked,
             http_port_locked,
             system_bus,
@@ -731,6 +736,9 @@ impl Shared {
                     matches!(status, Status::Connected | Status::Connecting)
                         || session.holding_traffic
                         || retry_pending
+                        || self.current_generation(profile).is_some_and(|generation| {
+                            self.failover.owns(profile, generation)
+                        })
                 }) || overrides
                     .values()
                     .any(|status| matches!(status.status, Status::Connected | Status::Connecting));
@@ -792,6 +800,7 @@ impl Shared {
     /// Invalidate any in-flight connect confirmation and return the id of the
     /// attempt starting now.
     fn next_connect_generation(&self, profile: &str) -> u64 {
+        self.failover.remove(profile);
         let generation = self.connect_generation.fetch_add(1, Ordering::SeqCst) + 1;
         oxidom_core::sync::lock(&self.current_generations).insert(profile.to_string(), generation);
         oxidom_core::sync::lock(&self.runtime_facts).reset(profile);
@@ -821,11 +830,13 @@ impl Shared {
     }
 
     fn invalidate_generation(&self, profile: &str) {
+        self.failover.remove(profile);
         oxidom_core::sync::lock(&self.current_generations).remove(profile);
         oxidom_core::sync::lock(&self.runtime_facts).reset(profile);
     }
 
     fn invalidate_all_generations(&self) {
+        self.failover.clear();
         oxidom_core::sync::lock(&self.current_generations).clear();
         oxidom_core::sync::lock(&self.runtime_facts).clear();
     }
@@ -970,6 +981,15 @@ impl Shared {
     }
 
     fn begin_reconnect(&self, profile: String, target: ConnectionTarget, snapshot: Confirmation) {
+        {
+            let engine = oxidom_core::sync::lock(&self.engine);
+            if !self.confirmation_is_current(&engine, &profile, snapshot) {
+                return;
+            }
+            if self.failover_failure_locked(&engine, &profile, &target, snapshot, true, true) {
+                return;
+            }
+        }
         if !self.claim_reconnect(&profile, &target, snapshot) {
             return;
         }
@@ -1192,6 +1212,7 @@ impl Shared {
         generation: u64,
     ) -> bool {
         self.generation_is_current(profile, generation)
+            && !self.failover.owns(profile, generation)
             && resilient(engine, profile)
             && oxidom_core::sync::lock(&self.runtime_facts).retry_allowed(profile, generation)
             && self.retry_receipt_is_current(profile, target, generation)
@@ -1268,6 +1289,9 @@ impl Shared {
         if let Some(runtime) = &mut info.runtime {
             runtime.health = facts.health(profile, subject);
             runtime.retry = facts.retry(profile, generation, Instant::now());
+            if let Some(retry) = self.failover.retry(profile, generation, Instant::now()) {
+                runtime.retry = retry;
+            }
         }
         info
     }
@@ -1837,22 +1861,17 @@ impl Shared {
         entries.truncate(PROBE_HISTORY_LIMIT);
     }
 
-    /// Probe the tunnel owned by one profile, keeping the raw outcome.
-    ///
-    /// Split out from `run_session_probe` so the watchdog can tell a server that
-    /// stopped answering (`Timeout`/`Unreachable`) from one that is merely slow
-    /// or from this machine losing its own uplink — a distinction the collapsed
-    /// `Option<u32>` throws away. Returns the method actually attempted alongside
-    /// the outcome, since a pool measures through a different verb than a single
-    /// server, and even a single-server session configured for `icmp` or `tcp`
-    /// confirms over HTTP through its SOCKS inbound. `None` means there was
-    /// nothing to measure.
-    fn session_probe_outcome_with_timeout(
+    /// Dispatch and publication share the same generation/core ownership guard.
+    fn session_probe_is_current(
         &self,
+        engine: &Engine,
         profile: &str,
-        timeout: Duration,
-    ) -> Option<(probe::ProbeOutcome, LatencyMethod)> {
-        self.session_probe_outcome_for(profile, timeout, None)
+        subject: Confirmation,
+    ) -> bool {
+        self.confirmation_is_current(engine, profile, subject)
+            && engine.sessions.get(profile).is_some_and(|session| {
+                session.status() == Status::Connected && session.selection.is_some()
+            })
     }
 
     fn session_probe_outcome_for(
@@ -1867,7 +1886,7 @@ impl Shared {
         let (server, config, address, selection) = {
             let engine = oxidom_core::sync::lock(&self.engine);
             if expected
-                .is_some_and(|snapshot| !self.confirmation_is_current(&engine, profile, snapshot))
+                .is_some_and(|snapshot| !self.session_probe_is_current(&engine, profile, snapshot))
             {
                 return None;
             }
@@ -1961,11 +1980,8 @@ impl Shared {
                     .map(|generation| self.capture_confirmation(&engine, profile, generation, None))
             })
         };
-        let outcome = if let Some(expected) = expected {
-            self.session_probe_outcome_for(profile, timeout, Some(expected))
-        } else {
-            self.session_probe_outcome_with_timeout(profile, timeout)
-        };
+        let outcome = subject
+            .and_then(|subject| self.session_probe_outcome_for(profile, timeout, Some(subject)));
         let reading = match &outcome {
             Some((probe::ProbeOutcome::Reachable(measured), _)) => {
                 LatencyReading::ok(measured.ms, ProbeRoute::Proxied, measured.method)
@@ -1980,32 +1996,39 @@ impl Shared {
             ),
         };
         let value = reading.value;
-        let engine = oxidom_core::sync::lock(&self.engine);
-        let still_current = {
-            engine.sessions.get(profile).is_some_and(|session| {
-                session.status() == Status::Connected && session.selection.is_some()
-            }) && generation
-                .is_some_and(|generation| self.generation_is_current(profile, generation))
-                && expected
-                    .is_none_or(|snapshot| self.confirmation_is_current(&engine, profile, snapshot))
-        };
-        if still_current {
-            oxidom_core::sync::lock(&self.proxied).insert(profile.to_string(), reading);
-            if let (Some(subject), Some((outcome, _))) = (subject, &outcome) {
-                self.accept_runtime_health(
-                    &engine,
-                    profile,
-                    subject,
-                    outcome,
-                    if expected.is_some() {
-                        "confirmation"
-                    } else {
-                        "active"
-                    },
-                );
-            }
+        if let Some(subject) = subject {
+            self.apply_session_probe_result(
+                profile,
+                subject,
+                reading,
+                outcome.as_ref().map(|(outcome, _)| outcome),
+                if expected.is_some() {
+                    "confirmation"
+                } else {
+                    "active"
+                },
+            );
         }
         (value, outcome.map(|(outcome, _)| outcome))
+    }
+
+    fn apply_session_probe_result(
+        &self,
+        profile: &str,
+        subject: Confirmation,
+        reading: LatencyReading,
+        outcome: Option<&probe::ProbeOutcome>,
+        source: &str,
+    ) -> bool {
+        let engine = oxidom_core::sync::lock(&self.engine);
+        if !self.session_probe_is_current(&engine, profile, subject) {
+            return false;
+        }
+        oxidom_core::sync::lock(&self.proxied).insert(profile.to_string(), reading);
+        if let Some(outcome) = outcome {
+            self.accept_runtime_health(&engine, profile, subject, outcome, source);
+        }
+        true
     }
 
     /// Start every connection through one path, whether the caller is a D-Bus
@@ -2063,6 +2086,8 @@ impl Shared {
         let connect_result = {
             let mut engine = oxidom_core::sync::lock(&self.engine);
             let accepted = self.generation_is_current(profile, generation)
+                && (origin != ConnectionOrigin::Failover
+                    || self.admit_failover_locked(&engine, profile, target, generation))
                 && (origin != ConnectionOrigin::Reconnect
                     || (self.retry_is_current(&engine, profile, target, generation)
                         && oxidom_core::sync::lock(&self.runtime_facts)
@@ -2132,6 +2157,11 @@ impl Shared {
                 // On failure, context is still the pre-spawn context (core None),
                 // even if the engine retains a previous core incarnation.
                 snapshot = Some(self.capture_confirmation(&engine, profile, generation, context));
+                self.failover
+                    .bind(profile, target, snapshot.expect("captured start"));
+                if result.is_err() {
+                    self.failover.disarm(profile);
+                }
                 if let Err(error) = &result {
                     if let Some(event) = trace::finished(
                         context,
@@ -2303,6 +2333,12 @@ impl Shared {
         self.spawn(move || {
             let (address, socks_port, method) = {
                 let Some(inbound) = snapshot.inbound else {
+                    {
+                        let _engine = oxidom_core::sync::lock(&shared.engine);
+                        if shared.generation_is_current(&profile, generation) {
+                            shared.failover.disarm(&profile);
+                        }
+                    }
                     let Some(commit) = shared.lifecycle.commit() else {
                         return;
                     };
@@ -2415,12 +2451,18 @@ impl Shared {
             && engine.sessions.get(profile).is_some_and(|session| {
                 session.status() == Status::Connected
                     && session.selection.as_ref() == Some(&target.selection())
-            });
+            })
+            && (!self.failover.owns(profile, snapshot.generation)
+                || engine
+                    .sessions
+                    .get_mut(profile)
+                    .is_some_and(|session| session.is_alive()));
         if current {
             if let Err(error) = engine.start_interface(profile) {
+                self.failover.disarm(profile);
                 let reason = format!("could not bring up the profile interface: {error:#}");
                 engine.confirmation_failed(profile, &reason);
-                if origin == ConnectionOrigin::Explicit {
+                if origin != ConnectionOrigin::Reconnect {
                     oxidom_core::sync::lock(&self.override_status).insert(
                         profile.to_string(),
                         ErrorOverride {
@@ -2453,11 +2495,38 @@ impl Shared {
                 return false;
             }
             engine.confirm_traffic(profile);
+            self.failover.success(profile, target, snapshot);
+            if origin == ConnectionOrigin::Failover {
+                self.clear_override(profile);
+            }
             if engine.registry.config.system_proxy
                 && let Err(error) = engine.sessions.claim_system_proxy(profile)
             {
                 log::warn!("profile {profile:?} reconnected without the system proxy: {error:#}");
             }
+        } else if self.confirmation_is_current(&engine, profile, snapshot)
+            && self.failover.owns(profile, snapshot.generation)
+            && engine.sessions.get_mut(profile).is_some_and(|session| {
+                session.selection.as_ref() == Some(&target.selection()) && !session.is_alive()
+            })
+        {
+            // The request succeeded, but its core died before the receipt could
+            // commit. Settle this confirmation before starting death recovery,
+            // independently of whether the supervisor has already swept it.
+            let logs = engine
+                .sessions
+                .get(profile)
+                .expect("current session")
+                .current_run_logs();
+            let eligible = !failover::local_complaint(&logs);
+            engine
+                .sessions
+                .get_mut(profile)
+                .expect("current session")
+                .core
+                .fail(CORE_EXITED_MESSAGE);
+            engine.note_core_exit(profile);
+            self.failover_failure_locked(&engine, profile, target, snapshot, eligible, false);
         }
         drop(engine);
         drop(order);
@@ -2524,7 +2593,7 @@ impl Shared {
         });
         if still_active {
             engine.confirmation_failed(profile, &reason);
-            if origin == ConnectionOrigin::Explicit {
+            if origin != ConnectionOrigin::Reconnect {
                 oxidom_core::sync::lock(&self.override_status).insert(
                     profile.to_string(),
                     ErrorOverride {
@@ -2544,6 +2613,10 @@ impl Shared {
         {
             self.cancel_retry_locked(profile, snapshot.generation);
         }
+        // Only a typed, measured remote failure permits another candidate.
+        // An inbound/configuration failure is not evidence against a server.
+        let eligible = failover::eligible_confirmation(end, probe_outcome, &logs);
+        self.failover_failure_locked(&engine, profile, target, snapshot, eligible, false);
         drop(engine);
         drop(order);
         self.reconcile_standby();
@@ -2601,6 +2674,7 @@ impl Shared {
     }
 
     fn capture_teardown(&self, before: &HashSet<String>, engine: &Engine, facts: &mut Facts) {
+        self.failover.reconcile_catalog(engine);
         let alive = engine
             .all_servers()
             .map(|server| server.id.as_str())
@@ -2804,7 +2878,7 @@ impl Shared {
             let mut engine = oxidom_core::sync::lock(&self.engine);
             if !self.watchdog_is_current(&engine, profile, attempt)
                 || engine.registry.config.watchdog != WatchdogMode::Aggressive
-                || !resilient(&engine, profile)
+                || !(resilient(&engine, profile) || self.failover.armed(profile))
             {
                 return None;
             }
@@ -2827,6 +2901,7 @@ impl Shared {
             engine.note_core_exit(profile);
             let snapshot =
                 self.capture_confirmation(&engine, profile, attempt.generation, attempt.context);
+            self.failover.rebind_death(profile, &target, snapshot);
             Some((target, snapshot))
         })();
         drop(order);
@@ -2953,7 +3028,7 @@ impl Shared {
                         };
                         if session.reported_status() == Status::Connected
                             && session.is_alive()
-                            && (reconnect_all || session_has_run_cgroup(session))
+                            && (reconnect_all || session_has_run_cgroup(session) || shared.failover.armed(&profile))
                             && let Some(attempt) = shared.watchdog_attempt(&engine, &profile)
                         {
                             watched.push((profile, attempt));
@@ -4056,6 +4131,7 @@ impl Service {
                     core: profile.core,
                     on_core_exit: profile.on_core_exit,
                     routing: profile.routing,
+                    failover: profile.failover,
                 }),
                 Err(error) => log::warn!("skipping profile {name:?}: {error:#}"),
             }
@@ -4070,7 +4146,19 @@ impl Service {
 
     fn save_profile(&self, name: String, profile_json: String) -> fdo::Result<()> {
         let _request = self.shared.admit()?;
-        let profile: Profile = serde_json::from_str(&profile_json).map_err(failed)?;
+        let raw: serde_json::Value = serde_json::from_str(&profile_json).map_err(failed)?;
+        let mut profile: Profile = serde_json::from_value(raw.clone()).map_err(failed)?;
+        let _engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
+        if raw.get("failover").is_none()
+            && let Ok(previous) = profile::load(&name)
+            && previous.select == profile.select
+        {
+            profile.failover = previous.failover;
+        }
+        // Revoke changed grants before persistence; unrelated successful saves
+        // preserve the active snapshot. A failed write disarms below.
+        self.shared.failover.reconcile_profile(&name, &profile);
         // `save` re-checks both the name and the ports. The daemon owns the
         // profiles directory — on the system bus it is root's — so validation
         // that only ran in the caller would be no validation at all.
@@ -4079,11 +4167,17 @@ impl Service {
             .lifecycle
             .commit()
             .ok_or_else(|| failed("daemon is stopping"))?;
-        profile::save(&name, &profile).map_err(failed)
+        let result = profile::save(&name, &profile);
+        if result.is_err() {
+            self.shared.failover.disarm(&name);
+        }
+        result.map_err(failed)
     }
 
     fn remove_profile(&self, name: String) -> fdo::Result<bool> {
         let _request = self.shared.admit()?;
+        let _engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.failover.disarm(&name);
         let _commit = self
             .shared
             .lifecycle
@@ -4097,16 +4191,6 @@ impl Service {
 
     fn up_profile(&self, name: String) -> fdo::Result<String> {
         let _request = self.shared.admit()?;
-        let profile = profile::load(&name).map_err(failed)?;
-        // Only files written through `SaveProfile` were validated on the way
-        // in; this one may have been edited by hand since.
-        profile.validate(&name).map_err(failed)?;
-        let profile_routing = profile.routing_block().map_err(failed)?;
-        if profile.select.server.is_empty() && profile.select.pool.is_none() {
-            return Err(failed(format!(
-                "profile {name:?} does not name a server yet; set select.server to an alias or id"
-            )));
-        }
 
         // Snapshotted before the engine lock rather than under it: this is the
         // only place the two are wanted together, and taking them in one order
@@ -4117,9 +4201,16 @@ impl Service {
         // guard: `start_connection` takes the same lock itself.
         let order = oxidom_core::sync::lock(&self.shared.diagnostic_order);
         let mut facts = Facts::default();
-        let (target, up_server, ignored_ports, generation) = {
+        let (target, up_server, ignored_ports, generation, profile) = {
             let mut engine = oxidom_core::sync::lock(&self.shared.engine);
             self.shared.ensure_open()?;
+            // Activation and daemon-mediated persistence share the engine lock.
+            let profile = profile::load(&name).map_err(failed)?;
+            profile.validate(&name).map_err(failed)?;
+            let profile_routing = profile.routing_block().map_err(failed)?;
+            if profile.select.server.is_empty() && profile.select.pool.is_none() {
+                return Err(failed("profile does not name a server yet"));
+            }
             if engine.sessions.get(&name).is_some() {
                 return Err(failed(format!(
                     "profile {name:?} is already up; run `oxidom down {name}` first"
@@ -4187,6 +4278,7 @@ impl Service {
                 )
             };
 
+            let activation = failover::Snapshot::new(&engine, &profile, &target).map_err(failed)?;
             if name == "default"
                 && (engine.registry.config.socks_port != socks_port
                     || engine.registry.config.http_port != http_port)
@@ -4208,7 +4300,10 @@ impl Service {
                 engine.sessions.claim_system_proxy(&name).map_err(failed)?;
             }
             let generation = self.shared.claim_generation(&name, &mut facts);
-            (target, up_server, ignored_ports, generation)
+            if let Some(activation) = activation {
+                self.shared.failover.install(&name, generation, activation);
+            }
+            (target, up_server, ignored_ports, generation, profile)
         };
         drop(order);
         facts.emit(&self.shared.recorder);
@@ -5433,12 +5528,12 @@ mod tests {
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
 
-    struct TestRoot {
+    pub(super) struct TestRoot {
         path: std::path::PathBuf,
     }
 
     impl TestRoot {
-        fn install(label: &str) -> Result<Self> {
+        pub(super) fn install(label: &str) -> Result<Self> {
             let suffix = NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "oxidom-test-{label}-{}-{suffix}",
@@ -5537,7 +5632,59 @@ mod tests {
         Ok(path.display().to_string())
     }
 
-    fn configure_fake_core(service: &Service, root: &TestRoot) -> Result<()> {
+    #[test]
+    fn saved_failover_removal_keeps_the_confirmed_fake_core_but_revokes_future_starts() -> Result<()>
+    {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("failover-profile-removal")?;
+        let service = for_test();
+        configure_fake_core(&service, &root)?;
+        let ids = oxidom_core::sync::lock(&service.shared.engine)
+            .all_servers()
+            .map(|server| server.id.clone())
+            .collect::<Vec<_>>();
+        let mut saved = profile::load("work")?;
+        saved.select.server = ids[0].clone();
+        saved.failover = Some(oxidom_core::failover::FailoverPolicy {
+            enabled: true,
+            members: ids.clone(),
+            ..Default::default()
+        });
+        profile::save("work", &saved)?;
+        service.up_profile("work".into())?;
+        confirm_live_session(&service, "work")?;
+        let generation = service
+            .shared
+            .current_generation("work")
+            .context("active generation")?;
+        let core = oxidom_core::sync::lock(&service.shared.engine)
+            .sessions
+            .get("work")
+            .context("active session")?
+            .core
+            .incarnation();
+        assert!(service.shared.failover.armed("work"));
+        assert!(service.remove_profile("work".into())?);
+        assert!(!service.shared.failover.armed("work"));
+        profile::save("work", &saved)?;
+        {
+            let engine = oxidom_core::sync::lock(&service.shared.engine);
+            assert_eq!(
+                engine.sessions.get("work").unwrap().core.incarnation(),
+                core
+            );
+            assert!(!service.shared.admit_failover_locked(
+                &engine,
+                "work",
+                &ConnectionTarget::Server(ids[1].clone()),
+                generation
+            ));
+        }
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    pub(super) fn configure_fake_core(service: &Service, root: &TestRoot) -> Result<()> {
         let mut engine = oxidom_core::sync::lock(&service.shared.engine);
         engine.registry.config.xray_binary = fake_core_binary(root)?;
         engine.registry.config.latency_test_url = "http://offline.example.invalid/check".into();
@@ -5631,7 +5778,7 @@ mod tests {
         }
     }
 
-    fn start_attributed_fake_session(
+    pub(super) fn start_attributed_fake_session(
         service: &Service,
         profile: &str,
         server: &str,
@@ -5688,6 +5835,76 @@ mod tests {
         Ok(service
             .shared
             .capture_confirmation(&engine, profile, generation, context))
+    }
+
+    #[test]
+    fn periodic_probe_results_cannot_land_on_a_same_generation_replacement_core() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("periodic-probe-core-currentness")?;
+        let service = for_test();
+        configure_fake_core(&service, &root)?;
+        let ids = oxidom_core::sync::lock(&service.shared.engine)
+            .all_servers()
+            .map(|server| server.id.clone())
+            .collect::<Vec<_>>();
+        let first = start_attributed_fake_session(&service, "default", &ids[0], None)?;
+        let replacement =
+            start_attributed_fake_session(&service, "default", &ids[1], Some(first.generation))?;
+        assert_eq!(first.generation, replacement.generation);
+        assert_ne!(first.core, replacement.core);
+        let reachable = probe::ProbeOutcome::Reachable(probe::Measurement {
+            ms: 7,
+            method: LatencyMethod::HttpGet,
+        });
+        assert!(service.shared.apply_session_probe_result(
+            "default",
+            replacement,
+            LatencyReading::ok(7, ProbeRoute::Proxied, LatencyMethod::HttpGet),
+            Some(&reachable),
+            "active",
+        ));
+        let before = oxidom_core::sync::lock(&service.shared.proxied)
+            .get("default")
+            .cloned();
+        assert!(!service.shared.apply_session_probe_result(
+            "default",
+            first,
+            LatencyReading::failed(
+                ProbeFailure::Timeout,
+                ProbeRoute::Proxied,
+                LatencyMethod::HttpGet
+            ),
+            Some(&probe::ProbeOutcome::Timeout),
+            "active",
+        ));
+        assert_eq!(
+            oxidom_core::sync::lock(&service.shared.proxied)
+                .get("default")
+                .cloned(),
+            before
+        );
+        assert!(
+            service
+                .shared
+                .session_probe_outcome_for("default", Duration::ZERO, Some(first))
+                .is_none()
+        );
+        let engine = oxidom_core::sync::lock(&service.shared.engine);
+        assert_eq!(
+            oxidom_core::sync::lock(&service.shared.runtime_facts)
+                .health("default", Some(replacement))
+                .unwrap()
+                .outcome,
+            "reachable"
+        );
+        assert!(
+            !service
+                .shared
+                .session_probe_is_current(&engine, "default", first)
+        );
+        drop(engine);
+        service.shared.terminate()?;
+        Ok(())
     }
 
     #[test]
@@ -9961,6 +10178,7 @@ mod tests {
             interface: Default::default(),
             core: Default::default(),
             on_core_exit: None,
+            failover: None,
             routing: Some(
                 r#"{"rules":[{"domain":["geosite:category-ads-all"],"outboundTag":"block"}]}"#
                     .to_string(),

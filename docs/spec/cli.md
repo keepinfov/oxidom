@@ -103,12 +103,18 @@ null means unknown, never false. Current daemon projections always emit a measur
 boolean (`Some(true)` or `Some(false)`); a defaulted `runtime: {}` asserts no negative facts.
 
 `retry` is an application-owned generation-scoped episode, independent of optional diagnostics:
-`state` is `idle`, `backoff` or `attempting`; `ordinal` is the zero-based attempt ordinal;
+`state` is `idle`, `backoff`, `attempting` or `exhausted`; `ordinal` is the zero-based attempt ordinal;
 `remaining_ms` is present only in backoff, computed from the actual monotonic wait deadline,
 saturating at zero and rounded up to milliseconds. Attempting begins at the actual start
 transition, not when a timer expires. Cancellation, replacement and confirmed recovery clear the
-episode to idle (ordinal zero, remaining null).
-Disabling resilience cancels only an owned retry episode, invalidating its generation and
+episode to idle (ordinal zero, remaining null). Bounded saved-profile failover reports
+`exhausted` at budget/candidate exhaustion with remaining null, independently of phase or hold;
+it never authorizes infinite reconnect underneath. Waiting for the first automatic attempt and
+that admitted attempt both use ordinal zero; positive fractional milliseconds round up just as
+for ordinary reconnect. Revocation prevents further admissions, not an already-admitted
+confirmation. Authorization and its lifecycle follow [failover.md](failover.md).
+For ordinary same-target reconnect, disabling resilience cancels only an owned retry episode,
+invalidating its generation and
 removing its reconnect override together if it is still waiting; manual generations are unaffected.
 An already-started automatic attempt retains ownership through confirmation, but further retries
 for that episode are permanently disabled. Its live confirmed success can clear the reconnect
@@ -117,6 +123,12 @@ Re-enabling does not revive a cancelled waiter or rearm a disabled in-flight epi
 A new explicit connection claims its own generation. Automatic
 starts validate current resilience, generation, matching reconnect override and live backoff
 episode under the engine lock before changing the episode to attempting or starting a core.
+Saved-profile failover instead revalidates its persisted grant, exact catalog IDs and current
+generation at admission. Global reconnect does not opt in to alternates or rearm a revoked grant.
+No dedicated failover flag or command is introduced: edit `[failover]` with the existing
+`oxidom profile edit <name>` and explicitly activate the saved profile with `oxidom up <name>`.
+This proxy-only P12 stage refuses enabled interfaces; mandatory TUN work remains open and P13
+owns dedicated controls.
 
 The text session table adds `PHASE HEALTH PROTECTION RETRY` when any row has runtime facts.
 Health includes outcome/source/timestamp, protection labels each recorded fact, and retry includes

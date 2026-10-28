@@ -20,5 +20,6 @@ the module layout — live in [`../../AGENTS.md`](../../AGENTS.md).
 | [latency.md](latency.md) | Probe methods, what a failed probe means, and the contract a measurement travels under |
 | [cli.md](cli.md) | The `oxidom` command surface, output and exit codes, and handle/alias resolution |
 | [profiles-and-pools.md](profiles-and-pools.md) | Profile files, pool selection and ranking, groups in the GUI, and running sessions |
+| [failover.md](failover.md) | Explicit saved-profile authorization, bounded sequential recovery, revocation, and the proxy-only P12 delivery boundary |
 | [interfaces.md](interfaces.md) | The privileged TUN path: device names, addresses, marks, routes and teardown |
 | [gui.md](gui.md) | The window layout, the server browser, and the adaptive breakpoint |

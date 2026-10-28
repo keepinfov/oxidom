@@ -6,6 +6,7 @@ use adw::prelude::*;
 
 use oxidom_core::config::OnCoreExit;
 use oxidom_core::core_options::CoreOptions;
+use oxidom_core::failover::FailoverPolicy;
 use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
 use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
@@ -129,6 +130,8 @@ struct DialogValues {
     /// there is no editor for it, the row below reports how many rules it holds,
     /// and a save writes back exactly what was loaded.
     routing: Option<String>,
+    failover: Option<FailoverPolicy>,
+    original_select: ProfileSelect,
 }
 
 impl DialogValues {
@@ -157,6 +160,11 @@ impl DialogValues {
             core: entry.map(|entry| entry.core.clone()).unwrap_or_default(),
             on_core_exit: entry.and_then(|entry| entry.on_core_exit),
             routing: entry.and_then(|entry| entry.routing.clone()),
+            failover: entry.and_then(|entry| entry.failover.clone()),
+            original_select: ProfileSelect {
+                server: entry.map(|entry| entry.server.clone()).unwrap_or_default(),
+                pool: entry.and_then(|entry| entry.pool.clone()),
+            },
         }
     }
 }
@@ -210,12 +218,17 @@ fn describe_routing(routing: Option<&str>) -> String {
 }
 
 fn profile_from_dialog(values: DialogValues) -> Profile {
+    let select = ProfileSelect {
+        server: values.server,
+        pool: values.pool,
+    };
+    // Authorization belongs to the loaded selection, never its replacement.
+    let failover = (select == values.original_select)
+        .then_some(values.failover)
+        .flatten();
     Profile {
         description: values.description,
-        select: ProfileSelect {
-            server: values.server,
-            pool: values.pool,
-        },
+        select,
         proxy: ProfileProxy {
             socks_port: values.socks_port,
             http_port: values.http_port,
@@ -231,6 +244,7 @@ fn profile_from_dialog(values: DialogValues) -> Profile {
         core: values.core,
         on_core_exit: values.on_core_exit,
         routing: values.routing,
+        failover,
     }
 }
 
@@ -573,6 +587,8 @@ pub fn show_profile_dialog(
         let strategy = strategy.clone();
         let carried = initial_pool.clone();
         let carried_routing = initial.routing.clone();
+        let carried_failover = initial.failover.clone();
+        let original_select = initial.original_select.clone();
         let pool_max = pool_max.clone();
         let pool_expected = pool_expected.clone();
         let pool_probe_interval = pool_probe_interval.clone();
@@ -621,6 +637,8 @@ pub fn show_profile_dialog(
                 core: core_editor.values(),
                 on_core_exit: core_exit_choice(core_exit.selected()),
                 routing: carried_routing.clone(),
+                failover: carried_failover.clone(),
+                original_select: original_select.clone(),
             };
             Some((name, profile_from_dialog(values)))
         }
@@ -1140,6 +1158,76 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_selection_preserves_enabled_failover_authorization() {
+        let entry: ProfileEntry = serde_json::from_str(
+            r#"{"name":"work","server":"canonical-a","socks_port":12080,"http_port":12081,"failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":2,"cooldown_secs":45}}"#,
+        )
+        .unwrap();
+        let mut values = DialogValues::new(Some(&entry));
+        values.description = "Updated description".into();
+        let saved = profile_from_dialog(values);
+        assert_eq!(saved.failover, entry.failover);
+        assert_eq!(
+            serde_json::to_string(&saved.failover).unwrap(),
+            r#"{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":2,"cooldown_secs":45}"#
+        );
+        saved.validate("work").unwrap();
+    }
+
+    #[test]
+    fn changing_selection_revokes_instead_of_transferring_failover_authorization() {
+        let entry: ProfileEntry = serde_json::from_str(
+            r#"{"server":"canonical-a","failover":{"enabled":true,"members":["canonical-a","canonical-b"]}}"#,
+        )
+        .unwrap();
+        let mut values = DialogValues::new(Some(&entry));
+        values.server = "canonical-b".into();
+        assert!(profile_from_dialog(values).failover.is_none());
+
+        let mut values = DialogValues::new(Some(&entry));
+        values.server.clear();
+        values.pool = Some(PoolQuery {
+            members: vec!["canonical-a".into(), "canonical-b".into()],
+            ..Default::default()
+        });
+        assert!(profile_from_dialog(values).failover.is_none());
+    }
+
+    #[test]
+    fn enabling_an_interface_does_not_silently_disable_failover() {
+        let entry: ProfileEntry = serde_json::from_str(
+            r#"{"server":"canonical-a","socks_port":12080,"http_port":12081,"failover":{"enabled":true,"members":["canonical-a","canonical-b"]}}"#,
+        )
+        .unwrap();
+        let mut values = DialogValues::new(Some(&entry));
+        values.interface_enable = true;
+        let saved = profile_from_dialog(values);
+        assert_eq!(saved.failover, entry.failover);
+        assert!(
+            saved
+                .validate("work")
+                .unwrap_err()
+                .to_string()
+                .contains("interface")
+        );
+    }
+
+    #[test]
+    fn new_and_legacy_profiles_never_opt_into_failover() {
+        for entry in [None, Some(ProfileEntry::default())] {
+            let mut values = DialogValues::new(entry.as_ref());
+            values.server = "canonical-a".into();
+            assert!(profile_from_dialog(values.clone()).failover.is_none());
+            values.server.clear();
+            values.pool = Some(PoolQuery {
+                members: vec!["canonical-a".into(), "canonical-b".into()],
+                ..Default::default()
+            });
+            assert!(profile_from_dialog(values).failover.is_none());
+        }
+    }
+
+    #[test]
     fn editing_other_profile_options_preserves_fixed_membership() {
         let entry = ProfileEntry {
             name: "work".into(),
@@ -1212,6 +1300,7 @@ mod tests {
                 r#"{"rules":[{"domain":["geosite:category-ads-all"],"outboundTag":"block"}]}"#
                     .to_string(),
             ),
+            failover: None,
         };
 
         let saved = profile_from_dialog(DialogValues::new(Some(&entry)));

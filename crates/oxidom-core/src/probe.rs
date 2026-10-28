@@ -556,6 +556,14 @@ pub fn http_ping(
     method: &str,
     timeout: Duration,
 ) -> ProbeOutcome {
+    if !url::Url::parse(url).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
+    }) {
+        return local("the HTTP probe URL must use HTTP or HTTPS with a host");
+    }
+    if !matches!(method, "HEAD" | "GET") {
+        return local("the HTTP probe method must be HEAD or GET");
+    }
     let proxy_url = format!("socks5://{address}:{socks_port}");
     let proxy = match ureq::Proxy::new(&proxy_url) {
         Ok(proxy) => proxy,

@@ -127,6 +127,16 @@ fn profiles_unsupported(error: zbus::Error) -> anyhow::Error {
     friendly(error)
 }
 
+fn profile_save_payload(profile: &Profile) -> Result<String> {
+    let mut payload = serde_json::to_value(profile)?;
+    // Omission means legacy preservation to SaveProfile; current clients must
+    // explicitly revoke absent authorization without changing profile files.
+    if profile.failover.is_none() {
+        payload["failover"] = serde_json::Value::Null;
+    }
+    Ok(serde_json::to_string(&payload)?)
+}
+
 /// Is a system daemon installed at all? Only its D-Bus policy file can say:
 /// without one the bus would refuse every call, so a machine that has it has a
 /// system daemon, and a machine that does not never will.
@@ -656,7 +666,7 @@ impl DaemonClient {
     }
 
     pub fn save_profile(&self, name: &str, profile: &Profile) -> Result<()> {
-        let payload = serde_json::to_string(profile)?;
+        let payload = profile_save_payload(profile)?;
         self.proxy
             .call("SaveProfile", &(name, payload))
             .map_err(profiles_unsupported)
@@ -1054,6 +1064,46 @@ fn is_unknown_method(error: &zbus::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saving_an_enabled_profile_carries_its_existing_authorization() -> anyhow::Result<()> {
+        let profile: crate::profile::Profile = serde_json::from_str(
+            r#"{"select":{"server":"primary-alias"},"failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":3,"cooldown_secs":30}}"#,
+        )?;
+        let payload: serde_json::Value =
+            serde_json::from_str(&super::profile_save_payload(&profile)?)?;
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"description":"","select":{"server":"primary-alias"},"proxy":{"socks_port":10808,"http_port":10809},"interface":{"enable":false,"device":"","address":"","mtu":0,"routes":"manual","list":[]},"failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":3,"cooldown_secs":30}}"#,
+        )?;
+        assert_eq!(payload, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn removing_authorization_sends_explicit_null_without_changing_file_serialization()
+    -> anyhow::Result<()> {
+        let mut profile: crate::profile::Profile = serde_json::from_str(
+            r#"{"select":{"server":"primary-alias"},"failover":{"enabled":true,"members":["canonical-a","canonical-b"]}}"#,
+        )?;
+        profile.failover = None;
+        let payload: serde_json::Value =
+            serde_json::from_str(&super::profile_save_payload(&profile)?)?;
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"description":"","select":{"server":"primary-alias"},"proxy":{"socks_port":10808,"http_port":10809},"interface":{"enable":false,"device":"","address":"","mtu":0,"routes":"manual","list":[]},"failover":null}"#,
+        )?;
+        assert_eq!(payload, expected);
+        assert!(
+            !serde_json::to_value(&profile)?
+                .as_object()
+                .unwrap()
+                .contains_key("failover")
+        );
+        assert!(!profile.to_toml()?.contains("failover"));
+        let legacy: serde_json::Value =
+            serde_json::from_str(r#"{"select":{"server":"primary-alias"}}"#)?;
+        assert!(!legacy.as_object().unwrap().contains_key("failover"));
+        Ok(())
+    }
+
     struct PrivateBus {
         child: std::process::Child,
         root: PathBuf,
