@@ -390,7 +390,8 @@ mod tests {
 
     #[test]
     fn catalog_validation_never_substitutes_aliases_or_composite_profiles() -> Result<()> {
-        let mut first = crate::link::parse_link("socks://192.0.2.1:1080#First")?;
+        let mut first = crate::link::parse_link("socks://192.0.2.1:1080#First")
+            .ok_or_else(|| anyhow::anyhow!("invented SOCKS fixture parses"))?;
         first.id = "a".into();
         first.alias = Some("b".into());
         let mut second = first.clone();
