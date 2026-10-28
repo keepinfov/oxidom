@@ -5142,6 +5142,7 @@ mod tests {
         );
 
         state.daemon_status = Status::Disconnected;
+        state.daemon_state = "disconnected".into();
         assert_eq!(
             card_action(&profiles, &state, "same"),
             CardAction::Connect("same".to_string())
@@ -6413,6 +6414,7 @@ mod tests {
     fn switcher_is_absent_for_one_profile_and_reuses_row_states() {
         let profiles = vec![profile("default", "same"), profile("work", "same")];
         let mut state = state();
+        state.daemon_state = "disconnected".into();
         state.sessions = vec![session("work", "connected", "same")];
 
         assert!(!switcher_visible(&profiles[..1]));
