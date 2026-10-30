@@ -1723,6 +1723,13 @@ impl Engine {
         http_port: u16,
     ) -> Result<()> {
         self.ensure_interface_ready(profile)?;
+        anyhow::ensure!(
+            self.sessions
+                .get(profile)
+                .and_then(|session| session.interface.as_ref())
+                .is_none_or(|interface| interface.envelope.is_none()),
+            "explicitly delete the TUN failover interface before preparing a replacement"
+        );
         if !crate::profile::valid_name(profile) {
             return Err(anyhow!("invalid profile name {profile:?}"));
         }
