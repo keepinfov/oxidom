@@ -4680,6 +4680,63 @@ mod tests {
     }
 
     #[test]
+    fn preparing_an_existing_envelope_session_is_refused_before_any_session_mutation() -> Result<()>
+    {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("prepare-existing-envelope")?;
+        let mut engine = Engine::load();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 10), 12480, 12481)?;
+        let candidates = [
+            parse_link("socks://192.0.2.10:1080#One").context("first candidate")?,
+            parse_link("socks://198.51.100.20:1080#Two").context("second candidate")?,
+        ];
+        let mut interface = held_interface("work");
+        interface.envelope = Some(TunEnvelope::new(
+            &candidates,
+            &ProfileInterface {
+                enable: true,
+                ..Default::default()
+            },
+            OnCoreExit::Hold,
+        )?);
+        let session = engine.sessions.get_mut("work").context("session")?;
+        session.interface = Some(interface);
+        session.holds_traffic = true;
+        session.holding_traffic = true;
+        let original = session.state();
+        let options = session.core_options.clone();
+        let envelope = session
+            .interface
+            .as_ref()
+            .context("interface")?
+            .envelope
+            .clone();
+        let plan = session
+            .interface
+            .as_ref()
+            .context("interface")?
+            .plan
+            .clone();
+        let result = engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 11), 12482, 12483);
+        let session = engine.sessions.get("work").context("retained session")?;
+        assert!(
+            result.is_err(),
+            "replacement preparation must refuse an existing envelope"
+        );
+        assert_eq!(session.state(), original);
+        assert_eq!(session.core.socks_port, original.socks_port);
+        assert_eq!(session.core.http_port, original.http_port);
+        assert_eq!(session.core_options, options);
+        assert!(session.holds_traffic);
+        assert!(session.holding_traffic);
+        let interface = session.interface.as_ref().context("retained interface")?;
+        assert_eq!(interface.envelope, envelope);
+        assert_eq!(interface.plan, plan);
+        assert!(interface.up);
+        Ok(())
+    }
+
+    #[test]
     fn failed_initial_confirmation_keeps_the_uninstalled_envelope_for_an_alternate() -> Result<()> {
         let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
         let root = TestRoot::install("uninstalled-envelope-confirmation")?;
