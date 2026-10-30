@@ -918,7 +918,16 @@ mod tests {
             entry.backoff = Instant::now();
         }
         profile.on_core_exit = Some(oxidom_core::config::OnCoreExit::Release);
-        profile::save("work", &profile)?;
+        assert!(profile::save("work", &profile).is_err());
+        // External file edits do not pass through the validated save API.
+        oxidom_core::fsutil::write_private_atomic(
+            &oxidom_core::paths::profiles_dir()?.join("work.toml"),
+            profile.to_toml()?.as_bytes(),
+        )?;
+        assert_eq!(
+            profile::load("work")?.on_core_exit,
+            Some(oxidom_core::config::OnCoreExit::Release)
+        );
         let engine = oxidom_core::sync::lock(&shared.engine);
         assert!(!shared.admit_failover_locked(&engine, "work", &alternate, generation));
         assert!(!shared.failover.armed("work"));
@@ -962,6 +971,9 @@ mod tests {
             .unwrap();
         assert_eq!(retry.state, "idle");
         assert_eq!(retry.ordinal, 0);
+        // The fake helper seam stopped the core without synchronizing its saved
+        // PID. Explicit teardown reconciles it only after the hold assertions.
+        assert!(service.stop_profile("default")?);
         service.shared.terminate()?;
         Ok(())
     }
