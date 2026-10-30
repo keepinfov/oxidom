@@ -20,7 +20,7 @@ use oxidom_core::ipc::{
 use oxidom_core::logbook::LogSlice;
 use oxidom_core::model::{OutboundSpec, Subscription};
 use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
-use oxidom_core::profile::RouteMode;
+use oxidom_core::profile::{Profile, ProfileProxy, ProfileSelect, RouteMode};
 use oxidom_core::versions::Versions;
 use oxidom_core::xray::assets;
 use oxidom_core::xray::core::Status;
@@ -1517,6 +1517,23 @@ pub(super) fn selected_status(state: &SnapshotState) -> Status {
         .unwrap_or_else(|| reported_status_for(state, &state.selected_profile))
 }
 
+/// An explicit Repoint replaces selection and revokes its authorization.
+pub(super) fn repointed_profile(entry: &ProfileEntry, server: String) -> Profile {
+    Profile {
+        description: entry.description.clone(),
+        select: ProfileSelect { server, pool: None },
+        proxy: ProfileProxy {
+            socks_port: entry.socks_port,
+            http_port: entry.http_port,
+        },
+        interface: entry.interface.clone(),
+        core: entry.core.clone(),
+        on_core_exit: entry.on_core_exit,
+        routing: entry.routing.clone(),
+        failover: None,
+    }
+}
+
 /// Presentation only: local intent never rewrites the daemon's independent facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RuntimePresentation {
@@ -1643,6 +1660,7 @@ pub(super) fn runtime_presentation(state: &SnapshotState, profile: &str) -> Runt
             "idle" => "Idle".into(),
             "backoff" => format!("Retry #{} in backoff", retry.ordinal),
             "attempting" => format!("Retry #{} attempting", retry.ordinal),
+            "exhausted" => "Failover exhausted".into(),
             value => unknown(value),
         }
     } else {
@@ -4629,6 +4647,7 @@ mod tests {
             core: Default::default(),
             on_core_exit: None,
             routing: None,
+            failover: None,
         }
     }
 
@@ -4688,6 +4707,59 @@ mod tests {
         assert!(pending.summary.contains("Retry #3 in 2 s"));
         assert!(pending.detail_text().contains("Phase: Running"));
         assert_eq!(state.requested_target("work").as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn explicitly_repointing_a_profile_revokes_failover_but_keeps_other_options() {
+        let entry: ProfileEntry = serde_json::from_str(
+            r#"{"server":"canonical-a","description":"Office","socks_port":12080,"http_port":12081,"on_core_exit":"release","routing":"{}","failover":{"enabled":true,"members":["canonical-a","canonical-b"]}}"#,
+        )
+        .unwrap();
+        let saved = repointed_profile(&entry, "canonical-b".into());
+        assert!(saved.failover.is_none());
+        assert_eq!(saved.select.server, "canonical-b");
+        assert!(saved.select.pool.is_none());
+        assert_eq!(saved.description, entry.description);
+        assert_eq!(saved.interface, entry.interface);
+        assert_eq!(saved.core, entry.core);
+        assert_eq!(saved.routing, entry.routing);
+        assert_eq!(saved.on_core_exit, entry.on_core_exit);
+        assert_eq!(saved.proxy.socks_port, entry.socks_port);
+        assert_eq!(saved.proxy.http_port, entry.http_port);
+    }
+
+    #[test]
+    fn exhausted_failover_is_known_and_keeps_phase_based_recovery_actions() {
+        use oxidom_core::ipc::{RuntimeRetry, RuntimeSessionInfo};
+        let profiles = vec![profile("work", "canonical-a")];
+        let mut state = SnapshotState::new(&StatusInfo::default());
+        let rows = session_rows(&profiles, &state, 0);
+        assert!(matches!(
+            rows[0].session_action,
+            Some(SessionAction::Start(..))
+        ));
+        for phase in ["stopped", "failed"] {
+            let mut reported = session("work", "error", "canonical-b");
+            reported.runtime = Some(RuntimeSessionInfo {
+                phase: phase.into(),
+                retry: RuntimeRetry {
+                    state: "exhausted".into(),
+                    ordinal: 2,
+                    remaining_ms: None,
+                },
+                ..Default::default()
+            });
+            state.sessions = vec![reported];
+            let shown = runtime_presentation(&state, "work");
+            assert!(shown.summary.contains("Failover exhausted"));
+            assert!(shown.detail_text().contains("Retry: Failover exhausted"));
+            assert!(!shown.summary.contains("Unknown"));
+            let rows = session_rows(&profiles, &state, 0);
+            assert!(matches!(
+                rows[0].session_action,
+                Some(SessionAction::Restart(..))
+            ));
+        }
     }
 
     #[test]

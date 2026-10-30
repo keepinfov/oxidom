@@ -10,6 +10,7 @@ pub mod distro;
 pub mod draft;
 pub mod egress;
 pub mod engine;
+pub mod failover;
 pub mod fsutil;
 pub mod handle;
 pub mod ipc;

@@ -107,7 +107,7 @@ nft_binary = ""
 | `http_port` | `u16` | `10809` | Local HTTP inbound port. |
 | `system_proxy` | bool | `false` | Whether a connected session takes over the GNOME system proxy. See [routing.md](routing.md#gnome-system-proxy). |
 | `standby_proxy` | bool | `false` | Opt in to direct SOCKS/HTTP on `127.0.0.1` at the configured ports only while no profile session is connected, connecting or holding traffic. See [Direct standby](#direct-standby). |
-| `reconnect` | bool | `false` | Redial when the core exits **unexpectedly** — never after you asked for `down`. Opt-in on purpose: a tunnel that silently comes back is a tunnel you cannot turn off. |
+| `reconnect` | bool | `false` | Redial the same target when the core exits **unexpectedly**, never after `down`. This does not authorize alternate servers; saved-profile failover is a separate explicit opt-in. |
 | `watchdog` | `"off"` \| `"conservative"` \| `"aggressive"` | `"conservative"` | Synthetic checks for automatically recovered sessions. Conservative warns after five failed checks (8 s request budget, 60 s between sweeps) but keeps a live core. Aggressive restarts after three failures (3 s, 30 s between sweeps). Off disables these checks, not process-exit supervision. Also selectable in Settings. |
 | `on_core_exit` | `"hold"` \| `"release"` | `"hold"` | What happens to a session's routes when its core exits by itself. `hold` keeps them, so traffic for that tunnel is **dropped** until it reconnects or you stop it. `release` removes them immediately, and your apps fall back to the ordinary connection with your own address. A profile's own `on_core_exit` wins. An explicit `down` always releases. |
 | `latency_method` | enum | `"http_get"` | One of `icmp`, `tcp`, `http_head`, `http_get`. |
@@ -142,6 +142,20 @@ still recorded. Direct does not mean connected or protected. In contrast,
 `on_core_exit = "hold"` keeps routes and **drops traffic** after a crash; standby
 stays off until that hold is released, for any profile. Merely enabling standby
 does not override this fail-closed policy.
+
+An automatic reconnect wait suppresses standby between attempts. A saved-profile failover
+activation also suppresses it after exhaustion or revocation, until explicit Stop or replacement
+removes ownership. Even with release policy, no direct standby window opens during that lifecycle.
+This is not a claim that proxy-only sessions protect traffic outside their proxy endpoints.
+
+### Saved-profile failover
+
+Failover is an optional `[failover]` table in a **profile**, not `config.toml`. It defaults to
+disabled and requires explicit saved-profile activation; enabling global reconnect does not opt
+in. Use `oxidom profile edit <name>` for manual TOML opt-in, then bring up that saved profile.
+The [profile guide](profiles-and-pools.md#sequential-failover) gives the complete example, limits,
+cooldown and revocation rules. This first P12 stage is proxy-only and refuses enabled interfaces;
+mandatory safe TUN support remains open. Dedicated controls are P13, not part of this stage.
 
 ### Where the geo data comes from
 

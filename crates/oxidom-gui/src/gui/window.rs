@@ -16,7 +16,7 @@ use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::logbook::{self, LogSlice};
 use oxidom_core::model::Subscription;
 use oxidom_core::pool::PoolQuery;
-use oxidom_core::profile::{Profile, ProfileProxy, ProfileSelect};
+use oxidom_core::profile::Profile;
 use oxidom_core::redact;
 use oxidom_core::xray::core::Status;
 use oxidom_core::{paths, sysproxy};
@@ -2643,32 +2643,7 @@ impl Controller {
             let handle = server
                 .and_then(|server| server.alias.clone())
                 .unwrap_or_else(|| server_id.clone());
-            (
-                Profile {
-                    description: entry.description.clone(),
-                    // Retargeting at one server replaces whatever the profile
-                    // selected, a pool included: that is what clicking a card
-                    // means. The confirmation dialog below is what keeps it
-                    // from happening silently.
-                    select: ProfileSelect {
-                        server: handle,
-                        pool: None,
-                    },
-                    proxy: ProfileProxy {
-                        socks_port: entry.socks_port,
-                        http_port: entry.http_port,
-                    },
-                    interface: entry.interface.clone(),
-                    // Retargeting changes the selection, nothing else: the
-                    // advanced core settings have no row in this flow and must
-                    // survive it untouched. So must the routing block, which has
-                    // no row anywhere.
-                    core: entry.core.clone(),
-                    on_core_exit: entry.on_core_exit,
-                    routing: entry.routing.clone(),
-                },
-                server_name,
-            )
+            (super::reduce::repointed_profile(entry, handle), server_name)
         };
 
         let title = if replaces_pool {
@@ -3561,6 +3536,7 @@ impl Controller {
             name: name.clone(),
             server: profile.select.server.clone(),
             pool: profile.select.pool.clone(),
+            failover: profile.failover.clone(),
             ..ProfileEntry::default()
         };
         if !self.prepare_saved_start(&entry) {

@@ -39,6 +39,12 @@ struct UserInfo { upload: u64, download: u64, total: u64, expire: Option<i64> }
 
 ## Subscription fetch & parse
 
+Saved-profile [failover authorization](failover.md) names exact canonical server IDs, not aliases,
+subscription IDs, GUI groups, filters or composite `XrayProfile` entries. Refresh may update the
+configuration behind an authorized ID but cannot enroll new IDs. Removal of any authorized ID
+disarms that activation; later readdition cannot revive it. Missing candidates are fatal to
+failover authorization, unlike the nonfatal missing-member behavior of an ordinary list pool.
+
 1. HTTP GET the subscription URL with `ureq`. Send a **client** `User-Agent`, not a browser one:
    panels gate both the body and its format on it, so the string is a choice from
    `subscription::CLIENT_PRESETS` — defaulting to `v2rayN/6.45` — settable per subscription over

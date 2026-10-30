@@ -519,6 +519,25 @@ TOML multi-line literal. It is spliced ahead of the generated rules; what it may
 [A profile's own routing block](xray-config.md#a-profiles-own-routing-block-binding). A profile
 that carries none gains no key.
 
+### Saved failover authorization (binding)
+
+An optional profile `[failover]` table stores `enabled` (default `false`), ordered `members`
+(default empty), `max_attempts` (default 3, inclusive range 1..64), and `cooldown_secs` (default
+30, inclusive range 1..3600). An absent table remains absent on serialization, preserving legacy
+bytes and behavior. Enabled policy requires 2..64 unique nonempty canonical server IDs, a
+single-server selection resolving to one of those IDs, no pool and no enabled interface.
+Activation and automatic admission refuse missing or composite candidates. This is profile
+authorization, not a global reconnect setting; see [failover.md](failover.md).
+
+Only authorization is persisted. Episode budget, visited candidates, cooldown deadlines and
+generation/core attribution are private runtime state, never resumed after daemon restart.
+`SaveProfile` omission preserves existing authorization only for unchanged selection; explicit
+JSON `null` removes it. Current clients round-trip the policy and send explicit null when removing
+it, rather than conflating removal with a legacy client's omission. Changed selection with an
+omitted field revokes authorization. Changed selection or policy disarms the active snapshot;
+unchanged saves preserve it. Failed or uncertain persistence cannot arm a grant. External profile
+file changes are reloaded and validated before automatic admission, not instantaneously observed.
+
 Every `[core]` key is optional at both levels, and an untouched section is not written to the file
 at all. See [Advanced core settings](xray-config.md#advanced-core-settings-binding) for what each
 one generates.
@@ -526,8 +545,9 @@ one generates.
 ### Tunnel watchdog and settings compatibility (binding)
 
 `watchdog` defaults to `conservative` in old on-disk files. It controls synthetic checks for
-resilient sessions (`reconnect = true` or a bound `oxidom run` cgroup), not process-exit
-supervision. Budgets and recovery semantics are specified in [latency.md](latency.md).
+resilient sessions (`reconnect = true`, a bound `oxidom run` cgroup, or armed saved-profile
+failover), not process-exit supervision. Budgets and recovery semantics are specified in
+[latency.md](latency.md).
 `GetSettings` and `SetSettings` retain their signatures. Omitting `watchdog` from a settings
 payload preserves the current daemon value; a valid explicit value replaces it. A policy
 change invalidates in-flight checks as well as stored failure streaks.
@@ -564,12 +584,15 @@ traffic. Starting any session must stop both listeners and close already accepte
 connections before the session starts; closing only the listening sockets would leave direct
 traffic alive alongside the tunnel. A held route suppresses standby even if its core is gone.
 `on_core_exit = "hold"` remains fail-closed, never an implicit direct fallback. Once all sessions
-are idle and no hold remains, enabled standby can resume. It never automatically claims the
-GNOME system proxy.
+are idle, no hold remains and no failover activation owns a generation, enabled standby can
+resume. It never automatically claims the GNOME system proxy.
 
-After an unexpected core exit with `on_core_exit = "release"` and reconnect disabled, standby
-resumes once the death is noticed. An automatic reconnect pending or retrying suppresses direct
+Without a failover-owned activation, an unexpected core exit with `on_core_exit = "release"`
+and reconnect disabled allows standby to resume once death is noticed. An automatic reconnect
+pending or retrying suppresses direct
 standby until that lifecycle ends; it must not open a direct window between attempts.
+Failover ownership suppresses standby even after exhaustion or revocation, until explicit Stop
+or replacement removes that ownership. No direct window may open between failover attempts.
 
 ### Standby over D-Bus (binding)
 

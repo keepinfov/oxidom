@@ -191,6 +191,39 @@ holds them. Starting any session closes standby's accepted direct connections
 before the tunnel starts. Standby never automatically enables the GNOME system
 proxy.
 
+### Failover does not try another server
+
+Check the saved profile's [explicit authorization](profiles-and-pools.md#sequential-failover).
+It is off by default and only an explicit saved-profile activation arms it. Temporary Connect,
+group/pool activation, `oxidom run` and global reconnect do not authorize alternates. Enabled
+interfaces and pools are refused in proxy-only P12 stage 1; safe TUN failover remains mandatory
+unfinished work, not a protection feature supplied by this stage.
+
+Every member must resolve by exact canonical ID to a current noncomposite server, and the
+initial server must be among them. Changing selection or authorization, removing the profile,
+or removing any authorized catalog member disarms the activation. Readding a member does not
+rearm it. External profile edits are checked again before automatic admission. Fix the saved
+configuration, stop any retained runtime, and explicitly bring up the profile again.
+
+Only a current measured confirmation timeout/unreachable without recognized local complaints,
+or an unexpected core death after verified operation (including death after a successful probe
+before its receipt is applied), can advance recovery. Conservative watchdog observations alone
+never switch a live core; aggressive mode retains its existing threshold. Recognized local
+configuration/protocol/geo-data/certificate errors, no network, internal failure, cancellation,
+an inbound that never became ready, and interface failures do not authorize alternates. Untyped
+startup errors conservatively disarm, even though an admitted start consumed budget. Inspect the
+reported cause rather than treating all failed starts as dead remote servers.
+
+`retry.state = "exhausted"` means budget or candidates ran out. Other members are visited
+cyclically once per episode; the initial failed member is not tried again in that episode.
+Waiting uses the later of bounded backoff and the minimum interval between automatic starts;
+success resets the episode but not cooldown. No infinite reconnect runs underneath exhaustion.
+Failover ownership keeps direct standby suppressed even after exhaustion or revocation until
+explicit Stop or replacement. This prevents a standby window, not arbitrary direct traffic from
+applications outside the proxy. Phase, retry and traffic scope remain independent status facts.
+
+### Other tunnel symptoms
+
 Things that look like a broken tunnel but are not:
 
 - **TLS failures on a link that asked for `allowInsecure`.** Xray 26.x removed it;

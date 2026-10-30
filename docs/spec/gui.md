@@ -89,6 +89,12 @@ new attempt incarnation.
 
 ### Runtime Dimensions (binding)
 
+Saved-profile failover follows [failover.md](failover.md). Current profile editors round-trip its
+optional policy, preserving unchanged authorization and explicitly removing it with JSON null.
+Changed selection or grant revokes the active snapshot; temporary Connect never inherits it.
+Manual `oxidom profile edit <name>` TOML opt-in is supported, but dedicated controls remain P13.
+This is proxy-only P12 stage 1; enabled interfaces are refused and mandatory TUN work remains open.
+
 Profiles, header, sidebar and tray share a pure presentation of independent runtime dimensions.
 Phase is stopped, starting, verifying, running or failed. Running is accepted lifecycle state,
 not a guarantee of continuous reachability. Local Start/Stop intent has summary and tone
@@ -105,8 +111,10 @@ desktop-proxy ownership independently. Neither logical ownership nor interface b
 proves desktop-setting application or whole-device protection. Missing fields mean not reported;
 held traffic concerns this session's assigned traffic, not every application on the machine.
 
-Retry is idle, backoff or attempting, independently of phase and hold. Backoff uses the daemon's
-remaining monotonic delay; the changing countdown must not rebuild expanded selectable details.
+Retry is idle, backoff, attempting or exhausted, independently of phase and hold. Exhausted is
+a known bounded-recovery state, not an unknown phase or permission to restart indefinitely.
+Backoff uses the daemon's remaining monotonic delay; the changing countdown must not rebuild
+expanded selectable details.
 Idle means no active retry episode, not disabled policy. Older daemons retain known legacy phase
 and hold but do not fabricate health, policy or retry facts. Existing semantic control admission,
 saved-target checks and binding-generation fences remain in force.

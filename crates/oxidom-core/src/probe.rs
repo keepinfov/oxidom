@@ -556,6 +556,14 @@ pub fn http_ping(
     method: &str,
     timeout: Duration,
 ) -> ProbeOutcome {
+    if !url::Url::parse(url).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
+    }) {
+        return local("the HTTP probe URL must use HTTP or HTTPS with a host");
+    }
+    if !matches!(method, "HEAD" | "GET") {
+        return local("the HTTP probe method must be HEAD or GET");
+    }
     let proxy_url = format!("socks5://{address}:{socks_port}");
     let proxy = match ureq::Proxy::new(&proxy_url) {
         Ok(proxy) => proxy,
@@ -614,6 +622,25 @@ fn classify_http_transport(transport: &ureq::Transport) -> ProbeOutcome {
         }
         ureq::ErrorKind::Io if transport_timed_out(transport) => ProbeOutcome::Timeout,
         _ => ProbeOutcome::Unreachable,
+    }
+}
+
+#[cfg(test)]
+mod local_http_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_http_probe_configuration_is_not_remote_failure_evidence() {
+        for url in [
+            "not-a-url",
+            "file:///invented-probe",
+            "ftp://example.invalid/probe",
+        ] {
+            assert!(matches!(
+                http_ping(Ipv4Addr::LOCALHOST, 1, url, "HEAD", Duration::ZERO),
+                ProbeOutcome::Internal(_)
+            ));
+        }
     }
 }
 
