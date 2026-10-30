@@ -93,7 +93,11 @@ Saved-profile failover follows [failover.md](failover.md). Current profile edito
 optional policy, preserving unchanged authorization and explicitly removing it with JSON null.
 Changed selection or grant revokes the active snapshot; temporary Connect never inherits it.
 Manual `oxidom profile edit <name>` TOML opt-in is supported, but dedicated controls remain P13.
-This is proxy-only P12 stage 1; enabled interfaces are refused and mandatory TUN work remains open.
+Enabled interfaces follow the bounded [owned-TUN contract](interfaces.md#owned-tun-failover-binding),
+not unrestricted TUN failover. Effective hold, supported literal IPv4 candidates, no custom
+routing and exclusive TUN admission are required. There is no new GUI authorization control.
+P12 is not marked complete from source; required P14/P15 validation and VM evidence are not
+implied by status presentation.
 
 Profiles, header, sidebar and tray share a pure presentation of independent runtime dimensions.
 Phase is stopped, starting, verifying, running or failed. Running is accepted lifecycle state,
@@ -110,6 +114,11 @@ Protection shows recorded exit policy, scoped traffic hold, interface/up/route m
 desktop-proxy ownership independently. Neither logical ownership nor interface bookkeeping
 proves desktop-setting application or whole-device protection. Missing fields mean not reported;
 held traffic concerns this session's assigned traffic, not every application on the machine.
+Owned TUN holds persist through switching, exhaustion, revocation and current-candidate removal.
+Stop removes that owned device after qualified cleanup; legacy ordinary disconnect retains its
+persistent TUN. Cleanup failure retains recovery ownership and must not be presented as a clean
+stop or permission to restart. Local helper readiness is a bounded process observation, not
+continuous packet-path proof. Route mode, IPv4 scope and DNS limitations remain explicit.
 
 Retry is idle, backoff, attempting or exhausted, independently of phase and hold. Exhausted is
 a known bounded-recovery state, not an unknown phase or permission to restart indefinitely.

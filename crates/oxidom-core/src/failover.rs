@@ -4,12 +4,215 @@
 //! and generation/core attribution. This module performs no I/O or scheduling.
 
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::config::OnCoreExit;
 use crate::model::{OutboundSpec, Server};
+use crate::profile::ProfileInterface;
+
+/// Runtime-only routing authorization. Credentials and TLS/HTTP names are not
+/// snapshotted: only endpoint identity and the supported outbound shape are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunEnvelope {
+    interface: ProfileInterface,
+    candidates: Vec<(String, Ipv4Addr, String)>,
+}
+
+impl TunEnvelope {
+    /// `catalog` must be the exact authorized candidate set, not the full store.
+    pub fn new<'a>(
+        catalog: impl IntoIterator<Item = &'a Server>,
+        requested: &ProfileInterface,
+        effective_policy: OnCoreExit,
+    ) -> Result<Self> {
+        ensure!(
+            requested.enable,
+            "TUN failover requires an enabled interface"
+        );
+        ensure!(
+            effective_policy == OnCoreExit::Hold,
+            "TUN failover requires on_core_exit = hold"
+        );
+        if !requested.device.is_empty() {
+            crate::bind::validate_device_name(&requested.device)?;
+        }
+        ensure!(
+            requested.mtu == 0 || requested.mtu >= 576,
+            "TUN failover requires a valid interface MTU"
+        );
+        if !requested.address.is_empty() {
+            ensure!(
+                requested.address.parse::<Ipv4Addr>().is_ok(),
+                "TUN failover requires an IPv4 interface address"
+            );
+        }
+        let list = requested
+            .list
+            .iter()
+            .map(|entry| entry.parse::<crate::tun::plan::Cidr>())
+            .collect::<Result<Vec<_>>>()?;
+        if requested.routes == crate::profile::RouteMode::List {
+            ensure!(
+                !list.is_empty(),
+                "TUN failover list routes require capture CIDRs"
+            );
+        }
+        let mut candidates = Vec::new();
+        let mut ids = HashSet::new();
+        for server in catalog {
+            ensure!(
+                !server.id.trim().is_empty() && ids.insert(&server.id),
+                "TUN failover requires unique exact candidate IDs"
+            );
+            let (address, shape) = Self::endpoint(server)?;
+            candidates.push((server.id.clone(), address, shape));
+        }
+        ensure!(
+            (2..=64).contains(&candidates.len()),
+            "TUN failover requires 2..64 candidates"
+        );
+        if requested.routes == crate::profile::RouteMode::List {
+            ensure!(
+                !list.iter().any(|route| route.prefix == 32
+                    && candidates
+                        .iter()
+                        .any(|candidate| candidate.1 == route.address)),
+                "TUN failover capture /32 conflicts with a candidate bypass"
+            );
+        }
+        Ok(Self {
+            interface: requested.clone(),
+            candidates,
+        })
+    }
+
+    fn endpoint(server: &Server) -> Result<(Ipv4Addr, String)> {
+        ensure!(
+            server.outbound_patch.is_none(),
+            "TUN failover refuses raw outbound patches"
+        );
+        let address = server
+            .address
+            .parse::<Ipv4Addr>()
+            .map_err(|_| anyhow::anyhow!("TUN failover requires literal IPv4 dial addresses"))?;
+        ensure!(
+            address.octets()[0] != 0
+                && address.octets()[0] < 224
+                && !address.is_loopback()
+                && !address.is_link_local()
+                && !address.is_broadcast(),
+            "TUN failover requires unicast non-loopback IPv4 dial addresses"
+        );
+        ensure!(
+            server.port != 0,
+            "TUN failover requires a nonzero dial port"
+        );
+        let (kind, stream) = match &server.spec {
+            OutboundSpec::Vless { stream, .. } => ("vless", Some(stream)),
+            OutboundSpec::Vmess { stream, .. } => ("vmess", Some(stream)),
+            OutboundSpec::Trojan { stream, .. } => ("trojan", Some(stream)),
+            OutboundSpec::Shadowsocks { .. } => ("shadowsocks", None),
+            OutboundSpec::Socks { .. } => ("socks", None),
+            OutboundSpec::Http { .. } => ("http", None),
+            OutboundSpec::Hysteria2 { settings, .. } => {
+                ensure!(
+                    settings.port_hop.is_empty(),
+                    "TUN failover refuses port hopping"
+                );
+                ("hysteria2", None)
+            }
+            OutboundSpec::XrayProfile { .. } => bail!("TUN failover refuses composite outbounds"),
+        };
+        let shape = if let Some(stream) = stream {
+            ensure!(
+                stream.xhttp_extra.is_none(),
+                "TUN failover refuses XHTTP extensions"
+            );
+            ensure!(stream.ech.is_none(), "TUN failover refuses ECH extensions");
+            ensure!(
+                matches!(
+                    stream.network.as_str(),
+                    "" | "tcp" | "ws" | "grpc" | "xhttp" | "splithttp" | "h2"
+                ),
+                "TUN failover refuses unsupported transports"
+            );
+            ensure!(
+                matches!(stream.security.as_str(), "" | "none" | "tls" | "reality"),
+                "TUN failover refuses unsupported security"
+            );
+            format!("{kind}/{}/{}", stream.network, stream.security)
+        } else {
+            kind.to_string()
+        };
+        Ok((address, shape))
+    }
+
+    pub fn validate_candidates<'a>(
+        &self,
+        catalog: impl IntoIterator<Item = &'a Server>,
+    ) -> Result<()> {
+        let catalog = catalog.into_iter().collect::<Vec<_>>();
+        for (id, address, shape) in &self.candidates {
+            let matches = catalog
+                .iter()
+                .filter(|server| &server.id == id)
+                .collect::<Vec<_>>();
+            ensure!(
+                matches.len() == 1,
+                "TUN failover candidate is missing or ambiguous"
+            );
+            let current = Self::endpoint(matches[0])?;
+            ensure!(
+                current == (*address, shape.clone()),
+                "TUN failover candidate endpoint or shape changed"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_candidate(&self, server: &Server) -> Result<()> {
+        let (_, address, shape) = self
+            .candidates
+            .iter()
+            .find(|candidate| candidate.0 == server.id)
+            .ok_or_else(|| anyhow::anyhow!("server is outside the TUN failover envelope"))?;
+        ensure!(
+            Self::endpoint(server)? == (*address, shape.clone()),
+            "TUN failover candidate endpoint or shape changed"
+        );
+        Ok(())
+    }
+
+    pub fn validate_interface(
+        &self,
+        requested: &ProfileInterface,
+        effective_policy: OnCoreExit,
+    ) -> Result<()> {
+        ensure!(
+            requested == &self.interface && effective_policy == OnCoreExit::Hold,
+            "TUN failover interface or hold policy changed"
+        );
+        Ok(())
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.candidates.iter().any(|candidate| candidate.0 == id)
+    }
+
+    pub fn addresses(&self) -> Vec<Ipv4Addr> {
+        let mut addresses = Vec::new();
+        for (_, address, _) in &self.candidates {
+            if !addresses.contains(address) {
+                addresses.push(*address);
+            }
+        }
+        addresses
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -234,6 +437,101 @@ impl Activation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tun_candidates() -> Vec<Server> {
+        [
+            "socks://192.0.2.10:1080#One",
+            "trojan://invented@198.51.100.20:443#Two",
+        ]
+        .map(|link| crate::link::parse_link(link).unwrap())
+        .to_vec()
+    }
+
+    #[test]
+    fn tun_envelopes_pin_exact_ids_and_addresses_but_keep_credentials_current() -> Result<()> {
+        let mut candidates = tun_candidates();
+        let interface = ProfileInterface {
+            enable: true,
+            ..Default::default()
+        };
+        let envelope = TunEnvelope::new(&candidates, &interface, OnCoreExit::Hold)?;
+        assert_eq!(
+            envelope.addresses(),
+            [
+                Ipv4Addr::new(192, 0, 2, 10),
+                Ipv4Addr::new(198, 51, 100, 20)
+            ]
+        );
+        if let OutboundSpec::Trojan { password, stream } = &mut candidates[1].spec {
+            *password = "new-invented-password".into();
+            stream.sni = Some("tls.example".into());
+            stream.host = Some("transport.example".into());
+        }
+        envelope.validate_candidates(&candidates)?;
+        if let OutboundSpec::Trojan { stream, .. } = &mut candidates[1].spec {
+            stream.network = "grpc".into();
+        }
+        assert!(envelope.validate_candidates(&candidates).is_err());
+        if let OutboundSpec::Trojan { stream, .. } = &mut candidates[1].spec {
+            stream.network = "tcp".into();
+        }
+        candidates[0].address = "192.0.2.11".into();
+        assert!(envelope.validate_candidates(&candidates).is_err());
+        candidates[0].address = "192.0.2.10".into();
+        candidates[0].id = "replacement-id".into();
+        assert!(envelope.validate_candidates(&candidates).is_err());
+        assert!(envelope.validate_candidates(&candidates[1..]).is_err());
+        assert!(
+            TunEnvelope::new(tun_candidates().iter(), &interface, OnCoreExit::Release).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tun_envelopes_refuse_endpoint_escape_and_nonunicast_literals() -> Result<()> {
+        let interface = ProfileInterface {
+            enable: true,
+            ..Default::default()
+        };
+        for address in [
+            "endpoint.example",
+            "2001:db8::1",
+            "0.0.0.0",
+            "0.1.2.3",
+            "127.0.0.2",
+            "169.254.1.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+        ] {
+            let mut candidates = tun_candidates();
+            candidates[0].address = address.into();
+            assert!(
+                TunEnvelope::new(&candidates, &interface, OnCoreExit::Hold).is_err(),
+                "{address}"
+            );
+        }
+        for patch in [serde_json::Value::Null, serde_json::json!({})] {
+            let mut candidates = tun_candidates();
+            candidates[0].outbound_patch = Some(patch.clone());
+            assert!(TunEnvelope::new(&candidates, &interface, OnCoreExit::Hold).is_err());
+            candidates[0].outbound_patch = None;
+            if let OutboundSpec::Trojan { stream, .. } = &mut candidates[1].spec {
+                stream.xhttp_extra = Some(patch);
+            }
+            assert!(TunEnvelope::new(&candidates, &interface, OnCoreExit::Hold).is_err());
+        }
+        let candidates = tun_candidates();
+        assert!(
+            TunEnvelope::new(
+                [&candidates[0], &candidates[0]],
+                &interface,
+                OnCoreExit::Hold
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     fn policy() -> FailoverPolicy {
         FailoverPolicy {

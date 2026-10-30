@@ -3,8 +3,8 @@
 Where oxidom keeps its configuration and state on disk, which daemon owns that store, and the schema of `config.toml`.
 
 Resolve config dir as `$XDG_CONFIG_HOME/oxidom` (`~/.config/oxidom`), data dir as
-`$XDG_DATA_HOME/oxidom` (`~/.local/share/oxidom`). Create parent dirs on write; never panic on
-missing files (treat as defaults/empty).
+`$XDG_DATA_HOME/oxidom` (`~/.local/share/oxidom`). Create parent dirs on write; missing files
+mean defaults/empty. Invalid or unreadable recovery state instead fails startup closed.
 
 - `~/.config/oxidom/config.toml` — user settings (see schema).
 - `~/.config/oxidom/profiles/<name>.toml` — named CLI/systemd connection profiles.
@@ -14,9 +14,9 @@ missing files (treat as defaults/empty).
   files predating it round-trip byte-identically.
 - `~/.local/share/oxidom/state.toml` — ephemeral `[[sessions]]` records: profile, server id,
   loopback address, fixed SOCKS/HTTP ports, recovery PIDs and the planned interface routes/rule.
-  Interface intent is written before kernel application so crash cleanup may safely over-delete
-  idempotent records but can never forget an applied route. The legacy flat active-server fields
-  are accepted only as migration input.
+  Interface intent is written before persistent kernel application; owned TUN intents use the
+  qualified recovery format below, not legacy wildcard cleanup selectors. The legacy flat
+  active-server fields are accepted only as migration input.
   `[[run_cgroups]]` records are the same file's other half: the profile, cgroup path and ancestor
   level of an `oxidom run` scope whose traffic must not reach the ordinary path while no tunnel
   carries it. They are deliberately not part of `[[sessions]]` — `down` removes the session while
@@ -47,6 +47,57 @@ missing files (treat as defaults/empty).
   answers.
 - `~/.cache/oxidom/egress.json` — user-owned 60-second cache for `oxidom ip --egress`, keyed by
   profile and server id.
+
+## Owned TUN recovery state (binding)
+
+When any session has `interface.ownership`, `state.toml` starts with `format_version = 1`.
+Without owned records, the writer keeps the unversioned session shape. The checked loader accepts
+normal legacy session and retired flat state, including migration of the old private default
+route. It rejects unsupported versions, malformed TOML, invalid ownership and owned records without
+the explicit version before recovery or startup mutation. It leaves the file untouched: no
+quarantine, defaults or empty replacement. Save also checks the existing file before replacing it;
+an invalid or unsupported versioned file must not be overwritten by a later write.
+
+`[sessions.interface.ownership]` contains a random 32-character lowercase hexadecimal `cookie`,
+nonzero random route `metric`, optional `gateway_interface` and `device_index`, qualified `routes`,
+optional `rule`, and optional `cleanup_dirty` (default false). Ownership and nested route/rule
+records reject unknown fields. Each route records `output_interface` and a `route` with required
+IPv4 `address`, `prefix` and `table`, plus optional `gateway` or connected-route `interface`.
+Prefixes must be canonical networks; the output index and next-hop kind must agree with the
+recorded device/gateway identities. The rule records nonzero `mark`, `table` and `priority` in
+1..32765. Route intents require a device index and rule identity, are bounded to 512, and belong
+only to main table 254 or the recorded private table.
+
+Kernel routes carry protocol **242**, the recorded metric, destination/prefix, table, output
+interface and next-hop/scope selectors. Rules carry IPv4 lookup action, protocol **242**, full
+`0xffffffff` fwmark mask, mark, table and priority. The mark/table are randomized per ownership
+cookie (high bit set), not stable profile marks; rule priority is `10000 + mark % 20000`.
+Device identity is its name, recorded ifindex and exact alias
+`oxidom-tun-v1:<cookie>`, never its name alone. Protocol 242 is an administrative namespace, not
+an unforgeable ownership credential.
+
+An exclusive transient TUN receives its alias and index first. The complete cleanup intent must
+be durably saved **before** enabling persistence or adding addresses, routes or rules. A crash
+before persistence closes the transient descriptor and lets the kernel remove the device.
+Helper replacement PIDs are persisted; failed persistence stops the replacement. Cleanup marks
+the owner dirty before destructive work, removes only qualified resources, and retains unresolved
+intent on identity, kernel or persistence failure. Dirty cleanup blocks restart/reuse; unresolved
+owned recovery blocks new interface activation and replacement of the affected session until
+resolved. Ownership failure never falls back to legacy cleanup.
+
+### Downgrade restriction (breaking)
+
+Old binaries **do not refuse** this format: they ignore `format_version` and `ownership`.
+For owned interfaces the legacy cleanup fields deliberately stay `created = false`, `routes = []`
+and `rule = false`, preventing those readers from applying unqualified device/route/rule deletion.
+This is not safe downgrade support: an old writer can discard the only ownership records and
+strand resources. The retained `nft_rule` and helper PID are not a replacement for ownership.
+
+The only supported downgrade is to explicitly stop every owned TUN session using the new binary,
+complete all cleanup and durable state writes, verify that no owned recovery records remain,
+then stop the new daemon and install/start the older binary. Never downgrade with outstanding
+owned records, including dirty or crash-recovery records. Do not delete or hand-clear state to
+make an older daemon start. Upgrading a normal legacy state remains supported.
 
 ## Which daemon owns the store (binding)
 
@@ -525,7 +576,9 @@ An optional profile `[failover]` table stores `enabled` (default `false`), order
 (default empty), `max_attempts` (default 3, inclusive range 1..64), and `cooldown_secs` (default
 30, inclusive range 1..3600). An absent table remains absent on serialization, preserving legacy
 bytes and behavior. Enabled policy requires 2..64 unique nonempty canonical server IDs, a
-single-server selection resolving to one of those IDs, no pool and no enabled interface.
+single-server selection resolving to one of those IDs and no pool. An enabled interface additionally
+requires the bounded literal-IPv4 TUN envelope, effective hold policy and no custom profile routing
+specified in [interfaces.md](interfaces.md#owned-tun-failover-binding).
 Activation and automatic admission refuse missing or composite candidates. This is profile
 authorization, not a global reconnect setting; see [failover.md](failover.md).
 

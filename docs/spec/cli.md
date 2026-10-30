@@ -28,6 +28,9 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
   `oxidom env [PROFILE]`, `oxidom list [servers|profiles|subscriptions|sessions] [--json]`, and
   `oxidom ping <HANDLE>` are read commands and never spawn a session daemon.
 - `oxidom tun [PROFILE] [--down]` inspects the session interface or explicitly removes it.
+  Explicit Stop/`down` also deletes an owned failover TUN after qualified cleanup; only legacy
+  non-owned TUNs retain their persistent device on ordinary disconnect. Failed cleanup retains
+  ownership and blocks reuse, rather than reporting a clean stop.
 - `oxidom alias <HANDLE> <NEW>` changes a server alias.
 - `oxidom server add [--protocol P] [--file PATH|-]` creates a server by hand. Without
   `--file` it opens `$EDITOR`/`$VISUAL`/vi on a commented TOML template for the protocol;
@@ -127,8 +130,11 @@ Saved-profile failover instead revalidates its persisted grant, exact catalog ID
 generation at admission. Global reconnect does not opt in to alternates or rearm a revoked grant.
 No dedicated failover flag or command is introduced: edit `[failover]` with the existing
 `oxidom profile edit <name>` and explicitly activate the saved profile with `oxidom up <name>`.
-This proxy-only P12 stage refuses enabled interfaces; mandatory TUN work remains open and P13
-owns dedicated controls.
+Enabled interfaces require the bounded owned-TUN contract in [interfaces.md](interfaces.md#owned-tun-failover-binding):
+effective hold, literal unicast IPv4 typed candidates, no custom routing and exclusive TUN
+admission. Proxy-only sessions may coexist. Exhaustion/revocation does not release held routing;
+explicit Stop is required. P13 owns dedicated controls; source implementation does not establish
+P12 completion or substitute for required P14/P15 validation.
 
 The text session table adds `PHASE HEALTH PROTECTION RETRY` when any row has runtime facts.
 Health includes outcome/source/timestamp, protection labels each recorded fact, and retry includes

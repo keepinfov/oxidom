@@ -279,8 +279,10 @@ No dedicated failover command or flag is added. Configure the optional `[failove
 `oxidom profile edit <name>`, then explicitly `oxidom up <name>` to authorize that saved profile.
 Temporary `connect` or pool activation, `oxidom run`, and global `reconnect` do not authorize
 alternate servers. See [Sequential failover](profiles-and-pools.md#sequential-failover) for an
-invented-ID TOML example. This P12 stage is proxy-only; enabled interfaces are refused and safe
-TUN failover is still mandatory unfinished work. Dedicated CLI/GUI controls remain P13.
+invented-ID TOML example. TUN failover requires effective hold, supported literal IPv4 endpoints,
+an exclusive interface and a fixed routing envelope. Unsupported endpoints fail explicitly.
+Owned recovery records require cleanup with the new binary before downgrade. Dedicated CLI/GUI
+controls remain P13; isolated routing evidence remains P15.
 
 `STATE` reads `direct` for active standby service on the configured local ports.
 It has no remote server, tunnel latency or interface, and does not own the system

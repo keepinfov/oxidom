@@ -195,9 +195,12 @@ proxy.
 
 Check the saved profile's [explicit authorization](profiles-and-pools.md#sequential-failover).
 It is off by default and only an explicit saved-profile activation arms it. Temporary Connect,
-group/pool activation, `oxidom run` and global reconnect do not authorize alternates. Enabled
-interfaces and pools are refused in proxy-only P12 stage 1; safe TUN failover remains mandatory
-unfinished work, not a protection feature supplied by this stage.
+group/pool activation, `oxidom run` and global reconnect do not authorize alternates. Pools are
+refused. An enabled interface needs the restricted [owned-TUN envelope](routing.md#owned-tun-failover):
+effective hold, all candidates supported literal unicast IPv4 endpoints, no custom profile
+routing, no existing device and no other configured TUN. Domains/IPv6, raw patches, composite
+profiles, XHTTP extras, ECH and port hopping cannot enter that envelope. Source implementation
+does not complete P12; required P14/P15 validation and VM evidence are not claimed.
 
 Every member must resolve by exact canonical ID to a current noncomposite server, and the
 initial server must be among them. Changing selection or authorization, removing the profile,
@@ -221,6 +224,13 @@ success resets the episode but not cooldown. No infinite reconnect runs undernea
 Failover ownership keeps direct standby suppressed even after exhaustion or revocation until
 explicit Stop or replacement. This prevents a standby window, not arbitrary direct traffic from
 applications outside the proxy. Phase, retry and traffic scope remain independent status facts.
+
+For owned TUN, the device and routing hold also remain across switches, exhaustion, revocation
+and removal of the current catalog member. Address/shape, interface and effective-policy changes
+revoke the activation; restoring them does not rearm it. Local helper failure does not authorize
+another candidate: a replacement is pending until a later stable observation, and repeated
+failure requires explicit teardown. HTTP through SOCKS and helper survival do not continuously
+prove TUN forwarding. Explicit Stop removes the owned device; handle cleanup errors before reuse.
 
 ### Other tunnel symptoms
 
@@ -282,10 +292,12 @@ already-running tunnel keeps working.
 | `fetching subscription: the server responded with HTTP 403` | Usually the User-Agent or an expired subscription. The URL is deliberately not echoed — it is a credential. |
 | `shadowsocks link requests a SIP003 plugin, which is not supported` | Xray cannot run plugins. That server will not work. |
 
-If a refresh disconnected you: `the active server is no longer in its subscription
+For ordinary sessions, if a refresh disconnected you: `the active server is no longer in its subscription
 — disconnected`. That is deliberate. oxidom will not silently move you to a server
 you did not choose. Pick another, or use a [rule pool](profiles-and-pools.md#lists-and-rules)
 that follows the subscription.
+An owned TUN failover session instead retains its installed hold when its current member is
+removed, disarms further alternate admissions and remains available for explicit Stop.
 
 ## TUN and `oxidom run`
 
@@ -325,6 +337,26 @@ The `nft` binary is missing or the daemon lacks the privilege to use it. Only
 `oxidom run` needs it. Note the AUR package does not depend on `nftables` or
 `tun2socks` — install them if you use these features.
 
+### Owned TUN recovery is blocked
+
+`owned TUN cleanup is incomplete`, `unresolved owned TUN recovery`, or an identity mismatch
+means the daemon cannot safely forget or reuse the recorded resources. Keep the state file and
+use the new owning binary to retry explicit teardown after resolving the reported privilege,
+storage or resource conflict. Recovery may need a compatible-daemon restart when no live
+interface remains. Do not rename/delete a replacement interface just because its name matches:
+owned cleanup checks the recorded alias and ifindex, and routes/rules have qualified selectors.
+
+`unsupported recovery state version` or a recovery parse/validation error fails startup closed.
+The file is not quarantined or overwritten with defaults. Keep it intact and use a compatible
+daemon; do not remove `format_version` or `ownership` to force legacy cleanup. A failed final
+save can retain dirty intent even after kernel resources were removed; complete recovery rather
+than assuming the record is expendable. Other privileged route writers must coordinate with
+oxidom because conflict checks are not an atomic multi-object kernel transaction.
+
+Older binaries do not reject owned state and can silently discard its ownership records.
+[Downgrade only after complete cleanup with the new binary](installation.md#downgrading-after-owned-tun-use),
+never with outstanding owned records.
+
 ## The GUI
 
 - **No tray icon.** The tray needs a StatusNotifierItem host. On stock GNOME that
@@ -346,9 +378,12 @@ The `nft` binary is missing or the daemon lacks the privilege to use it. Only
 config.toml is not valid (…); moved aside to …/config.toml.corrupt-1753970400
 ```
 
-A file that cannot be parsed is **never overwritten**. It is renamed and oxidom
+A configuration file that cannot be parsed is **never overwritten**. It is renamed and oxidom
 continues with defaults. Your data is still there — inspect the `.corrupt-*` file,
 fix it, and move it back with the daemon stopped.
+Recovery `state.toml` is an exception: malformed, unreadable, unsupported-version or invalid
+owned state stops startup and remains untouched, without quarantine or default replacement.
+See [owned recovery](#owned-tun-recovery-is-blocked) before attempting repairs.
 
 ## Getting logs
 

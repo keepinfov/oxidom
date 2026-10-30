@@ -5,14 +5,19 @@ use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result, bail};
 use futures_util::TryStreamExt;
-use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, RouteScope};
-use rtnetlink::packet_route::rule::RuleAction;
+use rtnetlink::packet_route::link::LinkAttribute;
+use rtnetlink::packet_route::route::{
+    RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope,
+};
+use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute, RuleMessage};
 use rtnetlink::{AddressMessageBuilder, Handle, LinkUnspec, RouteMessageBuilder};
 
-use crate::tun::plan::{Cidr, ConnectedRoute, RouteSpec, Via};
+use crate::state::{InterfaceOwnership, OWNED_ROUTE_PROTOCOL, OwnedRoute, OwnedRule};
+use crate::tun::plan::{Cidr, ConnectedRoute, RoutePlan, RouteSpec, Via};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultNetwork {
+    pub interface: u32,
     pub gateway: Option<Ipv4Addr>,
     pub connected: Vec<ConnectedRoute>,
 }
@@ -94,6 +99,85 @@ impl Net {
         )
     }
 
+    pub fn set_alias(&self, index: u32, alias: &str) -> Result<()> {
+        let mut message = LinkUnspec::new_with_index(index).build();
+        message
+            .attributes
+            .push(LinkAttribute::IfAlias(alias.into()));
+        self.set_link(message, "setting exclusive TUN identity".into())
+    }
+
+    /// Name lookup is never a fallback for an absent/mismatched owner identity.
+    pub fn owned_device_index(
+        &self,
+        name: &str,
+        owner: &InterfaceOwnership,
+    ) -> Result<Option<u32>> {
+        owner.validate()?;
+        self.block(async {
+            let mut links = self.handle.link().get().execute();
+            let mut found = None;
+            while let Some(link) = links.try_next().await.context("checking exclusive TUN identity")? {
+                if Some(link.header.index) == owner.device_index || link.attributes.iter().any(|attribute| matches!(attribute, LinkAttribute::IfName(current) if current == name)) {
+                    found = Some(link);
+                    break;
+                }
+            }
+            let Some(link) = found else { return Ok(None); };
+            let alias = link
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    LinkAttribute::IfAlias(alias) => Some(alias.as_str()),
+                    _ => None,
+                });
+            anyhow::ensure!(
+                owned_device_matches(link.header.index, alias, owner)
+                    && link.attributes.iter().any(|attribute| matches!(attribute, LinkAttribute::IfName(current) if current == name)),
+                "refusing to touch a device whose TUN recovery identity does not match"
+            );
+            Ok(Some(link.header.index))
+        })
+    }
+
+    pub fn delete_owned_device(&self, name: &str, owner: &InterfaceOwnership) -> Result<()> {
+        if let Some(index) = self.owned_device_index(name, owner)? {
+            self.block(self.handle.link().del(index).execute())
+                .context("deleting exclusively owned TUN")?;
+        }
+        Ok(())
+    }
+
+    pub fn owned_route_add(&self, route: &OwnedRoute, owner: &InterfaceOwnership) -> Result<()> {
+        let message = owned_route_message(route, owner)?;
+        self.block(self.handle.route().add(message).execute())
+            .context("exclusively adding owned route")
+    }
+
+    pub fn owned_route_del(&self, route: &OwnedRoute, owner: &InterfaceOwnership) -> Result<()> {
+        let message = owned_route_message(route, owner)?;
+        settle(
+            self.block(self.handle.route().del(message).execute()),
+            Change::Delete,
+            "deleting ownership-qualified route".into(),
+        )
+    }
+
+    pub fn owned_rule_add(&self, rule: &OwnedRule) -> Result<()> {
+        let mut request = self.handle.rule().add();
+        *request.message_mut() = owned_rule_message(rule)?;
+        self.block(request.execute())
+            .context("exclusively adding owned rule")
+    }
+
+    pub fn owned_rule_del(&self, rule: &OwnedRule) -> Result<()> {
+        settle(
+            self.block(self.handle.rule().del(owned_rule_message(rule)?).execute()),
+            Change::Delete,
+            "deleting ownership-qualified rule".into(),
+        )
+    }
+
     pub fn link_down(&self, index: u32) -> Result<()> {
         self.set_link(
             LinkUnspec::new_with_index(index).down().build(),
@@ -152,6 +236,127 @@ impl Net {
         settle(result, Change::Add, format!("adding route {spec:?}"))
     }
 
+    /// An existing route is never evidence of ownership by this activation.
+    pub fn route_add_strict(&self, spec: &RouteSpec, device_index: u32) -> Result<()> {
+        let result = self.block(
+            self.handle
+                .route()
+                .add(route_message(spec, device_index))
+                .execute(),
+        );
+        settle(
+            result,
+            Change::ExclusiveAdd,
+            format!("exclusively adding route {spec:?}"),
+        )
+    }
+
+    /// Refuse stale private tables/rules and colliding main-table prefixes
+    /// before any capture. Strict adds still close the route-add race.
+    pub fn ensure_plan_available(&self, plan: &RoutePlan) -> Result<()> {
+        self.ensure_plan_available_except(plan, None)
+    }
+
+    /// Recheck immediately before capture, exempting only exact qualified
+    /// intents already installed by this activation. Privileged route writers
+    /// must still coordinate: netlink has no atomic multi-object transaction.
+    pub fn ensure_capture_available(
+        &self,
+        plan: &RoutePlan,
+        owner: &InterfaceOwnership,
+    ) -> Result<()> {
+        self.ensure_plan_available_except(plan, Some(owner))
+    }
+
+    fn ensure_plan_available_except(
+        &self,
+        plan: &RoutePlan,
+        owner: Option<&InterfaceOwnership>,
+    ) -> Result<()> {
+        self.block(async {
+            let mut routes = self
+                .handle
+                .route()
+                .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+                .execute();
+            while let Some(route) = routes
+                .try_next()
+                .await
+                .context("checking TUN failover route ownership")?
+            {
+                if let Some(owner) = owner
+                    && owner
+                        .routes
+                        .iter()
+                        .any(|intent| owned_route_matches(&route, intent, owner))
+                {
+                    continue;
+                }
+                if route_table(&route) == plan.rule.table {
+                    bail!("TUN failover private routing table is already in use");
+                }
+                for spec in &plan.system {
+                    let destination = route
+                        .attributes
+                        .iter()
+                        .find_map(|attribute| match attribute {
+                            RouteAttribute::Destination(RouteAddress::Inet(address)) => {
+                                Some(*address)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+                    let prefix = spec.destination.prefix;
+                    let mask = if prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - prefix)
+                    };
+                    if route_table(&route) == spec.table
+                        && route.header.destination_prefix_length == prefix
+                        && (u32::from(destination) & mask)
+                            == (u32::from(spec.destination.address) & mask)
+                    {
+                        bail!("TUN failover route prefix is already in use");
+                    }
+                }
+            }
+            let mut rules = self.handle.rule().get(rtnetlink::IpVersion::V4).execute();
+            while let Some(rule) = rules
+                .try_next()
+                .await
+                .context("checking TUN failover rule ownership")?
+            {
+                if let Some(rule_intent) = owner.and_then(|owner| owner.rule.as_ref())
+                    && owned_rule_message(rule_intent).is_ok_and(|expected| {
+                        expected.header.family == rule.header.family
+                            && expected.header.action == rule.header.action
+                            && expected.header.src_len == rule.header.src_len
+                            && expected.header.dst_len == rule.header.dst_len
+                            && expected.header.tos == rule.header.tos
+                            && expected
+                                .attributes
+                                .iter()
+                                .all(|attribute| rule.attributes.contains(attribute))
+                    })
+                {
+                    continue;
+                }
+                if u32::from(rule.header.table) == plan.rule.table
+                    || rule.attributes.iter().any(|attribute| match attribute {
+                        RuleAttribute::Table(table) => *table == plan.rule.table,
+                        RuleAttribute::Priority(priority) => *priority == plan.rule.priority,
+                        RuleAttribute::FwMark(mark) => *mark == plan.rule.mark,
+                        _ => false,
+                    })
+                {
+                    bail!("TUN failover routing rule is already in use");
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub fn route_del(&self, spec: &RouteSpec, device_index: u32) -> Result<()> {
         // Including the known output interface avoids removing a same-prefix
         // device route owned by somebody else.
@@ -177,6 +382,21 @@ impl Net {
             Change::Add,
             format!("adding IPv4 rule fwmark {mark:#x} table {table} priority {priority}"),
         )
+    }
+
+    pub fn rule_add_strict(&self, mark: u32, table: u32, priority: u32) -> Result<()> {
+        self.block(
+            self.handle
+                .rule()
+                .add()
+                .v4()
+                .fw_mark(mark)
+                .table_id(table)
+                .priority(priority)
+                .action(RuleAction::ToTable)
+                .execute(),
+        )
+        .context("exclusively adding TUN failover routing rule")
     }
 
     pub fn rule_del(&self, mark: u32, table: u32, priority: u32) -> Result<()> {
@@ -256,9 +476,17 @@ impl Net {
                     })
                 })
                 .collect();
-            Ok(Some(DefaultNetwork { gateway, connected }))
+            Ok(Some(DefaultNetwork {
+                interface,
+                gateway,
+                connected,
+            }))
         })
     }
+}
+
+fn owned_device_matches(index: u32, alias: Option<&str>, owner: &InterfaceOwnership) -> bool {
+    Some(index) == owner.device_index && alias.is_some_and(|alias| alias == owner.alias())
 }
 
 /// Retire the runtime without blocking.
@@ -297,6 +525,69 @@ fn route_message(spec: &RouteSpec, device_index: u32) -> RouteMessage {
     builder.build()
 }
 
+fn owned_route_message(route: &OwnedRoute, owner: &InterfaceOwnership) -> Result<RouteMessage> {
+    owner.validate()?;
+    anyhow::ensure!(
+        route.output_interface != 0 && route.route.prefix <= 32,
+        "invalid owned route selector"
+    );
+    let mut message = route_message(&route.route.to_spec(), route.output_interface);
+    message.header.protocol = RouteProtocol::from(OWNED_ROUTE_PROTOCOL);
+    message.attributes.retain(|attribute| {
+        !matches!(
+            attribute,
+            RouteAttribute::Oif(_) | RouteAttribute::Priority(_)
+        )
+    });
+    message
+        .attributes
+        .push(RouteAttribute::Oif(route.output_interface));
+    message
+        .attributes
+        .push(RouteAttribute::Priority(owner.metric));
+    Ok(message)
+}
+
+fn owned_route_matches(
+    message: &RouteMessage,
+    intent: &OwnedRoute,
+    owner: &InterfaceOwnership,
+) -> bool {
+    let Ok(expected) = owned_route_message(intent, owner) else {
+        return false;
+    };
+    message.header.protocol == expected.header.protocol
+        && message.header.destination_prefix_length == expected.header.destination_prefix_length
+        && message.header.scope == expected.header.scope
+        && message.header.kind == expected.header.kind
+        && route_table(message) == intent.route.table
+        && message.attributes.iter().find_map(|attribute| match attribute {
+            RouteAttribute::Destination(RouteAddress::Inet(address)) => Some(*address),
+            _ => None,
+        }).unwrap_or(Ipv4Addr::UNSPECIFIED) == intent.route.address
+        && expected.attributes.iter().filter(|attribute| !matches!(attribute, RouteAttribute::Destination(RouteAddress::Inet(address)) if address.is_unspecified()))
+            .all(|attribute| message.attributes.contains(attribute))
+        && !message.attributes.iter().any(|attribute| matches!(attribute, RouteAttribute::MultiPath(_) | RouteAttribute::Via(_) | RouteAttribute::Encap(_) | RouteAttribute::EncapType(_)))
+}
+
+fn owned_rule_message(rule: &OwnedRule) -> Result<RuleMessage> {
+    anyhow::ensure!(
+        rule.mark != 0 && rule.table != 0 && (1..32766).contains(&rule.priority),
+        "invalid owned rule selector"
+    );
+    let mut message = RuleMessage::default();
+    message.header.family = rtnetlink::packet_route::AddressFamily::Inet;
+    message.header.action = RuleAction::ToTable;
+    message.attributes = vec![
+        RuleAttribute::Table(rule.table),
+        RuleAttribute::FwMark(rule.mark),
+        RuleAttribute::FwMask(u32::MAX),
+        RuleAttribute::Priority(rule.priority),
+        RuleAttribute::Protocol(RouteProtocol::from(OWNED_ROUTE_PROTOCOL)),
+    ];
+    Ok(message)
+}
+
 fn route_table(route: &RouteMessage) -> u32 {
     route
         .attributes
@@ -324,6 +615,7 @@ fn route_oif(route: &RouteMessage) -> Option<u32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Change {
     Add,
+    ExclusiveAdd,
     Delete,
 }
 
@@ -347,12 +639,83 @@ fn netlink_errno(error: &rtnetlink::Error) -> Option<i32> {
 fn ignored_errno(change: Change, errno: i32) -> bool {
     match change {
         Change::Add => errno == libc::EEXIST,
+        Change::ExclusiveAdd => false,
         Change::Delete => matches!(errno, libc::ESRCH | libc::ENOENT | libc::EADDRNOTAVAIL),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_messages_preserve_every_nonwildcard_recovery_selector() -> Result<()> {
+        let owner = InterfaceOwnership {
+            cookie: "0123456789abcdef0123456789abcdef".into(),
+            metric: 1234567,
+            gateway_interface: Some(7),
+            device_index: Some(42),
+            routes: Vec::new(),
+            rule: None,
+            cleanup_dirty: false,
+        };
+        let route = OwnedRoute {
+            route: crate::state::RouteRecord {
+                address: Ipv4Addr::new(192, 0, 2, 10),
+                prefix: 32,
+                table: 254,
+                gateway: Some(Ipv4Addr::new(192, 0, 2, 1)),
+                interface: None,
+            },
+            output_interface: 7,
+        };
+        let message = owned_route_message(&route, &owner)?;
+        assert!(owned_route_matches(&message, &route, &owner));
+        let mut raced = message.clone();
+        raced
+            .attributes
+            .retain(|attribute| !matches!(attribute, RouteAttribute::Priority(_)));
+        raced
+            .attributes
+            .push(RouteAttribute::Priority(owner.metric + 1));
+        assert!(
+            !owned_route_matches(&raced, &route, &owner),
+            "a same-prefix different-metric route is not exempt from capture preflight"
+        );
+        assert_eq!(u8::from(message.header.protocol), OWNED_ROUTE_PROTOCOL);
+        assert_eq!(
+            message.attributes,
+            vec![
+                RouteAttribute::Destination(RouteAddress::Inet(Ipv4Addr::new(192, 0, 2, 10))),
+                RouteAttribute::Gateway(RouteAddress::Inet(Ipv4Addr::new(192, 0, 2, 1))),
+                RouteAttribute::Oif(7),
+                RouteAttribute::Priority(1234567)
+            ]
+        );
+        let rule = OwnedRule {
+            mark: 2147483649,
+            table: 2147483649,
+            priority: 12000,
+        };
+        assert_eq!(
+            owned_rule_message(&rule)?.attributes,
+            vec![
+                RuleAttribute::Table(2147483649),
+                RuleAttribute::FwMark(2147483649),
+                RuleAttribute::FwMask(u32::MAX),
+                RuleAttribute::Priority(12000),
+                RuleAttribute::Protocol(RouteProtocol::from(OWNED_ROUTE_PROTOCOL))
+            ]
+        );
+        assert!(owned_device_matches(42, Some(&owner.alias()), &owner));
+        assert!(!owned_device_matches(43, Some(&owner.alias()), &owner));
+        assert!(!owned_device_matches(42, Some("unrelated-owner"), &owner));
+        assert!(!owned_device_matches(42, None, &owner));
+        let mut invalid = owner.clone();
+        invalid.metric = 0;
+        assert!(owned_route_message(&route, &invalid).is_err());
+        Ok(())
+    }
     #[test]
     fn only_contractual_errnos_are_idempotent() {
         assert!(super::ignored_errno(super::Change::Add, libc::EEXIST));
@@ -361,5 +724,13 @@ mod tests {
             assert!(super::ignored_errno(super::Change::Delete, errno));
         }
         assert!(!super::ignored_errno(super::Change::Delete, libc::EPERM));
+    }
+
+    #[test]
+    fn exclusive_route_additions_never_claim_existing_kernel_objects() {
+        for errno in [libc::EEXIST, libc::EPERM, libc::ESRCH, libc::ENOENT] {
+            assert!(!super::ignored_errno(super::Change::ExclusiveAdd, errno));
+        }
+        assert!(super::settle(Ok(()), super::Change::ExclusiveAdd, "exclusive add".into()).is_ok());
     }
 }

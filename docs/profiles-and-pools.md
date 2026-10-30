@@ -178,7 +178,8 @@ cooldown_secs = 30
 The resolved initial server must be in `members`. Every member must currently exist and be a
 single, noncomposite server. Pools, GUI groups, subscription references, aliases in `members`,
 health filters and latency ranking are not authorization. Empty membership never means all.
-Candidates use the current configuration behind those IDs, not frozen endpoint snapshots.
+Candidates use the current configuration behind those IDs. TUN failover additionally pins each
+candidate's literal IPv4 address and supported outbound shape; it does not freeze credentials.
 
 After an eligible current failure, the daemon traverses the other members in cyclic saved order,
 each at most once in that episode. With the example's initial A, the order is B then C; the
@@ -200,10 +201,29 @@ catalog ID disarms that activation; adding it back cannot rearm it. Direct exter
 are reloaded before automatic admission, not observed instantaneously. After fixing a revoked
 or exhausted setup, explicitly stop any retained runtime and bring up the saved profile again.
 
-This is **proxy-only P12 stage 1**. An enabled interface is refused even with `routes = "manual"`.
-Safe TUN failover remains a mandatory second stage, so P12 is still open; this stage makes no
-routing-protection claim. There are no dedicated failover flags or GUI controls yet: those belong
-to P13. See the binding [failover specification](spec/failover.md) and
+### With a TUN interface
+
+An enabled interface is accepted only within the restricted
+[owned-TUN envelope](routing.md#owned-tun-failover). Set top-level `on_core_exit = "hold"`
+before any TOML table (or inherit a machine setting of hold), enable the interface and keep the
+explicit `[failover]` authorization above. All candidates, including alternates, must have
+supported typed outbounds and literal unicast IPv4 dial addresses. Domains, IPv6, composite
+profiles, raw patches, XHTTP extras, ECH, port hopping and custom profile routing are refused.
+Only the system daemon may supply the required privilege. A different TUN cannot coexist in
+either admission order; proxy-only sessions may coexist.
+
+The same owned device and route plan remain across alternate starts. `manual` captures no main
+traffic; `list` and `default` install the bounded candidate bypass union before their captures.
+Private marked traffic does not gain those bypasses. Exhaustion, revocation and removal of the
+current catalog member retain the hold, rather than silently releasing traffic. Endpoint/shape,
+interface or effective-policy changes revoke the grant; restoring them does not rearm it.
+Explicit Stop deletes this owned TUN, unlike ordinary legacy persistent TUN disconnect. Resolve
+any cleanup error before restarting; never erase its recovery records or downgrade around them.
+
+P12 remains open pending required P14/P15 validation; source support is not VM packet-path or
+leak evidence. Neither this mode nor status bookkeeping promises full-device protection, IPv6
+tunnelling, resolver containment or uninterrupted connections. There are no dedicated failover
+flags or GUI controls yet: those belong to P13. See the binding [failover specification](spec/failover.md) and
 [failure diagnosis](troubleshooting.md#failover-does-not-try-another-server).
 
 ## Pools
