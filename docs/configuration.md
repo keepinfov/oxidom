@@ -154,8 +154,10 @@ Failover is an optional `[failover]` table in a **profile**, not `config.toml`. 
 disabled and requires explicit saved-profile activation; enabling global reconnect does not opt
 in. Use `oxidom profile edit <name>` for manual TOML opt-in, then bring up that saved profile.
 The [profile guide](profiles-and-pools.md#sequential-failover) gives the complete example, limits,
-cooldown and revocation rules. This first P12 stage is proxy-only and refuses enabled interfaces;
-mandatory safe TUN support remains open. Dedicated controls are P13, not part of this stage.
+cooldown and revocation rules. Enabled interfaces require the restricted
+[owned-TUN envelope](routing.md#owned-tun-failover): effective hold, supported literal IPv4
+candidates, no custom profile routing and exclusive TUN admission. Dedicated controls remain
+P13. Source implementation alone does not complete P12; P14/P15 validation is still required.
 
 ### Where the geo data comes from
 
@@ -460,12 +462,21 @@ configure that daemon. See [managed session setup](installation.md#managed-sessi
   reported; a post-rename sync failure means publication happened but durability is unconfirmed.
 - Files are created `0600` and their parent directories `0700`. Generated Xray
   configs contain credentials and are no exception.
-- A file that cannot be parsed is **never overwritten**. It is renamed to
+- A configuration file that cannot be parsed is **never overwritten**. It is renamed to
   `<name>.corrupt-<timestamp>` and oxidom continues with defaults, telling you
   where the original went. Nothing you had is destroyed by a parse bug.
-- `config.toml` and `state.toml` are **owned by the daemon**. Hand-editing them
-  while a daemon is running will be overwritten; stop it first, or go through the
-  GUI or `oxidom profile edit`.
+- Recovery `state.toml` is different: malformed or unreadable state, unsupported versions and
+  invalid ownership stop startup without quarantine or replacement. Owned TUN records use
+  `format_version = 1`, qualified protocol-242 routes/rules and device alias/index identity;
+  dirty cleanup retains those records and prevents reuse. Do not edit or delete them to bypass
+  recovery. See [recovery diagnosis](troubleshooting.md#owned-tun-recovery-is-blocked).
+- **Downgrade restriction:** older binaries ignore, rather than refuse, owned recovery records
+  and may discard them. Stop and completely clean every owned TUN with the new binary, verify
+  no owned records remain, then stop the daemon and downgrade. Never downgrade with outstanding
+  owned records. See [the procedure](installation.md#downgrading-after-owned-tun-use).
+- `config.toml` and `state.toml` are **owned by the daemon**. Use the GUI for settings and
+  `oxidom profile edit` for profiles. Stop the daemon before hand-editing settings; recovery
+  state is not a settings surface and must not be hand-cleared to bypass cleanup.
 - The daemon holds `store.lock` before reading or recovering its data directory. A second
   daemon targeting that directory refuses to start. Do not delete the lock file to unlock it;
   the operating system releases the lock when its owner exits.

@@ -70,8 +70,18 @@ revokes the active grant rather than silently enrolling another target; removing
 through a current client sends explicit removal. Saved and reported selection can differ after
 automatic recovery because recovery never rewrites the saved initial choice.
 
-Only proxy-only P12 stage 1 is delivered: enabled interfaces are refused. Safe TUN failover is a
-mandatory remaining stage, so P12 is not complete and this feature promises no routing protection.
+Enabled interfaces require the restricted [owned-TUN envelope](routing.md#owned-tun-failover):
+effective hold, supported literal unicast IPv4 candidates, no custom profile routing and no
+other configured TUN. Proxy-only sessions may coexist. There is no new GUI opt-in control.
+P12 is not declared complete from source; P14/P15 validation remains required and no VM
+packet-path or leak measurement is claimed.
+
+Owned TUN holds remain through alternate starts, exhaustion, revocation and removal of the
+current catalog member. Stop removes that owned device after qualified cleanup, unlike legacy
+persistent-device retention on ordinary disconnect. A cleanup failure retains recovery ownership
+and must be resolved before restarting. Helper readiness is a bounded local observation, not
+continuous proof of forwarding or full-device protection. See the
+[downgrade restriction](installation.md#downgrading-after-owned-tun-use) before using an older binary.
 
 A session can outlive removal of its saved profile. It remains on Profiles and in the session
 switcher/tray with "No saved profile" and a Stop control. Its settings cannot be edited or started
@@ -435,9 +445,10 @@ since changed. It appears only for servers using ordinary TLS: REALITY
 authenticates by public key rather than by a certificate chain, and a plain
 protocol presents none at all.
 
-Removing a subscription disconnects any session using one of its servers, and a
-refresh that drops the active server disconnects that session rather than silently
-repointing it.
+Removing a subscription disconnects ordinary sessions using one of its servers, and a refresh
+that drops their active server disconnects rather than silently repointing them. An owned TUN
+failover session retains its installed hold when its current candidate is removed and disarms
+further admissions; explicitly Stop it to release that scope.
 
 ## Settings
 

@@ -8,15 +8,19 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{Config, OnCoreExit};
 use crate::core_options::{CoreOptions, ResolvedCore};
+use crate::failover::TunEnvelope;
 use crate::model::{Server, Subscription};
 use crate::nft::Nft;
 use crate::profile::{ProfileInterface, RouteMode};
 use crate::run::CgroupSlice;
 use crate::state::{
-    self, InterfaceState, RouteRecord, RunCgroupRecord, SessionState, State, store,
+    self, InterfaceOwnership, InterfaceState, OwnedRoute, OwnedRule, RouteRecord, RunCgroupRecord,
+    SessionState, State, store,
 };
 use crate::tun::core::Tun2socks;
-use crate::tun::plan::{Cidr, PlanInput, RoutePlan, Via, plan_routes};
+use crate::tun::plan::{
+    Cidr, PlanInput, RoutePlan, RouteSpec, Via, plan_failover_routes, plan_routes,
+};
 use crate::xray::api::BalancerInfo;
 use crate::xray::core::{Status, XrayCore};
 use crate::{alias, bind, link, probe, subscription};
@@ -612,6 +616,11 @@ pub struct Interface {
     pub plan: RoutePlan,
     pub up: bool,
     fresh: bool,
+    pub envelope: Option<TunEnvelope>,
+    helper_proxy: Option<SocketAddrV4>,
+    ownership: Option<InterfaceOwnership>,
+    helper_attempted: bool,
+    helper_restarts: u8,
 }
 
 impl Interface {
@@ -622,24 +631,57 @@ impl Interface {
             mtu: self.mtu,
             table: self.table,
             mark: self.mark,
-            created: self.created,
+            created: self.ownership.is_none() && self.created,
             tun2socks_pid: self.tun2socks.child_pid(),
             routes: self
-                .plan
-                .private
-                .iter()
-                .chain(&self.plan.system)
+                .recorded_routes()
+                .into_iter()
                 .map(RouteRecord::from_spec)
                 .collect(),
-            // Like routes, the rule is recorded as planned before it is
-            // applied. Idempotent netlink cleanup makes that the safe side.
-            rule: true,
+            rule: self.ownership.is_none(),
             // A binding is enough to have a chain to clean up: it is planned
             // before nftables is asked for it, and the chain it names may be a
             // mark, a block, or never installed at all. Removal is idempotent,
             // an unrecorded chain that did get installed is not.
             nft_rule: self.cgroup.is_some() || self.chain != ChainState::Off,
+            ownership: self.ownership.clone(),
         }
+    }
+
+    fn recorded_routes(&self) -> Vec<&RouteSpec> {
+        if self.ownership.is_some() {
+            Vec::new()
+        } else {
+            self.plan.private.iter().chain(&self.plan.system).collect()
+        }
+    }
+
+    fn ensure_helper(&mut self, proxy: SocketAddrV4) -> Result<()> {
+        anyhow::ensure!(
+            self.ownership
+                .as_ref()
+                .is_none_or(|owner| !owner.cleanup_dirty),
+            "owned TUN cleanup is incomplete"
+        );
+        if let Some(owner) = &self.ownership {
+            anyhow::ensure!(
+                crate::tun::net::Net::new()?
+                    .owned_device_index(&self.device, owner)?
+                    .is_some(),
+                "owned TUN disappeared before helper restart"
+            );
+        }
+        if !self.tun2socks.is_alive() || self.helper_proxy != Some(proxy) {
+            self.admit_helper_restart()?;
+            self.helper_attempted = true;
+            self.tun2socks.start(&self.device, proxy, self.mtu)?;
+            self.helper_proxy = Some(proxy);
+            anyhow::ensure!(
+                self.tun2socks.is_alive(),
+                "TUN helper exited immediately after spawn"
+            );
+        }
+        Ok(())
     }
 
     pub fn route_mode(&self) -> &'static str {
@@ -648,6 +690,17 @@ impl Interface {
             RouteMode::List => "list",
             RouteMode::Default => "default",
         }
+    }
+
+    fn admit_helper_restart(&mut self) -> Result<()> {
+        if self.ownership.is_some() && self.helper_attempted {
+            anyhow::ensure!(
+                self.helper_restarts == 0,
+                "TUN helper failed repeatedly; explicit teardown is required"
+            );
+            self.helper_restarts += 1;
+        }
+        Ok(())
     }
 }
 
@@ -775,6 +828,50 @@ impl Session {
     }
 
     pub fn connect(&mut self, server: &Server) -> Result<()> {
+        let proxy = self.socks_endpoint();
+        anyhow::ensure!(
+            self.interface
+                .as_ref()
+                .and_then(|interface| interface.ownership.as_ref())
+                .is_none_or(|owner| !owner.cleanup_dirty),
+            "owned TUN cleanup is incomplete"
+        );
+        if let Some(envelope) = self
+            .interface
+            .as_ref()
+            .and_then(|interface| interface.envelope.as_ref())
+        {
+            anyhow::ensure!(
+                self.holds_traffic && self.core_options.routing.is_none(),
+                "TUN failover requires hold without custom routing"
+            );
+            anyhow::ensure!(
+                envelope.contains(&server.id),
+                "server is outside the TUN failover envelope"
+            );
+            // Engine validates the entire current catalog; direct Session callers
+            // still cannot substitute an endpoint for this particular member.
+            envelope.validate_candidate(server)?;
+            if let Some(interface) = &mut self.interface {
+                anyhow::ensure!(
+                    interface
+                        .ownership
+                        .as_ref()
+                        .is_none_or(|owner| !owner.cleanup_dirty),
+                    "owned TUN cleanup is incomplete"
+                );
+                if interface.up {
+                    if interface.ownership.is_some() {
+                        anyhow::ensure!(
+                            interface.tun2socks.is_alive(),
+                            "TUN helper is unavailable; restore through Engine::ensure_interface_helper"
+                        );
+                    } else {
+                        interface.ensure_helper(proxy)?;
+                    }
+                }
+            }
+        }
         self.selection = None;
         self.api_port = 0;
         self.balancer_info = None;
@@ -797,6 +894,19 @@ impl Session {
     }
 
     pub fn connect_pool(&mut self, members: &[Server], pool: &PoolSession<'_>) -> Result<()> {
+        anyhow::ensure!(
+            self.interface
+                .as_ref()
+                .and_then(|interface| interface.ownership.as_ref())
+                .is_none_or(|owner| !owner.cleanup_dirty),
+            "owned TUN cleanup is incomplete"
+        );
+        anyhow::ensure!(
+            self.interface
+                .as_ref()
+                .is_none_or(|interface| interface.envelope.is_none()),
+            "a TUN failover envelope cannot run a pool"
+        );
         self.selection = None;
         self.api_port = 0;
         self.balancer_info = None;
@@ -861,31 +971,47 @@ impl Session {
     }
 
     pub fn is_alive(&mut self) -> bool {
-        if !self.core.is_alive() {
+        if !self.core_is_alive() {
             return false;
         }
+        // Owned TUN supervision must classify helper errors separately, never
+        // turn a local helper failure into evidence against a remote candidate.
+        if self
+            .interface
+            .as_ref()
+            .is_some_and(|interface| interface.envelope.is_some())
+        {
+            return true;
+        }
+        if let Err(error) = self.ensure_interface_helper() {
+            log::warn!(
+                "could not restart tun2socks for profile {:?}: {error:#}",
+                self.profile
+            );
+            return false;
+        }
+        true
+    }
+
+    pub fn core_is_alive(&mut self) -> bool {
+        self.core.is_alive()
+    }
+
+    /// Restore only the local helper. Failure never removes an installed hold.
+    /// Engine::start_interface additionally persists a changed recovery PID.
+    pub fn ensure_interface_helper(&mut self) -> Result<()> {
         let proxy = self.socks_endpoint();
         if let Some(interface) = self.interface.as_mut()
             && interface.up
-            && !interface.tun2socks.is_alive()
-            && interface.tun2socks.child_pid().is_some()
+            && (interface.envelope.is_some() || interface.tun2socks.child_pid().is_some())
         {
-            log::warn!(
-                "tun2socks for profile {:?} exited while Xray was still running; restarting it",
-                self.profile
+            anyhow::ensure!(
+                interface.ownership.is_none(),
+                "owned TUN helpers must be restored through Engine::ensure_interface_helper"
             );
-            if let Err(error) = interface
-                .tun2socks
-                .start(&interface.device, proxy, interface.mtu)
-            {
-                log::warn!(
-                    "could not restart tun2socks for profile {:?}: {error:#}",
-                    self.profile
-                );
-                return false;
-            }
+            interface.ensure_helper(proxy)?;
         }
-        true
+        Ok(())
     }
 
     /// See [`XrayCore::current_run_logs`] — for diagnosing this attempt, not
@@ -1084,8 +1210,15 @@ pub struct Engine {
 
 impl Engine {
     pub fn load() -> Self {
+        Self::load_checked()
+            .expect("recovery state cannot be safely read; refusing startup before recovery")
+    }
+
+    pub fn load_checked() -> Result<Self> {
         let mut registry = Registry::load();
-        let mut state = State::load(&registry.config);
+        // This guard must precede identity migration, process adoption, nft and
+        // netlink recovery. Unsupported owned formats are never legacy state.
+        let mut state = State::load_checked(&registry.config)?;
         registry.migrate_identities(&mut state);
         let sessions = Sessions::from_state(&state, &registry.config);
         let mut engine = Engine {
@@ -1094,7 +1227,7 @@ impl Engine {
             state,
         };
         engine.recover();
-        engine
+        Ok(engine)
     }
 
     /// Undo each resource a crashed previous instance could have left behind.
@@ -1158,6 +1291,24 @@ impl Engine {
                     }
                 });
             let interface_clean = saved.interface.as_ref().is_none_or(|interface| {
+                if interface.ownership.is_some() {
+                    if let Some(record) = self
+                        .state
+                        .sessions
+                        .iter_mut()
+                        .find(|record| record.profile == saved.profile)
+                        && let Some(owner) = record
+                            .interface
+                            .as_mut()
+                            .and_then(|interface| interface.ownership.as_mut())
+                    {
+                        owner.cleanup_dirty = true;
+                    }
+                    if let Err(error) = self.state.save() {
+                        log::warn!("could not record owned TUN cleanup intent: {error:#}");
+                        return false;
+                    }
+                }
                 match recover_interface(
                     &saved.profile,
                     interface,
@@ -1571,6 +1722,14 @@ impl Engine {
         socks_port: u16,
         http_port: u16,
     ) -> Result<()> {
+        self.ensure_interface_ready(profile)?;
+        anyhow::ensure!(
+            self.sessions
+                .get(profile)
+                .and_then(|session| session.interface.as_ref())
+                .is_none_or(|interface| interface.envelope.is_none()),
+            "explicitly delete the TUN failover interface before preparing a replacement"
+        );
         if !crate::profile::valid_name(profile) {
             return Err(anyhow!("invalid profile name {profile:?}"));
         }
@@ -1640,10 +1799,13 @@ impl Engine {
     /// Returns whether the session held. A session set to release, or one with
     /// nothing installed to hold, is torn down here as before.
     pub fn note_core_exit(&mut self, profile: &str) -> bool {
-        let holds = self
-            .sessions
-            .get(profile)
-            .is_some_and(|session| session.holds_traffic);
+        let holds = self.sessions.get(profile).is_some_and(|session| {
+            session.holds_traffic
+                || session
+                    .interface
+                    .as_ref()
+                    .is_some_and(|interface| interface.envelope.is_some())
+        });
         if !holds {
             let verdict = self.teardown_verdict(profile);
             if let Err(error) = self.stop_interface_with(profile, verdict) {
@@ -1677,8 +1839,29 @@ impl Engine {
 
     /// A confirmation failed for a session whose core reported `Connected`.
     pub fn confirmation_failed(&mut self, profile: &str, reason: &str) -> bool {
+        if let Some(session) = self.sessions.get_mut(profile)
+            && session
+                .interface
+                .as_ref()
+                .is_some_and(|interface| interface.envelope.is_some() && !interface.up)
+        {
+            // Initial verification precedes installation. Preserve authorization
+            // and the complete plan without claiming an already installed hold.
+            session.core.disconnect();
+            session.core.fail(reason);
+            session.holding_traffic = false;
+            self.sync_session(profile);
+            if let Err(error) = self.state.save() {
+                log::warn!("could not persist initial TUN confirmation failure: {error:#}");
+            }
+            return false;
+        }
         let holds = self.sessions.get(profile).is_some_and(|session| {
-            session.holds_traffic
+            (session.holds_traffic
+                || session
+                    .interface
+                    .as_ref()
+                    .is_some_and(|interface| interface.envelope.is_some()))
                 && session
                     .interface
                     .as_ref()
@@ -1709,6 +1892,167 @@ impl Engine {
         requested: &ProfileInterface,
         servers: &[Server],
     ) -> Result<()> {
+        self.check_interface_admission(profile, requested.enable, false)?;
+        self.configure_interface_plan(profile, requested, servers, None)
+    }
+
+    fn check_interface_admission(
+        &self,
+        profile: &str,
+        enabled: bool,
+        failover: bool,
+    ) -> Result<()> {
+        if enabled {
+            anyhow::ensure!(
+                !self.sessions.iter().any(|(_, session)| session
+                    .interface
+                    .as_ref()
+                    .and_then(|interface| interface.ownership.as_ref())
+                    .is_some_and(|owner| owner.cleanup_dirty)),
+                "owned TUN cleanup is incomplete; retry explicit teardown"
+            );
+            anyhow::ensure!(
+                !self.state.sessions.iter().any(|saved| saved
+                    .interface
+                    .as_ref()
+                    .is_some_and(|interface| interface.ownership.is_some())
+                    && self
+                        .sessions
+                        .get(&saved.profile)
+                        .is_none_or(|session| session.interface.is_none())),
+                "unresolved owned TUN recovery blocks interface activation"
+            );
+        }
+        for (name, session) in self.sessions.iter() {
+            if let Some(interface) = &session.interface {
+                anyhow::ensure!(
+                    !(name == profile && interface.envelope.is_some()),
+                    "explicitly delete the TUN failover interface before reconfiguration"
+                );
+                if enabled && name != profile {
+                    anyhow::ensure!(
+                        !failover && interface.envelope.is_none(),
+                        "TUN failover requires exclusive interface ownership"
+                    );
+                }
+            }
+        }
+        if failover {
+            anyhow::ensure!(
+                self.sessions
+                    .get(profile)
+                    .is_some_and(|session| session.interface.is_none()),
+                "delete the existing interface before activating TUN failover"
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_no_unresolved_owner(&self, profile: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .state
+                .sessions
+                .iter()
+                .any(|saved| saved.profile == profile
+                    && saved
+                        .interface
+                        .as_ref()
+                        .is_some_and(|interface| interface.ownership.is_some())
+                    && self
+                        .sessions
+                        .get(profile)
+                        .is_none_or(|session| session.interface.is_none())),
+            "unresolved owned TUN recovery must be completed before replacing this session"
+        );
+        Ok(())
+    }
+
+    fn ensure_interface_ready(&self, profile: &str) -> Result<()> {
+        self.ensure_no_unresolved_owner(profile)?;
+        anyhow::ensure!(
+            self.sessions
+                .get(profile)
+                .and_then(|session| session.interface.as_ref())
+                .and_then(|interface| interface.ownership.as_ref())
+                .is_none_or(|owner| !owner.cleanup_dirty),
+            "owned TUN cleanup is incomplete; retry explicit teardown"
+        );
+        Ok(())
+    }
+
+    /// Restore only the local helper and durably record its replacement PID.
+    /// Success means spawn plus an immediate child liveness check, not measured
+    /// stability or packet readiness. Errors never remove routes.
+    pub fn ensure_interface_helper(&mut self, profile: &str) -> Result<()> {
+        self.ensure_interface_ready(profile)?;
+        let proxy = self
+            .sessions
+            .get(profile)
+            .context("session is missing")?
+            .socks_endpoint();
+        let Some(mut interface) = self
+            .sessions
+            .get_mut(profile)
+            .and_then(|session| session.interface.take())
+        else {
+            return Ok(());
+        };
+        let result = if interface.up {
+            let previous = interface.tun2socks.child_pid();
+            let restored = interface.ensure_helper(proxy);
+            // Persist even an unsuccessful immediate-child check: it may have
+            // replaced the process. If persistence fails stop that replacement.
+            let persisted = if interface.tun2socks.child_pid() != previous {
+                self.persist_interface_state(profile, &interface)
+            } else {
+                Ok(())
+            };
+            finish_helper_persistence(&mut interface, persisted).and(restored)
+        } else {
+            Ok(())
+        };
+        self.sessions
+            .get_mut(profile)
+            .expect("session existed")
+            .interface = Some(interface);
+        result
+    }
+
+    /// Preplan the authorized literal union without modifying existing routing.
+    /// Call after configure_core/configure_hold_traffic and before the first start.
+    pub fn configure_failover_interface(
+        &mut self,
+        profile: &str,
+        requested: &ProfileInterface,
+        servers: &[Server],
+    ) -> Result<()> {
+        self.check_interface_admission(profile, requested.enable, true)?;
+        let session = self
+            .sessions
+            .get(profile)
+            .context("TUN failover requires a prepared session")?;
+        anyhow::ensure!(
+            session.core_options.routing.is_none(),
+            "TUN failover refuses custom routing blocks"
+        );
+        let policy = if session.holds_traffic {
+            OnCoreExit::Hold
+        } else {
+            OnCoreExit::Release
+        };
+        let envelope = TunEnvelope::new(servers, requested, policy)?;
+        envelope.validate_candidates(self.all_servers())?;
+        self.configure_interface_plan(profile, requested, servers, Some(envelope))
+    }
+
+    fn configure_interface_plan(
+        &mut self,
+        profile: &str,
+        requested: &ProfileInterface,
+        servers: &[Server],
+        envelope: Option<TunEnvelope>,
+    ) -> Result<()> {
         if !requested.enable {
             if self
                 .sessions
@@ -1732,6 +2076,12 @@ impl Engine {
         } else {
             requested.device.clone()
         };
+        if envelope.is_some() {
+            anyhow::ensure!(
+                !crate::tun::device::exists(&device),
+                "TUN failover refuses an existing device"
+            );
+        }
         let address = if requested.address.is_empty() {
             bind::device_address_for(profile, &self.sessions.taken_device_addresses())
                 .context("no free profile interface addresses remain")?
@@ -1741,7 +2091,7 @@ impl Engine {
                 .parse()
                 .context("parsing [interface] address")?
         };
-        let mark = bind::routing_mark(profile, &self.sessions.taken_routing_marks())
+        let mut mark = bind::routing_mark(profile, &self.sessions.taken_routing_marks())
             .context("no free profile routing marks remain")?;
         let mtu = if requested.mtu == 0 {
             1500
@@ -1783,11 +2133,27 @@ impl Engine {
         // with no default route at this moment still gets its interface. Only
         // `routes = "default"` genuinely cannot be planned without a gateway.
         let network = crate::tun::net::Net::new()?.default_network()?;
+        let ownership = if envelope.is_some() {
+            let owner = InterfaceOwnership::new(network.as_ref().map(|network| network.interface))?;
+            mark = owner.routing_mark()?;
+            anyhow::ensure!(
+                !self.sessions.taken_routing_marks().contains(&mark),
+                "TUN recovery routing identity collision"
+            );
+            Some(owner)
+        } else {
+            None
+        };
         let connected = network
             .as_ref()
             .map(|network| network.connected.as_slice())
             .unwrap_or_default();
-        let (server_addresses, default_gateway) = if requested.routes == RouteMode::Default {
+        let (server_addresses, default_gateway) = if let Some(envelope) = &envelope {
+            (
+                envelope.addresses(),
+                network.as_ref().and_then(|network| network.gateway),
+            )
+        } else if requested.routes == RouteMode::Default {
             // A full-tunnel pool pays one DNS lookup per member during `up`.
             // Caching it would make route lifetime and DNS lifetime diverge;
             // phase 5 deliberately resolves the fixed membership once here.
@@ -1800,7 +2166,7 @@ impl Engine {
         } else {
             (Vec::new(), None)
         };
-        let plan = plan_routes(&PlanInput {
+        let input = PlanInput {
             table: mark,
             mark,
             mode: requested.routes,
@@ -1808,7 +2174,20 @@ impl Engine {
             server_addresses,
             default_gateway,
             connected,
-        })?;
+        };
+        let mut plan = if envelope.is_some() {
+            plan_failover_routes(&input)?
+        } else {
+            plan_routes(&input)?
+        };
+        if ownership.is_some() {
+            // Rule priority stays ahead of main while mark/table use a random
+            // activation namespace. Route metrics never choose a rule priority.
+            plan.rule.priority = 10000 + mark % 20000;
+        }
+        if envelope.is_some() {
+            crate::tun::net::Net::new()?.ensure_plan_available(&plan)?;
+        }
         let tun2socks = Tun2socks::new(
             profile.to_string(),
             self.registry.config.tun2socks_binary.clone(),
@@ -1830,7 +2209,8 @@ impl Engine {
             table: mark,
             mark,
             routes: requested.routes,
-            created: previous_created || !crate::tun::device::exists(&device),
+            created: envelope.is_none()
+                && (previous_created || !crate::tun::device::exists(&device)),
             tun2socks,
             nft_binary: self.registry.config.nft_binary.clone(),
             cgroup,
@@ -1838,6 +2218,11 @@ impl Engine {
             plan,
             up: false,
             fresh: false,
+            envelope,
+            helper_proxy: None,
+            ownership,
+            helper_attempted: false,
+            helper_restarts: 0,
         };
         self.sessions
             .get_mut(profile)
@@ -2014,6 +2399,11 @@ impl Engine {
             },
             up: false,
             fresh: false,
+            envelope: None,
+            helper_proxy: None,
+            ownership: None,
+            helper_attempted: false,
+            helper_restarts: 0,
         });
         Ok(())
     }
@@ -2021,6 +2411,27 @@ impl Engine {
     /// Apply an already planned interface after the session's SOCKS inbound
     /// has proved it can carry traffic.
     pub fn start_interface(&mut self, profile: &str) -> Result<()> {
+        self.ensure_interface_ready(profile)?;
+        if let Some(session) = self.sessions.get(profile)
+            && let Some(envelope) = session
+                .interface
+                .as_ref()
+                .and_then(|interface| interface.envelope.as_ref())
+        {
+            anyhow::ensure!(
+                session.holds_traffic && session.core_options.routing.is_none(),
+                "TUN failover settings no longer match the envelope"
+            );
+            envelope.validate_candidates(self.all_servers())?;
+        }
+        if self
+            .sessions
+            .get(profile)
+            .and_then(|session| session.interface.as_ref())
+            .is_some_and(|interface| interface.up)
+        {
+            return self.ensure_interface_helper(profile);
+        }
         let Some(mut interface) = self
             .sessions
             .get_mut(profile)
@@ -2028,50 +2439,6 @@ impl Engine {
         else {
             return Ok(());
         };
-        if interface.up {
-            // A session that held its traffic across a core death still has its
-            // device, routes and rule installed, so a reconnect finds this
-            // already up and there is nothing to add — adding it twice is what
-            // "leaves no rule behind" means here.
-            //
-            // Its tun2socks is the exception. It is the one part of an interface
-            // that is a process rather than kernel state, and it spent the whole
-            // outage dialling a SOCKS port nothing was listening on. If it did
-            // not survive that, the device stays up with nothing servicing it
-            // and the tunnel is black-holed for good — worse than the leak the
-            // holding prevents. Restarting only the helper leaves every route
-            // exactly where it was.
-            let result = if interface.tun2socks.is_alive() {
-                Ok(())
-            } else {
-                let proxy = self
-                    .sessions
-                    .get(profile)
-                    .map(Session::socks_endpoint)
-                    .expect("the session existed above");
-                log::warn!(
-                    "profile {profile:?} kept its routes but lost tun2socks; restarting it \
-                     rather than leaving the device with nothing behind it"
-                );
-                interface
-                    .tun2socks
-                    .start(&interface.device, proxy, interface.mtu)
-            };
-            if result.is_ok()
-                // The recovery PID moved, and a daemon that died now would reap
-                // the wrong process — or none.
-                && let Err(error) = self.persist_interface_state(profile, &interface)
-            {
-                log::warn!(
-                    "could not record the restarted tun2socks for profile {profile:?}: {error:#}"
-                );
-            }
-            self.sessions
-                .get_mut(profile)
-                .expect("the session existed above")
-                .interface = Some(interface);
-            return result;
-        }
         if !crate::tun::caps::has_net_admin() {
             let error = anyhow!(crate::tun::caps::missing_capability_error(profile));
             self.sessions
@@ -2086,9 +2453,8 @@ impl Engine {
             .map(Session::socks_endpoint)
             .expect("the session existed above");
 
-        // The state is intentionally a superset of what reached the kernel:
-        // every cleanup operation is idempotent, while an unrecorded route
-        // would survive a crash forever.
+        // Record legacy plans or the empty exclusive identity first. Exclusive
+        // setup persists its complete qualified intents before persistence.
         if let Err(error) = self.persist_interface_state(profile, &interface) {
             self.sessions
                 .get_mut(profile)
@@ -2102,7 +2468,17 @@ impl Engine {
         if let Err(error) = result {
             let delete_fresh_device = interface.fresh;
             let verdict = self.teardown_verdict(profile);
-            let rollback = cleanup_live_interface(&mut interface, delete_fresh_device, &verdict);
+            let rollback = if interface.envelope.is_some() && !interface.created {
+                Ok(())
+            } else {
+                if let Some(owner) = &mut interface.ownership {
+                    owner.cleanup_dirty = true;
+                }
+                self.persist_interface_state(profile, &interface)
+                    .and_then(|()| {
+                        cleanup_live_interface(&mut interface, delete_fresh_device, &verdict)
+                    })
+            };
             self.sessions
                 .get_mut(profile)
                 .expect("the session existed above")
@@ -2133,6 +2509,7 @@ impl Engine {
     }
 
     fn stop_interface_with(&mut self, profile: &str, verdict: Verdict) -> Result<()> {
+        self.ensure_no_unresolved_owner(profile)?;
         let Some(mut interface) = self
             .sessions
             .get_mut(profile)
@@ -2140,7 +2517,24 @@ impl Engine {
         else {
             return Ok(());
         };
+        if let Some(owner) = &mut interface.ownership {
+            owner.cleanup_dirty = true;
+            if let Err(error) = self.persist_interface_state(profile, &interface) {
+                self.sessions
+                    .get_mut(profile)
+                    .expect("session existed")
+                    .interface = Some(interface);
+                return Err(error);
+            }
+        }
         let result = cleanup_live_interface(&mut interface, false, &verdict);
+        if result.is_ok() && interface.ownership.is_some() {
+            self.finish_interface_deletion(profile, interface, State::save)?;
+            if matches!(verdict, Verdict::Release) {
+                self.unbind_run_cgroup(profile)?;
+            }
+            return Ok(());
+        }
         if result.is_ok() {
             match &verdict {
                 Verdict::Block(slice) => interface.cgroup = Some(slice.clone()),
@@ -2164,6 +2558,7 @@ impl Engine {
     /// Explicit `oxidom tun --down`: unlike a profile disconnect, this removes
     /// a device oxidom created and forgets the plan from the live session.
     pub fn delete_interface(&mut self, profile: &str) -> Result<bool> {
+        self.ensure_no_unresolved_owner(profile)?;
         let Some(mut interface) = self
             .sessions
             .get_mut(profile)
@@ -2172,6 +2567,16 @@ impl Engine {
             return Ok(false);
         };
         let verdict = self.teardown_verdict(profile);
+        if let Some(owner) = &mut interface.ownership {
+            owner.cleanup_dirty = true;
+            if let Err(error) = self.persist_interface_state(profile, &interface) {
+                self.sessions
+                    .get_mut(profile)
+                    .expect("session existed")
+                    .interface = Some(interface);
+                return Err(error);
+            }
+        }
         if let Err(error) = cleanup_live_interface(&mut interface, true, &verdict) {
             self.sessions
                 .get_mut(profile)
@@ -2179,12 +2584,49 @@ impl Engine {
                 .interface = Some(interface);
             return Err(error);
         }
-        self.sync_session(profile);
-        self.state.save()?;
+        self.finish_interface_deletion(profile, interface, State::save)?;
         if let Verdict::Release = verdict {
             self.unbind_run_cgroup(profile)?;
         }
         Ok(true)
+    }
+
+    /// Only confirmed cleanup can bypass the unresolved-owner sync guard.
+    fn finish_interface_deletion(
+        &mut self,
+        profile: &str,
+        mut interface: Interface,
+        persist: impl FnOnce(&State) -> Result<()>,
+    ) -> Result<()> {
+        let previous = self.state.sessions.clone();
+        if let Some(saved) = self
+            .state
+            .sessions
+            .iter_mut()
+            .find(|saved| saved.profile == profile)
+        {
+            saved.interface = None;
+        }
+        if let Err(error) = persist(&self.state) {
+            self.state.sessions = previous;
+            if let Some(owner) = &mut interface.ownership {
+                owner.cleanup_dirty = true;
+            }
+            if let Some(saved) = self
+                .state
+                .sessions
+                .iter_mut()
+                .find(|saved| saved.profile == profile)
+            {
+                saved.interface = Some(interface.state());
+            }
+            self.sessions
+                .get_mut(profile)
+                .context("session disappeared after cleanup")?
+                .interface = Some(interface);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn persist_interface_state(&mut self, profile: &str, interface: &Interface) -> Result<()> {
@@ -2280,7 +2722,23 @@ impl Engine {
             )
             .collect();
         for profile in &affected {
-            self.stop_session(profile);
+            if self
+                .sessions
+                .get(profile)
+                .and_then(|session| session.interface.as_ref())
+                .is_some_and(|interface| interface.envelope.is_some())
+            {
+                if let Some(session) = self.sessions.get_mut(profile) {
+                    session.disconnect();
+                    session
+                        .core
+                        .fail("the authorized candidate is no longer available; TUN hold retained");
+                    session.holding_traffic = true;
+                }
+                self.sync_session(profile);
+            } else {
+                self.stop_session(profile);
+            }
         }
         if !affected.is_empty()
             && let Err(error) = self.state.save()
@@ -2295,6 +2753,27 @@ impl Engine {
     }
 
     pub fn connect_session(&mut self, profile: &str, server_id: &str) -> Result<()> {
+        self.ensure_interface_ready(profile)?;
+        if let Some(envelope) = self
+            .sessions
+            .get(profile)
+            .and_then(|session| session.interface.as_ref())
+            .and_then(|interface| interface.envelope.as_ref())
+        {
+            anyhow::ensure!(
+                envelope.contains(server_id),
+                "TUN failover requires an exact authorized server ID"
+            );
+            envelope.validate_candidates(self.all_servers())?;
+        }
+        if self
+            .sessions
+            .get(profile)
+            .and_then(|session| session.interface.as_ref())
+            .is_some_and(|interface| interface.up && interface.ownership.is_some())
+        {
+            self.ensure_interface_helper(profile)?;
+        }
         let server = self
             .find_server(server_id)
             .ok_or_else(|| anyhow!("server not found"))?;
@@ -2308,6 +2787,10 @@ impl Engine {
         // `configure_interface` first, which stops the interface itself.
         if self.sessions.get(profile).is_some_and(|session| {
             !session.holding_traffic
+                && session
+                    .interface
+                    .as_ref()
+                    .is_none_or(|interface| interface.envelope.is_none())
                 && session.interface.as_ref().is_some_and(|interface| {
                     interface.up || interface.tun2socks.child_pid().is_some()
                 })
@@ -2331,6 +2814,14 @@ impl Engine {
         member_ids: &[String],
         pool: &PoolSession<'_>,
     ) -> Result<()> {
+        self.ensure_interface_ready(profile)?;
+        anyhow::ensure!(
+            self.sessions
+                .get(profile)
+                .and_then(|session| session.interface.as_ref())
+                .is_none_or(|interface| interface.envelope.is_none()),
+            "a TUN failover envelope cannot run a pool"
+        );
         let members = member_ids
             .iter()
             .map(|id| {
@@ -2496,6 +2987,9 @@ impl Engine {
     }
 
     fn sync_session(&mut self, profile: &str) {
+        if self.ensure_no_unresolved_owner(profile).is_err() {
+            return;
+        }
         let Some(saved) = self.sessions.get(profile).map(Session::state) else {
             return;
         };
@@ -2603,11 +3097,24 @@ fn resolve_servers_ipv4(servers: &[Server]) -> Result<Vec<Ipv4Addr>> {
     Ok(addresses)
 }
 
+fn finish_helper_persistence(interface: &mut Interface, result: Result<()>) -> Result<()> {
+    if let Err(error) = result {
+        interface.tun2socks.stop();
+        interface.helper_restarts = 1;
+        interface.helper_attempted = true;
+        return Err(error).context("recording restored TUN helper PID; replacement stopped");
+    }
+    Ok(())
+}
+
 fn start_interface_steps(
     interface: &mut Interface,
     proxy: SocketAddrV4,
     mut persist: impl FnMut(&Interface) -> Result<()>,
 ) -> Result<()> {
+    if interface.envelope.is_some() {
+        return start_owned_interface(interface, proxy, persist);
+    }
     let created = crate::tun::device::create_persistent(
         &interface.device,
         nix::unistd::Uid::effective().as_raw(),
@@ -2632,6 +3139,7 @@ fn start_interface_steps(
     interface
         .tun2socks
         .start(&interface.device, proxy, interface.mtu)?;
+    interface.helper_proxy = Some(proxy);
     // Persist the recovery PID before another kernel mutation. If the daemon
     // dies between spawn and link-up, the next start can still identify and
     // reap only this tun2socks process.
@@ -2644,11 +3152,8 @@ fn start_interface_steps(
     for route in &interface.plan.private {
         net.route_add(route, index)?;
     }
-    net.rule_add(
-        interface.plan.rule.mark,
-        interface.plan.rule.table,
-        interface.plan.rule.priority,
-    )?;
+    let rule = &interface.plan.rule;
+    net.rule_add(rule.mark, rule.table, rule.priority)?;
     for route in &interface.plan.system {
         net.route_add(route, index)?;
     }
@@ -2668,6 +3173,162 @@ fn start_interface_steps(
     }
     interface.up = true;
     interface.fresh = false;
+    Ok(())
+}
+
+/// Build the complete recovery intent without touching the kernel. All output
+/// interfaces are explicit; recovery never resolves a replacement by name.
+fn plan_owned_interface(interface: &mut Interface, index: u32) -> Result<()> {
+    let owner = interface
+        .ownership
+        .as_mut()
+        .context("TUN envelope has no recovery identity")?;
+    owner.device_index = Some(index);
+    owner.routes = interface
+        .plan
+        .system
+        .iter()
+        .filter(|route| !matches!(route.via, Via::Device))
+        .chain(&interface.plan.private)
+        .chain(
+            interface
+                .plan
+                .system
+                .iter()
+                .filter(|route| matches!(route.via, Via::Device)),
+        )
+        .map(|route| {
+            let output_interface = match route.via {
+                Via::Device => index,
+                Via::Interface(index) => index,
+                Via::Gateway(_) => owner
+                    .gateway_interface
+                    .context("owned bypass requires a recorded gateway interface")?,
+            };
+            Ok(OwnedRoute {
+                route: RouteRecord::from_spec(route),
+                output_interface,
+            })
+        })
+        .collect::<Result<_>>()?;
+    owner.rule = Some(OwnedRule {
+        mark: interface.plan.rule.mark,
+        table: interface.plan.rule.table,
+        priority: interface.plan.rule.priority,
+    });
+    owner.validate()
+}
+
+/// The same sequence is exercised with fake I/O: a failed durable write must
+/// never reach the subsequent persistent-device or routing mutation.
+fn commit_owned_intent(
+    interface: &Interface,
+    persist: impl FnOnce(&Interface) -> Result<()>,
+    apply: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    persist(interface)?;
+    apply()
+}
+
+fn start_owned_interface(
+    interface: &mut Interface,
+    proxy: SocketAddrV4,
+    mut persist: impl FnMut(&Interface) -> Result<()>,
+) -> Result<()> {
+    let net = crate::tun::net::Net::new()?;
+    net.ensure_plan_available(&interface.plan)?;
+    let transient = crate::tun::device::TransientTun::create_exclusive(
+        &interface.device,
+        nix::unistd::Uid::effective().as_raw(),
+    )?;
+    let index = net.link_index(&interface.device)?;
+    let alias = interface
+        .ownership
+        .as_ref()
+        .context("missing exclusive TUN identity")?
+        .alias();
+    net.set_alias(index, &alias)?;
+    plan_owned_interface(interface, index)?;
+    // No persistent device, address, route or rule exists until the complete
+    // ownership-qualified intents have reached durable storage.
+    commit_owned_intent(interface, &mut persist, || transient.make_persistent())?;
+    interface.created = true;
+    interface.fresh = true;
+    drop(transient);
+    net.set_mtu(index, u32::from(interface.mtu))?;
+    net.address_add(index, interface.address, 32)?;
+    let sysctl_dir =
+        std::path::PathBuf::from(format!("/proc/sys/net/ipv4/conf/{}", interface.device));
+    let _ = std::fs::write(sysctl_dir.join("src_valid_mark"), b"1\n");
+    let _ = std::fs::write(sysctl_dir.join("rp_filter"), b"2\n");
+    interface.ensure_helper(proxy)?;
+    persist(interface)?;
+    net.link_up(index)?;
+    let owner = interface
+        .ownership
+        .as_ref()
+        .context("missing exclusive TUN identity")?;
+    // All candidate bypasses precede every capture, including the private rule.
+    apply_owned_routes(
+        owner,
+        interface.table,
+        |route| {
+            if route.route.table != interface.table && route.route.gateway.is_none() {
+                net.ensure_capture_available(&interface.plan, owner)?;
+            }
+            net.owned_route_add(route, owner)
+        },
+        |rule| {
+            net.ensure_capture_available(&interface.plan, owner)?;
+            net.owned_rule_add(rule)
+        },
+    )?;
+    if let Some(slice) = &interface.cgroup {
+        anyhow::ensure!(
+            crate::paths::cgroup_dir(&slice.path).exists(),
+            "bound TUN cgroup disappeared before capture"
+        );
+        Nft::new(interface.nft_binary.clone()).install(
+            &interface.profile,
+            slice,
+            interface.mark,
+        )?;
+        interface.chain = ChainState::Mark;
+    }
+    interface.up = true;
+    interface.fresh = false;
+    Ok(())
+}
+
+fn apply_owned_routes(
+    owner: &InterfaceOwnership,
+    private_table: u32,
+    mut add_route: impl FnMut(&OwnedRoute) -> Result<()>,
+    mut add_rule: impl FnMut(&OwnedRule) -> Result<()>,
+) -> Result<()> {
+    owner.validate()?;
+    for route in owner
+        .routes
+        .iter()
+        .filter(|route| route.route.table != private_table && route.route.gateway.is_some())
+    {
+        add_route(route)?;
+    }
+    for route in owner
+        .routes
+        .iter()
+        .filter(|route| route.route.table == private_table)
+    {
+        add_route(route)?;
+    }
+    add_rule(owner.rule.as_ref().context("missing owned rule intent")?)?;
+    for route in owner
+        .routes
+        .iter()
+        .filter(|route| route.route.table != private_table && route.route.gateway.is_none())
+    {
+        add_route(route)?;
+    }
     Ok(())
 }
 
@@ -2703,6 +3364,29 @@ fn cleanup_live_interface(
     delete_device: bool,
     verdict: &Verdict,
 ) -> Result<()> {
+    if interface.ownership.is_some() {
+        // Ownership failure is never an invitation to use the legacy path.
+        let owner = interface.ownership.as_mut().context("owned interface")?;
+        owner.cleanup_dirty = true;
+        interface.up = false;
+        let net = crate::tun::net::Net::new()?;
+        net.owned_device_index(&interface.device, owner)?;
+        interface.chain = set_chain(
+            &interface.profile,
+            &interface.nft_binary,
+            interface.chain,
+            verdict,
+        )?;
+        interface.tun2socks.stop();
+        interface.helper_proxy = None;
+        // Exclusive devices are never left persistent after explicit stop:
+        // removing the session would otherwise strand an unrecorded device.
+        cleanup_owned_resources(&net, &interface.device, owner, true)?;
+        interface.up = false;
+        interface.fresh = false;
+        interface.created = false;
+        return Ok(());
+    }
     interface.chain = set_chain(
         &interface.profile,
         &interface.nft_binary,
@@ -2710,14 +3394,17 @@ fn cleanup_live_interface(
         verdict,
     )?;
     interface.tun2socks.stop();
+    interface.helper_proxy = None;
     interface.up = false;
-    let device_exists = crate::tun::device::exists(&interface.device);
+    let device_exists = (interface.envelope.is_none() || interface.created)
+        && crate::tun::device::exists(&interface.device);
     let mut errors = Vec::new();
     match crate::tun::net::Net::new().and_then(|net| {
         let index = device_exists
             .then(|| net.link_index(&interface.device))
             .transpose()?;
-        for route in interface.plan.system.iter().rev() {
+        let system = &interface.plan.system;
+        for route in system.iter().rev() {
             if (matches!(route.via, Via::Gateway(_) | Via::Interface(_)) || index.is_some())
                 && let Err(error) = net.route_del(route, index.unwrap_or(0))
             {
@@ -2731,7 +3418,8 @@ fn cleanup_live_interface(
         ) {
             errors.push(format!("{error:#}"));
         }
-        for route in interface.plan.private.iter().rev() {
+        let private = interface.plan.private.as_slice();
+        for route in private.iter().rev() {
             if (matches!(route.via, Via::Gateway(_) | Via::Interface(_)) || index.is_some())
                 && let Err(error) = net.route_del(route, index.unwrap_or(0))
             {
@@ -2768,6 +3456,9 @@ fn cleanup_live_interface(
     }
     interface.fresh = false;
     if errors.is_empty() {
+        if delete_device {
+            interface.created = false;
+        }
         Ok(())
     } else {
         bail!("{}", errors.join("; "))
@@ -2780,6 +3471,25 @@ fn recover_interface(
     nft_binary: &str,
     chain_handled: bool,
 ) -> Result<()> {
+    if let Some(owner) = &interface.ownership {
+        owner.validate()?;
+        anyhow::ensure!(
+            !interface.created && !interface.rule && interface.routes.is_empty(),
+            "owned recovery contains unsafe legacy selectors"
+        );
+        let net = crate::tun::net::Net::new()?;
+        net.owned_device_index(&interface.device, owner)?;
+        if let Some(pid) = interface.tun2socks_pid {
+            anyhow::ensure!(
+                kill_stale_tun2socks(pid, &interface.device),
+                "could not identify recovered owned TUN helper"
+            );
+        }
+        if interface.nft_rule && !chain_handled {
+            Nft::new(nft_binary.to_string()).remove(profile)?;
+        }
+        return cleanup_owned_resources(&net, &interface.device, owner, true);
+    }
     if interface.nft_rule && !chain_handled {
         Nft::new(nft_binary.to_string()).remove(profile)?;
     }
@@ -2823,6 +3533,30 @@ fn recover_interface(
     }
     if device_exists && interface.created {
         crate::tun::device::delete(&interface.device)?;
+    }
+    Ok(())
+}
+
+fn cleanup_owned_resources(
+    net: &crate::tun::net::Net,
+    device: &str,
+    owner: &InterfaceOwnership,
+    delete_device: bool,
+) -> Result<()> {
+    owner.validate()?;
+    let index = net.owned_device_index(device, owner)?;
+    // Intents remain durable through every failure and are harmless when the
+    // operation never happened. Never delete by prefix or device name alone.
+    for route in owner.routes.iter().rev() {
+        net.owned_route_del(route, owner)?;
+    }
+    if let Some(rule) = &owner.rule {
+        net.owned_rule_del(rule)?;
+    }
+    if delete_device {
+        net.delete_owned_device(device, owner)?;
+    } else if let Some(index) = index {
+        net.link_down(index)?;
     }
     Ok(())
 }
@@ -2929,7 +3663,7 @@ fn arguments_name_tun2socks(arguments: &[String], device: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::hash::{Hash, Hasher};
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddrV4};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::core_options::ResolvedCore;
@@ -2941,10 +3675,11 @@ mod tests {
     };
     use crate::bind;
     use crate::config::OnCoreExit;
+    use crate::failover::TunEnvelope;
     use crate::link::parse_link;
     use crate::model::{Server, Subscription};
-    use crate::profile::RouteMode;
-    use crate::state::{RouteRecord, SessionState, State, store};
+    use crate::profile::{ProfileInterface, RouteMode};
+    use crate::state::{InterfaceOwnership, RouteRecord, SessionState, State, store};
     use crate::tun::core::Tun2socks;
     use crate::tun::plan::{Cidr, RoutePlan, RouteSpec, RuleSpec, Via};
 
@@ -3642,6 +4377,11 @@ mod tests {
             },
             up: false,
             fresh: false,
+            envelope: None,
+            helper_proxy: None,
+            ownership: None,
+            helper_attempted: false,
+            helper_restarts: 0,
         };
         let interface = planned.state();
         assert_eq!(
@@ -3727,6 +4467,11 @@ mod tests {
             },
             up: true,
             fresh: false,
+            envelope: None,
+            helper_proxy: None,
+            ownership: None,
+            helper_attempted: false,
+            helper_restarts: 0,
         });
 
         assert!(engine.note_core_exit("work"), "the default is to hold");
@@ -3921,7 +4666,777 @@ mod tests {
             },
             up: true,
             fresh: false,
+            envelope: None,
+            helper_proxy: None,
+            ownership: None,
+            helper_attempted: false,
+            helper_restarts: 0,
         }
+    }
+
+    fn invented_owner() -> InterfaceOwnership {
+        InterfaceOwnership {
+            cookie: "0123456789abcdef0123456789abcdef".into(),
+            metric: 1234567,
+            gateway_interface: Some(7),
+            device_index: None,
+            routes: Vec::new(),
+            rule: None,
+            cleanup_dirty: false,
+        }
+    }
+
+    #[test]
+    fn preparing_an_existing_envelope_session_is_refused_before_any_session_mutation() -> Result<()>
+    {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("prepare-existing-envelope")?;
+        let mut engine = Engine::load();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 10), 12480, 12481)?;
+        let candidates = [
+            parse_link("socks://192.0.2.10:1080#One").context("first candidate")?,
+            parse_link("socks://198.51.100.20:1080#Two").context("second candidate")?,
+        ];
+        let mut interface = held_interface("work");
+        interface.envelope = Some(TunEnvelope::new(
+            &candidates,
+            &ProfileInterface {
+                enable: true,
+                ..Default::default()
+            },
+            OnCoreExit::Hold,
+        )?);
+        let session = engine.sessions.get_mut("work").context("session")?;
+        session.interface = Some(interface);
+        session.holds_traffic = true;
+        session.holding_traffic = true;
+        let original = session.state();
+        let options = session.core_options.clone();
+        let envelope = session
+            .interface
+            .as_ref()
+            .context("interface")?
+            .envelope
+            .clone();
+        let plan = session
+            .interface
+            .as_ref()
+            .context("interface")?
+            .plan
+            .clone();
+        let result = engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 11), 12482, 12483);
+        let session = engine.sessions.get("work").context("retained session")?;
+        assert!(
+            result.is_err(),
+            "replacement preparation must refuse an existing envelope"
+        );
+        assert_eq!(session.state(), original);
+        assert_eq!(session.core.socks_port, original.socks_port);
+        assert_eq!(session.core.http_port, original.http_port);
+        assert_eq!(session.core_options, options);
+        assert!(session.holds_traffic);
+        assert!(session.holding_traffic);
+        let interface = session.interface.as_ref().context("retained interface")?;
+        assert_eq!(interface.envelope, envelope);
+        assert_eq!(interface.plan, plan);
+        assert!(interface.up);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_initial_confirmation_keeps_the_uninstalled_envelope_for_an_alternate() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("uninstalled-envelope-confirmation")?;
+        let mut engine = Engine::load();
+        engine.registry.config.xray_binary = fake_core_binary(&root.path)?;
+        engine.import_links("socks://192.0.2.10:1080#One\nsocks://198.51.100.20:1080#Two")?;
+        let candidates = engine.all_servers().cloned().collect::<Vec<_>>();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 9), 12480, 12481)?;
+        let mut interface = held_interface("work");
+        interface.up = false;
+        interface.created = false;
+        interface.ownership = Some(invented_owner());
+        interface.envelope = Some(TunEnvelope::new(
+            &candidates,
+            &ProfileInterface {
+                enable: true,
+                ..Default::default()
+            },
+            OnCoreExit::Hold,
+        )?);
+        let plan = interface.plan.clone();
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(interface);
+        engine.connect_session("work", &candidates[0].id)?;
+        engine.confirmation_failed("work", "invented initial timeout");
+        let session = engine.sessions.get("work").context("session")?;
+        let interface = session.interface.as_ref().context("retained plan")?;
+        assert!(interface.envelope.is_some());
+        assert_eq!(interface.plan, plan);
+        assert!(!interface.up);
+        assert!(
+            !session.holding_traffic,
+            "an uninstalled plan cannot claim a routing hold"
+        );
+        engine.connect_session("work", &candidates[1].id)?;
+        assert!(
+            engine
+                .sessions
+                .get("work")
+                .context("session")?
+                .interface
+                .as_ref()
+                .context("interface")?
+                .envelope
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_helper_restore_persists_the_replacement_pid_without_touching_the_plan() -> Result<()>
+    {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("engine-helper-recovery-pid")?;
+        let mut engine = Engine::load();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 8), 12480, 12481)?;
+        let mut interface = held_interface("work");
+        interface.tun2socks.binary = fake_core_binary(&root.path)?;
+        let plan = interface.plan.clone();
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(interface);
+        engine.sync_session("work");
+        engine.ensure_interface_helper("work")?;
+        let first = engine
+            .sessions
+            .get("work")
+            .context("session")?
+            .interface
+            .as_ref()
+            .context("interface")?
+            .tun2socks
+            .child_pid();
+        assert!(first.is_some());
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface
+            .as_mut()
+            .context("interface")?
+            .tun2socks
+            .stop();
+        engine.ensure_interface_helper("work")?;
+        let interface = engine
+            .sessions
+            .get("work")
+            .context("session")?
+            .interface
+            .as_ref()
+            .context("interface")?;
+        assert_ne!(interface.tun2socks.child_pid(), first);
+        let saved = State::load_checked(&engine.registry.config)?;
+        assert_eq!(
+            saved
+                .sessions
+                .iter()
+                .find(|saved| saved.profile == "work")
+                .context("saved")?
+                .interface
+                .as_ref()
+                .context("saved interface")?
+                .tun2socks_pid,
+            interface.tun2socks.child_pid()
+        );
+        assert_eq!(interface.plan, plan);
+        assert!(interface.up);
+        Ok(())
+    }
+
+    #[test]
+    fn replacement_helpers_are_stopped_on_failed_pid_persistence_and_retry_is_bounded() -> Result<()>
+    {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("helper-persistence-failure")?;
+        let mut interface = held_interface("work");
+        interface.tun2socks.binary = fake_core_binary(&root.path)?;
+        interface.ensure_helper(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12480))?;
+        assert!(interface.tun2socks.child_pid().is_some());
+        interface.ownership = Some(invented_owner());
+        assert!(
+            super::finish_helper_persistence(
+                &mut interface,
+                Err(anyhow!("injected PID write failure"))
+            )
+            .is_err()
+        );
+        assert!(interface.tun2socks.child_pid().is_none());
+        assert!(
+            interface.up,
+            "stopping the replacement does not tear down the hold"
+        );
+        assert!(interface.admit_helper_restart().is_err());
+        interface.helper_restarts = 0;
+        interface.admit_helper_restart()?;
+        assert!(interface.admit_helper_restart().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_live_spawn_with_a_persisted_pid_needs_no_delayed_readiness_transition() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("helper-immediate-liveness")?;
+        let mut interface = held_interface("work");
+        interface.tun2socks.binary = fake_core_binary(&root.path)?;
+        interface.ensure_helper(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12480))?;
+        interface.ownership = Some(invented_owner());
+        super::finish_helper_persistence(&mut interface, Ok(()))?;
+        assert!(interface.tun2socks.is_alive());
+        assert!(interface.helper_attempted);
+        assert_eq!(interface.helper_restarts, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn confirmed_owned_deletion_clears_saved_intent_and_failed_save_restores_it() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("owned-delete-finalize")?;
+        let mut engine = Engine::load();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 5), 12480, 12481)?;
+        let mut interface = held_interface("work");
+        interface.ownership = Some(invented_owner());
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(interface);
+        engine.sync_session("work");
+        let interface = engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface
+            .take()
+            .context("interface")?;
+        engine.finish_interface_deletion("work", interface, |_| Ok(()))?;
+        assert!(
+            engine
+                .state
+                .sessions
+                .iter()
+                .find(|saved| saved.profile == "work")
+                .context("saved")?
+                .interface
+                .is_none()
+        );
+        engine.ensure_no_unresolved_owner("work")?;
+        let mut interface = held_interface("work");
+        interface.ownership = Some(invented_owner());
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(interface);
+        engine.sync_session("work");
+        let interface = engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface
+            .take()
+            .context("interface")?;
+        assert!(
+            engine
+                .finish_interface_deletion("work", interface, |_| Err(anyhow!(
+                    "injected write failure"
+                )))
+                .is_err()
+        );
+        assert!(
+            engine
+                .sessions
+                .get("work")
+                .context("session")?
+                .interface
+                .as_ref()
+                .context("interface")?
+                .ownership
+                .as_ref()
+                .context("owner")?
+                .cleanup_dirty
+        );
+        assert!(engine.ensure_interface_ready("work").is_err());
+        assert!(
+            engine
+                .state
+                .sessions
+                .iter()
+                .find(|saved| saved.profile == "work")
+                .context("saved")?
+                .interface
+                .as_ref()
+                .context("intent")?
+                .ownership
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_failure_blocks_connect_and_start_but_not_repeated_explicit_teardown() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("owned-dirty-admission")?;
+        let mut engine = Engine::load();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 6), 12480, 12481)?;
+        let mut interface = held_interface("work");
+        let mut owner = invented_owner();
+        owner.cleanup_dirty = true;
+        interface.ownership = Some(owner);
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(interface);
+        engine.sync_session("work");
+        assert!(engine.connect_session("work", "anything").is_err());
+        assert!(engine.start_interface("work").is_err());
+        engine.ensure_no_unresolved_owner("work")?;
+        Ok(())
+    }
+
+    #[test]
+    fn removal_of_the_current_envelope_candidate_keeps_the_installed_hold() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("owned-catalog-removal")?;
+        let mut engine = Engine::load();
+        engine.import_links("socks://192.0.2.10:1080#One\nsocks://198.51.100.20:1080#Two")?;
+        let candidates = engine.all_servers().cloned().collect::<Vec<_>>();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 7), 12480, 12481)?;
+        let mut interface = held_interface("work");
+        interface.envelope = Some(TunEnvelope::new(
+            &candidates,
+            &ProfileInterface {
+                enable: true,
+                ..Default::default()
+            },
+            OnCoreExit::Hold,
+        )?);
+        let plan = interface.plan.clone();
+        let session = engine.sessions.get_mut("work").context("session")?;
+        session.interface = Some(interface);
+        session.selection = Some(super::SessionSelection::Server(candidates[0].id.clone()));
+        session.core.fail("invented core exit");
+        engine.disconnect_if_active_within(|id, _| id == candidates[0].id);
+        let session = engine.sessions.get("work").context("session")?;
+        assert!(session.holding_traffic);
+        assert!(session.interface.as_ref().context("interface")?.up);
+        assert_eq!(session.interface.as_ref().context("interface")?.plan, plan);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_state_versions_stop_engine_startup_before_recovery_or_rewrite() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("owned-engine-version-guard")?;
+        let body = "format_version = 999\n[[sessions]]\nprofile = 'work'\n";
+        let path = crate::paths::state_file()?;
+        crate::fsutil::write_private_atomic(&path, body.as_bytes())?;
+        assert!(Engine::load_checked().is_err());
+        assert_eq!(std::fs::read_to_string(path)?, body);
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_owned_recovery_cannot_be_overwritten_by_session_operations() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("owned-unresolved-guard")?;
+        let mut engine = Engine::load();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 4), 12480, 12481)?;
+        let mut interface = held_interface("work");
+        interface.ownership = Some(invented_owner());
+        engine.state.sessions.push(SessionState {
+            profile: "work".into(),
+            interface: Some(interface.state()),
+            ..Default::default()
+        });
+        let original = engine.state.sessions.clone();
+        assert!(
+            engine
+                .prepare_session("work", Ipv4Addr::LOCALHOST, 12482, 12483)
+                .is_err()
+        );
+        assert!(engine.connect_session("work", "invented-id").is_err());
+        assert!(engine.delete_interface("work").is_err());
+        assert!(engine.remove_session("work").is_err());
+        engine.sync_session("work");
+        assert_eq!(engine.state.sessions, original);
+        // Avoid leaving fake unresolved records for Engine's shutdown path.
+        engine.state.sessions.clear();
+        Ok(())
+    }
+
+    #[test]
+    fn owned_intents_are_durable_before_persistence_and_survive_ambiguous_add_failure() -> Result<()>
+    {
+        use std::cell::RefCell;
+        let mut interface = held_interface("work");
+        interface.ownership = Some(invented_owner());
+        interface.plan.rule.priority = 12000;
+        interface.plan.system.push(RouteSpec {
+            destination: "192.0.2.10/32".parse()?,
+            via: Via::Gateway(Ipv4Addr::new(192, 0, 2, 1)),
+            table: 254,
+        });
+        super::plan_owned_interface(&mut interface, 42)?;
+        let intent = interface.state();
+        assert!(!intent.created && !intent.rule && intent.routes.is_empty());
+        let owner = intent.ownership.as_ref().context("owner")?;
+        assert_eq!(owner.device_index, Some(42));
+        assert_eq!(owner.routes[0].output_interface, 7);
+        let events = RefCell::new(Vec::new());
+        assert!(
+            super::commit_owned_intent(
+                &interface,
+                |_| {
+                    events.borrow_mut().push("persist-failed");
+                    Err(anyhow!("injected durable write failure"))
+                },
+                || {
+                    events.borrow_mut().push("mutation");
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(*events.borrow(), ["persist-failed"]);
+        events.borrow_mut().clear();
+        assert!(
+            super::commit_owned_intent(
+                &interface,
+                |current| {
+                    assert_eq!(current.state(), intent);
+                    events.borrow_mut().push("durable-intent");
+                    Ok(())
+                },
+                || {
+                    events.borrow_mut().push("ambiguous-add");
+                    Err(anyhow!("injected lost acknowledgement"))
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(*events.borrow(), ["durable-intent", "ambiguous-add"]);
+        assert_eq!(
+            interface.state(),
+            intent,
+            "an uncertain add cannot erase recovery intent"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_bypasses_never_reach_capture_and_every_mutation_has_durable_intent() -> Result<()> {
+        use std::cell::RefCell;
+        let mut interface = held_interface("work");
+        interface.ownership = Some(invented_owner());
+        interface.plan.rule.priority = 12000;
+        interface.plan.private.push(RouteSpec {
+            destination: "0.0.0.0/0".parse()?,
+            via: Via::Device,
+            table: interface.table,
+        });
+        interface.plan.system = vec![
+            RouteSpec {
+                destination: "192.0.2.10/32".parse()?,
+                via: Via::Gateway(Ipv4Addr::new(192, 0, 2, 1)),
+                table: 254,
+            },
+            RouteSpec {
+                destination: "0.0.0.0/1".parse()?,
+                via: Via::Device,
+                table: 254,
+            },
+        ];
+        super::plan_owned_interface(&mut interface, 42)?;
+        let owner = interface.ownership.as_ref().context("owner")?;
+        let durable = RefCell::new(None);
+        let events = RefCell::new(Vec::new());
+        super::commit_owned_intent(
+            &interface,
+            |current| {
+                *durable.borrow_mut() = current.state().ownership;
+                Ok(())
+            },
+            || {
+                super::apply_owned_routes(
+                    owner,
+                    interface.table,
+                    |route| {
+                        assert!(
+                            durable
+                                .borrow()
+                                .as_ref()
+                                .context("durable intent")?
+                                .routes
+                                .contains(route)
+                        );
+                        events.borrow_mut().push(if route.route.gateway.is_some() {
+                            "bypass"
+                        } else if route.route.table == interface.table {
+                            "private"
+                        } else {
+                            "capture"
+                        });
+                        Ok(())
+                    },
+                    |rule| {
+                        assert_eq!(
+                            durable
+                                .borrow()
+                                .as_ref()
+                                .context("durable intent")?
+                                .rule
+                                .as_ref(),
+                            Some(rule)
+                        );
+                        events.borrow_mut().push("rule");
+                        Ok(())
+                    },
+                )
+            },
+        )?;
+        assert_eq!(*events.borrow(), ["bypass", "private", "rule", "capture"]);
+        events.borrow_mut().clear();
+        assert!(
+            super::apply_owned_routes(
+                owner,
+                interface.table,
+                |_| {
+                    events.borrow_mut().push("bypass-eexist");
+                    Err(anyhow!("injected EEXIST"))
+                },
+                |_| {
+                    events.borrow_mut().push("rule");
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(*events.borrow(), ["bypass-eexist"]);
+        assert_eq!(durable.borrow().as_ref(), Some(owner));
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_admission_is_exclusive_in_both_directions_without_mutating_plans() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("tun-envelope-admission")?;
+        let mut engine = Engine::load();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 1), 12480, 12481)?;
+        engine.prepare_session("other", Ipv4Addr::new(127, 72, 17, 2), 12480, 12481)?;
+        let candidates = [
+            parse_link("socks://192.0.2.10:1080#One").context("first")?,
+            parse_link("socks://198.51.100.20:1080#Two").context("second")?,
+        ];
+        let requested = ProfileInterface {
+            enable: true,
+            ..Default::default()
+        };
+        engine.sessions.get_mut("other").context("other")?.interface =
+            Some(held_interface("other"));
+        assert!(
+            engine
+                .configure_failover_interface("work", &requested, &candidates)
+                .is_err()
+        );
+        assert!(
+            engine
+                .sessions
+                .get("work")
+                .context("work")?
+                .interface
+                .is_none()
+        );
+        assert!(
+            engine
+                .sessions
+                .get("other")
+                .context("other")?
+                .interface
+                .as_ref()
+                .context("interface")?
+                .up
+        );
+        engine.sessions.get_mut("other").context("other")?.interface = None;
+        let mut interface = held_interface("work");
+        interface.envelope = Some(TunEnvelope::new(&candidates, &requested, OnCoreExit::Hold)?);
+        engine.sessions.get_mut("work").context("work")?.interface = Some(interface);
+        assert!(
+            engine
+                .configure_interface("other", &requested, &candidates)
+                .is_err()
+        );
+        assert!(
+            engine
+                .configure_interface("work", &ProfileInterface::default(), &[])
+                .is_err()
+        );
+        assert!(
+            engine
+                .sessions
+                .get("work")
+                .context("work")?
+                .interface
+                .as_ref()
+                .context("interface")?
+                .up
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_switches_keep_the_plan_without_requiring_a_preexisting_hold_flag() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("tun-envelope-switch")?;
+        let mut engine = Engine::load();
+        engine.registry.config.xray_binary = fake_core_binary(&root.path)?;
+        engine.import_links("socks://192.0.2.10:1080#One\nsocks://198.51.100.20:1080#Two")?;
+        let candidates = engine.all_servers().cloned().collect::<Vec<_>>();
+        engine.prepare_session("work", Ipv4Addr::new(127, 72, 17, 3), 12480, 12481)?;
+        let requested = ProfileInterface {
+            enable: true,
+            ..Default::default()
+        };
+        let mut interface = held_interface("work");
+        interface.envelope = Some(TunEnvelope::new(&candidates, &requested, OnCoreExit::Hold)?);
+        interface.tun2socks.binary = fake_core_binary(&root.path)?;
+        let plan = interface.plan.clone();
+        engine.sessions.get_mut("work").context("work")?.interface = Some(interface);
+        engine.connect_session("work", &candidates[0].id)?;
+        let pid = engine.sessions.get("work").context("work")?.child_pid();
+        engine.connect_session("work", &candidates[1].id)?;
+        let session = engine.sessions.get_mut("work").context("work")?;
+        assert_ne!(session.child_pid(), pid);
+        assert!(!session.holding_traffic);
+        assert!(session.core_is_alive());
+        assert_eq!(session.interface.as_ref().context("interface")?.plan, plan);
+        assert!(session.interface.as_ref().context("interface")?.up);
+        session
+            .interface
+            .as_mut()
+            .context("interface")?
+            .tun2socks
+            .stop();
+        session
+            .interface
+            .as_mut()
+            .context("interface")?
+            .tun2socks
+            .binary = root.path.join("missing-helper").display().to_string();
+        assert!(session.core_is_alive());
+        assert!(
+            session.is_alive(),
+            "helper failure is not remote core death"
+        );
+        assert!(session.ensure_interface_helper().is_err());
+        assert!(session.interface.as_ref().context("interface")?.up);
+        let before = session.child_pid();
+        assert!(engine.connect_session("work", "outside-envelope").is_err());
+        assert_eq!(
+            engine.sessions.get("work").context("work")?.child_pid(),
+            before
+        );
+        for subscription in &mut engine.registry.subscriptions {
+            for server in &mut subscription.servers {
+                if server.id == candidates[0].id {
+                    server.address = "192.0.2.11".into();
+                }
+            }
+        }
+        assert!(engine.connect_session("work", &candidates[1].id).is_err());
+        let session = engine.sessions.get("work").context("work")?;
+        assert_eq!(session.child_pid(), before);
+        assert_eq!(session.interface.as_ref().context("interface")?.plan, plan);
+        assert!(session.interface.as_ref().context("interface")?.up);
+        Ok(())
+    }
+
+    #[test]
+    fn helper_endpoint_changes_restart_only_the_helper_and_keep_qualified_intents() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("tun-envelope-helper-endpoint")?;
+        let candidates = [
+            parse_link("socks://192.0.2.10:1080#One").context("first")?,
+            parse_link("socks://198.51.100.20:1080#Two").context("second")?,
+        ];
+        let requested = ProfileInterface {
+            enable: true,
+            ..Default::default()
+        };
+        let mut interface = held_interface("work");
+        interface.envelope = Some(TunEnvelope::new(&candidates, &requested, OnCoreExit::Hold)?);
+        interface.ownership = Some(invented_owner());
+        interface.tun2socks.binary = fake_core_binary(&root.path)?;
+        interface.plan.system.push(RouteSpec {
+            destination: "192.0.2.10/32".parse()?,
+            via: Via::Gateway(Ipv4Addr::new(192, 0, 2, 1)),
+            table: 254,
+        });
+        assert!(interface.state().routes.is_empty());
+        assert!(!interface.state().rule);
+        interface.plan.rule.priority = 12000;
+        super::plan_owned_interface(&mut interface, 42)?;
+        assert_eq!(
+            interface
+                .state()
+                .ownership
+                .as_ref()
+                .context("owner")?
+                .routes[0]
+                .route,
+            RouteRecord::from_spec(&interface.plan.system[0])
+        );
+        assert!(!interface.state().rule);
+        assert!(
+            interface
+                .state()
+                .ownership
+                .as_ref()
+                .context("owner")?
+                .rule
+                .is_some()
+        );
+        // Helper process supervision is tested without a real device. Preserve
+        // the intent separately; kernel identity checks have their own pure test.
+        let ownership = interface.ownership.take();
+        let first = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12480);
+        interface.ensure_helper(first)?;
+        let pid = interface.tun2socks.child_pid();
+        interface.ensure_helper(first)?;
+        assert_eq!(interface.tun2socks.child_pid(), pid);
+        let second = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12482);
+        interface.ensure_helper(second)?;
+        assert_ne!(interface.tun2socks.child_pid(), pid);
+        assert_eq!(interface.helper_proxy, Some(second));
+        assert!(interface.up);
+        interface.ownership = ownership;
+        assert_eq!(
+            interface
+                .state()
+                .ownership
+                .as_ref()
+                .context("owner")?
+                .routes
+                .len(),
+            1
+        );
+        Ok(())
     }
 
     /// `docs/spec/interfaces.md` binds this: "A reconnect under a held
