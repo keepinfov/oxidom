@@ -62,3 +62,4 @@ inside:
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | Clone to pull request: the dev shell, the checks, what a reviewer looks for |
 | [AGENTS.md](../AGENTS.md) | The working agreement — testing obligations, commits, releases, safeguards. Binding for humans and agents alike |
 | [spec/](spec/) | The implementation contract: on-disk formats, generated Xray configuration, the CLI surface, probe semantics, interfaces |
+| [testing.md](testing.md) | Isolated process tests, their assertions and remaining fault-verification boundaries |
