@@ -137,6 +137,15 @@ fn profile_save_payload(profile: &Profile) -> Result<String> {
     Ok(serde_json::to_string(&payload)?)
 }
 
+fn checked_profile_save_payload(
+    profile: &Profile,
+    expected: &crate::profile::ProfileExpectation,
+) -> Result<String> {
+    let mut payload: serde_json::Value = serde_json::from_str(&profile_save_payload(profile)?)?;
+    payload["expected_failover"] = serde_json::to_value(expected)?;
+    Ok(serde_json::to_string(&payload)?)
+}
+
 /// Is a system daemon installed at all? Only its D-Bus policy file can say:
 /// without one the bus would refuse every call, so a machine that has it has a
 /// system daemon, and a machine that does not never will.
@@ -686,6 +695,25 @@ impl DaemonClient {
         })
     }
 
+    pub fn save_profile_checked(
+        &self,
+        name: &str,
+        profile: &Profile,
+        expected: &crate::profile::ProfileExpectation,
+    ) -> Result<()> {
+        if !self.supports_failover() {
+            bail!(
+                "the selected daemon cannot guard failover edits; restart it with a compatible binary"
+            );
+        }
+        self.proxy
+            .call(
+                "SaveProfile",
+                &(name, checked_profile_save_payload(profile, expected)?),
+            )
+            .map_err(profiles_unsupported)
+    }
+
     pub fn set_profile_failover(
         &self,
         name: &str,
@@ -1098,6 +1126,28 @@ fn is_unknown_method(error: &zbus::Error) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn guarded_saves_carry_loaded_selection_and_policy_only_in_the_request() -> anyhow::Result<()> {
+        let loaded: crate::profile::Profile = serde_json::from_str(
+            r#"{"select":{"server":"canonical-a"},"failover":{"enabled":true,"members":["canonical-a","canonical-b"]}}"#,
+        )?;
+        let expected = crate::profile::ProfileExpectation::from(&loaded);
+        let mut edited = loaded.clone();
+        edited.description = "Edited description".into();
+        edited.failover.as_mut().unwrap().enabled = false;
+        let payload = super::checked_profile_save_payload(&edited, &expected)?;
+        let raw: serde_json::Value = serde_json::from_str(&payload)?;
+        let literal: serde_json::Value = serde_json::from_str(
+            r#"{"select":{"server":"canonical-a"},"failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":3,"cooldown_secs":30}}"#,
+        )?;
+        assert_eq!(raw["expected_failover"], literal);
+        assert_eq!(raw["failover"]["enabled"], false);
+        let persisted: crate::profile::Profile = serde_json::from_str(&payload)?;
+        assert_eq!(persisted, edited);
+        assert!(!persisted.to_toml()?.contains("expected_failover"));
+        Ok(())
+    }
+
+    #[test]
     fn saving_an_enabled_profile_carries_its_existing_authorization() -> anyhow::Result<()> {
         let profile: crate::profile::Profile = serde_json::from_str(
             r#"{"select":{"server":"primary-alias"},"failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":3,"cooldown_secs":30}}"#,
@@ -1300,6 +1350,17 @@ mod tests {
         assert!(!client.supports_geo_download());
         assert!(!client.supports_probe_cancel());
         assert!(!client.supports_failover());
+        assert!(
+            client
+                .save_profile_checked(
+                    "work",
+                    &crate::profile::Profile::default(),
+                    &crate::profile::ProfileExpectation::from(&crate::profile::Profile::default())
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cannot guard failover edits")
+        );
         assert!(
             client
                 .set_profile_failover("work", None)

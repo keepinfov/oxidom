@@ -155,6 +155,9 @@ Use the profile dialog’s **Sequential failover** section or
 `oxidom profile failover work [--json]` inspects saved and activation facts; `--disable` revokes
 future attempts while keeping list/limits. Setting a list or limit alone never enables policy.
 Saving does not start or rearm runtime: explicitly Stop/Up to activate the new saved grant.
+CLI flag updates preserve unmentioned current settings, including a concurrent disable.
+GUI/TOML editors refuse stale selection/authorization instead of restoring an older grant.
+Changing the primary in the dialog preserves its visible candidate list and limits disabled.
 The TOML editor `oxidom profile edit work` remains supported. This example uses
 invented IDs, not usable credentials or real catalog entries; substitute exact IDs from
 `oxidom list servers --json`, not aliases or name substrings:

@@ -79,7 +79,8 @@ legacy lifecycle and shows holding separately, never as a replacement lifecycle.
 `oxidom profile failover NAME [--enable|--disable] [--members ID,ID]
 [--max-attempts N] [--cooldown-secs N] [--json]` requires an existing selected daemon.
 Without setting flags it is read-only. Setting list/limits alone never opts in; disabled policy
-retains its list and limits. Only explicit saved Up arms a grant; configuration changes cannot
+retains its list and limits. Only explicit flags enter the patch payload; omitted enabled and
+other settings come from the current daemon state even after concurrent disable/removal. Only explicit saved Up arms a grant; configuration changes cannot
 rearm existing runtime. Validation, compatibility refusal and the narrow policy RPC follow
 [failover.md](failover.md#controls-and-progress-binding). Limits retain defaults 3/30 and ranges
 1..64/1..3600. Missing, ambiguous, duplicate or unsupported enabled candidates fail before save.

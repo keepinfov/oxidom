@@ -539,7 +539,7 @@ mod tests {
         disabled.enabled = false;
         service.set_profile_failover("work".into(), serde_json::to_string(&disabled)?)?;
         // The payload comes from the same CLI helper used by the command.
-        service.set_profile_failover("work".into(), args.policy_payload(&loaded)?)?;
+        service.set_profile_failover("work".into(), args.policy_payload()?)?;
         let current = profile::load("work")?.failover.unwrap();
         assert!(
             !current.enabled,
@@ -574,6 +574,72 @@ mod tests {
             "a stale authorization expectation must reject before writing"
         );
         assert_eq!(profile::load("work")?, disabled);
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_editor_guards_leave_current_selection_and_activation_armed() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-editor-selection-guard");
+        let (engine, loaded) = fixture()?;
+        let mut current = loaded.clone();
+        current.select.server = current.failover.as_ref().unwrap().members[1].clone();
+        profile::save("work", &current)?;
+        let target = ConnectionTarget::Server(current.select.server.clone());
+        let snapshot = Snapshot::new(&engine, &current, &target)?.unwrap();
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        let generation = service.shared.next_connect_generation("work");
+        service
+            .shared
+            .failover
+            .install("work", generation, snapshot);
+        for guard in [
+            serde_json::Value::Null,
+            serde_json::json!({"select": loaded.select, "failover": loaded.failover}),
+            serde_json::json!({"select": current.select, "failover": current.failover, "unknown": true}),
+        ] {
+            let mut raw = serde_json::to_value(&loaded)?;
+            raw["expected_failover"] = guard;
+            assert!(
+                service
+                    .save_profile("work".into(), raw.to_string())
+                    .is_err()
+            );
+            assert_eq!(profile::load("work")?, current);
+            assert!(service.shared.failover.armed("work"));
+        }
+        let mut raw = serde_json::to_value(&current)?;
+        raw["expected_failover"] =
+            serde_json::to_value(oxidom_core::profile::ProfileExpectation::from(&current))?;
+        raw["description"] = "Current editor".into();
+        service.save_profile("work".into(), raw.to_string())?;
+        assert_eq!(profile::load("work")?.description, "Current editor");
+        assert!(service.shared.failover.armed("work"));
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_policy_patch_preserves_the_absent_table_and_other_current_fields() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-empty-patch");
+        let (engine, mut profile) = fixture()?;
+        profile.failover = None;
+        profile::save("work", &profile)?;
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        service.set_profile_failover("work".into(), "{}".into())?;
+        assert_eq!(profile::load("work")?, profile);
+        service.set_profile_failover("work".into(), r#"{"cooldown_secs":45}"#.into())?;
+        let current = profile::load("work")?;
+        assert!(!current.failover.as_ref().unwrap().enabled);
+        assert_eq!(current.failover.as_ref().unwrap().cooldown_secs, 45);
+        assert_eq!(current.select, profile.select);
+        assert_eq!(current.proxy, profile.proxy);
         service.shared.terminate()?;
         Ok(())
     }

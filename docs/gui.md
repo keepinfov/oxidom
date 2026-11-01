@@ -66,7 +66,10 @@ disabled-by-default authorization. In the profile dialog, use **Sequential failo
 allow switching, add exact IDs with the catalog picker, and edit their comma-separated order.
 Include the primary and 2–64 unique IDs; aliases and rotating groups cannot authorize membership.
 Set maximum automatic attempts (default 3) and minimum seconds between them (default 30).
-Changing the primary turns switching off; enable again only after reviewing the new list.
+Changing the primary turns switching off while retaining the visible list and limits; enable
+again only after reviewing the new list. If another client changes the saved selection or
+authorization while this dialog is open, Save refuses the stale edit. Reopen the dialog and
+review current settings; it never silently restores permission revoked elsewhere.
 Disabling retains the list/limits. Saving never starts or rearms runtime; Stop/Start explicitly
 to activate a changed policy. An older daemon disables the controls with a restart explanation.
 The TOML editor remains available. Explicit saved-profile activation can arm the grant;

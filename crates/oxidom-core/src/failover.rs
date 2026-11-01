@@ -234,6 +234,52 @@ impl Default for FailoverPolicy {
     }
 }
 
+/// Request-only intent. Omitted fields never copy authorization from a stale
+/// client snapshot; the daemon applies them to its current saved policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct FailoverPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_secs: Option<u64>,
+}
+
+impl FailoverPatch {
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.members.is_none()
+            && self.max_attempts.is_none()
+            && self.cooldown_secs.is_none()
+    }
+
+    pub fn apply(&self, current: &mut Option<FailoverPolicy>) -> Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        let mut policy = current.clone().unwrap_or_default();
+        if let Some(enabled) = self.enabled {
+            policy.enabled = enabled;
+        }
+        if let Some(members) = &self.members {
+            policy.members = members.clone();
+        }
+        if let Some(max_attempts) = self.max_attempts {
+            policy.max_attempts = max_attempts;
+        }
+        if let Some(cooldown_secs) = self.cooldown_secs {
+            policy.cooldown_secs = cooldown_secs;
+        }
+        policy.validate()?;
+        *current = Some(policy);
+        Ok(())
+    }
+}
+
 impl FailoverPolicy {
     /// Validate persisted shape without resolving aliases or consulting a catalog.
     pub fn validate(&self) -> Result<()> {
@@ -453,6 +499,42 @@ impl Activation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_policy_edits_preserve_current_revocation_and_unmentioned_limits() -> Result<()> {
+        let patch: FailoverPatch = serde_json::from_str(r#"{"max_attempts":2}"#)?;
+        assert_eq!(serde_json::to_string(&patch)?, r#"{"max_attempts":2}"#);
+        let mut current = Some(FailoverPolicy {
+            enabled: false,
+            cooldown_secs: 45,
+            ..policy()
+        });
+        patch.apply(&mut current)?;
+        let updated = current.as_ref().unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.max_attempts, 2);
+        assert_eq!(updated.cooldown_secs, 45);
+        assert_eq!(updated.members, policy().members);
+        current = None;
+        let empty: FailoverPatch = serde_json::from_str("{}")?;
+        empty.apply(&mut current)?;
+        assert!(current.is_none());
+        patch.apply(&mut current)?;
+        assert!(!current.as_ref().unwrap().enabled);
+        assert_eq!(current.as_ref().unwrap().max_attempts, 2);
+        assert!(current.as_ref().unwrap().members.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_policy_patches_leave_the_current_authorization_untouched() {
+        let mut current = Some(policy());
+        let original = current.clone();
+        let patch: FailoverPatch = serde_json::from_str(r#"{"max_attempts":0}"#).unwrap();
+        assert!(patch.apply(&mut current).is_err());
+        assert_eq!(current, original);
+        assert!(serde_json::from_str::<FailoverPatch>(r#"{"enable":true}"#).is_err());
+    }
 
     #[test]
     fn progress_names_only_unvisited_authorized_candidates_without_admitting_them() -> Result<()> {

@@ -853,7 +853,7 @@ fn profile_command(command: ProfileCommand) -> CliResult {
                 client
                     .set_profile_failover_json(
                         &args.name,
-                        &args.policy_payload(&profile).map_err(Failure::error)?,
+                        &args.policy_payload().map_err(Failure::error)?,
                     )
                     .map_err(Failure::error)?;
                 profile = client.profile(&args.name).map_err(Failure::error)?;
@@ -1019,6 +1019,7 @@ fn new_profile(client: &DaemonClient, name: &str) -> CliResult {
 
 fn edit_profile(client: &DaemonClient, name: &str) -> CliResult {
     let profile = client.profile(name).map_err(Failure::error)?;
+    let expected = oxidom_core::profile::ProfileExpectation::from(&profile);
     let original = profile.to_toml().map_err(Failure::error)?;
     let temporary = TemporaryProfile::create(original.as_bytes()).map_err(Failure::error)?;
     open_editor(temporary.path())?;
@@ -1028,7 +1029,13 @@ fn edit_profile(client: &DaemonClient, name: &str) -> CliResult {
     }
     let profile = Profile::from_toml(&edited).map_err(Failure::error)?;
     profile.validate(name).map_err(Failure::error)?;
-    client.save_profile(name, &profile).map_err(Failure::error)
+    if client.supports_failover() {
+        client
+            .save_profile_checked(name, &profile, &expected)
+            .map_err(Failure::error)
+    } else {
+        client.save_profile(name, &profile).map_err(Failure::error)
+    }
 }
 
 /// $EDITOR, $VISUAL, or vi, on one file. Shared by everything that edits a

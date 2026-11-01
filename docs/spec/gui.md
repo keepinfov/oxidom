@@ -92,6 +92,9 @@ new attempt incarnation.
 Saved-profile failover follows [failover.md](failover.md). Current profile editors round-trip its
 optional policy, preserving unchanged authorization and explicitly removing it with JSON null.
 Changed selection or grant revokes the active snapshot; temporary Connect never inherits it.
+Current dialog saves carry loaded selection/policy expectations; concurrent changes reject the
+save before mutation and require reopening. Changing primary retains the visible candidate
+list and limits disabled, rather than silently deleting settings or transferring permission.
 The profile dialog exposes explicit policy controls as specified in
 [failover.md](failover.md#controls-and-progress-binding); the TOML editor remains supported.
 Enabled interfaces follow the bounded [owned-TUN contract](interfaces.md#owned-tun-failover-binding),

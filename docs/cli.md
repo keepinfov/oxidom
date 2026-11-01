@@ -287,7 +287,9 @@ oxidom profile failover work --disable
 The IDs above are invented; use exact IDs from `oxidom list servers --json`, not aliases.
 The list is ordered and fixed; refreshed servers never join it. No flags means inspection.
 `--enable` is the explicit opt-in; changing a list/limit alone does not turn a disabled policy
-on. Defaults are 3 attempts and 30 seconds, with ranges 1–64 and 1–3600. Disable keeps the list
+on, including when another client disabled or removed authorization after this command read
+the profile. Only explicit flags are sent; other fields come from current daemon settings.
+Defaults are 3 attempts and 30 seconds, with ranges 1–64 and 1–3600. Disable keeps the list
 and limits while revoking future starts; admitted confirmation may finish and held routes stay.
 Saved settings and the activation's original grant/progress are labelled separately. Exhaustion
 may occur before the budget if there are no untried alternates. Missing progress means unreported,

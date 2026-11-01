@@ -581,10 +581,13 @@ requires the bounded literal-IPv4 TUN envelope, effective hold policy and no cus
 specified in [interfaces.md](interfaces.md#owned-tun-failover-binding).
 Activation and automatic admission refuse missing or composite candidates. This is profile
 authorization, not a global reconnect setting; see [failover.md](failover.md).
-`SetProfileFailover` changes only that optional table under the activation/admission lock;
+`SetProfileFailover` patches only explicitly provided fields of that optional table under the
+activation/admission lock, preserving a concurrent disable when enabled is omitted;
 `SaveProfile` keeps its omission/null behavior. Both validate enabled policies against current
 catalog/primary/effective TUN settings before saving. These controls and optional runtime
 progress are specified in [failover.md](failover.md#controls-and-progress-binding).
+Checked editors carry request-only expected selection/policy metadata in SaveProfile JSON;
+conflicts or malformed guards fail before reconciliation/write. Metadata is never stored.
 No new persisted field or retry-progress resumption is introduced.
 
 Only authorization is persisted. Episode budget, visited candidates, cooldown deadlines and

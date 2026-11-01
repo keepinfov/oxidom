@@ -4177,6 +4177,16 @@ impl Service {
         let mut profile: Profile = serde_json::from_value(raw.clone()).map_err(failed)?;
         let engine = oxidom_core::sync::lock(&self.shared.engine);
         self.shared.ensure_open()?;
+        if let Some(expected) = raw.get("expected_failover") {
+            let expected: oxidom_core::profile::ProfileExpectation =
+                serde_json::from_value(expected.clone()).map_err(failed)?;
+            let current = profile::load_or_default(&name).map_err(failed)?;
+            if expected != oxidom_core::profile::ProfileExpectation::from(&current) {
+                return Err(failed(
+                    "profile selection or failover authorization changed; reopen the editor",
+                ));
+            }
+        }
         if raw.get("failover").is_none()
             && let Ok(previous) = profile::load(&name)
             && previous.select == profile.select
@@ -4208,11 +4218,19 @@ impl Service {
     /// policy update must not copy back an obsolete primary, ports or routing.
     fn set_profile_failover(&self, name: String, policy_json: String) -> fdo::Result<()> {
         let _request = self.shared.admit()?;
-        let policy = serde_json::from_str(&policy_json).map_err(failed)?;
+        let patch: Option<oxidom_core::failover::FailoverPatch> =
+            serde_json::from_str(&policy_json).map_err(failed)?;
         let engine = oxidom_core::sync::lock(&self.shared.engine);
         self.shared.ensure_open()?;
         let mut profile = profile::load(&name).map_err(failed)?;
-        profile.failover = policy;
+        if let Some(patch) = patch {
+            if patch.is_empty() {
+                return Ok(());
+            }
+            patch.apply(&mut profile.failover).map_err(failed)?;
+        } else {
+            profile.failover = None;
+        }
         failover::validate_saved(&engine, &name, &profile).map_err(failed)?;
         self.shared
             .failover

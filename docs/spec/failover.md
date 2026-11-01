@@ -34,25 +34,39 @@ limits. No flags means no mutation; `--json` changes output only. These existing
 never bootstrap, stop, start or rearm a session. Repeated enable of the same policy does not
 rearm a revoked activation. Explicit Stop/Up is required for a new activation.
 
-The additive `SetProfileFailover(name: String, policy_json: String) -> ()` D-Bus method replaces
-only the optional policy (a JSON policy object, or null for removal). It loads the latest saved
-profile under the same engine lock as activation/admission; stale CLI reads cannot write back
-primary, ports, interface, routing or core options. Validation and durable persistence precede
+The additive `SetProfileFailover(name: String, policy_json: String) -> ()` D-Bus method patches
+only the optional policy. Its JSON object has optional `enabled`, `members`, `max_attempts` and
+`cooldown_secs`; only present non-null fields are changed. Omitted fields come from the CURRENT
+saved policy under the activation/admission lock, never the client snapshot. Thus a limits-only
+edit cannot undo a concurrent disable or restore a removed group. Empty `{}` is a no-op,
+including keeping an absent section absent; top-level null removes the policy. Unknown patch
+fields are refused. Stale CLI reads cannot write back primary, ports, interface, routing or
+core options. Validation and durable persistence precede
 use by a later explicit activation. Changed authorization revokes the current activation before
 persistence; failed writes disarm it. It never removes a held interface or interrupts admitted
 confirmation. `SaveProfile` remains available, with unchanged signature and legacy omission/null
-semantics. Both mutation paths validate enabled authorization against the current catalog,
+semantics. Both writing paths validate enabled authorization against the current catalog,
 resolved primary and effective TUN envelope; a disabled policy can retain unavailable IDs.
 Activation/admission still revalidate, since the catalog can change after saving.
 
 The profile dialog provides an off-by-default switch, an ordered comma-separated exact-ID list,
 a catalog picker with explicit Add, and bounded attempt/cooldown controls. Add appends a canonical
 ID, never an alias or implicit group. The list can be reordered/trimmed explicitly. Selecting a
-new primary or pool turns switching off and invalidates the prior permission; enabling it after
-that selection is an explicit new authorization. Pools cannot enable it. Ordinary unchanged
+new primary or pool turns switching off and invalidates the prior permission while retaining
+the visible list and limits in disabled form; enabling it after that selection is an explicit
+new authorization. Pools cannot enable it. Ordinary unchanged
 saves preserve policy; untouched new/legacy profiles keep the section absent. Saving never
 starts or rearms runtime. The dialog explains temporary-connection exclusion, fixed membership,
 revocation and the restricted TUN boundary.
+
+Current GUI and TOML editors send request-only `expected_failover: {select, failover}` in the
+existing SaveProfile JSON. The expectation is captured when loading, independently of edited
+values. Under the engine lock the daemon compares both fields with the current saved profile
+before reconciliation, disarming or writing. A conflict fails explicitly and requires reopening;
+no automatic merge/replay or authorization restoration follows an unrelated description/limit
+edit. Malformed/null expectation is an error, not an unchecked save. An absent expectation
+retains legacy caller behavior. The guard is never serialized into a profile or recovery file.
+It guards selection and authorization, not a revision of every profile field.
 
 The read-only daemon handshake advertises `profile_failover`. New clients refuse policy writes
 without it; the GUI explains why controls are unavailable instead of silently succeeding against

@@ -210,10 +210,23 @@ pub struct FailoverArgs {
 }
 
 impl FailoverArgs {
-    pub fn policy_payload(&self, loaded: &oxidom_core::profile::Profile) -> anyhow::Result<String> {
-        let mut profile = loaded.clone();
-        self.apply(&mut profile)?;
-        Ok(serde_json::to_string(&profile.failover)?)
+    pub fn policy_payload(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(&self.patch())?)
+    }
+
+    pub fn patch(&self) -> oxidom_core::failover::FailoverPatch {
+        oxidom_core::failover::FailoverPatch {
+            enabled: if self.enable {
+                Some(true)
+            } else if self.disable {
+                Some(false)
+            } else {
+                None
+            },
+            members: self.members.clone(),
+            max_attempts: self.max_attempts.map(usize::from),
+            cooldown_secs: self.cooldown_secs.map(u64::from),
+        }
     }
 
     pub fn changes_policy(&self) -> bool {
@@ -222,28 +235,6 @@ impl FailoverArgs {
             || self.members.is_some()
             || self.max_attempts.is_some()
             || self.cooldown_secs.is_some()
-    }
-
-    pub fn apply(&self, profile: &mut oxidom_core::profile::Profile) -> anyhow::Result<()> {
-        if !self.changes_policy() {
-            return Ok(());
-        }
-        let mut policy = profile.failover.clone().unwrap_or_default();
-        if self.enable || self.disable {
-            policy.enabled = self.enable;
-        }
-        if let Some(members) = &self.members {
-            policy.members = members.clone();
-        }
-        if let Some(max_attempts) = self.max_attempts {
-            policy.max_attempts = usize::from(max_attempts);
-        }
-        if let Some(cooldown_secs) = self.cooldown_secs {
-            policy.cooldown_secs = u64::from(cooldown_secs);
-        }
-        policy.validate()?;
-        profile.failover = Some(policy);
-        profile.validate(&self.name)
     }
 }
 
@@ -434,16 +425,22 @@ mod tests {
             "--cooldown-secs",
             "45",
         ]);
-        args.apply(&mut profile).unwrap();
+        args.patch().apply(&mut profile.failover).unwrap();
+        assert_eq!(
+            args.policy_payload().unwrap(),
+            r#"{"members":["canonical-b","canonical-a"],"max_attempts":2,"cooldown_secs":45}"#
+        );
         let policy = profile.failover.as_ref().unwrap();
         assert!(!policy.enabled);
         assert_eq!(policy.members, ["canonical-b", "canonical-a"]);
         assert_eq!((policy.max_attempts, policy.cooldown_secs), (2, 45));
         let enable = failover_args(&["oxidom", "profile", "failover", "work", "--enable"]);
-        enable.apply(&mut profile).unwrap();
+        assert_eq!(enable.policy_payload().unwrap(), r#"{"enabled":true}"#);
+        enable.patch().apply(&mut profile.failover).unwrap();
         assert!(profile.failover.as_ref().unwrap().enabled);
         let disable = failover_args(&["oxidom", "profile", "failover", "work", "--disable"]);
-        disable.apply(&mut profile).unwrap();
+        assert_eq!(disable.policy_payload().unwrap(), r#"{"enabled":false}"#);
+        disable.patch().apply(&mut profile.failover).unwrap();
         let policy = profile.failover.unwrap();
         assert!(!policy.enabled);
         assert_eq!(policy.members, ["canonical-b", "canonical-a"]);
@@ -454,7 +451,7 @@ mod tests {
     fn inspecting_failover_does_not_create_or_enable_a_policy() {
         let args = failover_args(&["oxidom", "profile", "failover", "work", "--json"]);
         let mut profile = oxidom_core::profile::Profile::default();
-        args.apply(&mut profile).unwrap();
+        args.patch().apply(&mut profile.failover).unwrap();
         assert!(!args.changes_policy());
         assert!(profile.failover.is_none());
     }
@@ -484,7 +481,7 @@ mod tests {
             ]);
             let mut profile = oxidom_core::profile::Profile::default();
             profile.select.server = "a".into();
-            assert!(args.apply(&mut profile).is_err());
+            assert!(args.patch().apply(&mut profile.failover).is_err());
         }
     }
 
