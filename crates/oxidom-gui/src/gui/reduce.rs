@@ -6168,6 +6168,10 @@ mod tests {
                     "No legacy hold reported; runtime protection not reported"
                 ),
                 ("Retry", "Not reported by daemon"),
+                (
+                    "Failover authorization",
+                    "Not reported; no activation grant inferred from saved settings"
+                ),
                 ("Saved target", "shared"),
                 ("Reported target", "shared"),
                 ("Reported status", "connected"),
@@ -6218,6 +6222,10 @@ mod tests {
                     "No legacy hold reported; runtime protection not reported"
                 ),
                 ("Retry", "Not reported by daemon"),
+                (
+                    "Failover authorization",
+                    "Not reported; no activation grant inferred from saved settings"
+                ),
                 ("Saved target", "shared"),
                 ("Reported target", "Shared server"),
                 ("Reported status", "connecting"),
