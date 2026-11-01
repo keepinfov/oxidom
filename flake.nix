@@ -169,6 +169,9 @@
               inherit self pkgs lib;
               inherit (inputs) nixpkgs;
             };
+            gui-smoke = import ./nix/checks/gui-smoke.nix {
+              inherit pkgs lib oxidom-cli oxidom-gui;
+            };
           };
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [pkg-config wrapGAppsHook4];

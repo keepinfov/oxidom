@@ -26,8 +26,11 @@ nix develop -c cargo run -p oxidom -- status  # the CLI
 nix develop -c cargo test --workspace         # ~7s once warm
 ```
 
-You do not need a real VPN subscription to develop. Nothing in the test suite
-talks to a network.
+You do not need a real VPN subscription to develop. The default suite does not
+contact external destinations.
+
+The Linux flake checks also include an [isolated GUI lifecycle smoke](docs/gui-smoke.md)
+with private display, bus and fake core. It runs separately from GTK-free unit tests.
 
 ## Find something to do
 
