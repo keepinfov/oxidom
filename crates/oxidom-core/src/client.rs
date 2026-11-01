@@ -1306,7 +1306,7 @@ mod tests {
                 .to_string()
                 .contains("cannot configure failover")
         );
-        let profile = Profile {
+        let profile = crate::profile::Profile {
             failover: Some(crate::failover::FailoverPolicy::default()),
             ..Default::default()
         };
