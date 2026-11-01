@@ -1201,14 +1201,16 @@ mod tests {
         .unwrap();
         let mut values = DialogValues::new(Some(&entry));
         values.interface_enable = true;
-        let saved = profile_from_dialog(values);
+        let mut saved = profile_from_dialog(values);
         assert_eq!(saved.failover, entry.failover);
+        saved.validate("work").unwrap();
+        saved.on_core_exit = Some(OnCoreExit::Release);
         assert!(
             saved
                 .validate("work")
                 .unwrap_err()
                 .to_string()
-                .contains("interface")
+                .contains("hold")
         );
     }
 

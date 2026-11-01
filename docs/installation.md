@@ -20,6 +20,7 @@ oxidom downloads its pinned, verified **Xray core** automatically on first use.
 - [Arch](#arch)
 - [From source](#from-source)
 - [Managed session daemon](#managed-session-daemon)
+- [Downgrading after owned TUN use](#downgrading-after-owned-tun-use)
 - [Tested distro matrix](#tested-distro-matrix)
 - [Getting an Xray core](#getting-an-xray-core)
 - [Optional runtime dependencies](#optional-runtime-dependencies)
@@ -423,6 +424,32 @@ journalctl --user -u oxidom-session.service -f
 
 The unit does not introduce portable automatic supervision, transport reconnection
 after loss of the bus itself, or a new daemon shutdown protocol.
+
+## Downgrading after owned TUN use
+
+**Breaking recovery-format restriction:** owned failover TUN sessions write
+`format_version = 1` recovery state with ownership-qualified device, route and rule intents.
+The new daemon still reads normal legacy state. Older binaries do **not** refuse the new state:
+they ignore the version/ownership fields and can rewrite the file without the only safe cleanup
+identity. Empty legacy route/rule/device-cleanup fields reduce unsafe legacy deletion, but do
+not make downgrade with live or outstanding owned records supported.
+
+Before installing or launching an older binary:
+
+1. Keep the new binary running against the owning store. Explicitly stop every owned TUN
+   session with `oxidom down <profile>` or its GUI Stop control. This removes the owned TUN,
+   unlike ordinary legacy persistent-device retention.
+2. Resolve every cleanup or persistence error using the new compatible binary. Complete any
+   crash recovery and verify no `interface.ownership` recovery records remain in that store's
+   `state.toml`, including dirty records. An empty-looking status alone is not this verification.
+3. Stop the new daemon and any launcher/supervisor that could start it. Only after successful
+   cleanup and durable forgetting, downgrade the binaries and deliberately start the old daemon.
+
+Never downgrade while any owned recovery record remains. Do not delete state, strip ownership,
+or let an old writer "migrate" it. If cleanup cannot complete, retain the new binary and diagnose
+the [blocked recovery](troubleshooting.md#owned-tun-recovery-is-blocked). Package installation,
+service restart and source support are not VM evidence for the new TUN failover packet path;
+required P14/P15 validation remains separate and P12 is not declared complete here.
 
 ## Tested distro matrix
 

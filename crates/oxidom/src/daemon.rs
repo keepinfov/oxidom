@@ -936,11 +936,20 @@ impl Shared {
             .collect::<Vec<_>>();
         let mut dead = Vec::new();
         for profile in profiles {
+            if !self.failover_helper_ready_locked(&mut engine, &profile) {
+                continue;
+            }
             let Some(session) = engine.sessions.get_mut(&profile) else {
                 continue;
             };
-            let alive = session.is_alive();
-            if session.status() != Status::Connected || alive {
+            let alive = session.core_is_alive();
+            if alive {
+                // Restore legacy helpers too, but never label a helper failure
+                // as remote core death.
+                let _ = engine.ensure_interface_helper(&profile);
+                continue;
+            }
+            if session.status() != Status::Connected {
                 continue;
             }
             let Some(target) = reconnect_target(session) else {
@@ -2086,6 +2095,7 @@ impl Shared {
         let connect_result = {
             let mut engine = oxidom_core::sync::lock(&self.engine);
             let accepted = self.generation_is_current(profile, generation)
+                && self.failover_helper_ready_locked(&mut engine, profile)
                 && (origin != ConnectionOrigin::Failover
                     || self.admit_failover_locked(&engine, profile, target, generation))
                 && (origin != ConnectionOrigin::Reconnect
@@ -2183,7 +2193,14 @@ impl Shared {
                         ),
                     );
                     oxidom_core::sync::lock(&self.probes).finish(probe_job.token);
-                    engine.sessions.release_system_proxy(profile);
+                    if !engine.sessions.get(profile).is_some_and(|session| {
+                        session
+                            .interface
+                            .as_ref()
+                            .is_some_and(|interface| interface.envelope.is_some())
+                    }) {
+                        engine.sessions.release_system_proxy(profile);
+                    }
                 }
                 Some(result)
             }
@@ -2447,7 +2464,10 @@ impl Shared {
         let order = oxidom_core::sync::lock(&self.diagnostic_order);
         let mut engine = oxidom_core::sync::lock(&self.engine);
         // Currentness and interface/traffic release form one engine operation.
+        let helper_ready = !self.confirmation_is_current(&engine, profile, snapshot)
+            || self.failover_helper_ready_locked(&mut engine, profile);
         let current = self.confirmation_is_current(&engine, profile, snapshot)
+            && helper_ready
             && engine.sessions.get(profile).is_some_and(|session| {
                 session.status() == Status::Connected
                     && session.selection.as_ref() == Some(&target.selection())
@@ -2456,7 +2476,7 @@ impl Shared {
                 || engine
                     .sessions
                     .get_mut(profile)
-                    .is_some_and(|session| session.is_alive()));
+                    .is_some_and(|session| session.core_is_alive()));
         if current {
             if let Err(error) = engine.start_interface(profile) {
                 self.failover.disarm(profile);
@@ -2504,10 +2524,11 @@ impl Shared {
             {
                 log::warn!("profile {profile:?} reconnected without the system proxy: {error:#}");
             }
-        } else if self.confirmation_is_current(&engine, profile, snapshot)
+        } else if helper_ready
+            && self.confirmation_is_current(&engine, profile, snapshot)
             && self.failover.owns(profile, snapshot.generation)
             && engine.sessions.get_mut(profile).is_some_and(|session| {
-                session.selection.as_ref() == Some(&target.selection()) && !session.is_alive()
+                session.selection.as_ref() == Some(&target.selection()) && !session.core_is_alive()
             })
         {
             // The request succeeded, but its core died before the receipt could
@@ -2587,6 +2608,7 @@ impl Shared {
                 .map(|(_, _, method)| method)
                 .unwrap_or_default(),
         );
+        let helper_ready = self.failover_helper_ready_locked(&mut engine, profile);
         let still_active = engine.sessions.get(profile).is_some_and(|session| {
             session.selection.as_ref() == Some(&target.selection())
                 && session.status() == Status::Connected
@@ -2615,7 +2637,7 @@ impl Shared {
         }
         // Only a typed, measured remote failure permits another candidate.
         // An inbound/configuration failure is not evidence against a server.
-        let eligible = failover::eligible_confirmation(end, probe_outcome, &logs);
+        let eligible = helper_ready && failover::eligible_confirmation(end, probe_outcome, &logs);
         self.failover_failure_locked(&engine, profile, target, snapshot, eligible, false);
         drop(engine);
         drop(order);
@@ -2880,6 +2902,9 @@ impl Shared {
                 || engine.registry.config.watchdog != WatchdogMode::Aggressive
                 || !(resilient(&engine, profile) || self.failover.armed(profile))
             {
+                return None;
+            }
+            if !self.failover_helper_ready_locked(&mut engine, profile) {
                 return None;
             }
             let session = engine.sessions.get_mut(profile)?;
@@ -4148,7 +4173,7 @@ impl Service {
         let _request = self.shared.admit()?;
         let raw: serde_json::Value = serde_json::from_str(&profile_json).map_err(failed)?;
         let mut profile: Profile = serde_json::from_value(raw.clone()).map_err(failed)?;
-        let _engine = oxidom_core::sync::lock(&self.shared.engine);
+        let engine = oxidom_core::sync::lock(&self.shared.engine);
         self.shared.ensure_open()?;
         if raw.get("failover").is_none()
             && let Ok(previous) = profile::load(&name)
@@ -4158,7 +4183,9 @@ impl Service {
         }
         // Revoke changed grants before persistence; unrelated successful saves
         // preserve the active snapshot. A failed write disarms below.
-        self.shared.failover.reconcile_profile(&name, &profile);
+        self.shared
+            .failover
+            .reconcile_profile(&engine, &name, &profile);
         // `save` re-checks both the name and the ports. The daemon owns the
         // profiles directory — on the system bus it is root's — so validation
         // that only ran in the caller would be no validation at all.
@@ -4292,7 +4319,22 @@ impl Service {
                 .map_err(failed)?;
             engine.configure_core(&name, &profile.core, profile_routing);
             engine.configure_hold_traffic(&name, profile.on_core_exit);
-            if let Err(error) = engine.configure_interface(&name, &profile.interface, &servers) {
+            let interface_result = if activation.is_some() && profile.interface.enable {
+                let members = &profile
+                    .failover
+                    .as_ref()
+                    .expect("validated authorization")
+                    .members;
+                let candidates = engine
+                    .all_servers()
+                    .filter(|server| members.contains(&server.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                engine.configure_failover_interface(&name, &profile.interface, &candidates)
+            } else {
+                engine.configure_interface(&name, &profile.interface, &servers)
+            };
+            if let Err(error) = interface_result {
                 engine.sessions.remove(&name);
                 return Err(failed(error));
             }
@@ -4376,6 +4418,7 @@ impl Service {
         let order = oxidom_core::sync::lock(&self.shared.diagnostic_order);
         let mut engine = oxidom_core::sync::lock(&self.shared.engine);
         self.shared.ensure_open()?;
+        self.shared.failover.disarm(&profile);
         let result = engine.delete_interface(&profile);
         let mut facts = Facts::default();
         oxidom_core::sync::lock(&self.shared.identities).prune(&engine, &mut facts);
@@ -4592,6 +4635,20 @@ impl Service {
             oxidom_core::sync::lock(&self.shared.identities).flush_all(&mut facts);
         }
         engine.registry.config = config;
+        for name in engine
+            .sessions
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect::<Vec<_>>()
+        {
+            match profile::load(&name) {
+                Ok(profile) => self
+                    .shared
+                    .failover
+                    .reconcile_profile(&engine, &name, &profile),
+                Err(_) => self.shared.failover.disarm(&name),
+            }
+        }
         self.shared.cancel_disabled_retries(&engine);
         let socks_port = engine.registry.config.socks_port;
         let http_port = engine.registry.config.http_port;
@@ -4990,7 +5047,7 @@ pub(super) fn run(
         &oxidom_core::paths::config_dir()?,
     )?;
     diagnostics.phase(Phase::Recovery);
-    let mut engine = Engine::load();
+    let mut engine = Engine::load_checked()?;
     diagnostics.catalog_load_warnings(engine.registry.load_warnings.len());
     for warning in engine.registry.load_warnings.drain(..) {
         log::warn!("{warning}");

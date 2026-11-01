@@ -97,14 +97,16 @@ services.oxidom.enable = true;
 services.oxidom.tun.enable = true;
 ```
 
-Everything is derived and stable, so two profiles never collide: device
+Without owned TUN failover, routing identities are derived and stable: device
 `oxi-<profile>` (within Linux's 15-byte name limit), a `/32` address from the
 RFC 2544 benchmark block `198.18.0.0/16` (`default` is `198.18.0.1`), and a
 routing table id, fwmark and rule priority that share one value — `0x6f00` for
 `default`, then `0x6f01..0x6fff`, chosen to stay clear of the marks people
-actually use.
+actually use. Owned failover uses randomized mark/table identity and a separately derived rule
+priority instead; do not depend on the stable values for that mode. Existing resource conflicts
+are refused, not proof that a route belongs to oxidom.
 
-The device is **persistent**: an ordinary `down` stops tun2socks and removes
+The legacy device is **persistent**: an ordinary `down` stops tun2socks and removes
 oxidom's routes but leaves the device, so hand-written routes on it survive a
 reconnect. `oxidom tun --down` removes it — but only if oxidom created it. A
 device someone else made is never deleted:
@@ -126,7 +128,7 @@ is not by itself a VPN.
 |---|---|
 | `"manual"` | Nothing. Only `oxidom run` traffic is carried. |
 | `"list"` | Each CIDR in `[interface] list` is routed via the device. |
-| `"default"` | A host route to each server via the old gateway, plus `0.0.0.0/1` and `128.0.0.0/1` via the device — the classic split default. Everything goes through the tunnel. |
+| `"default"` | A host route to each server via the old gateway, plus `0.0.0.0/1` and `128.0.0.0/1` via the device: split-default IPv4 capture, subject to more-specific routes and existing direct/private exceptions. Not IPv6 or resolver containment. |
 
 `routes = "default"` needs a current default IPv4 gateway, and `oxidom up` warns:
 
@@ -141,6 +143,55 @@ connected routes, so your LAN and its resolver stay reachable from inside.
 The interface is brought up only **after** the SOCKS inbound has passed its check —
 a tunnel that cannot carry traffic never gets to capture your routes. If bring-up
 fails, the session is torn back down rather than left half-applied.
+
+### Owned TUN failover
+
+[Saved-profile failover](profiles-and-pools.md#sequential-failover) supports a bounded TUN mode,
+not arbitrary endpoint or route changes. It requires effective `on_core_exit = "hold"`, no
+custom profile `routing`, and 2..64 exact authorized IDs with supported typed literal unicast
+IPv4 dial endpoints. Supported protocols are VLESS, VMess, Trojan, Shadowsocks, SOCKS, HTTP and
+Hysteria2. Stream transports are default/TCP, WebSocket, gRPC, XHTTP/splithttp and h2, with
+default/none, TLS or REALITY security. Domains, IPv6, loopback/link-local/nonunicast dial
+addresses, composite profiles, raw outbound patches, XHTTP extras, ECH and port hopping are
+refused before starting the initial candidate. TLS/HTTP names may still be names; they are not
+the dial endpoint. Every candidate must remain in the original address/shape envelope.
+
+Only one such TUN may exist, with no other configured TUN in the same engine. Starting failover
+beside an existing TUN, or starting another TUN beside retained failover ownership, is refused.
+Proxy-only sessions remain allowed. A pre-existing device is refused instead of adopted.
+
+The route modes keep distinct scopes:
+
+- `manual` changes no main-table route. Capture still needs an explicit mark or administrator
+  route; merely enabling failover is not a VPN.
+- `list` first installs deduplicated `/32` main-table bypasses for every authorized IPv4
+  candidate via the original default gateway, then its listed capture networks. It needs a
+  default gateway and refuses a capture `/32` equal to a candidate address.
+- `default` installs the same candidate union before the two IPv4 half-default captures.
+- The private marked-application table gets connected routes and its TUN default, never the
+  candidate bypass union. The union must not give `oxidom run` a direct candidate escape.
+
+The daemon exclusively creates a transient device, stamps its alias/index identity and durably
+records complete cleanup intent before making it persistent or adding addresses/routes/rules.
+Owned routes carry protocol 242 and a random metric; rules carry protocol 242, full mark mask,
+randomized mark/table and derived priority. Checks before capture refuse routing conflicts,
+but netlink cannot atomically reserve the whole plan against arbitrary privileged writers.
+Coordinate other route managers/administrators; do not treat protocol 242 as a security token.
+
+Automatic switches reuse the device, bypass union, private domain and captures. They do not
+tear down the hold between candidates. Failed confirmation, exhaustion, revocation and catalog
+removal of the current member keep assigned traffic held and direct standby off. Explicit Stop
+removes the owned device as well as its routes/rule; legacy ordinary disconnect still leaves
+its persistent device. Cleanup failures retain ownership, block reuse and require resolution,
+not deleting `state.toml`. [Downgrade only after new-binary cleanup](installation.md#downgrading-after-owned-tun-use).
+
+Helper restoration is local, not a reason to blame or advance a remote server. A new helper
+is checked for immediate child liveness and its PID is persisted. One automatic replacement
+is allowed; repeated helper failure requires explicit teardown. These checks and HTTP confirmation
+through SOCKS are not continuous proof of packet forwarding through TUN. This remains scoped
+IPv4 capture with connected/private exceptions, no resolver rewrite and no whole-device promise.
+P12 is not complete merely because the source implements this path: P14/P15 validation remains
+required, and no VM packet-path or leak measurement is claimed here.
 
 ## Per-process routing
 

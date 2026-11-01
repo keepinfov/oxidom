@@ -157,8 +157,13 @@ impl Profile {
                 if self.select.server.trim().is_empty() || self.select.pool.is_some() {
                     bail!("enabled [failover] requires a single-server selection, not a pool");
                 }
-                if self.interface.enable {
-                    bail!("enabled [failover] does not support an enabled interface");
+                if self.interface.enable
+                    && self.on_core_exit == Some(crate::config::OnCoreExit::Release)
+                {
+                    bail!("TUN failover requires on_core_exit = hold");
+                }
+                if self.interface.enable && self.routing.is_some() {
+                    bail!("TUN failover does not support custom routing blocks");
                 }
                 // The saved selection may be an alias. The daemon checks the
                 // resolved canonical primary against members at activation.
@@ -479,19 +484,21 @@ future_key = "ignored"
     }
 
     #[test]
-    fn enabled_failover_requires_a_proxy_only_single_server_profile() -> Result<()> {
+    fn enabled_failover_requires_a_single_server_and_tun_requires_hold_without_raw_routing()
+    -> Result<()> {
         let mut profile = Profile::from_toml(
             "[select]\nserver = \"primary-alias\"\n[failover]\nenabled = true\nmembers = [\"a\", \"b\"]\n",
         )?;
         profile.validate("work")?;
         profile.interface.enable = true;
-        assert!(
-            profile
-                .validate("work")
-                .unwrap_err()
-                .to_string()
-                .contains("interface")
-        );
+        profile.validate("work")?;
+        profile.on_core_exit = Some(crate::config::OnCoreExit::Release);
+        assert!(profile.validate("work").is_err());
+        profile.on_core_exit = Some(crate::config::OnCoreExit::Hold);
+        profile.routing = Some("{}".into());
+        assert!(profile.validate("work").is_err());
+        profile.routing = None;
+        profile.validate("work")?;
         profile.interface.enable = false;
         profile.select.server.clear();
         assert!(profile.validate("work").is_err());

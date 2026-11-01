@@ -85,6 +85,14 @@ protocol, geo-asset or certificate complaints take priority and disarm rather th
 do not authorize another candidate. Startup errors are currently untyped and conservatively
 disarm without advancing, even though an admitted automatic start consumed budget.
 
+For owned TUN failover, helper loss/restoration is local evidence, never permission to advance a
+remote candidate. A newly spawned helper receives an immediate child-liveness check and
+replacement PID persistence is required. Repeated helper failure disarms while
+retaining the held device/routes. The full envelope, effective hold and current candidate set
+must remain valid at admission. Neither helper process survival nor HTTP through SOCKS proves
+continuous TUN forwarding, DNS containment or whole-device protection. P14/P15 validation is
+still required; these source semantics are not VM packet-path evidence.
+
 Direct probes, latency ranking and diagnostic events grant no application authorization.
 Confirmation remains generation/core-attributed and traffic-based. Successful recovery resets
 the episode, but retains activation-wide cooldown. The next automatic admission waits for the

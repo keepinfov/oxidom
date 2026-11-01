@@ -40,7 +40,9 @@ running session intact so the unit can still stop what it started.
 `oxidom run` do not authorize alternates. The initial resolved server must be an authorized
 canonical ID. Ordered exact IDs are neither pool handles nor a rule, subscription or GUI group;
 no alias matching, ranking, health filter or empty-list expansion may enroll candidates.
-Candidates use the current configuration of each authorized ID, not frozen endpoint bytes.
+Candidates use the current configuration of each authorized ID. For enabled interfaces the
+bounded TUN envelope additionally pins IPv4 address and supported outbound shape, not credentials;
+see [interfaces.md](interfaces.md#owned-tun-failover-binding).
 
 Recovery visits the other members cyclically from the failed member, each at most once per
 episode, and stops at budget or candidate exhaustion. The explicit initial start is outside the
@@ -52,9 +54,13 @@ reconnect. Stop, replacement and shutdown cancel future starts; stale receipts c
 replacement. Removal of the profile disarms without implicitly stopping its session. Removal of
 any authorized catalog ID disarms permanently for that activation; readdition cannot rearm it.
 
-This is P12 stage 1, proxy-only: enabled interfaces and pools are refused. Safe TUN failover is
-still a mandatory second stage, so P12 remains open. Dedicated CLI/GUI controls belong to P13;
-the existing `oxidom profile edit <name>` TOML workflow is the current opt-in surface.
+Pools remain refused. Enabled interfaces require effective hold, supported literal unicast IPv4
+candidates, no custom profile routing, exclusive TUN admission and qualified recovery ownership.
+Proxy-only sessions may coexist with that TUN. Its hold and plan survive switches, exhaustion,
+revocation and current-member removal; explicit Stop deletes its owned device, unlike a legacy
+persistent TUN. Dirty cleanup must be resolved before reuse. P12 is not marked complete from
+source; P14/P15 validation is still required, with no VM evidence claimed. Dedicated CLI/GUI
+controls belong to P13; `oxidom profile edit <name>` remains the opt-in surface.
 
 A profile selects **either** one server **or** a pool, never both:
 

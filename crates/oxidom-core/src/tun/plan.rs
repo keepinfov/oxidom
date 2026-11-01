@@ -170,6 +170,38 @@ pub fn plan_routes(input: &PlanInput<'_>) -> Result<RoutePlan> {
     })
 }
 
+/// The bounded union is main-table only. A marked application's private table
+/// must never gain a direct route to a candidate from this envelope.
+pub fn plan_failover_routes(input: &PlanInput<'_>) -> Result<RoutePlan> {
+    let mut plan = plan_routes(input)?;
+    if input.mode == RouteMode::List {
+        let gateway = input
+            .default_gateway
+            .context("TUN failover list routes require a default IPv4 gateway")?;
+        let mut bypasses = Vec::new();
+        for address in &input.server_addresses {
+            if input
+                .list
+                .iter()
+                .any(|route| route.prefix == 32 && route.address == *address)
+            {
+                bail!("TUN failover capture /32 conflicts with a candidate bypass");
+            }
+            let bypass = RouteSpec {
+                destination: cidr(*address, 32),
+                via: Via::Gateway(gateway),
+                table: 254,
+            };
+            if !bypasses.contains(&bypass) {
+                bypasses.push(bypass);
+            }
+        }
+        bypasses.append(&mut plan.system);
+        plan.system = bypasses;
+    }
+    Ok(plan)
+}
+
 const fn cidr(address: Ipv4Addr, prefix: u8) -> Cidr {
     Cidr { address, prefix }
 }
@@ -177,6 +209,49 @@ const fn cidr(address: Ipv4Addr, prefix: u8) -> Cidr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failover_list_bypasses_the_literal_union_before_capture_only_in_main() -> Result<()> {
+        let list = ["0.0.0.0/0".parse()?];
+        let mut input = input(RouteMode::List);
+        input.list = &list;
+        input.server_addresses.push(Ipv4Addr::new(198, 51, 100, 9));
+        let plan = plan_failover_routes(&input)?;
+        assert_eq!(
+            plan.system
+                .iter()
+                .map(|route| route.destination.to_string())
+                .collect::<Vec<_>>(),
+            ["203.0.113.7/32", "198.51.100.9/32", "0.0.0.0/0"]
+        );
+        assert!(
+            plan.system[..2]
+                .iter()
+                .all(|route| route.table == 254 && matches!(route.via, Via::Gateway(_)))
+        );
+        assert!(
+            plan.private
+                .iter()
+                .all(|route| !matches!(route.via, Via::Gateway(_)))
+        );
+        let conflict = ["203.0.113.7/32".parse()?];
+        input.list = &conflict;
+        assert!(plan_failover_routes(&input).is_err());
+        input.list = &list;
+        input.default_gateway = None;
+        assert!(plan_failover_routes(&input).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn failover_manual_and_default_keep_the_existing_route_semantics() -> Result<()> {
+        for mode in [RouteMode::Manual, RouteMode::Default] {
+            let mut input = input(mode);
+            input.server_addresses.push(Ipv4Addr::new(198, 51, 100, 9));
+            assert_eq!(plan_failover_routes(&input)?, plan_routes(&input)?);
+        }
+        Ok(())
+    }
 
     const CONNECTED: [ConnectedRoute; 1] = [ConnectedRoute {
         destination: Cidr {

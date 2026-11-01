@@ -8,6 +8,42 @@ use libc::c_short;
 
 const IFF_TUN: c_short = 0x0001;
 const IFF_NO_PI: c_short = 0x1000;
+const IFF_TUN_EXCL: c_short = 0x8000_u16 as c_short;
+
+/// A newly allocated nonpersistent device. Until persistence is enabled, a
+/// crash or error closes this fd and the kernel removes the transient device.
+pub struct TransientTun(std::fs::File);
+
+impl TransientTun {
+    pub fn create_exclusive(name: &str, owner_uid: u32) -> Result<Self> {
+        crate::bind::validate_device_name(name)?;
+        let file = open_tun()?;
+        let mut request = request(name);
+        request.flags |= IFF_TUN_EXCL;
+        // SAFETY: request has the kernel ifreq layout; EXCL refuses attachment
+        // to an existing device while holding the kernel RTNL lock.
+        ioctl_result(
+            unsafe { tun_set_iff(file.as_raw_fd(), &request) },
+            "exclusively creating",
+            name,
+        )?;
+        // SAFETY: the fd refers only to the newly created device.
+        ioctl_result(
+            unsafe { tun_set_owner(file.as_raw_fd(), owner_uid as libc::c_int) },
+            "setting exclusive owner",
+            name,
+        )?;
+        Ok(Self(file))
+    }
+
+    /// Caller must durably record identity and cleanup intents before this.
+    pub fn make_persistent(&self) -> Result<()> {
+        // SAFETY: this fd still refers to the exclusively allocated device.
+        unsafe { tun_set_persist(self.0.as_raw_fd(), 1) }
+            .context("making exclusive TUN persistent")?;
+        Ok(())
+    }
+}
 
 #[repr(C)]
 struct IfReq {
@@ -153,6 +189,14 @@ fn ioctl_result<T>(result: nix::Result<T>, operation: &str, name: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exclusive_creation_requests_the_kernel_exclusion_bit_without_changing_legacy_flags() {
+        let legacy = super::request("oxi-test");
+        assert_eq!(legacy.flags as u16, 0x1001);
+        let mut exclusive = super::request("oxi-test");
+        exclusive.flags |= super::IFF_TUN_EXCL;
+        assert_eq!(exclusive.flags as u16, 0x9001);
+    }
     #[test]
     fn kernel_ifreq_layout_is_exact() {
         assert_eq!(std::mem::size_of::<super::IfReq>(), 40);

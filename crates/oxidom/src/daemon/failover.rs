@@ -1,7 +1,7 @@
 //! Saved-profile grants and their private, nonpersistent recovery progress.
 
 use super::*;
-use oxidom_core::failover::{Activation, Decision, FailoverPolicy};
+use oxidom_core::failover::{Activation, Decision, FailoverPolicy, TunEnvelope};
 use oxidom_core::ipc::RuntimeRetry;
 use oxidom_core::profile::ProfileSelect;
 
@@ -40,6 +40,7 @@ pub(super) struct Snapshot {
     select: ProfileSelect,
     policy: FailoverPolicy,
     activation: Activation,
+    envelope: Option<TunEnvelope>,
 }
 
 impl Snapshot {
@@ -52,25 +53,59 @@ impl Snapshot {
             return Ok(None);
         };
         anyhow::ensure!(
-            !profile.interface.enable && profile.select.pool.is_none(),
-            "failover requires a proxy-only single-server profile"
+            profile.select.pool.is_none(),
+            "failover requires a single-server profile"
         );
         policy.validate_candidates(engine.all_servers())?;
         let initial = target
             .server_id()
             .context("failover requires a single server")?;
+        let envelope = if profile.interface.enable {
+            Some(TunEnvelope::new(
+                engine
+                    .all_servers()
+                    .filter(|server| policy.members.contains(&server.id)),
+                &profile.interface,
+                profile
+                    .on_core_exit
+                    .unwrap_or(engine.registry.config.on_core_exit),
+            )?)
+        } else {
+            None
+        };
         Ok(Some(Self {
             initial: initial.into(),
             select: profile.select.clone(),
             policy: policy.clone(),
             activation: Activation::new(policy.clone(), initial)?,
+            envelope,
         }))
     }
 
-    fn matches(&self, profile: &Profile) -> bool {
+    fn matches(&self, engine: &Engine, profile: &Profile) -> bool {
         profile.select == self.select
             && profile.failover.as_ref() == Some(&self.policy)
-            && !profile.interface.enable
+            && match &self.envelope {
+                Some(envelope) => envelope
+                    .validate_interface(
+                        &profile.interface,
+                        profile
+                            .on_core_exit
+                            .unwrap_or(engine.registry.config.on_core_exit),
+                    )
+                    .is_ok(),
+                None => !profile.interface.enable,
+            }
+    }
+
+    fn catalog_is_current(&self, engine: &Engine) -> bool {
+        self.policy
+            .validate_candidates(engine.all_servers())
+            .is_ok()
+            && self
+                .envelope
+                .as_ref()
+                .is_none_or(|envelope| envelope.validate_candidates(engine.all_servers()).is_ok())
     }
 }
 
@@ -132,10 +167,10 @@ impl Activations {
             entry.snapshot.activation.disarm();
         }
     }
-    pub(super) fn reconcile_profile(&self, name: &str, profile: &Profile) {
+    pub(super) fn reconcile_profile(&self, engine: &Engine, name: &str, profile: &Profile) {
         let mut entries = oxidom_core::sync::lock(&self.0);
         if let Some(entry) = entries.get_mut(name)
-            && !entry.snapshot.matches(profile)
+            && !entry.snapshot.matches(engine, profile)
         {
             entry.disarmed = true;
             entry.snapshot.activation.disarm();
@@ -143,12 +178,7 @@ impl Activations {
     }
     pub(super) fn reconcile_catalog(&self, engine: &Engine) {
         for entry in oxidom_core::sync::lock(&self.0).values_mut() {
-            if entry
-                .snapshot
-                .policy
-                .validate_candidates(engine.all_servers())
-                .is_err()
-            {
+            if !entry.snapshot.catalog_is_current(engine) {
                 entry.disarmed = true;
                 entry.snapshot.activation.disarm();
             }
@@ -231,6 +261,36 @@ impl Entry {
 }
 
 impl Shared {
+    pub(super) fn failover_helper_ready_locked(&self, engine: &mut Engine, profile: &str) -> bool {
+        let owned = engine.sessions.get(profile).is_some_and(|session| {
+            session
+                .interface
+                .as_ref()
+                .is_some_and(|interface| interface.envelope.is_some())
+        });
+        if owned && let Err(error) = engine.ensure_interface_helper(profile) {
+            self.failover_helper_failed_locked(engine, profile, &error);
+            return false;
+        }
+        true
+    }
+
+    fn failover_helper_failed_locked(
+        &self,
+        engine: &mut Engine,
+        profile: &str,
+        error: &anyhow::Error,
+    ) {
+        self.failover.disarm(profile);
+        if let Some(session) = engine.sessions.get_mut(profile) {
+            session.core.disconnect();
+            session.core.fail(&format!(
+                "could not restore the profile interface helper: {error:#}"
+            ));
+        }
+        engine.note_core_exit(profile);
+    }
+
     /// Called with engine ownership, never from diagnostics or catalog refresh.
     pub(super) fn failover_failure_locked(
         &self,
@@ -314,12 +374,8 @@ impl Shared {
             return false;
         };
         let valid = profile::load(profile).is_ok_and(|profile| {
-            profile.validate("activation").is_ok() && entry.snapshot.matches(&profile)
-        }) && entry
-            .snapshot
-            .policy
-            .validate_candidates(engine.all_servers())
-            .is_ok();
+            profile.validate("activation").is_ok() && entry.snapshot.matches(engine, &profile)
+        }) && entry.snapshot.catalog_is_current(engine);
         if !valid {
             entry.disarmed = true;
             entry.snapshot.activation.disarm();
@@ -784,6 +840,268 @@ mod tests {
     }
 
     #[test]
+    fn tun_snapshots_cover_every_authorized_address_and_require_effective_hold() -> Result<()> {
+        use oxidom_core::config::OnCoreExit;
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("tun-snapshot-hold");
+        let (mut engine, mut profile) = fixture()?;
+        profile.interface.enable = true;
+        let target = ConnectionTarget::Server(profile.select.server.clone());
+        engine.registry.config.on_core_exit = OnCoreExit::Release;
+        assert!(Snapshot::new(&engine, &profile, &target).is_err());
+        profile.on_core_exit = Some(OnCoreExit::Hold);
+        let snapshot = Snapshot::new(&engine, &profile, &target)?.unwrap();
+        let envelope = snapshot.envelope.as_ref().unwrap();
+        assert_eq!(envelope.addresses().len(), 2);
+        for id in &profile.failover.as_ref().unwrap().members {
+            assert!(envelope.contains(id));
+        }
+        assert!(snapshot.matches(&engine, &profile));
+        profile.on_core_exit = None;
+        assert!(!snapshot.matches(&engine, &profile));
+        engine.registry.config.on_core_exit = OnCoreExit::Hold;
+        assert!(snapshot.matches(&engine, &profile));
+        profile.interface.mtu = 1400;
+        assert!(!snapshot.matches(&engine, &profile));
+        Ok(())
+    }
+
+    #[test]
+    fn tun_catalog_endpoint_changes_disarm_permanently_but_labels_remain_current() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("tun-catalog-envelope");
+        let (mut engine, mut profile) = fixture()?;
+        profile.interface.enable = true;
+        profile.on_core_exit = Some(oxidom_core::config::OnCoreExit::Hold);
+        let target = ConnectionTarget::Server(profile.select.server.clone());
+        let snapshot = Snapshot::new(&engine, &profile, &target)?.unwrap();
+        let original = engine.registry.subscriptions.clone();
+        engine.registry.subscriptions[0].servers[0].name = "Updated catalog label".into();
+        assert!(snapshot.catalog_is_current(&engine));
+        let activations = Activations::default();
+        activations.install("work", 1, snapshot);
+        // Even changing the non-current member must revoke the whole union.
+        let alternate = &profile.failover.as_ref().unwrap().members[1];
+        for subscription in &mut engine.registry.subscriptions {
+            for server in &mut subscription.servers {
+                if &server.id == alternate {
+                    server.address = "192.0.2.99".into();
+                }
+            }
+        }
+        activations.reconcile_catalog(&engine);
+        assert!(!activations.armed("work"));
+        engine.registry.subscriptions = original;
+        activations.reconcile_catalog(&engine);
+        assert!(!activations.armed("work"));
+        Ok(())
+    }
+
+    #[test]
+    fn external_tun_policy_changes_block_admission_without_consuming_an_attempt() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("tun-policy-admission");
+        let (engine, mut profile) = fixture()?;
+        profile.interface.enable = true;
+        profile.on_core_exit = Some(oxidom_core::config::OnCoreExit::Hold);
+        let primary = ConnectionTarget::Server(profile.select.server.clone());
+        let alternate =
+            ConnectionTarget::Server(profile.failover.as_ref().unwrap().members[1].clone());
+        let snapshot = Snapshot::new(&engine, &profile, &primary)?.unwrap();
+        let shared = Shared::new(engine, false, false, false);
+        let generation = shared.next_connect_generation("work");
+        shared.failover.install("work", generation, snapshot);
+        {
+            let mut entries = oxidom_core::sync::lock(&shared.failover.0);
+            let entry = entries.get_mut("work").unwrap();
+            entry.snapshot.activation.begin_episode(&entry.current)?;
+            entry.backoff = Instant::now();
+        }
+        profile.on_core_exit = Some(oxidom_core::config::OnCoreExit::Release);
+        assert!(profile::save("work", &profile).is_err());
+        // External file edits do not pass through the validated save API.
+        oxidom_core::fsutil::write_private_atomic(
+            &oxidom_core::paths::profiles_dir()?.join("work.toml"),
+            profile.to_toml()?.as_bytes(),
+        )?;
+        assert_eq!(
+            profile::load("work")?.on_core_exit,
+            Some(oxidom_core::config::OnCoreExit::Release)
+        );
+        let engine = oxidom_core::sync::lock(&shared.engine);
+        assert!(!shared.admit_failover_locked(&engine, "work", &alternate, generation));
+        assert!(!shared.failover.armed("work"));
+        assert_eq!(
+            oxidom_core::sync::lock(&shared.failover.0)["work"].ordinal,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_helper_failure_disarms_a_live_fake_core_and_keeps_the_hold() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let (_root, service, target, subject) = live_activation(false)?;
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            let session = engine.sessions.get_mut("default").unwrap();
+            assert!(session.core_is_alive());
+            // Boolean hold seam: no real device or privileged interface setup.
+            session.holds_traffic = true;
+            session.holding_traffic = true;
+            service.shared.failover_helper_failed_locked(
+                &mut engine,
+                "default",
+                &anyhow::anyhow!("offline helper failed"),
+            );
+            assert!(engine.sessions.get("default").unwrap().holding_traffic);
+        }
+        assert!(service.shared.capture_core_deaths().is_empty());
+        assert!(!service.shared.apply_confirmation_success(
+            "default",
+            &target,
+            ConnectionOrigin::Explicit,
+            subject,
+        ));
+        assert!(!service.shared.failover.armed("default"));
+        let retry = service
+            .shared
+            .failover
+            .retry("default", Some(subject.generation), Instant::now())
+            .unwrap();
+        assert_eq!(retry.state, "idle");
+        assert_eq!(retry.ordinal, 0);
+        // The fake helper seam stopped the core without synchronizing its saved
+        // PID. Explicit teardown reconciles it only after the hold assertions.
+        assert!(service.stop_profile("default")?);
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_interface_deletion_revokes_even_when_no_interface_exists() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let (_root, service, _target, subject) = live_activation(false)?;
+        assert!(!service.delete_interface("default".into())?);
+        assert!(!service.shared.failover.armed("default"));
+        assert!(service.shared.failover.owns("default", subject.generation));
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn settings_endpoint_restarts_revoke_the_existing_grant_without_rearming() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let (_root, service, _target, subject) = live_activation(false)?;
+        let mut config = oxidom_core::sync::lock(&service.shared.engine)
+            .registry
+            .config
+            .clone();
+        let socks = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let http = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        config.socks_port = socks.local_addr()?.port();
+        config.http_port = http.local_addr()?.port();
+        drop((socks, http));
+        let result: ApplySettingsResult =
+            serde_json::from_str(&service.set_settings(serde_json::to_string(&config)?)?)?;
+        assert!(result.reconnect_error.is_none());
+        assert_ne!(
+            service.shared.current_generation("default"),
+            Some(subject.generation)
+        );
+        assert!(!service.shared.failover.armed("default"));
+        assert!(!service.shared.failover.owns("default", subject.generation));
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn saved_tun_interface_changes_revoke_and_restoring_settings_never_rearms() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("tun-profile-currentness");
+        let (engine, mut profile) = fixture()?;
+        profile.interface.enable = true;
+        profile.on_core_exit = Some(oxidom_core::config::OnCoreExit::Hold);
+        let target = ConnectionTarget::Server(profile.select.server.clone());
+        let snapshot = Snapshot::new(&engine, &profile, &target)?.unwrap();
+        profile::save("work", &profile)?;
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        let generation = service.shared.next_connect_generation("work");
+        service
+            .shared
+            .failover
+            .install("work", generation, snapshot);
+        let original = profile.clone();
+        profile.interface.mtu = 1400;
+        service.save_profile("work".into(), serde_json::to_string(&profile)?)?;
+        assert!(!service.shared.failover.armed("work"));
+        service.save_profile("work".into(), serde_json::to_string(&original)?)?;
+        assert!(!service.shared.failover.armed("work"));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_interface_deletion_revokes_before_touching_unresolved_owned_resources() -> Result<()>
+    {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let (_root, service, _target, subject) = live_activation(false)?;
+        {
+            let mut engine = oxidom_core::sync::lock(&service.shared.engine);
+            let interface = serde_json::from_value(serde_json::json!({
+                "device": "oxi-invented",
+                "ownership": {
+                    "cookie": "0123456789abcdef0123456789abcdef",
+                    "metric": 1234567,
+                    "gateway_interface": null,
+                    "device_index": null,
+                    "routes": [],
+                    "rule": null
+                }
+            }))?;
+            engine
+                .state
+                .sessions
+                .push(oxidom_core::state::SessionState {
+                    profile: "default".into(),
+                    interface: Some(interface),
+                    ..Default::default()
+                });
+        }
+        assert!(service.delete_interface("default".into()).is_err());
+        assert!(!service.shared.failover.armed("default"));
+        assert!(service.shared.failover.owns("default", subject.generation));
+        // Remove only the invented recovery fixture before ordinary test cleanup.
+        oxidom_core::sync::lock(&service.shared.engine)
+            .state
+            .sessions
+            .retain(|session| session.interface.is_none());
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn tun_activation_rejects_an_unsupported_alternate_before_initial_start() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("tun-alternate-shape");
+        let (mut engine, mut profile) = fixture()?;
+        profile.interface.enable = true;
+        let target = ConnectionTarget::Server(profile.select.server.clone());
+        let alternate = &profile.failover.as_ref().unwrap().members[1];
+        for subscription in &mut engine.registry.subscriptions {
+            for server in &mut subscription.servers {
+                if &server.id == alternate {
+                    server.address = "alternate.example.invalid".into();
+                }
+            }
+        }
+        assert!(Snapshot::new(&engine, &profile, &target).is_err());
+        assert!(engine.sessions.get("work").is_none());
+        Ok(())
+    }
+
+    #[test]
     fn absent_or_disabled_authorization_never_creates_an_activation() -> Result<()> {
         let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("failover-no-grant");
@@ -814,7 +1132,7 @@ mod tests {
         engine.registry.subscriptions = subscriptions;
         activations.reconcile_catalog(&engine);
         assert!(!activations.armed("work"));
-        activations.reconcile_profile("work", &profile);
+        activations.reconcile_profile(&engine, "work", &profile);
         assert!(!activations.armed("work"));
         assert!(activations.owns("work", 1));
         Ok(())
