@@ -235,6 +235,19 @@ impl OwnedChild {
         Ok(())
     }
 
+    fn reap_verified_bus_loss(&mut self) -> Result<()> {
+        let status = self.child.wait()?;
+        self.reaped = true;
+        ensure!(!status.success(), "bus loss must report a terminal failure");
+        let log = self.log();
+        ensure!(
+            log.contains("D-Bus transport closed")
+                || log.contains("D-Bus service ownership unavailable"),
+            "daemon failed outside the expected bus-loss boundary: {log}"
+        );
+        Ok(())
+    }
+
     fn kill_group(&self) {
         let _ = nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(self.child.id() as i32),
@@ -555,7 +568,7 @@ fn ready_sessions(proxy: &zbus::blocking::Proxy<'_>, names: &[&str]) -> Result<(
 fn one_store_owner_reaps_independent_sessions_and_restarts_without_permission_resumption()
 -> Result<()> {
     let _subreaper = Subreaper::install()?;
-    let harness = Harness::new()?;
+    let mut harness = Harness::new()?;
     let sentinels = [
         harness.config_dir().join("config.toml"),
         harness.config_dir().join("profiles/default.toml"),
@@ -843,8 +856,36 @@ fn one_store_owner_reaps_independent_sessions_and_restarts_without_permission_re
             .is_some_and(serde_json::Value::is_null),
         "CLI reports no resumed activation"
     );
-    restarted.terminate()?;
-    restarted.reap_verified_shutdown()?;
+    // A transport loss is also terminal. A fresh explicit Up creates one core;
+    // killing only our private bus must make the daemon drain it by itself.
+    harness.cli(&["up", "home"])?;
+    ready_sessions(&next, &["home"])?;
+    let before_loss: oxidom_core::state::State =
+        toml::from_str(&fs::read_to_string(harness.data_dir().join("state.toml"))?)?;
+    ensure!(
+        before_loss.sessions.len() == 1,
+        "only the explicit Up resumed"
+    );
+    let core = ProcessFd::open(
+        before_loss.sessions[0]
+            .xray_pid
+            .context("core before private bus loss")?,
+    )?;
+    harness.bus.child.kill()?;
+    harness.bus.child.wait()?;
+    restarted
+        .process
+        .wait(LIMIT)
+        .with_context(|| restarted.log())?;
+    core.wait(LIMIT)?;
+    core.was_reaped_by_daemon()?;
+    restarted.reap_verified_bus_loss()?;
+    let after_loss: oxidom_core::state::State =
+        toml::from_str(&fs::read_to_string(harness.data_dir().join("state.toml"))?)?;
+    ensure!(
+        after_loss.sessions.is_empty(),
+        "bus loss clears recovery sessions"
+    );
     Ok(())
 }
 

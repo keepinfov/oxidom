@@ -45,7 +45,8 @@ proxy settings.
 
 The process assertions cover store-owner contention without saved-file changes,
 independent saved-profile sessions, loss and explicit recovery of one core,
-terminal shutdown and a new daemon incarnation using the same store. Losing or
+terminal signal shutdown, a new daemon incarnation using the same store and
+private-bus transport loss with a live session. Losing or
 stopping an unarmed peer must preserve the other session's core and unused
 activation grant. The tests inspect both client-visible state and child-process
 lifecycle. A saved failover policy surviving restart does not authorize automatic
