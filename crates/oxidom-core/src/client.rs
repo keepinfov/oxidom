@@ -666,10 +666,42 @@ impl DaemonClient {
     }
 
     pub fn save_profile(&self, name: &str, profile: &Profile) -> Result<()> {
+        if profile.failover.is_some() && !self.supports_failover() {
+            bail!(
+                "the selected daemon cannot configure failover; restart it with a compatible binary"
+            );
+        }
         let payload = profile_save_payload(profile)?;
         self.proxy
             .call("SaveProfile", &(name, payload))
             .map_err(profiles_unsupported)
+    }
+
+    /// Discovery is read-only and bound to this daemon's unique owner.
+    pub fn supports_failover(&self) -> bool {
+        self.info.as_ref().is_some_and(|info| {
+            info.capabilities
+                .iter()
+                .any(|capability| capability == "profile_failover")
+        })
+    }
+
+    pub fn set_profile_failover(
+        &self,
+        name: &str,
+        policy: Option<&crate::failover::FailoverPolicy>,
+    ) -> Result<()> {
+        if !self.supports_failover() {
+            bail!(
+                "the selected daemon cannot configure failover; restart it with a compatible binary"
+            );
+        }
+        self.proxy
+            .call(
+                "SetProfileFailover",
+                &(name, serde_json::to_string(&policy)?),
+            )
+            .map_err(friendly)
     }
 
     pub fn remove_profile(&self, name: &str) -> Result<bool> {
@@ -1266,6 +1298,25 @@ mod tests {
         let client = private_client(&bus)?;
         assert!(!client.supports_geo_download());
         assert!(!client.supports_probe_cancel());
+        assert!(!client.supports_failover());
+        assert!(
+            client
+                .set_profile_failover("work", None)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot configure failover")
+        );
+        let profile = Profile {
+            failover: Some(crate::failover::FailoverPolicy::default()),
+            ..Default::default()
+        };
+        assert!(
+            client
+                .save_profile("work", &profile)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot configure failover")
+        );
         assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
         Ok(())
     }
@@ -1275,6 +1326,45 @@ mod tests {
         incarnation: String,
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         malformed: bool,
+    }
+
+    struct PolicyDaemon(std::sync::Arc<std::sync::Mutex<(String, String)>>);
+
+    #[zbus::interface(name = "dev.keepinfov.oxidom1")]
+    impl PolicyDaemon {
+        fn status(&self) -> String {
+            r#"{"state":"disconnected"}"#.into()
+        }
+        fn daemon_info(&self) -> String {
+            serde_json::json!({"version": 1, "incarnation": "a".repeat(64),
+                "store_id": "b".repeat(64), "capabilities": ["profile_failover"]})
+            .to_string()
+        }
+        fn set_profile_failover(&self, name: String, policy: String) {
+            *crate::sync::lock(&self.0) = (name, policy);
+        }
+    }
+
+    #[test]
+    fn policy_controls_send_only_the_exact_policy_to_the_bound_daemon() -> anyhow::Result<()> {
+        let bus = PrivateBus::start()?;
+        let received = std::sync::Arc::new(std::sync::Mutex::new((String::new(), String::new())));
+        let _server = private_service(&bus, PolicyDaemon(received.clone()))?;
+        let client = private_client(&bus)?;
+        assert!(client.supports_failover());
+        let policy = crate::failover::FailoverPolicy {
+            enabled: true,
+            members: vec!["canonical-b".into(), "canonical-a".into()],
+            ..Default::default()
+        };
+        client.set_profile_failover("work", Some(&policy))?;
+        assert_eq!(*crate::sync::lock(&received), ("work".into(), r#"{"enabled":true,"members":["canonical-b","canonical-a"],"max_attempts":3,"cooldown_secs":30}"#.into()));
+        client.set_profile_failover("work", None)?;
+        assert_eq!(
+            *crate::sync::lock(&received),
+            ("work".into(), "null".into())
+        );
+        Ok(())
     }
 
     #[zbus::interface(name = "dev.keepinfov.oxidom1")]

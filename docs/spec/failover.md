@@ -5,7 +5,7 @@
 P12 is delivered in two required parts. The first implements proxy-only saved-profile
 failover; the second adds safe interface routing. P12 is not complete after the first part.
 The TUN part supports an explicitly bounded routing envelope, described below. No routing
-protection claim follows from proxy-only operation. P13 adds dedicated controls.
+protection claim follows from proxy-only operation. Dedicated controls follow the contract below.
 
 ## Persisted Authorization
 
@@ -23,6 +23,53 @@ ConnectPool, global reconnect and `oxidom run` do not authorize alternate server
 configuration is persisted before a later activation can use it. No automatic attempt
 rewrites the saved selection. Candidates use the current configuration of an authorized
 ID, not an immutable endpoint snapshot; missing IDs cannot be replaced by aliases.
+
+## Controls And Progress (binding)
+
+`oxidom profile failover NAME` reads saved authorization and the current activation, if reported.
+`--enable` and `--disable` are mutually exclusive explicit choices. `--members ID,ID` replaces the
+ordered exact-ID list; `--max-attempts` and `--cooldown-secs` replace only those settings. Merely
+setting a list or limit never enables an absent/disabled policy. Disable retains the list and
+limits. No flags means no mutation; `--json` changes output only. These existing-daemon commands
+never bootstrap, stop, start or rearm a session. Repeated enable of the same policy does not
+rearm a revoked activation. Explicit Stop/Up is required for a new activation.
+
+The additive `SetProfileFailover(name: String, policy_json: String) -> ()` D-Bus method replaces
+only the optional policy (a JSON policy object, or null for removal). It loads the latest saved
+profile under the same engine lock as activation/admission; stale CLI reads cannot write back
+primary, ports, interface, routing or core options. Validation and durable persistence precede
+use by a later explicit activation. Changed authorization revokes the current activation before
+persistence; failed writes disarm it. It never removes a held interface or interrupts admitted
+confirmation. `SaveProfile` remains available, with unchanged signature and legacy omission/null
+semantics. Both mutation paths validate enabled authorization against the current catalog,
+resolved primary and effective TUN envelope; a disabled policy can retain unavailable IDs.
+Activation/admission still revalidate, since the catalog can change after saving.
+
+The profile dialog provides an off-by-default switch, an ordered comma-separated exact-ID list,
+a catalog picker with explicit Add, and bounded attempt/cooldown controls. Add appends a canonical
+ID, never an alias or implicit group. The list can be reordered/trimmed explicitly. Selecting a
+new primary or pool turns switching off and invalidates the prior permission; enabling it after
+that selection is an explicit new authorization. Pools cannot enable it. Ordinary unchanged
+saves preserve policy; untouched new/legacy profiles keep the section absent. Saving never
+starts or rearms runtime. The dialog explains temporary-connection exclusion, fixed membership,
+revocation and the restricted TUN boundary.
+
+The read-only daemon handshake advertises `profile_failover`. New clients refuse policy writes
+without it; the GUI explains why controls are unavailable instead of silently succeeding against
+a daemon that ignores the field. No mutating capability probes are permitted. Older clients
+ignore the new capability, method and runtime field; their existing signatures remain valid.
+
+`runtime.failover` is optional, omitted when no activation grant is reported, and never inferred
+from saved configuration. It is generation-fenced application state with open-string `state`
+(`armed`, `recovering`, `exhausted`, `disarmed`), ordered canonical `members`, `current` ID,
+optional `next` ID, episode `attempts`, `max_attempts` and `cooldown_secs`. Waiting reports the
+next unvisited authorized candidate without admitting it; in-flight, idle, exhausted and
+disarmed states have no next candidate. Attempts count automatic admissions, excluding explicit
+Up; success resets the episode. Exhaustion can occur before max_attempts when every alternate
+was tried. Revocation retains the activation's original list and progress for explanation;
+new saved settings do not relabel it. Stop/replacement clears that old activation. Missing or
+unknown facts do not establish disabled policy, authorization, health or protection. GUI details
+and CLI text/JSON present these facts separately from phase, health, hold and retry deadlines.
 
 ## Recovery Episode
 

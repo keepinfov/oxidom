@@ -1301,6 +1301,7 @@ impl Shared {
             if let Some(retry) = self.failover.retry(profile, generation, Instant::now()) {
                 runtime.retry = retry;
             }
+            runtime.failover = self.failover.progress(profile, generation, Instant::now());
         }
         info
     }
@@ -3483,6 +3484,7 @@ fn session_info_with_status(
                 state: "idle".to_string(),
                 ..Default::default()
             },
+            failover: None,
         }),
     }
 }
@@ -4181,6 +4183,7 @@ impl Service {
         {
             profile.failover = previous.failover;
         }
+        failover::validate_saved(&engine, &name, &profile).map_err(failed)?;
         // Revoke changed grants before persistence; unrelated successful saves
         // preserve the active snapshot. A failed write disarms below.
         self.shared
@@ -4189,6 +4192,31 @@ impl Service {
         // `save` re-checks both the name and the ports. The daemon owns the
         // profiles directory — on the system bus it is root's — so validation
         // that only ran in the caller would be no validation at all.
+        let _commit = self
+            .shared
+            .lifecycle
+            .commit()
+            .ok_or_else(|| failed("daemon is stopping"))?;
+        let result = profile::save(&name, &profile);
+        if result.is_err() {
+            self.shared.failover.disarm(&name);
+        }
+        result.map_err(failed)
+    }
+
+    /// Change only authorization, under the activation/admission lock. A CLI
+    /// policy update must not copy back an obsolete primary, ports or routing.
+    fn set_profile_failover(&self, name: String, policy_json: String) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
+        let policy = serde_json::from_str(&policy_json).map_err(failed)?;
+        let engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
+        let mut profile = profile::load(&name).map_err(failed)?;
+        profile.failover = policy;
+        failover::validate_saved(&engine, &name, &profile).map_err(failed)?;
+        self.shared
+            .failover
+            .reconcile_profile(&engine, &name, &profile);
         let _commit = self
             .shared
             .lifecycle

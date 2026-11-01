@@ -180,8 +180,65 @@ pub enum ProfileCommand {
     New { name: String },
     /// Edit one profile with $EDITOR, $VISUAL, or vi.
     Edit { name: String },
+    /// Inspect or explicitly configure sequential failover for a saved profile.
+    Failover(FailoverArgs),
     /// Remove one profile.
     Rm { name: String },
+}
+
+#[derive(clap::Args, Debug)]
+pub struct FailoverArgs {
+    pub name: String,
+    /// Authorize switching within the fixed ordered list on the next saved Up.
+    #[arg(long, conflicts_with = "disable")]
+    pub enable: bool,
+    /// Revoke future automatic starts, retaining the configured list and limits.
+    #[arg(long)]
+    pub disable: bool,
+    /// Ordered exact canonical IDs, comma-separated; aliases and rules are refused.
+    #[arg(long, value_delimiter = ',', value_name = "ID,ID")]
+    pub members: Option<Vec<String>>,
+    /// Maximum automatic starts per recovery episode (1..64; default 3).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=64))]
+    pub max_attempts: Option<u8>,
+    /// Minimum seconds between automatic starts (1..3600; default 30).
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=3600))]
+    pub cooldown_secs: Option<u16>,
+    /// Print saved authorization and this activation's progress as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl FailoverArgs {
+    pub fn changes_policy(&self) -> bool {
+        self.enable
+            || self.disable
+            || self.members.is_some()
+            || self.max_attempts.is_some()
+            || self.cooldown_secs.is_some()
+    }
+
+    pub fn apply(&self, profile: &mut oxidom_core::profile::Profile) -> anyhow::Result<()> {
+        if !self.changes_policy() {
+            return Ok(());
+        }
+        let mut policy = profile.failover.clone().unwrap_or_default();
+        if self.enable || self.disable {
+            policy.enabled = self.enable;
+        }
+        if let Some(members) = &self.members {
+            policy.members = members.clone();
+        }
+        if let Some(max_attempts) = self.max_attempts {
+            policy.max_attempts = usize::from(max_attempts);
+        }
+        if let Some(cooldown_secs) = self.cooldown_secs {
+            policy.cooldown_secs = u64::from(cooldown_secs);
+        }
+        policy.validate()?;
+        profile.failover = Some(policy);
+        profile.validate(&self.name)
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -343,6 +400,87 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    fn failover_args(args: &[&str]) -> FailoverArgs {
+        let cli = parse(args).unwrap();
+        let Command::Profile {
+            command: ProfileCommand::Failover(args),
+        } = cli.command
+        else {
+            panic!("failover command expected")
+        };
+        args
+    }
+
+    #[test]
+    fn failover_requires_explicit_enable_and_preserves_exact_member_order() {
+        let mut profile = oxidom_core::profile::Profile::default();
+        profile.select.server = "primary-alias".into();
+        let args = failover_args(&[
+            "oxidom",
+            "profile",
+            "failover",
+            "work",
+            "--members",
+            "canonical-b,canonical-a",
+            "--max-attempts",
+            "2",
+            "--cooldown-secs",
+            "45",
+        ]);
+        args.apply(&mut profile).unwrap();
+        let policy = profile.failover.as_ref().unwrap();
+        assert!(!policy.enabled);
+        assert_eq!(policy.members, ["canonical-b", "canonical-a"]);
+        assert_eq!((policy.max_attempts, policy.cooldown_secs), (2, 45));
+        let enable = failover_args(&["oxidom", "profile", "failover", "work", "--enable"]);
+        enable.apply(&mut profile).unwrap();
+        assert!(profile.failover.as_ref().unwrap().enabled);
+        let disable = failover_args(&["oxidom", "profile", "failover", "work", "--disable"]);
+        disable.apply(&mut profile).unwrap();
+        let policy = profile.failover.unwrap();
+        assert!(!policy.enabled);
+        assert_eq!(policy.members, ["canonical-b", "canonical-a"]);
+        assert_eq!((policy.max_attempts, policy.cooldown_secs), (2, 45));
+    }
+
+    #[test]
+    fn inspecting_failover_does_not_create_or_enable_a_policy() {
+        let args = failover_args(&["oxidom", "profile", "failover", "work", "--json"]);
+        let mut profile = oxidom_core::profile::Profile::default();
+        args.apply(&mut profile).unwrap();
+        assert!(!args.changes_policy());
+        assert!(profile.failover.is_none());
+    }
+
+    #[test]
+    fn failover_controls_refuse_ambiguous_switches_and_unbounded_limits() {
+        for flags in [
+            vec!["--enable", "--disable"],
+            vec!["--max-attempts", "0"],
+            vec!["--max-attempts", "65"],
+            vec!["--cooldown-secs", "0"],
+            vec!["--cooldown-secs", "3601"],
+        ] {
+            let mut args = vec!["oxidom", "profile", "failover", "work"];
+            args.extend(flags);
+            assert!(parse(&args).is_err());
+        }
+        for members in ["a", "a,a", "a,"] {
+            let args = failover_args(&[
+                "oxidom",
+                "profile",
+                "failover",
+                "work",
+                "--enable",
+                "--members",
+                members,
+            ]);
+            let mut profile = oxidom_core::profile::Profile::default();
+            profile.select.server = "a".into();
+            assert!(args.apply(&mut profile).is_err());
+        }
+    }
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(normalize(args.iter().map(OsString::from).collect()))

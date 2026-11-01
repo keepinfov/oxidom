@@ -59,8 +59,9 @@ candidates, no custom profile routing, exclusive TUN admission and qualified rec
 Proxy-only sessions may coexist with that TUN. Its hold and plan survive switches, exhaustion,
 revocation and current-member removal; explicit Stop deletes its owned device, unlike a legacy
 persistent TUN. Dirty cleanup must be resolved before reuse. P12 is not marked complete from
-source; P14/P15 validation is still required, with no VM evidence claimed. Dedicated CLI/GUI
-controls belong to P13; `oxidom profile edit <name>` remains the opt-in surface.
+source; P14/P15 validation is still required, with no VM evidence claimed. Explicit CLI/GUI
+controls and their compatibility boundary are specified in
+[failover.md](failover.md#controls-and-progress-binding). The TOML editor remains supported.
 
 A profile selects **either** one server **or** a pool, never both:
 

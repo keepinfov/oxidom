@@ -83,7 +83,11 @@ impl StoreLock {
             version: 1,
             incarnation: random_token()?,
             store_id: hex(digest.finish().as_ref()),
-            capabilities: vec!["probe_cancel".into(), "geo_download".into()],
+            capabilities: vec![
+                "probe_cancel".into(),
+                "geo_download".into(),
+                "profile_failover".into(),
+            ],
         })
     }
 

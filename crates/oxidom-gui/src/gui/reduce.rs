@@ -1695,6 +1695,41 @@ pub(super) fn runtime_presentation(state: &SnapshotState, profile: &str) -> Runt
         },
     ));
     details.push(SessionDetail::new("Retry", retry.clone()));
+    if let Some(progress) = runtime.and_then(|runtime| runtime.failover.as_ref()) {
+        let status = match progress.state.as_str() {
+            "armed" => "Armed".into(),
+            "recovering" => "Recovering".into(),
+            "exhausted" => "Exhausted; explicit Stop/Start required".into(),
+            "disarmed" => "Disarmed; saving or refresh cannot rearm this activation".into(),
+            value => unknown(value),
+        };
+        details.push(SessionDetail::new("Failover authorization", status));
+        details.push(SessionDetail::new(
+            "Authorized IDs in order",
+            progress.members.join(" → "),
+        ));
+        details.push(SessionDetail::new("Failover current ID", &progress.current));
+        details.push(SessionDetail::new(
+            "Failover next ID",
+            progress.next.as_deref().unwrap_or("None reported"),
+        ));
+        details.push(SessionDetail::new(
+            "Automatic attempts this episode",
+            format!("{} / {}", progress.attempts, progress.max_attempts),
+        ));
+        details.push(SessionDetail::new(
+            "Failover cooldown",
+            format!(
+                "{} s minimum between automatic starts",
+                progress.cooldown_secs
+            ),
+        ));
+    } else {
+        details.push(SessionDetail::new(
+            "Failover authorization",
+            "Not reported; no activation grant inferred from saved settings",
+        ));
+    }
     let mut summary = if state.poll_error.is_some() {
         details.insert(
             0,
@@ -4689,6 +4724,7 @@ mod tests {
                 ordinal: 3,
                 remaining_ms: Some(1250),
             },
+            failover: None,
         });
         state.sessions.push(reported);
         let shown = runtime_presentation(&state, "work");
@@ -4760,6 +4796,54 @@ mod tests {
                 Some(SessionAction::Restart(..))
             ));
         }
+    }
+
+    #[test]
+    fn failover_details_use_activation_facts_and_unknown_does_not_mean_disabled() {
+        use oxidom_core::ipc::{RuntimeFailover, RuntimeSessionInfo};
+        let mut state = SnapshotState::new(&StatusInfo::default());
+        let mut reported = session("work", "error", "canonical-b");
+        reported.runtime = Some(RuntimeSessionInfo {
+            phase: "failed".into(),
+            failover: Some(RuntimeFailover {
+                state: "exhausted".into(),
+                members: vec!["canonical-a".into(), "canonical-b".into()],
+                current: "canonical-b".into(),
+                next: None,
+                attempts: 1,
+                max_attempts: 3,
+                cooldown_secs: 30,
+            }),
+            ..Default::default()
+        });
+        state.sessions = vec![reported];
+        let shown = runtime_presentation(&state, "work");
+        assert_eq!(shown.phase, "Failed");
+        let details = shown.detail_text();
+        assert!(
+            details.contains("Failover authorization: Exhausted; explicit Stop/Start required")
+        );
+        assert!(details.contains("Authorized IDs in order: canonical-a → canonical-b"));
+        assert!(details.contains("Automatic attempts this episode: 1 / 3"));
+        let progress = state.sessions[0]
+            .runtime
+            .as_mut()
+            .unwrap()
+            .failover
+            .as_mut()
+            .unwrap();
+        progress.state = "future-state".into();
+        assert!(
+            runtime_presentation(&state, "work")
+                .detail_text()
+                .contains("Unknown (future-state)")
+        );
+        state.sessions[0].runtime.as_mut().unwrap().failover = None;
+        assert!(
+            runtime_presentation(&state, "work")
+                .detail_text()
+                .contains("no activation grant inferred")
+        );
     }
 
     #[test]

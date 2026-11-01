@@ -275,14 +275,35 @@ verification, but will not retry again if
 it fails, even if recovery is re-enabled before it finishes. Bring the profile up explicitly to
 begin a fresh connection after cancellation.
 
-No dedicated failover command or flag is added. Configure the optional `[failover]` table using
-`oxidom profile edit <name>`, then explicitly `oxidom up <name>` to authorize that saved profile.
-Temporary `connect` or pool activation, `oxidom run`, and global `reconnect` do not authorize
-alternate servers. See [Sequential failover](profiles-and-pools.md#sequential-failover) for an
-invented-ID TOML example. TUN failover requires effective hold, supported literal IPv4 endpoints,
-an exclusive interface and a fixed routing envelope. Unsupported endpoints fail explicitly.
-Owned recovery records require cleanup with the new binary before downgrade. Dedicated CLI/GUI
-controls remain P13; isolated routing evidence remains P15.
+Configure and inspect failover with an existing daemon:
+
+```sh
+oxidom profile failover work --members canonical-a,canonical-b --enable
+oxidom profile failover work --max-attempts 2 --cooldown-secs 45
+oxidom profile failover work --json
+oxidom profile failover work --disable
+```
+
+The IDs above are invented; use exact IDs from `oxidom list servers --json`, not aliases.
+The list is ordered and fixed; refreshed servers never join it. No flags means inspection.
+`--enable` is the explicit opt-in; changing a list/limit alone does not turn a disabled policy
+on. Defaults are 3 attempts and 30 seconds, with ranges 1–64 and 1–3600. Disable keeps the list
+and limits while revoking future starts; admitted confirmation may finish and held routes stay.
+Saved settings and the activation's original grant/progress are labelled separately. Exhaustion
+may occur before the budget if there are no untried alternates. Missing progress means unreported,
+not proof that policy is disabled. JSON has `profile`, optional `saved`, and optional `runtime`.
+
+Saving never starts/rearms a session. To activate changed authorization, explicitly stop any
+retained session with `oxidom down work`, then `oxidom up work`. Temporary `connect`, pool
+activation, `oxidom run` and global reconnect do not authorize alternates. The TOML editor remains
+available. A daemon lacking the advertised failover capability is refused with an upgrade/restart
+message; no automatic daemon restart or store switch occurs. The narrow policy command preserves
+the latest saved primary, ports, routing and core options.
+
+See [Sequential failover](profiles-and-pools.md#sequential-failover). TUN still requires effective
+hold, supported literal IPv4 endpoints, an exclusive interface and a fixed routing envelope.
+Unsupported endpoints fail explicitly. Owned recovery requires new-binary cleanup before
+downgrade; isolated routing evidence remains P15.
 
 `STATE` reads `direct` for active standby service on the configured local ports.
 It has no remote server, tunnel latency or interface, and does not own the system

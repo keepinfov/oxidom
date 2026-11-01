@@ -650,12 +650,17 @@ fn runtime_columns(runtime: &oxidom_core::ipc::RuntimeSessionInfo) -> [String; 4
                 .unwrap_or_else(|| "unknown".into())
         ),
         format!(
-            "{}#{}{}",
+            "{}#{}{}{}",
             retry.state,
             retry.ordinal,
             retry
                 .remaining_ms
                 .map(|ms| format!("({ms}ms)"))
+                .unwrap_or_default(),
+            runtime
+                .failover
+                .as_ref()
+                .map(|progress| format!("; failover {}", failover_progress_text(progress)))
                 .unwrap_or_default()
         ),
     ]
@@ -842,6 +847,33 @@ fn profile_command(command: ProfileCommand) -> CliResult {
         }
         ProfileCommand::New { name } => new_profile(&client, &name),
         ProfileCommand::Edit { name } => edit_profile(&client, &name),
+        ProfileCommand::Failover(args) => {
+            let mut profile = client.profile(&args.name).map_err(Failure::error)?;
+            args.apply(&mut profile).map_err(Failure::error)?;
+            if args.changes_policy() {
+                client
+                    .set_profile_failover(&args.name, profile.failover.as_ref())
+                    .map_err(Failure::error)?;
+                profile = client.profile(&args.name).map_err(Failure::error)?;
+            }
+            let runtime = client
+                .list_sessions()
+                .map_err(Failure::error)?
+                .into_iter()
+                .find(|session| session.profile == args.name)
+                .and_then(|session| session.runtime)
+                .and_then(|runtime| runtime.failover);
+            let output = FailoverOutput {
+                profile: args.name,
+                saved: profile.failover,
+                runtime,
+            };
+            if args.json {
+                print_json(&output)
+            } else {
+                print_text(failover_text(&output))
+            }
+        }
         ProfileCommand::Rm { name } => {
             if client.remove_profile(&name).map_err(Failure::error)? {
                 Ok(())
@@ -850,6 +882,53 @@ fn profile_command(command: ProfileCommand) -> CliResult {
             }
         }
     }
+}
+
+#[derive(Serialize)]
+struct FailoverOutput {
+    profile: String,
+    saved: Option<oxidom_core::failover::FailoverPolicy>,
+    runtime: Option<oxidom_core::ipc::RuntimeFailover>,
+}
+
+fn failover_text(output: &FailoverOutput) -> String {
+    let saved = output.saved.as_ref().map_or_else(
+        || "not configured (disabled)".to_string(),
+        |policy| {
+            format!(
+                "{}; members={}; max_attempts={}; cooldown_secs={}",
+                if policy.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                policy.members.join(","),
+                policy.max_attempts,
+                policy.cooldown_secs
+            )
+        },
+    );
+    format!(
+        "saved failover: {saved}\nactivation failover: {}\nSaving does not start or rearm a session; use explicit down/up to activate the saved policy.\n",
+        output
+            .runtime
+            .as_ref()
+            .map(failover_progress_text)
+            .unwrap_or_else(|| "not reported; no activation grant inferred".into())
+    )
+}
+
+fn failover_progress_text(progress: &oxidom_core::ipc::RuntimeFailover) -> String {
+    format!(
+        "{}; current={}; next={}; attempts={}/{}; cooldown={}s; members={}",
+        progress.state,
+        progress.current,
+        progress.next.as_deref().unwrap_or("none"),
+        progress.attempts,
+        progress.max_attempts,
+        progress.cooldown_secs,
+        progress.members.join(",")
+    )
 }
 
 fn core_command(command: CoreCommand) -> CliResult {
@@ -1420,6 +1499,39 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn failover_output_keeps_saved_settings_separate_from_a_revoked_activation() {
+        let literal = r#"{"profile":"work","saved":{"enabled":true,"members":["new-a","new-b"],"max_attempts":3,"cooldown_secs":30},"runtime":{"state":"disarmed","members":["old-a","old-b"],"current":"old-b","next":null,"attempts":1,"max_attempts":2,"cooldown_secs":45}}"#;
+        let output = FailoverOutput {
+            profile: "work".into(),
+            saved: Some(oxidom_core::failover::FailoverPolicy {
+                enabled: true,
+                members: vec!["new-a".into(), "new-b".into()],
+                ..Default::default()
+            }),
+            runtime: Some(oxidom_core::ipc::RuntimeFailover {
+                state: "disarmed".into(),
+                members: vec!["old-a".into(), "old-b".into()],
+                current: "old-b".into(),
+                next: None,
+                attempts: 1,
+                max_attempts: 2,
+                cooldown_secs: 45,
+            }),
+        };
+        assert_eq!(serde_json::to_string(&output).unwrap(), literal);
+        let text = failover_text(&output);
+        assert!(text.contains("saved failover: enabled; members=new-a,new-b"));
+        assert!(
+            text.contains("activation failover: disarmed; current=old-b; next=none; attempts=1/2")
+        );
+        let runtime = oxidom_core::ipc::RuntimeSessionInfo {
+            failover: output.runtime,
+            ..Default::default()
+        };
+        assert!(runtime_columns(&runtime)[3].contains("failover disarmed"));
+    }
 
     #[test]
     fn direct_standby_is_visible_even_with_a_failed_default_session() {

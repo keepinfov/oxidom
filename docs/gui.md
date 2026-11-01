@@ -62,8 +62,14 @@ group. The profile dialog preserves that membership; edit an existing profile's 
 `oxidom profile edit <name>`. Editing a GUI group alone does not rewrite the profile.
 
 Saved-profile [sequential failover](profiles-and-pools.md#sequential-failover) is a separate,
-disabled-by-default authorization. Opt in manually through that existing TOML editor; there are
-no dedicated GUI failover controls yet (P13). Explicit saved-profile activation can arm the grant;
+disabled-by-default authorization. In the profile dialog, use **Sequential failover** to explicitly
+allow switching, add exact IDs with the catalog picker, and edit their comma-separated order.
+Include the primary and 2–64 unique IDs; aliases and rotating groups cannot authorize membership.
+Set maximum automatic attempts (default 3) and minimum seconds between them (default 30).
+Changing the primary turns switching off; enable again only after reviewing the new list.
+Disabling retains the list/limits. Saving never starts or rearms runtime; Stop/Start explicitly
+to activate a changed policy. An older daemon disables the controls with a restart explanation.
+The TOML editor remains available. Explicit saved-profile activation can arm the grant;
 temporary server/group Connect never inherits it, and the global reconnect switch does not opt in.
 Current editors preserve the policy on unchanged saves. A changed selection or authorization
 revokes the active grant rather than silently enrolling another target; removing the section
@@ -72,8 +78,10 @@ automatic recovery because recovery never rewrites the saved initial choice.
 
 Enabled interfaces require the restricted [owned-TUN envelope](routing.md#owned-tun-failover):
 effective hold, supported literal unicast IPv4 candidates, no custom profile routing and no
-other configured TUN. Proxy-only sessions may coexist. There is no new GUI opt-in control.
-P12 is not declared complete from source; P14/P15 validation remains required and no VM
+other configured TUN. Proxy-only sessions may coexist. Expanded session details show the
+activation grant, ordered IDs, current/next candidate, consumed attempts, budget and cooldown.
+These can differ from the saved policy after revocation; missing progress means unreported.
+P14/P15 validation remains required and no VM
 packet-path or leak measurement is claimed.
 
 Owned TUN holds remain through alternate starts, exhaustion, revocation and removal of the

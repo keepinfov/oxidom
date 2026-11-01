@@ -314,6 +314,22 @@ pub struct Activation {
 }
 
 impl Activation {
+    /// Read-only progress; waiting must not hide the next authorized candidate.
+    pub fn progress(&self) -> (usize, Option<&str>) {
+        let next = (self.armed
+            && self.episode
+            && !self.in_flight
+            && self.attempts < self.policy.max_attempts)
+            .then(|| {
+                (1..self.policy.members.len())
+                    .map(|offset| (self.current + offset) % self.policy.members.len())
+                    .find(|index| !self.visited[*index])
+                    .map(|index| self.policy.members[index].as_str())
+            })
+            .flatten();
+        (self.attempts, next)
+    }
+
     /// `initial_id` is the resolved canonical primary, not the saved alias.
     /// The explicit initial start does not consume budget or start cooldown.
     pub fn new(policy: FailoverPolicy, initial_id: &str) -> Result<Self> {
@@ -437,6 +453,23 @@ impl Activation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_names_only_unvisited_authorized_candidates_without_admitting_them() -> Result<()> {
+        let mut activation = Activation::new(policy(), "a")?;
+        let now = Instant::now();
+        assert_eq!(activation.progress(), (0, None));
+        activation.begin_episode("a")?;
+        assert_eq!(activation.progress(), (0, Some("b")));
+        assert_eq!(activation.progress(), (0, Some("b")));
+        activation.admit("b", now, now)?;
+        assert_eq!(activation.progress(), (1, None));
+        activation.attempt_failed("b")?;
+        assert_eq!(activation.progress(), (1, Some("c")));
+        activation.disarm();
+        assert_eq!(activation.progress(), (1, None));
+        Ok(())
+    }
 
     fn tun_candidates() -> Vec<Server> {
         [

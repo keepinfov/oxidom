@@ -176,6 +176,23 @@ pub struct RuntimeSessionInfo {
     pub health: Option<RuntimeHealth>,
     pub protection: RuntimeProtection,
     pub retry: RuntimeRetry,
+    /// This activation's grant, never reconstructed from the saved profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<RuntimeFailover>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RuntimeFailover {
+    /// "armed" | "recovering" | "exhausted" | "disarmed"; an open vocabulary.
+    pub state: String,
+    pub members: Vec<String>,
+    pub current: String,
+    pub next: Option<String>,
+    /// Automatic starts admitted in the current episode, not the explicit Up.
+    pub attempts: usize,
+    pub max_attempts: usize,
+    pub cooldown_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1065,6 +1082,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.state, "connected");
+    }
+
+    #[test]
+    fn failover_progress_is_additive_literal_and_independent_of_saved_authorization() {
+        let literal = r#"{"state":"recovering","members":["canonical-a","canonical-b"],"current":"canonical-a","next":"canonical-b","attempts":0,"max_attempts":3,"cooldown_secs":30}"#;
+        let progress: RuntimeFailover = serde_json::from_str(literal).unwrap();
+        assert_eq!(serde_json::to_string(&progress).unwrap(), literal);
+        let runtime: RuntimeSessionInfo =
+            serde_json::from_str(&format!(r#"{{"phase":"failed","failover":{literal}}}"#)).unwrap();
+        #[derive(Deserialize)]
+        struct OlderRuntime {
+            phase: String,
+            retry: RuntimeRetry,
+        }
+        let old: OlderRuntime =
+            serde_json::from_str(&serde_json::to_string(&runtime).unwrap()).unwrap();
+        assert_eq!(old.phase, "failed");
+        assert_eq!(old.retry, RuntimeRetry::default());
+        let partial: RuntimeSessionInfo =
+            serde_json::from_str(r#"{"failover":{"state":"future","future":true}}"#).unwrap();
+        assert_eq!(partial.failover.unwrap().state, "future");
+        let absent: RuntimeSessionInfo = serde_json::from_str("{}").unwrap();
+        assert!(absent.failover.is_none());
+        assert!(!serde_json::to_string(&absent).unwrap().contains("failover"));
     }
 
     #[test]

@@ -2126,6 +2126,7 @@ impl Controller {
             (state.profiles.clone(), server_choices(&state.subscriptions))
         };
         let callbacks = ProfileDialogCallbacks {
+            failover_supported: self.state.borrow().client.supports_failover(),
             save: {
                 let weak = self.bound();
                 Rc::new(move |name, profile| {

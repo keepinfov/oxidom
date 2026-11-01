@@ -92,12 +92,14 @@ new attempt incarnation.
 Saved-profile failover follows [failover.md](failover.md). Current profile editors round-trip its
 optional policy, preserving unchanged authorization and explicitly removing it with JSON null.
 Changed selection or grant revokes the active snapshot; temporary Connect never inherits it.
-Manual `oxidom profile edit <name>` TOML opt-in is supported, but dedicated controls remain P13.
+The profile dialog exposes explicit policy controls as specified in
+[failover.md](failover.md#controls-and-progress-binding); the TOML editor remains supported.
 Enabled interfaces follow the bounded [owned-TUN contract](interfaces.md#owned-tun-failover-binding),
 not unrestricted TUN failover. Effective hold, supported literal IPv4 candidates, no custom
-routing and exclusive TUN admission are required. There is no new GUI authorization control.
-P12 is not marked complete from source; required P14/P15 validation and VM evidence are not
-implied by status presentation.
+routing and exclusive TUN admission are required. Expanded session details show the activation
+grant, exact ordered IDs, current/next candidate, episode budget and cooldown separately from
+saved configuration. Missing/unknown progress never establishes disabled policy. Required
+P14/P15 validation and VM evidence are not implied by status presentation.
 
 Profiles, header, sidebar and tray share a pure presentation of independent runtime dimensions.
 Phase is stopped, starting, verifying, running or failed. Running is accepted lifecycle state,
