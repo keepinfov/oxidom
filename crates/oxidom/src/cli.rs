@@ -210,6 +210,12 @@ pub struct FailoverArgs {
 }
 
 impl FailoverArgs {
+    pub fn policy_payload(&self, loaded: &oxidom_core::profile::Profile) -> anyhow::Result<String> {
+        let mut profile = loaded.clone();
+        self.apply(&mut profile)?;
+        Ok(serde_json::to_string(&profile.failover)?)
+    }
+
     pub fn changes_policy(&self) -> bool {
         self.enable
             || self.disable

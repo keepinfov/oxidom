@@ -849,10 +849,12 @@ fn profile_command(command: ProfileCommand) -> CliResult {
         ProfileCommand::Edit { name } => edit_profile(&client, &name),
         ProfileCommand::Failover(args) => {
             let mut profile = client.profile(&args.name).map_err(Failure::error)?;
-            args.apply(&mut profile).map_err(Failure::error)?;
             if args.changes_policy() {
                 client
-                    .set_profile_failover(&args.name, profile.failover.as_ref())
+                    .set_profile_failover_json(
+                        &args.name,
+                        &args.policy_payload(&profile).map_err(Failure::error)?,
+                    )
                     .map_err(Failure::error)?;
                 profile = client.profile(&args.name).map_err(Failure::error)?;
             }

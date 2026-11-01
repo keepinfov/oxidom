@@ -512,6 +512,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_limits_only_cli_edit_cannot_restore_a_concurrently_revoked_saved_grant() -> Result<()> {
+        use clap::Parser;
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-stale-cli");
+        let (engine, loaded) = fixture()?;
+        profile::save("work", &loaded)?;
+        let crate::cli::Command::Profile {
+            command: crate::cli::ProfileCommand::Failover(args),
+        } = crate::cli::Cli::try_parse_from([
+            "oxidom",
+            "profile",
+            "failover",
+            "work",
+            "--max-attempts",
+            "2",
+        ])?
+        .command
+        else {
+            unreachable!()
+        };
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        let mut disabled = loaded.failover.clone().unwrap();
+        disabled.enabled = false;
+        service.set_profile_failover("work".into(), serde_json::to_string(&disabled)?)?;
+        // The payload comes from the same CLI helper used by the command.
+        service.set_profile_failover("work".into(), args.policy_payload(&loaded)?)?;
+        let current = profile::load("work")?.failover.unwrap();
+        assert!(
+            !current.enabled,
+            "limits-only editing must not undo a concurrent disable"
+        );
+        assert_eq!(current.max_attempts, 2);
+        assert_eq!(current.members, disabled.members);
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_guarded_stale_editor_cannot_restore_a_concurrently_revoked_saved_grant() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-stale-editor");
+        let (engine, loaded) = fixture()?;
+        profile::save("work", &loaded)?;
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        let mut disabled = loaded.clone();
+        disabled.failover.as_mut().unwrap().enabled = false;
+        profile::save("work", &disabled)?;
+        let mut request = serde_json::to_value(&loaded)?;
+        request["description"] = "Unrelated edit from a stale dialog".into();
+        request["expected_failover"] =
+            serde_json::json!({"select": loaded.select, "failover": loaded.failover});
+        assert!(
+            service
+                .save_profile("work".into(), request.to_string())
+                .is_err(),
+            "a stale authorization expectation must reject before writing"
+        );
+        assert_eq!(profile::load("work")?, disabled);
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
     fn policy_controls_preserve_other_settings_and_revoke_without_rearming() -> Result<()> {
         let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
         let _root = TestRoot::install("failover-controls");

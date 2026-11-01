@@ -1371,6 +1371,25 @@ mod tests {
     }
 
     #[test]
+    fn changing_primary_preserves_visible_disabled_failover_settings() {
+        let entry: ProfileEntry = serde_json::from_str(
+            r#"{"server":"canonical-a","failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":2,"cooldown_secs":45}}"#,
+        )
+        .unwrap();
+        let mut values = DialogValues::new(Some(&entry));
+        values.server = "canonical-b".into();
+        // The primary-change handler turns switching off but leaves these
+        // visible fields intact. Save must describe the form that was shown.
+        values.failover.as_mut().unwrap().enabled = false;
+        assert!(!values.failover_reviewed);
+        let saved = profile_from_dialog(values);
+        let mut expected = entry.failover.unwrap();
+        expected.enabled = false;
+        assert_eq!(saved.select.server, "canonical-b");
+        assert_eq!(saved.failover, Some(expected));
+    }
+
+    #[test]
     fn authorized_member_edits_preserve_order_and_never_discard_empty_entries() {
         assert_eq!(failover_member_ids(" b , a "), ["b", "a"]);
         assert!(failover_member_ids(" ").is_empty());

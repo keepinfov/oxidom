@@ -691,16 +691,17 @@ impl DaemonClient {
         name: &str,
         policy: Option<&crate::failover::FailoverPolicy>,
     ) -> Result<()> {
+        self.set_profile_failover_json(name, &serde_json::to_string(&policy)?)
+    }
+
+    pub fn set_profile_failover_json(&self, name: &str, policy_json: &str) -> Result<()> {
         if !self.supports_failover() {
             bail!(
                 "the selected daemon cannot configure failover; restart it with a compatible binary"
             );
         }
         self.proxy
-            .call(
-                "SetProfileFailover",
-                &(name, serde_json::to_string(&policy)?),
-            )
+            .call("SetProfileFailover", &(name, policy_json))
             .map_err(friendly)
     }
 
