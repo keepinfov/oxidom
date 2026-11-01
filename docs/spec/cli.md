@@ -38,7 +38,7 @@ level to `debug`; `$RUST_LOG` overrides that default in either mode.
   (`docs/spec/data-model.md`), and validation is the daemon's: the CLI sends the draft and
   prints the daemon's error, so the dialog and the command line reject with one voice. An
   unchanged template creates nothing. `server` is a reserved profile name.
-- `oxidom profile {list,show,new,edit,rm}` manages daemon-owned profiles.
+- `oxidom profile {list,show,new,edit,failover,rm}` manages daemon-owned profiles.
 - `oxidom daemon [--system --socks-port --http-port]` runs the D-Bus service.
   SIGINT/SIGTERM returns success only after successful terminal cleanup; bus/name loss,
   startup/wait failure or failed cleanup returns failure. Terminal request rejection and
@@ -73,6 +73,27 @@ uses the fixed DTOs in `oxidom-core/src/cli_json.rs`. `SessionOutput` carries `h
 beside `state`: a session whose core exited while it kept its routes is in `error` and dropping
 traffic, which is a different claim from `error` alone. The sessions table keeps `STATE` as the
 legacy lifecycle and shows holding separately, never as a replacement lifecycle.
+
+### Saved failover controls (binding)
+
+`oxidom profile failover NAME [--enable|--disable] [--members ID,ID]
+[--max-attempts N] [--cooldown-secs N] [--json]` requires an existing selected daemon.
+Without setting flags it is read-only. Setting list/limits alone never opts in; disabled policy
+retains its list and limits. Only explicit flags enter the patch payload; omitted enabled and
+other settings come from the current daemon state even after concurrent disable/removal. Only explicit saved Up arms a grant; configuration changes cannot
+rearm existing runtime. Validation, compatibility refusal and the narrow policy RPC follow
+[failover.md](failover.md#controls-and-progress-binding). Limits retain defaults 3/30 and ranges
+1..64/1..3600. Missing, ambiguous, duplicate or unsupported enabled candidates fail before save.
+Errors use existing exit 1; missing daemon uses exit 4. No existing exit-code changes.
+
+JSON has the literal shape below; `saved` and `runtime` may independently be null. The command
+shows a failed/held activation without requiring Connected, unlike profile-specific `status`.
+Its text labels saved and activation policy separately. Status/session JSON forwards the optional
+`runtime.failover` field unchanged; text includes candidate/budget details when reported.
+
+```json
+{"profile":"work","saved":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":3,"cooldown_secs":30},"runtime":{"state":"recovering","members":["canonical-a","canonical-b"],"current":"canonical-a","next":"canonical-b","attempts":0,"max_attempts":3,"cooldown_secs":30}}
+```
 
 ### Runtime session facts (binding)
 
@@ -128,13 +149,13 @@ starts validate current resilience, generation, matching reconnect override and 
 episode under the engine lock before changing the episode to attempting or starting a core.
 Saved-profile failover instead revalidates its persisted grant, exact catalog IDs and current
 generation at admission. Global reconnect does not opt in to alternates or rearm a revoked grant.
-No dedicated failover flag or command is introduced: edit `[failover]` with the existing
-`oxidom profile edit <name>` and explicitly activate the saved profile with `oxidom up <name>`.
+Configure with `oxidom profile failover <name>` as specified above, or the TOML editor;
+explicitly activate the saved profile with `oxidom up <name>`.
 Enabled interfaces require the bounded owned-TUN contract in [interfaces.md](interfaces.md#owned-tun-failover-binding):
 effective hold, literal unicast IPv4 typed candidates, no custom routing and exclusive TUN
 admission. Proxy-only sessions may coexist. Exhaustion/revocation does not release held routing;
-explicit Stop is required. P13 owns dedicated controls; source implementation does not establish
-P12 completion or substitute for required P14/P15 validation.
+explicit Stop is required. Source implementation and status presentation do not substitute for
+required P14/P15 validation.
 
 The text session table adds `PHASE HEALTH PROTECTION RETRY` when any row has runtime facts.
 Health includes outcome/source/timestamp, protection labels each recorded fact, and retry includes

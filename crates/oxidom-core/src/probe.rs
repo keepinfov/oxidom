@@ -884,16 +884,24 @@ mod tests {
     }
 
     #[test]
-    fn free_ports_are_bindable_and_distinct() {
+    fn probe_ports_exclude_live_listeners_and_the_other_inbound() {
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a private listener");
+        let occupied_port = occupied.local_addr().unwrap().port();
         let first = free_port().expect("the OS has a spare port");
-        let second = free_port().expect("the OS has a second spare port");
+        let second = crate::engine::free_port(Ipv4Addr::LOCALHOST, &[first])
+            .expect("the OS has a second spare port");
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, occupied_port);
+        assert_ne!(second, occupied_port);
         assert_ne!(
             first, second,
-            "two probes running at once must not be handed the same inbound"
+            "the probe's SOCKS and HTTP inbounds exclude each other"
         );
-        // The core is going to bind it a moment later; if we cannot, neither
-        // can it, and every probe would report an unreachable server.
-        TcpListener::bind(("127.0.0.1", first)).expect("the port we picked is free");
+        // Keep the occupied listener alive throughout allocation. The returned
+        // numbers are not reservations; another test/process may bind them
+        // immediately after allocation, just as during the real Xray handoff.
+        drop(occupied);
     }
 
     #[test]

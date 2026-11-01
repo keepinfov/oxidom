@@ -44,7 +44,7 @@ jobs:
           key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: test-${{ runner.os }}-
       - name: cargo test
-        run: nix develop -c cargo test --workspace --locked
+        run: nix develop -c cargo test --workspace --locked --no-fail-fast
 
   lockfile:
     # A lockfile that no longer matches the manifests breaks every downstream

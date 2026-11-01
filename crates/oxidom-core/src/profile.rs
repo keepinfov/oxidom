@@ -90,6 +90,23 @@ pub struct ProfileSelect {
     pub pool: Option<PoolQuery>,
 }
 
+/// Request-only comparison guard. Never part of a persisted profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileExpectation {
+    pub select: ProfileSelect,
+    pub failover: Option<FailoverPolicy>,
+}
+
+impl From<&Profile> for ProfileExpectation {
+    fn from(profile: &Profile) -> Self {
+        Self {
+            select: profile.select.clone(),
+            failover: profile.failover.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProfileProxy {

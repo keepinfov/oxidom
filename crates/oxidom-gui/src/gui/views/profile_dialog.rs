@@ -11,7 +11,7 @@ use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::model::Subscription;
 use oxidom_core::pool::{PoolKind, PoolQuery, Strategy};
 use oxidom_core::profile::{
-    self, Profile, ProfileInterface, ProfileProxy, ProfileSelect, RouteMode,
+    self, Profile, ProfileExpectation, ProfileInterface, ProfileProxy, ProfileSelect, RouteMode,
 };
 
 use super::super::reduce::describe_pool;
@@ -53,6 +53,8 @@ const RULE_MEMBERSHIP_HINT: &str = "A rule; matching servers added by refresh ca
 /// One server the profile's picker can point at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerChoice {
+    /// Exact authorization identity, independent of the display alias.
+    pub id: String,
     /// What gets written to `select.server`: the alias when the server has
     /// one, its id otherwise.
     pub handle: String,
@@ -77,8 +79,9 @@ pub enum Preselect {
 /// own callbacks: the page no longer owns the dialog.
 #[derive(Clone)]
 pub struct ProfileDialogCallbacks {
-    /// `(name, profile)` — both for editing and creating.
-    pub save: Rc<dyn Fn(String, Profile)>,
+    pub failover_supported: bool,
+    /// The edited profile and the immutable selection/policy that was loaded.
+    pub save: Rc<dyn Fn(String, Profile, ProfileExpectation)>,
     pub remove: Rc<dyn Fn(String)>,
 }
 
@@ -131,6 +134,8 @@ struct DialogValues {
     /// and a save writes back exactly what was loaded.
     routing: Option<String>,
     failover: Option<FailoverPolicy>,
+    /// An explicit edit after choosing the primary can authorize a new group.
+    failover_reviewed: bool,
     original_select: ProfileSelect,
 }
 
@@ -161,10 +166,18 @@ impl DialogValues {
             on_core_exit: entry.and_then(|entry| entry.on_core_exit),
             routing: entry.and_then(|entry| entry.routing.clone()),
             failover: entry.and_then(|entry| entry.failover.clone()),
+            failover_reviewed: false,
             original_select: ProfileSelect {
                 server: entry.map(|entry| entry.server.clone()).unwrap_or_default(),
                 pool: entry.and_then(|entry| entry.pool.clone()),
             },
+        }
+    }
+
+    fn expectation(&self) -> ProfileExpectation {
+        ProfileExpectation {
+            select: self.original_select.clone(),
+            failover: self.failover.clone(),
         }
     }
 }
@@ -222,10 +235,15 @@ fn profile_from_dialog(values: DialogValues) -> Profile {
         server: values.server,
         pool: values.pool,
     };
-    // Authorization belongs to the loaded selection, never its replacement.
-    let failover = (select == values.original_select)
-        .then_some(values.failover)
-        .flatten();
+    // Keep the visible configuration when the primary changes, but require
+    // explicit review before its enabled permission can follow that change.
+    let mut failover = values.failover;
+    if select != values.original_select
+        && !values.failover_reviewed
+        && let Some(policy) = failover.as_mut()
+    {
+        policy.enabled = false;
+    }
     Profile {
         description: values.description,
         select,
@@ -273,6 +291,7 @@ pub fn show_profile_dialog(
             ("New profile".to_string(), None, initial)
         }
     };
+    let expected = initial.expectation();
 
     let window = adw::Window::builder()
         .title(&title)
@@ -360,6 +379,80 @@ pub fn show_profile_dialog(
     http.set_title("HTTP port");
     http.set_value(f64::from(initial.http_port));
     profile_group.add(&http);
+
+    let failover_group = adw::PreferencesGroup::builder()
+        .title("Sequential failover")
+        .description(if callbacks.failover_supported {
+            "Off by default. Only explicit Start of this saved profile authorizes switching. Saving never starts or rearms a session. Stop cancels recovery; policy changes revoke future attempts."
+        } else {
+            "The selected daemon cannot configure failover. Restart it with a compatible binary."
+        })
+        .sensitive(callbacks.failover_supported)
+        .build();
+    let initial_policy = initial.failover.clone().unwrap_or_default();
+    let failover_enable = adw::SwitchRow::builder()
+        .title("Allow automatic switching")
+        .subtitle("Only within the exact authorized list; no automatic return to the primary")
+        .active(initial_policy.enabled)
+        .build();
+    failover_group.add(&failover_enable);
+    let failover_members = adw::EntryRow::builder()
+        .title("Authorized IDs in order (comma-separated)")
+        .text(initial_policy.members.join(", "))
+        .build();
+    failover_group.add(&failover_members);
+    let candidate_labels = choices
+        .iter()
+        .map(|choice| choice.label.as_str())
+        .collect::<Vec<_>>();
+    let candidate_picker = adw::ComboRow::builder()
+        .title("Append an authorized server")
+        .subtitle("Choose, then Add. Include the primary; 2–64 exact IDs. Edit the list above to reorder or remove. Refresh never adds members.")
+        .subtitle_lines(0)
+        .model(&gtk::StringList::new(&candidate_labels))
+        .expression(gtk::PropertyExpression::new(
+            gtk::StringObject::static_type(), None::<gtk::Expression>, "string",
+        ))
+        .enable_search(true)
+        .build();
+    let add_candidate = gtk::Button::with_label("Add");
+    add_candidate.set_valign(gtk::Align::Center);
+    add_candidate.set_sensitive(!choices.is_empty());
+    candidate_picker.add_suffix(&add_candidate);
+    failover_group.add(&candidate_picker);
+    add_candidate.connect_clicked({
+        let choices = choices.to_vec();
+        let candidate_picker = candidate_picker.clone();
+        let failover_members = failover_members.clone();
+        move |_| {
+            if let Some(choice) = choices.get(candidate_picker.selected() as usize) {
+                let mut members = failover_member_ids(&failover_members.text());
+                if !members.contains(&choice.id) {
+                    members.push(choice.id.clone());
+                    failover_members.set_text(&members.join(", "));
+                }
+            }
+        }
+    });
+    let failover_attempts = adw::SpinRow::with_range(1.0, 64.0, 1.0);
+    failover_attempts.set_title("Maximum automatic attempts per episode");
+    failover_attempts.set_subtitle("The explicit initial Start does not consume this budget");
+    failover_attempts.set_value(initial_policy.max_attempts as f64);
+    failover_group.add(&failover_attempts);
+    let failover_cooldown = adw::SpinRow::with_range(1.0, 3600.0, 1.0);
+    failover_cooldown.set_title("Minimum seconds between automatic attempts");
+    failover_cooldown.set_value(initial_policy.cooldown_secs as f64);
+    failover_group.add(&failover_cooldown);
+    let failover_limits = adw::ActionRow::builder()
+        .title("A fixed authorization, separate from rotating groups")
+        .subtitle("Pools and composite servers are unsupported. TUN requires Hold traffic, supported literal IPv4 endpoints, no custom routing and exclusive TUN use. A held interface stays until explicit Stop; no whole-device protection is implied.")
+        .subtitle_lines(0)
+        .build();
+    failover_group.add(&failover_limits);
+    let failover_reviewed = Rc::new(Cell::new(false));
+    // Whether the visible draft has been configured is independent of whether
+    // its permission was reviewed after the latest primary change.
+    let failover_edited = Rc::new(Cell::new(false));
 
     let initial_pool = initial.pool.clone().unwrap_or_default();
     let pool_group = adw::PreferencesGroup::builder()
@@ -518,6 +611,7 @@ pub fn show_profile_dialog(
 
     let groups = gtk::Box::new(gtk::Orientation::Vertical, 24);
     groups.append(&profile_group);
+    groups.append(&failover_group);
     groups.append(&pool_group);
     groups.append(&interface_group);
     groups.append(&routing_group);
@@ -588,6 +682,12 @@ pub fn show_profile_dialog(
         let carried = initial_pool.clone();
         let carried_routing = initial.routing.clone();
         let carried_failover = initial.failover.clone();
+        let failover_enable = failover_enable.clone();
+        let failover_members = failover_members.clone();
+        let failover_attempts = failover_attempts.clone();
+        let failover_cooldown = failover_cooldown.clone();
+        let failover_reviewed = failover_reviewed.clone();
+        let failover_edited = failover_edited.clone();
         let original_select = initial.original_select.clone();
         let pool_max = pool_max.clone();
         let pool_expected = pool_expected.clone();
@@ -637,7 +737,17 @@ pub fn show_profile_dialog(
                 core: core_editor.values(),
                 on_core_exit: core_exit_choice(core_exit.selected()),
                 routing: carried_routing.clone(),
-                failover: carried_failover.clone(),
+                failover: if carried_failover.is_some() || failover_edited.get() {
+                    Some(FailoverPolicy {
+                        enabled: failover_enable.is_active(),
+                        members: failover_member_ids(&failover_members.text()),
+                        max_attempts: failover_attempts.value() as usize,
+                        cooldown_secs: failover_cooldown.value() as u64,
+                    })
+                } else {
+                    None
+                },
+                failover_reviewed: failover_reviewed.get(),
                 original_select: original_select.clone(),
             };
             Some((name, profile_from_dialog(values)))
@@ -663,6 +773,7 @@ pub fn show_profile_dialog(
         let validation = validation.clone();
         let collect_profile = collect_profile.clone();
         let interface_enable = interface_enable.clone();
+        let failover_enable = failover_enable.clone();
         move || {
             let name = dialog_name(name_entry.as_ref(), edit_name.as_deref());
             set_device_hint(&device_hint, &name);
@@ -670,6 +781,7 @@ pub fn show_profile_dialog(
                 .as_ref()
                 .and_then(|entry| profile_name_validation(entry.text().as_str(), &existing_names));
             let pool_mode = selection_mode.selected() == 1;
+            failover_enable.set_sensitive(!pool_mode);
             let selected = picker_entries.get(server.selected() as usize);
             server.set_visible(!pool_mode);
             pool_group.set_visible(pool_mode);
@@ -694,7 +806,9 @@ pub fn show_profile_dialog(
                 })
                 .or_else(|| {
                     collect_profile().and_then(|(_, profile)| {
-                        profile.validate(&name).err().map(|error| error.to_string())
+                        validate_dialog_profile(&profile, &name, machine_hold)
+                            .err()
+                            .map(|error| error.to_string())
                     })
                 });
             save.set_sensitive(issue.is_none());
@@ -713,11 +827,63 @@ pub fn show_profile_dialog(
     });
     selection_mode.connect_selected_notify({
         let update_validation = update_validation.clone();
-        move |_| update_validation()
+        let failover_enable = failover_enable.clone();
+        let failover_reviewed = failover_reviewed.clone();
+        move |_| {
+            failover_enable.set_active(false);
+            failover_reviewed.set(false);
+            update_validation();
+        }
     });
     server.connect_selected_notify({
         let update_validation = update_validation.clone();
-        move |_| update_validation()
+        let failover_enable = failover_enable.clone();
+        let failover_reviewed = failover_reviewed.clone();
+        move |_| {
+            failover_enable.set_active(false);
+            failover_reviewed.set(false);
+            update_validation();
+        }
+    });
+    failover_enable.connect_active_notify({
+        let update_validation = update_validation.clone();
+        let reviewed = failover_reviewed.clone();
+        let edited = failover_edited.clone();
+        move |_| {
+            reviewed.set(true);
+            edited.set(true);
+            update_validation();
+        }
+    });
+    failover_members.connect_changed({
+        let update_validation = update_validation.clone();
+        let reviewed = failover_reviewed.clone();
+        let edited = failover_edited.clone();
+        move |_| {
+            reviewed.set(true);
+            edited.set(true);
+            update_validation();
+        }
+    });
+    failover_attempts.connect_value_notify({
+        let update_validation = update_validation.clone();
+        let reviewed = failover_reviewed.clone();
+        let edited = failover_edited.clone();
+        move |_| {
+            reviewed.set(true);
+            edited.set(true);
+            update_validation();
+        }
+    });
+    failover_cooldown.connect_value_notify({
+        let update_validation = update_validation.clone();
+        let reviewed = failover_reviewed.clone();
+        let edited = failover_edited.clone();
+        move |_| {
+            reviewed.set(true);
+            edited.set(true);
+            update_validation();
+        }
     });
     strategy.connect_selected_notify({
         let update_validation = update_validation.clone();
@@ -814,7 +980,7 @@ pub fn show_profile_dialog(
         let Some((name, profile)) = collect_profile() else {
             return;
         };
-        (callbacks.save)(name, profile);
+        (callbacks.save)(name, profile, expected.clone());
         window_for_save.close();
     });
     window.present();
@@ -919,6 +1085,36 @@ fn parse_values(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn failover_member_ids(text: &str) -> Vec<String> {
+    if text.trim().is_empty() {
+        Vec::new()
+    } else {
+        text.split(',').map(|id| id.trim().to_string()).collect()
+    }
+}
+
+fn validate_dialog_profile(
+    profile: &Profile,
+    name: &str,
+    machine_hold: bool,
+) -> anyhow::Result<()> {
+    profile.validate(name)?;
+    if profile.interface.enable
+        && profile
+            .failover
+            .as_ref()
+            .is_some_and(|policy| policy.enabled)
+    {
+        anyhow::ensure!(
+            profile
+                .on_core_exit
+                .map_or(machine_hold, |policy| policy == OnCoreExit::Hold),
+            "TUN failover requires Hold traffic, including the inherited machine setting"
+        );
+    }
+    Ok(())
+}
+
 fn route_mode(index: u32) -> RouteMode {
     match index {
         1 => RouteMode::List,
@@ -984,6 +1180,7 @@ pub fn server_choices(subscriptions: &[Subscription]) -> Vec<ServerChoice> {
             continue;
         }
         choices.push(ServerChoice {
+            id: server.id.clone(),
             label: format!(
                 "{handle}  ·  {}",
                 oxidom_core::model::name_without_flag(&server.name)
@@ -1057,10 +1254,12 @@ mod tests {
             choices,
             vec![
                 ServerChoice {
+                    id: "id-zulu".into(),
                     handle: "alpha".to_string(),
                     label: "alpha  ·  Zulu".to_string(),
                 },
                 ServerChoice {
+                    id: "bravo".into(),
                     handle: "bravo".to_string(),
                     label: "bravo  ·  Alpine".to_string(),
                 },
@@ -1072,6 +1271,7 @@ mod tests {
     #[test]
     fn preselection_never_silently_repoints_a_missing_handle() {
         let choices = vec![ServerChoice {
+            id: "known-id".into(),
             handle: "known".to_string(),
             label: "known  ·  Server".to_string(),
         }];
@@ -1092,10 +1292,12 @@ mod tests {
     fn a_profile_without_a_server_gets_an_entry_that_is_not_a_server() {
         let choices = vec![
             ServerChoice {
+                id: "alpha-id".into(),
                 handle: "alpha".to_string(),
                 label: "alpha  ·  Alpha".to_string(),
             },
             ServerChoice {
+                id: "bravo-id".into(),
                 handle: "bravo".to_string(),
                 label: "bravo  ·  Bravo".to_string(),
             },
@@ -1175,14 +1377,73 @@ mod tests {
     }
 
     #[test]
-    fn changing_selection_revokes_instead_of_transferring_failover_authorization() {
+    fn a_new_primary_requires_explicit_failover_review_before_authorization() {
+        let entry: ProfileEntry = serde_json::from_str(r#"{"server":"canonical-a","failover":{"enabled":true,"members":["canonical-a","canonical-b"]}}"#).unwrap();
+        let mut values = DialogValues::new(Some(&entry));
+        values.server = "canonical-b".into();
+        let mut unreviewed = entry.failover.clone().unwrap();
+        unreviewed.enabled = false;
+        assert_eq!(
+            profile_from_dialog(values.clone()).failover,
+            Some(unreviewed)
+        );
+        values.failover_reviewed = true;
+        let saved = profile_from_dialog(values.clone());
+        assert_eq!(saved.failover, entry.failover);
+        assert_eq!(saved.select.server, "canonical-b");
+        values.failover.as_mut().unwrap().enabled = false;
+        let disabled = profile_from_dialog(values);
+        assert!(!disabled.failover.as_ref().unwrap().enabled);
+        assert_eq!(
+            disabled.failover.unwrap().members,
+            ["canonical-a", "canonical-b"]
+        );
+    }
+
+    #[test]
+    fn changing_primary_preserves_visible_disabled_failover_settings() {
         let entry: ProfileEntry = serde_json::from_str(
-            r#"{"server":"canonical-a","failover":{"enabled":true,"members":["canonical-a","canonical-b"]}}"#,
+            r#"{"server":"canonical-a","failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":2,"cooldown_secs":45}}"#,
         )
         .unwrap();
         let mut values = DialogValues::new(Some(&entry));
         values.server = "canonical-b".into();
-        assert!(profile_from_dialog(values).failover.is_none());
+        // The primary-change handler turns switching off but leaves these
+        // visible fields intact. Save must describe the form that was shown.
+        values.failover.as_mut().unwrap().enabled = false;
+        assert!(!values.failover_reviewed);
+        let saved = profile_from_dialog(values);
+        let mut expected = entry.failover.unwrap();
+        expected.enabled = false;
+        assert_eq!(saved.select.server, "canonical-b");
+        assert_eq!(saved.failover, Some(expected));
+    }
+
+    #[test]
+    fn authorized_member_edits_preserve_order_and_never_discard_empty_entries() {
+        assert_eq!(failover_member_ids(" b , a "), ["b", "a"]);
+        assert!(failover_member_ids(" ").is_empty());
+        for text in ["a,", "a,,b", "a,a"] {
+            let policy = FailoverPolicy {
+                enabled: true,
+                members: failover_member_ids(text),
+                ..Default::default()
+            };
+            assert!(policy.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn changing_selection_disables_but_preserves_fixed_failover_configuration() {
+        let entry: ProfileEntry = serde_json::from_str(
+            r#"{"server":"canonical-a","failover":{"enabled":true,"members":["canonical-a","canonical-b"]}}"#,
+        )
+        .unwrap();
+        let mut expected = entry.failover.clone().unwrap();
+        expected.enabled = false;
+        let mut values = DialogValues::new(Some(&entry));
+        values.server = "canonical-b".into();
+        assert_eq!(profile_from_dialog(values).failover, Some(expected.clone()));
 
         let mut values = DialogValues::new(Some(&entry));
         values.server.clear();
@@ -1190,7 +1451,42 @@ mod tests {
             members: vec!["canonical-a".into(), "canonical-b".into()],
             ..Default::default()
         });
-        assert!(profile_from_dialog(values).failover.is_none());
+        assert_eq!(profile_from_dialog(values).failover, Some(expected));
+    }
+
+    #[test]
+    fn saving_edited_fields_keeps_the_original_selection_and_policy_expectation() {
+        let entry: ProfileEntry = serde_json::from_str(
+            r#"{"server":"canonical-a","failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":2,"cooldown_secs":45}}"#,
+        )
+        .unwrap();
+        let mut values = DialogValues::new(Some(&entry));
+        let expected = values.expectation();
+        values.server = "canonical-b".into();
+        values.failover.as_mut().unwrap().cooldown_secs = 90;
+        let saved = profile_from_dialog(values);
+        assert_eq!(expected.select.server, "canonical-a");
+        assert_eq!(expected.failover, entry.failover);
+        assert_eq!(saved.select.server, "canonical-b");
+        let policy = saved.failover.unwrap();
+        assert!(!policy.enabled);
+        assert_eq!(policy.cooldown_secs, 90);
+        assert_eq!(expected.failover.unwrap().cooldown_secs, 45);
+    }
+
+    #[test]
+    fn newly_configured_disabled_failover_survives_a_primary_change() {
+        let mut values = DialogValues::new(None);
+        values.server = "canonical-b".into();
+        let policy = FailoverPolicy {
+            enabled: false,
+            members: vec!["canonical-b".into(), "canonical-a".into()],
+            max_attempts: 2,
+            cooldown_secs: 45,
+        };
+        values.failover = Some(policy.clone());
+        assert!(!values.failover_reviewed);
+        assert_eq!(profile_from_dialog(values).failover, Some(policy));
     }
 
     #[test]
@@ -1204,6 +1500,10 @@ mod tests {
         let mut saved = profile_from_dialog(values);
         assert_eq!(saved.failover, entry.failover);
         saved.validate("work").unwrap();
+        assert!(validate_dialog_profile(&saved, "work", false).is_err());
+        validate_dialog_profile(&saved, "work", true).unwrap();
+        saved.on_core_exit = Some(OnCoreExit::Hold);
+        validate_dialog_profile(&saved, "work", false).unwrap();
         saved.on_core_exit = Some(OnCoreExit::Release);
         assert!(
             saved

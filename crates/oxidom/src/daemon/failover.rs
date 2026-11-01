@@ -2,7 +2,7 @@
 
 use super::*;
 use oxidom_core::failover::{Activation, Decision, FailoverPolicy, TunEnvelope};
-use oxidom_core::ipc::RuntimeRetry;
+use oxidom_core::ipc::{RuntimeFailover, RuntimeRetry};
 use oxidom_core::profile::ProfileSelect;
 
 pub(super) fn local_complaint(logs: &[String]) -> bool {
@@ -10,6 +10,22 @@ pub(super) fn local_complaint(logs: &[String]) -> bool {
         || logs
             .iter()
             .any(|line| probe::classify_complaint(line).is_some())
+}
+
+pub(super) fn validate_saved(engine: &Engine, name: &str, profile: &Profile) -> Result<()> {
+    profile.validate(name)?;
+    if profile
+        .failover
+        .as_ref()
+        .is_some_and(|policy| policy.enabled)
+    {
+        let primary = match handle::resolve(engine.all_servers(), &profile.select.server) {
+            HandleMatch::One(server) => server.id.clone(),
+            _ => anyhow::bail!("failover requires an unambiguous current primary server"),
+        };
+        Snapshot::new(engine, profile, &ConnectionTarget::Server(primary))?;
+    }
+    Ok(())
 }
 
 pub(super) fn eligible_confirmation(
@@ -126,6 +142,35 @@ struct Entry {
 pub(super) struct Activations(Mutex<HashMap<String, Entry>>);
 
 impl Activations {
+    pub(super) fn progress(
+        &self,
+        profile: &str,
+        generation: Option<u64>,
+        now: Instant,
+    ) -> Option<RuntimeFailover> {
+        let entries = oxidom_core::sync::lock(&self.0);
+        let entry = entries
+            .get(profile)
+            .filter(|entry| Some(entry.generation) == generation)?;
+        let decision = entry.snapshot.activation.next(now, entry.backoff);
+        let state = match decision {
+            Decision::Idle => "armed",
+            Decision::Disarmed => "disarmed",
+            Decision::Exhausted => "exhausted",
+            _ => "recovering",
+        };
+        let (attempts, next) = entry.snapshot.activation.progress();
+        Some(RuntimeFailover {
+            state: state.into(),
+            members: entry.snapshot.policy.members.clone(),
+            current: entry.current.clone(),
+            next: next.map(str::to_string),
+            attempts,
+            max_attempts: entry.snapshot.policy.max_attempts,
+            cooldown_secs: entry.snapshot.policy.cooldown_secs,
+        })
+    }
+
     pub(super) fn install(&self, profile: &str, generation: u64, snapshot: Snapshot) {
         let current = snapshot.initial.clone();
         oxidom_core::sync::lock(&self.0).insert(
@@ -465,6 +510,304 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limits_only_cli_edit_cannot_restore_a_concurrently_revoked_saved_grant() -> Result<()> {
+        use clap::Parser;
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-stale-cli");
+        let (engine, loaded) = fixture()?;
+        profile::save("work", &loaded)?;
+        let crate::cli::Command::Profile {
+            command: crate::cli::ProfileCommand::Failover(args),
+        } = crate::cli::Cli::try_parse_from([
+            "oxidom",
+            "profile",
+            "failover",
+            "work",
+            "--max-attempts",
+            "2",
+        ])?
+        .command
+        else {
+            unreachable!()
+        };
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        let mut disabled = loaded.failover.clone().unwrap();
+        disabled.enabled = false;
+        service.set_profile_failover("work".into(), serde_json::to_string(&disabled)?)?;
+        // The payload comes from the same CLI helper used by the command.
+        service.set_profile_failover("work".into(), args.policy_payload()?)?;
+        let current = profile::load("work")?.failover.unwrap();
+        assert!(
+            !current.enabled,
+            "limits-only editing must not undo a concurrent disable"
+        );
+        assert_eq!(current.max_attempts, 2);
+        assert_eq!(current.members, disabled.members);
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_guarded_stale_editor_cannot_restore_a_concurrently_revoked_saved_grant() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-stale-editor");
+        let (engine, loaded) = fixture()?;
+        profile::save("work", &loaded)?;
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        let mut disabled = loaded.clone();
+        disabled.failover.as_mut().unwrap().enabled = false;
+        profile::save("work", &disabled)?;
+        let mut request = serde_json::to_value(&loaded)?;
+        request["description"] = "Unrelated edit from a stale dialog".into();
+        request["expected_failover"] =
+            serde_json::json!({"select": loaded.select, "failover": loaded.failover});
+        assert!(
+            service
+                .save_profile("work".into(), request.to_string())
+                .is_err(),
+            "a stale authorization expectation must reject before writing"
+        );
+        assert_eq!(profile::load("work")?, disabled);
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_editor_guards_leave_current_selection_and_activation_armed() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-editor-selection-guard");
+        let (engine, loaded) = fixture()?;
+        let mut current = loaded.clone();
+        current.select.server = current.failover.as_ref().unwrap().members[1].clone();
+        profile::save("work", &current)?;
+        let target = ConnectionTarget::Server(current.select.server.clone());
+        let snapshot = Snapshot::new(&engine, &current, &target)?.unwrap();
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        let generation = service.shared.next_connect_generation("work");
+        service
+            .shared
+            .failover
+            .install("work", generation, snapshot);
+        for guard in [
+            serde_json::Value::Null,
+            serde_json::json!({"select": loaded.select, "failover": loaded.failover}),
+            serde_json::json!({"select": current.select, "failover": current.failover, "unknown": true}),
+        ] {
+            let mut raw = serde_json::to_value(&loaded)?;
+            raw["expected_failover"] = guard;
+            assert!(
+                service
+                    .save_profile("work".into(), raw.to_string())
+                    .is_err()
+            );
+            assert_eq!(profile::load("work")?, current);
+            assert!(service.shared.failover.armed("work"));
+        }
+        let mut raw = serde_json::to_value(&current)?;
+        raw["expected_failover"] =
+            serde_json::to_value(oxidom_core::profile::ProfileExpectation::from(&current))?;
+        raw["description"] = "Current editor".into();
+        service.save_profile("work".into(), raw.to_string())?;
+        assert_eq!(profile::load("work")?.description, "Current editor");
+        assert!(service.shared.failover.armed("work"));
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_policy_patch_preserves_the_absent_table_and_other_current_fields() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-empty-patch");
+        let (engine, mut profile) = fixture()?;
+        profile.failover = None;
+        profile::save("work", &profile)?;
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        service.set_profile_failover("work".into(), "{}".into())?;
+        assert_eq!(profile::load("work")?, profile);
+        service.set_profile_failover("work".into(), r#"{"cooldown_secs":45}"#.into())?;
+        let current = profile::load("work")?;
+        assert!(!current.failover.as_ref().unwrap().enabled);
+        assert_eq!(current.failover.as_ref().unwrap().cooldown_secs, 45);
+        assert_eq!(current.select, profile.select);
+        assert_eq!(current.proxy, profile.proxy);
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn policy_controls_preserve_other_settings_and_revoke_without_rearming() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-controls");
+        let (engine, mut profile) = fixture()?;
+        profile.description = "Invented office".into();
+        profile.proxy.socks_port = 12080;
+        profile.proxy.http_port = 12081;
+        profile::save("work", &profile)?;
+        let target = ConnectionTarget::Server(profile.select.server.clone());
+        let snapshot = Snapshot::new(&engine, &profile, &target)?.unwrap();
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        let generation = service.shared.next_connect_generation("work");
+        service
+            .shared
+            .failover
+            .install("work", generation, snapshot);
+        // Another editor changed non-policy settings after the CLI's read.
+        profile.select.server = profile.failover.as_ref().unwrap().members[1].clone();
+        profile.description = "New saved configuration".into();
+        profile.proxy.socks_port = 13080;
+        profile.proxy.http_port = 13081;
+        profile::save("work", &profile)?;
+        let mut disabled = profile.failover.clone().unwrap();
+        disabled.enabled = false;
+        service.set_profile_failover("work".into(), serde_json::to_string(&disabled)?)?;
+        assert!(!service.shared.failover.armed("work"));
+        let mut expected = profile.clone();
+        expected.failover = Some(disabled);
+        assert_eq!(profile::load("work")?, expected);
+        service.set_profile_failover("work".into(), serde_json::to_string(&profile.failover)?)?;
+        assert_eq!(profile::load("work")?, profile);
+        assert!(!service.shared.failover.armed("work"));
+        let now = Instant::now();
+        let progress = service
+            .shared
+            .failover
+            .progress("work", Some(generation), now)
+            .unwrap();
+        assert_eq!(progress.state, "disarmed");
+        assert!(progress.next.is_none());
+        assert!(
+            service
+                .shared
+                .failover
+                .progress("work", Some(generation + 1), now)
+                .is_none()
+        );
+        service.stop_profile("work")?;
+        assert!(
+            service
+                .shared
+                .failover
+                .progress("work", Some(generation), now)
+                .is_none()
+        );
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_policy_controls_refuse_alias_members_missing_primary_and_unsafe_tun() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-controls-validation");
+        let (engine, profile) = fixture()?;
+        profile::save("work", &profile)?;
+        let service = Service {
+            shared: Shared::new(engine, false, false, false),
+        };
+        for members in [
+            vec!["friendly-alias".to_string(), profile.select.server.clone()],
+            vec!["missing-a".into(), "missing-b".into()],
+        ] {
+            let mut policy = profile.failover.clone().unwrap();
+            policy.members = members;
+            assert!(
+                service
+                    .set_profile_failover("work".into(), serde_json::to_string(&policy)?)
+                    .is_err()
+            );
+            assert_eq!(profile::load("work")?, profile);
+        }
+        let mut unsafe_tun = profile.clone();
+        unsafe_tun.failover = None;
+        unsafe_tun.interface.enable = true;
+        unsafe_tun.on_core_exit = Some(oxidom_core::config::OnCoreExit::Release);
+        profile::save("work", &unsafe_tun)?;
+        assert!(
+            service
+                .set_profile_failover("work".into(), serde_json::to_string(&profile.failover)?)
+                .is_err()
+        );
+        assert_eq!(profile::load("work")?, unsafe_tun);
+        service.shared.terminate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_progress_tracks_the_episode_without_granting_an_admission() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("failover-progress");
+        let (engine, profile) = fixture()?;
+        let activations = Activations::default();
+        let target = ConnectionTarget::Server(profile.select.server.clone());
+        activations.install(
+            "work",
+            1,
+            Snapshot::new(&engine, &profile, &target)?.unwrap(),
+        );
+        let now = Instant::now();
+        let primary = profile.select.server.clone();
+        let alternate = profile.failover.as_ref().unwrap().members[1].clone();
+        let armed = activations.progress("work", Some(1), now).unwrap();
+        assert_eq!(armed.state, "armed");
+        assert_eq!(armed.current, primary);
+        assert!(armed.next.is_none());
+        {
+            let mut entries = oxidom_core::sync::lock(&activations.0);
+            let entry = entries.get_mut("work").unwrap();
+            entry.snapshot.activation.begin_episode(&primary)?;
+            entry.backoff = now + Duration::from_secs(5);
+        }
+        let waiting = activations.progress("work", Some(1), now).unwrap();
+        assert_eq!(waiting.state, "recovering");
+        assert_eq!(waiting.attempts, 0);
+        assert_eq!(waiting.next.as_deref(), Some(alternate.as_str()));
+        assert_eq!(activations.progress("work", Some(1), now).unwrap(), waiting);
+        {
+            let mut entries = oxidom_core::sync::lock(&activations.0);
+            let entry = entries.get_mut("work").unwrap();
+            entry
+                .snapshot
+                .activation
+                .admit(&alternate, entry.backoff, entry.backoff)?;
+            entry.current = alternate.clone();
+        }
+        let attempting = activations.progress("work", Some(1), now).unwrap();
+        assert_eq!(attempting.current, alternate);
+        assert_eq!(attempting.attempts, 1);
+        assert!(attempting.next.is_none());
+        {
+            let mut entries = oxidom_core::sync::lock(&activations.0);
+            entries
+                .get_mut("work")
+                .unwrap()
+                .snapshot
+                .activation
+                .attempt_failed(&alternate)?;
+        }
+        let exhausted = activations.progress("work", Some(1), now).unwrap();
+        assert_eq!(exhausted.state, "exhausted");
+        assert!(exhausted.attempts < exhausted.max_attempts);
+        assert!(exhausted.next.is_none());
+        activations.disarm("work");
+        let disarmed = activations.progress("work", Some(1), now).unwrap();
+        assert_eq!(disarmed.state, "disarmed");
+        assert_eq!(disarmed.members, armed.members);
+        assert_eq!(disarmed.attempts, 1);
+        activations.remove("work");
+        assert!(activations.progress("work", Some(1), now).is_none());
+        Ok(())
+    }
 
     fn live_activation(
         automatic: bool,

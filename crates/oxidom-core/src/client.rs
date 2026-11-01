@@ -137,6 +137,15 @@ fn profile_save_payload(profile: &Profile) -> Result<String> {
     Ok(serde_json::to_string(&payload)?)
 }
 
+fn checked_profile_save_payload(
+    profile: &Profile,
+    expected: &crate::profile::ProfileExpectation,
+) -> Result<String> {
+    let mut payload: serde_json::Value = serde_json::from_str(&profile_save_payload(profile)?)?;
+    payload["expected_failover"] = serde_json::to_value(expected)?;
+    Ok(serde_json::to_string(&payload)?)
+}
+
 /// Is a system daemon installed at all? Only its D-Bus policy file can say:
 /// without one the bus would refuse every call, so a machine that has it has a
 /// system daemon, and a machine that does not never will.
@@ -666,10 +675,62 @@ impl DaemonClient {
     }
 
     pub fn save_profile(&self, name: &str, profile: &Profile) -> Result<()> {
+        if profile.failover.is_some() && !self.supports_failover() {
+            bail!(
+                "the selected daemon cannot configure failover; restart it with a compatible binary"
+            );
+        }
         let payload = profile_save_payload(profile)?;
         self.proxy
             .call("SaveProfile", &(name, payload))
             .map_err(profiles_unsupported)
+    }
+
+    /// Discovery is read-only and bound to this daemon's unique owner.
+    pub fn supports_failover(&self) -> bool {
+        self.info.as_ref().is_some_and(|info| {
+            info.capabilities
+                .iter()
+                .any(|capability| capability == "profile_failover")
+        })
+    }
+
+    pub fn save_profile_checked(
+        &self,
+        name: &str,
+        profile: &Profile,
+        expected: &crate::profile::ProfileExpectation,
+    ) -> Result<()> {
+        if !self.supports_failover() {
+            bail!(
+                "the selected daemon cannot guard failover edits; restart it with a compatible binary"
+            );
+        }
+        self.proxy
+            .call(
+                "SaveProfile",
+                &(name, checked_profile_save_payload(profile, expected)?),
+            )
+            .map_err(profiles_unsupported)
+    }
+
+    pub fn set_profile_failover(
+        &self,
+        name: &str,
+        policy: Option<&crate::failover::FailoverPolicy>,
+    ) -> Result<()> {
+        self.set_profile_failover_json(name, &serde_json::to_string(&policy)?)
+    }
+
+    pub fn set_profile_failover_json(&self, name: &str, policy_json: &str) -> Result<()> {
+        if !self.supports_failover() {
+            bail!(
+                "the selected daemon cannot configure failover; restart it with a compatible binary"
+            );
+        }
+        self.proxy
+            .call("SetProfileFailover", &(name, policy_json))
+            .map_err(friendly)
     }
 
     pub fn remove_profile(&self, name: &str) -> Result<bool> {
@@ -1065,6 +1126,28 @@ fn is_unknown_method(error: &zbus::Error) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn guarded_saves_carry_loaded_selection_and_policy_only_in_the_request() -> anyhow::Result<()> {
+        let loaded: crate::profile::Profile = serde_json::from_str(
+            r#"{"select":{"server":"canonical-a"},"failover":{"enabled":true,"members":["canonical-a","canonical-b"]}}"#,
+        )?;
+        let expected = crate::profile::ProfileExpectation::from(&loaded);
+        let mut edited = loaded.clone();
+        edited.description = "Edited description".into();
+        edited.failover.as_mut().unwrap().enabled = false;
+        let payload = super::checked_profile_save_payload(&edited, &expected)?;
+        let raw: serde_json::Value = serde_json::from_str(&payload)?;
+        let literal: serde_json::Value = serde_json::from_str(
+            r#"{"select":{"server":"canonical-a"},"failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":3,"cooldown_secs":30}}"#,
+        )?;
+        assert_eq!(raw["expected_failover"], literal);
+        assert_eq!(raw["failover"]["enabled"], false);
+        let persisted: crate::profile::Profile = serde_json::from_str(&payload)?;
+        assert_eq!(persisted, edited);
+        assert!(!persisted.to_toml()?.contains("expected_failover"));
+        Ok(())
+    }
+
+    #[test]
     fn saving_an_enabled_profile_carries_its_existing_authorization() -> anyhow::Result<()> {
         let profile: crate::profile::Profile = serde_json::from_str(
             r#"{"select":{"server":"primary-alias"},"failover":{"enabled":true,"members":["canonical-a","canonical-b"],"max_attempts":3,"cooldown_secs":30}}"#,
@@ -1266,6 +1349,36 @@ mod tests {
         let client = private_client(&bus)?;
         assert!(!client.supports_geo_download());
         assert!(!client.supports_probe_cancel());
+        assert!(!client.supports_failover());
+        assert!(
+            client
+                .save_profile_checked(
+                    "work",
+                    &crate::profile::Profile::default(),
+                    &crate::profile::ProfileExpectation::from(&crate::profile::Profile::default())
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cannot guard failover edits")
+        );
+        assert!(
+            client
+                .set_profile_failover("work", None)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot configure failover")
+        );
+        let profile = crate::profile::Profile {
+            failover: Some(crate::failover::FailoverPolicy::default()),
+            ..Default::default()
+        };
+        assert!(
+            client
+                .save_profile("work", &profile)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot configure failover")
+        );
         assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
         Ok(())
     }
@@ -1275,6 +1388,45 @@ mod tests {
         incarnation: String,
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         malformed: bool,
+    }
+
+    struct PolicyDaemon(std::sync::Arc<std::sync::Mutex<(String, String)>>);
+
+    #[zbus::interface(name = "dev.keepinfov.oxidom1")]
+    impl PolicyDaemon {
+        fn status(&self) -> String {
+            r#"{"state":"disconnected"}"#.into()
+        }
+        fn daemon_info(&self) -> String {
+            serde_json::json!({"version": 1, "incarnation": "a".repeat(64),
+                "store_id": "b".repeat(64), "capabilities": ["profile_failover"]})
+            .to_string()
+        }
+        fn set_profile_failover(&self, name: String, policy: String) {
+            *crate::sync::lock(&self.0) = (name, policy);
+        }
+    }
+
+    #[test]
+    fn policy_controls_send_only_the_exact_policy_to_the_bound_daemon() -> anyhow::Result<()> {
+        let bus = PrivateBus::start()?;
+        let received = std::sync::Arc::new(std::sync::Mutex::new((String::new(), String::new())));
+        let _server = private_service(&bus, PolicyDaemon(received.clone()))?;
+        let client = private_client(&bus)?;
+        assert!(client.supports_failover());
+        let policy = crate::failover::FailoverPolicy {
+            enabled: true,
+            members: vec!["canonical-b".into(), "canonical-a".into()],
+            ..Default::default()
+        };
+        client.set_profile_failover("work", Some(&policy))?;
+        assert_eq!(*crate::sync::lock(&received), ("work".into(), r#"{"enabled":true,"members":["canonical-b","canonical-a"],"max_attempts":3,"cooldown_secs":30}"#.into()));
+        client.set_profile_failover("work", None)?;
+        assert_eq!(
+            *crate::sync::lock(&received),
+            ("work".into(), "null".into())
+        );
+        Ok(())
     }
 
     #[zbus::interface(name = "dev.keepinfov.oxidom1")]

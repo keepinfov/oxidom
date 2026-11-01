@@ -150,7 +150,15 @@ It is **disabled by default**. Only explicitly bringing up a saved profile with 
 authorizes its alternates. Temporary server/group Connect, `oxidom run`, and the global
 `reconnect` setting do not inherit or create that permission.
 
-Use the existing `oxidom profile edit work` workflow to opt in manually. This example uses
+Use the profile dialog’s **Sequential failover** section or
+`oxidom profile failover work --members canonical-a,canonical-b --enable` to opt in.
+`oxidom profile failover work [--json]` inspects saved and activation facts; `--disable` revokes
+future attempts while keeping list/limits. Setting a list or limit alone never enables policy.
+Saving does not start or rearm runtime: explicitly Stop/Up to activate the new saved grant.
+CLI flag updates preserve unmentioned current settings, including a concurrent disable.
+GUI/TOML editors refuse stale selection/authorization instead of restoring an older grant.
+Changing the primary in the dialog preserves its visible candidate list and limits disabled.
+The TOML editor `oxidom profile edit work` remains supported. This example uses
 invented IDs, not usable credentials or real catalog entries; substitute exact IDs from
 `oxidom list servers --json`, not aliases or name substrings:
 
@@ -220,10 +228,8 @@ interface or effective-policy changes revoke the grant; restoring them does not 
 Explicit Stop deletes this owned TUN, unlike ordinary legacy persistent TUN disconnect. Resolve
 any cleanup error before restarting; never erase its recovery records or downgrade around them.
 
-P12 remains open pending required P14/P15 validation; source support is not VM packet-path or
-leak evidence. Neither this mode nor status bookkeeping promises full-device protection, IPv6
-tunnelling, resolver containment or uninterrupted connections. There are no dedicated failover
-flags or GUI controls yet: those belong to P13. See the binding [failover specification](spec/failover.md) and
+P14/P15 validation remains required; source support is not VM packet-path or leak evidence. Neither this mode nor status bookkeeping promises full-device protection, IPv6
+tunnelling, resolver containment or uninterrupted connections. See the binding [failover specification](spec/failover.md) and
 [failure diagnosis](troubleshooting.md#failover-does-not-try-another-server).
 
 ## Pools

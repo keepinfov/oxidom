@@ -16,7 +16,7 @@ use oxidom_core::ipc::ProfileEntry;
 use oxidom_core::logbook::{self, LogSlice};
 use oxidom_core::model::Subscription;
 use oxidom_core::pool::PoolQuery;
-use oxidom_core::profile::Profile;
+use oxidom_core::profile::{Profile, ProfileExpectation};
 use oxidom_core::redact;
 use oxidom_core::xray::core::Status;
 use oxidom_core::{paths, sysproxy};
@@ -2126,11 +2126,12 @@ impl Controller {
             (state.profiles.clone(), server_choices(&state.subscriptions))
         };
         let callbacks = ProfileDialogCallbacks {
+            failover_supported: self.state.borrow().client.supports_failover(),
             save: {
                 let weak = self.bound();
-                Rc::new(move |name, profile| {
+                Rc::new(move |name, profile, expected| {
                     if let Some(controller) = weak.upgrade() {
-                        controller.save_profile(name, profile);
+                        controller.save_profile(name, profile, expected);
                     }
                 })
             },
@@ -3375,15 +3376,21 @@ impl Controller {
         );
     }
 
-    fn save_profile(self: &Rc<Self>, name: String, profile: Profile) {
+    fn save_profile(self: &Rc<Self>, name: String, profile: Profile, expected: ProfileExpectation) {
         let work_name = name.clone();
         self.client_job(
             UiOperation::for_profile(UiOperationKind::SaveProfile, name),
             move |client| {
-                Ok(refresh_profiles_after(
-                    client,
-                    client.save_profile(&work_name, &profile),
-                ))
+                let result = if client.supports_failover() {
+                    client.save_profile_checked(&work_name, &profile, &expected)
+                } else if expected.failover.is_some() || profile.failover.is_some() {
+                    Err(anyhow::anyhow!(
+                        "the selected daemon cannot configure failover; restart it with a compatible binary"
+                    ))
+                } else {
+                    client.save_profile(&work_name, &profile)
+                };
+                Ok(refresh_profiles_after(client, result))
             },
             |controller, result| match result {
                 Ok((operation, profiles)) => {

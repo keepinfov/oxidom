@@ -1301,6 +1301,7 @@ impl Shared {
             if let Some(retry) = self.failover.retry(profile, generation, Instant::now()) {
                 runtime.retry = retry;
             }
+            runtime.failover = self.failover.progress(profile, generation, Instant::now());
         }
         info
     }
@@ -3483,6 +3484,7 @@ fn session_info_with_status(
                 state: "idle".to_string(),
                 ..Default::default()
             },
+            failover: None,
         }),
     }
 }
@@ -4175,12 +4177,23 @@ impl Service {
         let mut profile: Profile = serde_json::from_value(raw.clone()).map_err(failed)?;
         let engine = oxidom_core::sync::lock(&self.shared.engine);
         self.shared.ensure_open()?;
+        if let Some(expected) = raw.get("expected_failover") {
+            let expected: oxidom_core::profile::ProfileExpectation =
+                serde_json::from_value(expected.clone()).map_err(failed)?;
+            let current = profile::load_or_default(&name).map_err(failed)?;
+            if expected != oxidom_core::profile::ProfileExpectation::from(&current) {
+                return Err(failed(
+                    "profile selection or failover authorization changed; reopen the editor",
+                ));
+            }
+        }
         if raw.get("failover").is_none()
             && let Ok(previous) = profile::load(&name)
             && previous.select == profile.select
         {
             profile.failover = previous.failover;
         }
+        failover::validate_saved(&engine, &name, &profile).map_err(failed)?;
         // Revoke changed grants before persistence; unrelated successful saves
         // preserve the active snapshot. A failed write disarms below.
         self.shared
@@ -4189,6 +4202,39 @@ impl Service {
         // `save` re-checks both the name and the ports. The daemon owns the
         // profiles directory — on the system bus it is root's — so validation
         // that only ran in the caller would be no validation at all.
+        let _commit = self
+            .shared
+            .lifecycle
+            .commit()
+            .ok_or_else(|| failed("daemon is stopping"))?;
+        let result = profile::save(&name, &profile);
+        if result.is_err() {
+            self.shared.failover.disarm(&name);
+        }
+        result.map_err(failed)
+    }
+
+    /// Change only authorization, under the activation/admission lock. A CLI
+    /// policy update must not copy back an obsolete primary, ports or routing.
+    fn set_profile_failover(&self, name: String, policy_json: String) -> fdo::Result<()> {
+        let _request = self.shared.admit()?;
+        let patch: Option<oxidom_core::failover::FailoverPatch> =
+            serde_json::from_str(&policy_json).map_err(failed)?;
+        let engine = oxidom_core::sync::lock(&self.shared.engine);
+        self.shared.ensure_open()?;
+        let mut profile = profile::load(&name).map_err(failed)?;
+        if let Some(patch) = patch {
+            if patch.is_empty() {
+                return Ok(());
+            }
+            patch.apply(&mut profile.failover).map_err(failed)?;
+        } else {
+            profile.failover = None;
+        }
+        failover::validate_saved(&engine, &name, &profile).map_err(failed)?;
+        self.shared
+            .failover
+            .reconcile_profile(&engine, &name, &profile);
         let _commit = self
             .shared
             .lifecycle
