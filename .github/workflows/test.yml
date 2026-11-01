@@ -1,8 +1,9 @@
 name: test
 
-# The suite is pure logic — parsers, config generation, reducers — and runs
-# headless. Tests that need a network, a live Xray core, root, or a display are
-# marked #[ignore] and are not run here; AGENTS.md says how to run those by hand.
+# The suite runs headless: parsers, config generation, reducers and isolated
+# process/private-bus tests with an offline fake core. Tests that need an
+# external network, a real Xray core, root, or a display are not run here.
+# AGENTS.md describes the ignored tests; docs/testing.md describes isolation.
 
 # No path filter, deliberately. `cargo-test` is a required status check, and a
 # required check that does not run is not a skipped check: GitHub waits for a
