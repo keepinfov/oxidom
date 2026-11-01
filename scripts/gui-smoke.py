@@ -357,7 +357,9 @@ class Smoke:
             )
             os.close(write)
             write = None
-            self.env["DISPLAY"] = "unix:" + self.read_line(read, "private Xvfb")
+            # Explicit transport/display syntax works in libxcb and python-xlib;
+            # libxcb interprets the different "unix:" prefix as a socket path.
+            self.env["DISPLAY"] = "unix/:" + self.read_line(read, "private Xvfb")
         finally:
             os.close(read)
             if write is not None:

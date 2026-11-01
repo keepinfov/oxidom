@@ -50,7 +50,9 @@ GSettings and an inaccessible system-bus address. A private session-bus config
 contains no activation service directories. External supervision policy forbids
 implicit daemon bootstrap. Xvfb allocates its display through `-displayfd`, uses
 a private MIT cookie and disables TCP listening. The display and bus announce
-readiness through pipes; process and protocol observations use bounded waits.
+readiness through pipes; `unix/:N` selects the local transport explicitly for
+both GTK/libxcb and python-xlib. Process and protocol observations use bounded
+waits.
 
 Configuration explicitly selects the fake `xray_binary`; a missing environment
 override would still allow managed-core resolution. The fake answers the pinned
