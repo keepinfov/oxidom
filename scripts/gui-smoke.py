@@ -104,6 +104,9 @@ def fake_core(arguments):
         address = inbound["listen"]
         require(address.startswith("127."), "fake listener must be loopback")
         listener = socket.socket()
+        # Keep the configured endpoints reusable after actively closing a
+        # completed probe, as required by the same-port replacement Up below.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((address, inbound["port"]))
         listener.listen()
         listeners.append(listener)
