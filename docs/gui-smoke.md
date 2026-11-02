@@ -1,7 +1,7 @@
 # Isolated GUI lifecycle smoke
 
 The Linux `gui-smoke` flake check starts the installed CLI and GUI packages with
-a private Xvfb display and session bus. It runs as part of `nix flake check` in
+a private Xvfb display, session bus and accessibility bus. It runs as part of `nix flake check` in
 the build workflow. The packages are the same derivations used by the other
 checks, so this adds a runtime smoke without building a second copy of them.
 
@@ -16,11 +16,13 @@ The implementation is in [`gui-smoke.py`](../scripts/gui-smoke.py) and
 and tool paths; it does not install tools at runtime. Its Python environment
 contains PyGObject for private D-Bus calls and python-xlib for X11 observations
 and input. Both come from the existing pinned nixpkgs input. GTK runs in the
-real GUI process, outside the reducer/unit suite.
+real GUI process, outside the reducer/unit suite. The pinned `at-spi2-core`
+package supplies the real accessibility registry; Python uses raw Gio D-Bus
+calls and needs no AT-SPI Python binding.
 
 ## What it asserts
 
-The test starts one explicit session daemon, imports an invented server, starts
+The test starts an explicit session daemon, imports an invented server, starts
 a proxy-only session and waits for application confirmation through an offline
 fake core. It then launches `oxidom-gui --debug` in the foreground.
 
@@ -31,24 +33,65 @@ that startup hydration has been attempted and widget construction completed;
 startup can tolerate partial RPC failures, so mapping alone does not establish
 that every displayed fact was hydrated successfully.
 
+An independent connection monitors only this private bus. It correlates read
+requests with successful replies from the selected daemon's unique owner and
+attributes each client sender to the owned GUI PID. The GApplication owner and
+the daemon client's zbus connection are distinct; recovery creates another zbus
+sender. The smoke requires the GUI's identity/runtime/catalog/profile/status/
+settings/probe reads, followed by `LogsSince` on that same sender. Recovery's
+hydration routine does not read logs; normal polling starts after the controller
+installs the hydrated client and reopens admission. Successful read attempts
+alone therefore cannot satisfy the recovery assertion.
+
+Before the daemon-loss fault, a separate accessibility connection reads the real
+GTK bridge. Registry discovery must return an application root whose unique
+sender belongs to the owned GUI PID on the accessibility bus, independently of
+the session-bus GApplication and zbus identities. That root must expose a
+visible/showing frame or window with main-window dimensions and a descendant
+whose accessible Name is the invented server label `Smoke`. All descendants
+must belong to the same unique GUI sender. Traversal is bounded by time, node
+count, queue size and depth; a missing bridge, frame or label fails the check.
+The mapped X11 main window must remain the same during that observation.
+
+While the GUI stays mapped, the smoke sends SIGTERM to the daemon and observes
+the old fake core's exit before fallback group cleanup. The GUI must report its
+existing polling-loss diagnostic and retain its process and main window. An
+explicit replacement daemon must preserve the store ID, change incarnation and
+start with no resumed session. The observer then requires full GUI hydration and
+subsequent admitted polling against the replacement's unique owner. A fresh CLI
+Up creates a new confirmed session, and a later successful GUI status reply must
+contain that session. These checks establish recovery wiring and admission, not
+the rendered text of the GUI's rows.
+
 The smoke dispatches the existing navigation shortcuts through X11, closes the
 window and checks that its process remains alive. A second GUI invocation must
 exit and reactivate the original window with the same application bus owner and
-PID. Quit must terminate that GUI while preserving the original daemon identity,
-the pinned live fake-core process and its confirmed session. Explicit CLI Stop
-and daemon SIGTERM finish the scenario.
+PID. Quit must terminate that GUI while preserving the replacement daemon
+identity, its pinned live fake-core process and its confirmed session. Explicit
+CLI Stop and daemon SIGTERM finish the scenario.
 
 Shortcut dispatch is an event-loop smoke. It does not assert which page rendered,
 the text of a status field, layout, focus order, screen-reader output or visual
-correctness. Those need additional evidence. GTK accessibility is disabled in
-this smoke, so it supplies no AT coverage.
+correctness. The AT assertion covers bridge registration and one fixture label
+in the real main-window tree before the fault. It does not verify accessible
+recovery announcements, focus, keyboard traversal, the complete accessible
+naming/role contract or Orca output. Those need additional evidence.
 
 ## Isolation and cleanup
 
 The script constructs child environments with private HOME/XDG paths, memory
 GSettings and an inaccessible system-bus address. A private session-bus config
 contains no activation service directories. External supervision policy forbids
-implicit daemon bootstrap. Xvfb allocates its display through `-displayfd`, uses
+implicit daemon bootstrap. A second custom bus config also has no activation
+service directories. The smoke starts and owns `at-spi2-registryd` explicitly,
+verifies its bus-owner PID, and supplies its private address directly through
+`AT_SPI_BUS_ADDRESS`; `GTK_A11Y=atspi` selects GTK's real bridge. No desktop
+accessibility launcher or service is used. Eavesdropping is enabled only in that private bus's
+fixture policy so an owned `BecomeMonitor` connection can observe correlated
+calls and replies. It consumes monitoring copies and does not send replies or
+issue control calls on the converted connection. Observations are bounded;
+sender PID queries use the separate control connection. Xvfb allocates its
+display through `-displayfd`, uses
 a private MIT cookie and disables TCP listening. The display and bus announce
 readiness through pipes; `unix/:N` selects the local transport explicitly for
 both GTK/libxcb and python-xlib. Process and protocol observations use bounded
@@ -62,7 +105,9 @@ standby and watchdog are disabled; no TUN or nftables operation is requested.
 
 Pidfds identify child processes. Process groups keep an unreaped leader until
 fallback cleanup has signalled the group, and a temporary child subreaper reaps
-orphaned fakes. Cleanup attempts all owned children even if closing X11 or D-Bus
+orphaned fakes. Both buses, the registry, its process group and the accessibility
+connection belong to the fixture and are included in cleanup. Cleanup attempts
+all owned children even if closing X11 or D-Bus
 fails; diagnostic output is bounded and a cleanup failure retains its private
 root. An ordinary scenario failure prints its fixture logs before cleanup.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated X11/GTK lifecycle smoke. This is not a GTK unit or AT test.
+"""Isolated X11/GTK lifecycle and basic AT-SPI bridge/tree smoke.
 
 The Nix check supplies built binaries and pinned tools. No host buses, display,
 settings, store or external destination are used. Actual forwarding is not tested.
@@ -30,6 +30,13 @@ APP = "dev.keepinfov.oxidom"
 BUS = APP + ".Daemon"
 OBJECT = "/dev/keepinfov/oxidom/Daemon"
 INTERFACE = "dev.keepinfov.oxidom1"
+ATSPI_REGISTRY = "org.a11y.atspi.Registry"
+ATSPI_ROOT = "/org/a11y/atspi/accessible/root"
+ATSPI_ACCESSIBLE = "org.a11y.atspi.Accessible"
+# AT-SPI wire enum values, independent of any Python AT-SPI binding.
+ATSPI_WINDOW_ROLES = frozenset((23, 69))  # FRAME, WINDOW
+ATSPI_SHOWING = 1 << 25
+ATSPI_VISIBLE = 1 << 30
 
 
 def require(condition, message):
@@ -97,6 +104,9 @@ def fake_core(arguments):
         address = inbound["listen"]
         require(address.startswith("127."), "fake listener must be loopback")
         listener = socket.socket()
+        # Keep the configured endpoints reusable after actively closing a
+        # completed probe, as required by the same-port replacement Up below.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((address, inbound["port"]))
         listener.listen()
         listeners.append(listener)
@@ -129,6 +139,354 @@ def bounded_gio(operation):
     finally:
         deadline.cancel()
         deadline.join()
+
+
+class BusObserver:
+    """Attribute successful GUI reads without becoming a control connection."""
+
+    READS = frozenset(
+        (
+            "DaemonInfo",
+            "RuntimeInfo",
+            "ListSubscriptions",
+            "ListProfiles",
+            "Status",
+            "GetSettings",
+            "ProbeState",
+            "LogsSince",
+        )
+    )
+    HYDRATION = READS - {"LogsSince"}
+
+    def __init__(self, address):
+        self.lock = threading.Lock()
+        self.pending = {}
+        self.completed = []
+        self.sequence = 0
+        self.failure = None
+        self.pids = {}
+        self.filter_id = None
+        self.connection = bounded_gio(
+            lambda cancellation: Gio.DBusConnection.new_for_address_sync(
+                address,
+                Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+                None,
+                cancellation,
+            )
+        )
+        self.unique = self.connection.get_unique_name()
+        try:
+            # Consume monitor copies before GDBus could dispatch another
+            # client's method call and send an unsolicited reply. The monitor's
+            # own setup reply still has to reach its pending call_sync.
+            self.filter_id = self.connection.add_filter(self.message, None)
+            self.connection.call_sync(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus.Monitoring",
+                "BecomeMonitor",
+                GLib.Variant(
+                    "(asu)",
+                    (
+                        [
+                            "type='method_call',path='%s',interface='%s'"
+                            % (OBJECT, INTERFACE),
+                            "type='method_return'",
+                            "type='error'",
+                        ],
+                        0,
+                    ),
+                ),
+                None,
+                Gio.DBusCallFlags.NO_AUTO_START,
+                2000,
+                None,
+            )
+        except BaseException:
+            try:
+                self.close()
+            except BaseException as failure:
+                print(
+                    "additional observer cleanup failure: " + str(failure),
+                    file=sys.stderr,
+                )
+            raise
+
+    def message(self, connection, message, incoming, user_data=None):
+        if not incoming:
+            return message
+        try:
+            self.observe(message)
+        except BaseException:
+            # A Python exception must not silently disappear in a GI callback.
+            # Payloads are never included in this diagnostic.
+            with self.lock:
+                self.failure = "private bus observer rejected a message"
+        return message if message.get_destination() == self.unique else None
+
+    def observe(self, message):
+        kind = message.get_message_type()
+        with self.lock:
+            if (
+                kind == Gio.DBusMessageType.METHOD_CALL
+                and message.get_path() == OBJECT
+                and message.get_interface() == INTERFACE
+                and message.get_member() in self.READS
+            ):
+                require(len(self.pending) < 256, "private bus pending bound exceeded")
+                self.pending[(message.get_sender(), message.get_serial())] = {
+                    "sender": message.get_sender(),
+                    "destination": message.get_destination(),
+                    "member": message.get_member(),
+                }
+            elif kind in (
+                Gio.DBusMessageType.METHOD_RETURN,
+                Gio.DBusMessageType.ERROR,
+            ):
+                request = self.pending.pop(
+                    (message.get_destination(), message.get_reply_serial()), None
+                )
+                if request is None:
+                    return
+                require(
+                    len(self.completed) < 1024, "private bus history bound exceeded"
+                )
+                self.sequence += 1
+                request.update(
+                    sequence=self.sequence,
+                    success=kind == Gio.DBusMessageType.METHOD_RETURN,
+                    reply_sender=message.get_sender(),
+                    sessions=(),
+                )
+                if request["success"] and request["member"] == "Status":
+                    values = message.get_body().unpack()
+                    require(len(values) == 1, "invalid status response shape")
+                    status = json.loads(values[0])
+                    request["sessions"] = tuple(
+                        (
+                            session.get("profile"),
+                            session.get("state"),
+                            session.get("server_id"),
+                        )
+                        for session in status["sessions"]
+                    )
+                self.completed.append(request)
+
+    def cursor(self):
+        with self.lock:
+            require(self.failure is None, self.failure)
+            return self.sequence
+
+    def reads(self, smoke, pid, owner, after=0):
+        with self.lock:
+            require(self.failure is None, self.failure)
+            records = [
+                record.copy()
+                for record in self.completed
+                if record["sequence"] > after
+                and record["destination"] == owner
+                and record["reply_sender"] == owner
+                and record["success"]
+            ]
+        # APP's GApplication owner is a different connection from zbus. Resolve
+        # daemon-client senders outside the monitor callback on the separate
+        # control connection; each recovery creates a new zbus sender.
+        for sender in {record["sender"] for record in records}:
+            if sender not in self.pids:
+                try:
+                    self.pids[sender] = smoke.call(
+                        "org.freedesktop.DBus",
+                        "/org/freedesktop/DBus",
+                        "org.freedesktop.DBus",
+                        "GetConnectionUnixProcessID",
+                        "(s)",
+                        (sender,),
+                    )[0]
+                except GLib.Error as failure:
+                    if "NameHasNoOwner" not in str(failure):
+                        raise
+                    self.pids[sender] = None
+        return [record for record in records if self.pids[record["sender"]] == pid]
+
+    def polling_sender(self, smoke, pid, owner, after=0):
+        records = self.reads(smoke, pid, owner, after)
+        for sender in {record["sender"] for record in records}:
+            first = {}
+            for record in records:
+                if record["sender"] == sender:
+                    first.setdefault(record["member"], record["sequence"])
+            if not self.HYDRATION.issubset(first):
+                continue
+            hydrated = max(first[member] for member in self.HYDRATION)
+            if any(
+                record["sender"] == sender
+                and record["member"] == "LogsSince"
+                and record["sequence"] > hydrated
+                for record in records
+            ):
+                # load_recovered never calls LogsSince. Normal polling only
+                # runs after the controller installs its hydrated candidate
+                # and reopens admission, so read attempts alone cannot pass.
+                return sender
+        return None
+
+    def saw_session(self, smoke, pid, owner, sender, server, after):
+        return any(
+            record["sender"] == sender
+            and record["member"] == "Status"
+            and ("default", "connected", server) in record["sessions"]
+            for record in self.reads(smoke, pid, owner, after)
+        )
+
+    def close(self):
+        try:
+            if self.filter_id is not None:
+                self.connection.remove_filter(self.filter_id)
+                self.filter_id = None
+        finally:
+            bounded_gio(self.connection.close_sync)
+
+
+class Accessibility:
+    """Read the real GUI's exported tree over the owned accessibility bus."""
+
+    def __init__(self, address):
+        self.connection = bounded_gio(
+            lambda cancellation: Gio.DBusConnection.new_for_address_sync(
+                address,
+                Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+                None,
+                cancellation,
+            )
+        )
+
+    def call(self, name, path, interface, method, signature="()", arguments=()):
+        return self.connection.call_sync(
+            name,
+            path,
+            interface,
+            method,
+            GLib.Variant(signature, arguments),
+            None,
+            Gio.DBusCallFlags.NO_AUTO_START,
+            2000,
+            None,
+        ).unpack()
+
+    def bus_call(self, method, name):
+        return self.call(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            method,
+            "(s)",
+            (name,),
+        )[0]
+
+    def children(self, name, path):
+        children = self.call(name, path, ATSPI_ACCESSIBLE, "GetChildren")[0]
+        require(len(children) <= 512, "accessibility child-list bound exceeded")
+        return children
+
+    def registry_ready(self, registry):
+        require(not registry.exited(), "accessibility registry exited: " + registry.logs())
+        try:
+            owner = self.bus_call("GetNameOwner", ATSPI_REGISTRY)
+            require(
+                self.bus_call("GetConnectionUnixProcessID", owner) == registry.child.pid,
+                "accessibility registry owner differs from owned process",
+            )
+            self.children(owner, ATSPI_ROOT)
+        except GLib.Error as failure:
+            # registryd claims its name before constructing its root object.
+            if Gio.DBusError.get_remote_error(failure) in (
+                "org.freedesktop.DBus.Error.NameHasNoOwner",
+                "org.freedesktop.DBus.Error.UnknownObject",
+                "org.freedesktop.DBus.Error.UnknownMethod",
+            ):
+                return False
+            raise
+        self.registry_owner = owner
+        return True
+
+    def has_main_tree(self, gui):
+        require(not gui.exited(), "GUI exited during accessibility observation")
+        deadline = time.monotonic() + LIMIT
+        try:
+            applications = self.children(self.registry_owner, ATSPI_ROOT)
+            roots = []
+            for name, path in applications:
+                require(time.monotonic() < deadline, "accessibility discovery deadline")
+                require(name.startswith(":"), "accessibility root lacks a unique sender")
+                if self.bus_call("GetConnectionUnixProcessID", name) == gui.child.pid:
+                    roots.append((name, path))
+            require(len(roots) <= 1, "GUI registered multiple accessibility roots")
+            if not roots:
+                return False
+            name, root = roots[0]
+            require(root == ATSPI_ROOT, "GUI accessibility root has an unexpected path")
+            for child_name, path in self.children(name, root):
+                require(time.monotonic() < deadline, "accessibility toplevel deadline")
+                require(child_name == name, "accessibility toplevel crossed GUI sender")
+                role = self.call(name, path, ATSPI_ACCESSIBLE, "GetRole")[0]
+                if role not in ATSPI_WINDOW_ROLES:
+                    continue
+                width, height = self.call(
+                    name, path, "org.a11y.atspi.Component", "GetSize"
+                )
+                # The mapped X11 main is already observed. Its AT top-level
+                # must also have main-window dimensions, excluding the splash.
+                if width < 1000 or height < 650:
+                    continue
+                words = self.call(name, path, ATSPI_ACCESSIBLE, "GetState")[0]
+                states = sum(word << (32 * index) for index, word in enumerate(words))
+                required_states = ATSPI_SHOWING | ATSPI_VISIBLE
+                if states & required_states != required_states:
+                    continue
+                pending = [(path, 0)]
+                visited = set()
+                while pending:
+                    require(time.monotonic() < deadline, "accessibility tree deadline")
+                    current, depth = pending.pop()
+                    if current in visited:
+                        continue
+                    visited.add(current)
+                    require(
+                        len(visited) <= 512 and depth <= 32,
+                        "accessibility tree bound exceeded",
+                    )
+                    label = self.call(
+                        name,
+                        current,
+                        "org.freedesktop.DBus.Properties",
+                        "Get",
+                        "(ss)",
+                        (ATSPI_ACCESSIBLE, "Name"),
+                    )[0]
+                    if label == "Smoke":
+                        return True
+                    for child_name, child_path in self.children(name, current):
+                        require(
+                            child_name == name,
+                            "accessibility descendant crossed GUI sender",
+                        )
+                        pending.append((child_path, depth + 1))
+                        require(len(pending) <= 512, "accessibility queue bound exceeded")
+            return False
+        except GLib.Error as failure:
+            # GTK may retire a splash/accessibility object during discovery.
+            # Missing methods, protocol failures and other errors must fail.
+            if Gio.DBusError.get_remote_error(failure) in (
+                "org.freedesktop.DBus.Error.UnknownObject",
+                "org.freedesktop.DBus.Error.NameHasNoOwner",
+            ):
+                return False
+            raise
+
+    def close(self):
+        bounded_gio(self.connection.close_sync)
 
 
 class Process:
@@ -168,6 +526,26 @@ class Process:
             with path.open(errors="replace") as stream:
                 records.append(path.name + ":\n" + stream.read(65536))
         return "\n".join(records)
+
+    def appended_notice(self, text):
+        """Observe a new stderr marker without depending on an old log prefix."""
+        needle = text.encode()
+        require(bool(needle), "an empty log notice cannot witness an event")
+        cursor = self.error.stat().st_size
+        suffix = b""
+
+        def arrived():
+            nonlocal cursor, suffix
+            with self.error.open("rb") as stream:
+                stream.seek(cursor)
+                data = stream.read(65536)
+            cursor += len(data)
+            combined = suffix + data
+            keep = len(needle) - 1
+            suffix = combined[-keep:] if keep else b""
+            return needle in combined
+
+        return arrived
 
     def signal(self, value):
         signal.pidfd_send_signal(self.fd, value)
@@ -225,6 +603,8 @@ class Smoke:
         self.children = []
         self.x = None
         self.connection = None
+        self.observer = None
+        self.accessibility = None
         self.libc = ctypes.CDLL(None, use_errno=True)
         self.previous_subreaper = ctypes.c_int()
         self.subreaper_installed = False
@@ -244,7 +624,7 @@ class Smoke:
             "GSETTINGS_BACKEND": "memory",
             "GDK_BACKEND": "x11",
             "GSK_RENDERER": "cairo",
-            "GTK_A11Y": "none",
+            "GTK_A11Y": "atspi",
             "LANG": "C.UTF-8",
         }
 
@@ -296,7 +676,7 @@ class Smoke:
             (self.root / directory).mkdir(mode=0o700)
         bus_config = self.root / "bus.conf"
         bus_config.write_text(
-            '<busconfig><type>session</type><listen>unix:path=%s</listen><auth>EXTERNAL</auth><policy context="default"><allow send_destination="*"/><allow receive_sender="*"/><allow own="*"/><allow user="*"/></policy></busconfig>'
+            '<busconfig><type>session</type><listen>unix:path=%s</listen><auth>EXTERNAL</auth><policy context="default"><allow send_destination="*"/><allow receive_sender="*"/><allow own="*"/><allow user="*"/><allow eavesdrop="true"/></policy></busconfig>'
             % (self.root / "bus")
         )
         read, write = os.pipe()
@@ -378,7 +758,44 @@ class Smoke:
                 os.environ["XAUTHORITY"] = previous_authority
         self.x.screen().root.change_attributes(event_mask=X.SubstructureNotifyMask)
         self.x.sync()
+        self.setup_accessibility()
         self.seed()
+
+    def setup_accessibility(self):
+        # A second bus with no activation service directories cannot reach a
+        # host accessibility launcher, registry or desktop session.
+        config = self.root / "a11y-bus.conf"
+        config.write_text(
+            '<busconfig><type>session</type><listen>unix:path=%s</listen><auth>EXTERNAL</auth><policy context="default"><allow send_destination="*"/><allow receive_sender="*"/><allow own="*"/><allow user="*"/></policy></busconfig>'
+            % (self.root / "a11y-bus")
+        )
+        read, write = os.pipe()
+        try:
+            self.spawn(
+                [
+                    self.args.dbus,
+                    "--config-file=" + str(config),
+                    "--nofork",
+                    "--print-address=1",
+                ],
+                "a11y-bus",
+                stdout=write,
+            )
+            os.close(write)
+            write = None
+            self.env["AT_SPI_BUS_ADDRESS"] = self.read_line(
+                read, "private accessibility bus"
+            )
+        finally:
+            os.close(read)
+            if write is not None:
+                os.close(write)
+        self.accessibility = Accessibility(self.env["AT_SPI_BUS_ADDRESS"])
+        registry = self.spawn([self.args.atspi_registry], "a11y-registry")
+        self.wait(
+            lambda: self.accessibility.registry_ready(registry),
+            "private accessibility registry",
+        )
 
     def seed(self):
         directory = self.root / "config/oxidom"
@@ -500,7 +917,10 @@ class Smoke:
                     and geometry.height >= 650
                 ):
                     candidates.append(window)
-            except error.BadWindow:
+            except (error.BadWindow, error.BadDrawable):
+                # query_tree/windows is a snapshot: GTK can destroy the splash
+                # before GetGeometry, which reports BadDrawable rather than
+                # BadWindow. Retry the bounded main-window observation only.
                 continue
         return (
             candidates[0]
@@ -524,15 +944,34 @@ class Smoke:
             [self.args.cli, *arguments], "cli-" + str(len(self.children))
         ).finish()
 
+    def start_daemon(self, name, previous=None):
+        daemon = self.spawn([self.args.cli, "daemon"], name)
+        observed = [None]
+
+        def ready():
+            observed[0] = self.name_owner(BUS)
+            return daemon.exited() or (
+                observed[0] is not None and observed[0] != previous
+            )
+
+        self.wait(ready, "owned daemon name")
+        require(not daemon.exited(), "daemon failed: " + daemon.logs())
+        owner = observed[0]
+        pid = self.call(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetConnectionUnixProcessID",
+            "(s)",
+            (owner,),
+        )[0]
+        require(pid == daemon.child.pid, "daemon name is owned by another process")
+        self.owner = owner
+        return daemon, self.json("DaemonInfo")
+
     def run(self):
         self.setup()
-        daemon = self.spawn([self.args.cli, "daemon"], "daemon")
-        self.wait(
-            lambda: self.name_owner(BUS) is not None or daemon.exited(), "daemon name"
-        )
-        require(not daemon.exited(), "daemon failed: " + daemon.logs())
-        self.owner = self.name_owner(BUS)
-        identity = self.json("DaemonInfo")
+        daemon, identity = self.start_daemon("daemon")
         imported = self.call(
             self.owner,
             OBJECT,
@@ -564,6 +1003,7 @@ class Smoke:
         core_pid = state["sessions"][0]["xray_pid"]
         core = os.pidfd_open(core_pid)
         try:
+            self.observer = BusObserver(self.env["DBUS_SESSION_BUS_ADDRESS"])
             gui = self.spawn([self.args.gui, "--debug"], "gui")
             mapped = [None]
 
@@ -587,6 +1027,128 @@ class Smoke:
                 application_pid == gui.child.pid,
                 "application owner differs from owned GUI",
             )
+            initial_sender = [None]
+
+            def initial_polling():
+                initial_sender[0] = self.observer.polling_sender(
+                    self, gui.child.pid, self.owner
+                )
+                return initial_sender[0] is not None
+
+            self.wait(initial_polling, "GUI startup hydration and admitted polling")
+            self.wait(
+                lambda: self.observer.saw_session(
+                    self,
+                    gui.child.pid,
+                    self.owner,
+                    initial_sender[0],
+                    servers[0]["id"],
+                    0,
+                ),
+                "GUI observed the initial confirmed session",
+            )
+            self.wait(
+                lambda: self.accessibility.has_main_tree(gui),
+                "GUI accessibility main frame and invented Smoke descendant",
+            )
+            accessible_window = self.main_window(gui)
+            require(
+                accessible_window is not None and accessible_window.id == main.id,
+                "accessibility observation lost the mapped main window",
+            )
+            require(
+                not select.select([core], [], [], 0)[0],
+                "initial fake core exited before the daemon-loss fault",
+            )
+
+            # The GUI must observe loss on its own timer, then install a fresh
+            # immutable client only after strict same-store rehydration. Keep
+            # the process/window alive through this actual owner replacement.
+            fault_cursor = self.observer.cursor()
+            old_owner = self.owner
+            loss_notice = gui.appended_notice(
+                "daemon polling failed; tunnel state is unknown"
+            )
+            daemon.signal(signal.SIGTERM)
+            daemon.wait_exit()
+            require(
+                select.select([core], [], [], LIMIT)[0],
+                "daemon signal shutdown left its old core alive",
+            )
+            # The core-exit assertion precedes fallback group cleanup.
+            daemon.finish()
+            self.wait(
+                loss_notice,
+                "GUI accepted daemon-loss state",
+            )
+            require(not gui.exited(), "daemon loss terminated the GUI")
+            current_window = self.main_window(gui)
+            require(
+                current_window is not None and current_window.id == main.id,
+                "daemon loss replaced or hid the main window",
+            )
+
+            daemon, replacement = self.start_daemon("replacement-daemon", old_owner)
+            require(
+                replacement["store_id"] == identity["store_id"]
+                and replacement["incarnation"] != identity["incarnation"],
+                "replacement did not preserve store continuity and change incarnation",
+            )
+            require(
+                self.json("ListSessions") == [],
+                "daemon restart resumed a session without an explicit Up",
+            )
+            recovered_sender = [None]
+
+            def recovered_polling():
+                recovered_sender[0] = self.observer.polling_sender(
+                    self, gui.child.pid, self.owner, fault_cursor
+                )
+                return recovered_sender[0] is not None
+
+            self.wait(
+                recovered_polling,
+                "GUI strict replacement hydration and committed polling",
+            )
+            require(
+                recovered_sender[0] != initial_sender[0],
+                "GUI reused its retired daemon-client connection",
+            )
+            current_window = self.main_window(gui)
+            require(
+                not gui.exited()
+                and self.name_owner(APP) == application_owner
+                and current_window is not None
+                and current_window.id == main.id,
+                "owner recovery replaced the GUI process, application or main window",
+            )
+
+            renewed_cursor = self.observer.cursor()
+            self.cli("up")
+            self.wait(
+                lambda: any(
+                    session["state"] == "connected"
+                    for session in self.json("ListSessions")
+                ),
+                "renewed confirmed fake session",
+            )
+            state = tomllib.loads((self.root / "data/oxidom/state.toml").read_text())
+            previous_core = core
+            core = os.pidfd_open(state["sessions"][0]["xray_pid"])
+            os.close(previous_core)
+            self.wait(
+                lambda: self.observer.saw_session(
+                    self,
+                    gui.child.pid,
+                    self.owner,
+                    recovered_sender[0],
+                    servers[0]["id"],
+                    renewed_cursor,
+                ),
+                "recovered GUI observed the renewed confirmed session",
+            )
+            identity = replacement
+
             # Dispatch existing navigation shortcuts through real X11 events.
             # This checks event-loop wiring/liveness, not displayed text or AT.
             for page in ("1", "2", "3", "4", "5", "1"):
@@ -647,7 +1209,7 @@ class Smoke:
         daemon.signal(signal.SIGTERM)
         daemon.finish()
         print(
-            "GUI smoke passed: startup main, navigation dispatch, hide/reactivate, quit preserves daemon and session"
+            "GUI smoke passed: startup main, same-store owner recovery, AT-SPI bridge/tree, navigation dispatch, hide/reactivate, quit preserves daemon and session"
         )
 
     def close(self):
@@ -659,6 +1221,10 @@ class Smoke:
             except BaseException as failure:
                 failures.append(str(failure))
 
+        if self.observer is not None:
+            cleanup(self.observer.close)
+        if self.accessibility is not None:
+            cleanup(self.accessibility.close)
         if self.x is not None:
             cleanup(self.x.close)
         if self.connection is not None:
@@ -690,7 +1256,7 @@ class Smoke:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for argument in ("cli", "gui", "dbus", "xvfb", "tool-path"):
+    for argument in ("cli", "gui", "dbus", "xvfb", "atspi-registry", "tool-path"):
         parser.add_argument("--" + argument, required=True)
     smoke = Smoke(parser.parse_args())
     failure = None

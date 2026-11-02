@@ -16,6 +16,7 @@ in
       --gui ${oxidom-gui}/bin/oxidom-gui \
       --dbus ${pkgs.dbus}/bin/dbus-daemon \
       --xvfb ${pkgs.xvfb}/bin/Xvfb \
+      --atspi-registry ${pkgs.at-spi2-core}/libexec/at-spi2-registryd \
       --tool-path ${lib.makeBinPath [pkgs.coreutils pkgs.glib pkgs.dbus]}
     touch $out
   ''
