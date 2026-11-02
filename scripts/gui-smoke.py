@@ -728,7 +728,10 @@ class Smoke:
                     and geometry.height >= 650
                 ):
                     candidates.append(window)
-            except error.BadWindow:
+            except (error.BadWindow, error.BadDrawable):
+                # query_tree/windows is a snapshot: GTK can destroy the splash
+                # before GetGeometry, which reports BadDrawable rather than
+                # BadWindow. Retry the bounded main-window observation only.
                 continue
         return (
             candidates[0]
