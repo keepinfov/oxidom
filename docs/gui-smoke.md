@@ -20,7 +20,7 @@ real GUI process, outside the reducer/unit suite.
 
 ## What it asserts
 
-The test starts one explicit session daemon, imports an invented server, starts
+The test starts an explicit session daemon, imports an invented server, starts
 a proxy-only session and waits for application confirmation through an offline
 fake core. It then launches `oxidom-gui --debug` in the foreground.
 
@@ -31,12 +31,32 @@ that startup hydration has been attempted and widget construction completed;
 startup can tolerate partial RPC failures, so mapping alone does not establish
 that every displayed fact was hydrated successfully.
 
+An independent connection monitors only this private bus. It correlates read
+requests with successful replies from the selected daemon's unique owner and
+attributes each client sender to the owned GUI PID. The GApplication owner and
+the daemon client's zbus connection are distinct; recovery creates another zbus
+sender. The smoke requires the GUI's identity/runtime/catalog/profile/status/
+settings/probe reads, followed by `LogsSince` on that same sender. Recovery's
+hydration routine does not read logs; normal polling starts after the controller
+installs the hydrated client and reopens admission. Successful read attempts
+alone therefore cannot satisfy the recovery assertion.
+
+While the GUI stays mapped, the smoke sends SIGTERM to the daemon and observes
+the old fake core's exit before fallback group cleanup. The GUI must report its
+existing polling-loss diagnostic and retain its process and main window. An
+explicit replacement daemon must preserve the store ID, change incarnation and
+start with no resumed session. The observer then requires full GUI hydration and
+subsequent admitted polling against the replacement's unique owner. A fresh CLI
+Up creates a new confirmed session, and a later successful GUI status reply must
+contain that session. These checks establish recovery wiring and admission, not
+the rendered text of the GUI's rows.
+
 The smoke dispatches the existing navigation shortcuts through X11, closes the
 window and checks that its process remains alive. A second GUI invocation must
 exit and reactivate the original window with the same application bus owner and
-PID. Quit must terminate that GUI while preserving the original daemon identity,
-the pinned live fake-core process and its confirmed session. Explicit CLI Stop
-and daemon SIGTERM finish the scenario.
+PID. Quit must terminate that GUI while preserving the replacement daemon
+identity, its pinned live fake-core process and its confirmed session. Explicit
+CLI Stop and daemon SIGTERM finish the scenario.
 
 Shortcut dispatch is an event-loop smoke. It does not assert which page rendered,
 the text of a status field, layout, focus order, screen-reader output or visual
@@ -48,7 +68,12 @@ this smoke, so it supplies no AT coverage.
 The script constructs child environments with private HOME/XDG paths, memory
 GSettings and an inaccessible system-bus address. A private session-bus config
 contains no activation service directories. External supervision policy forbids
-implicit daemon bootstrap. Xvfb allocates its display through `-displayfd`, uses
+implicit daemon bootstrap. Eavesdropping is enabled only in that private bus's
+fixture policy so an owned `BecomeMonitor` connection can observe correlated
+calls and replies. It consumes monitoring copies and does not send replies or
+issue control calls on the converted connection. Observations are bounded;
+sender PID queries use the separate control connection. Xvfb allocates its
+display through `-displayfd`, uses
 a private MIT cookie and disables TCP listening. The display and bus announce
 readiness through pipes; `unix/:N` selects the local transport explicitly for
 both GTK/libxcb and python-xlib. Process and protocol observations use bounded
