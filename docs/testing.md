@@ -96,7 +96,9 @@ The Linux flake also has an [isolated headless GUI check](gui-smoke.md).
 development bench. The Rust workspace suite does not run it or construct GTK
 widgets. Main-window mapping is distinct from successful hydration of every
 fact, and X11 shortcut dispatch is distinct from verifying rendered page contents.
-Screen-reader behavior, accessibility, geometry and focus need their own evidence.
+The GUI check also requires the real AT-SPI bridge to expose a visible main
+frame/window and the invented fixture label in its tree. Full screen-reader
+behavior, accessibility conformance, layout and focus need their own evidence.
 
 Privileged routing and packet-path fault evidence belongs to P15 in disposable
 VMs. Canned proxy responses do not demonstrate forwarding, no-leak behavior,
