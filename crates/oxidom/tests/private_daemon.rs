@@ -23,6 +23,20 @@ use oxidom_core::profile::{Profile, ProfileProxy};
 
 const LIMIT: Duration = Duration::from_secs(15);
 
+#[path = "private_daemon/failover_matrix.rs"]
+mod failover_matrix;
+#[path = "private_daemon/owner.rs"]
+mod owner;
+#[path = "private_daemon/refresh.rs"]
+mod refresh;
+
+// PR_SET_CHILD_SUBREAPER is process-global. Hold this guard until all scenario
+// children have dropped and the previous subreaper policy has been restored.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SCENARIOS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    oxidom_core::sync::lock(&SCENARIOS)
+}
+
 struct Root(PathBuf);
 
 impl Root {
@@ -383,19 +397,8 @@ impl Harness {
     fn seed(&self) -> Result<()> {
         private_dir(&self.config_dir().join("profiles"))?;
         private_dir(&self.data_dir())?;
-        let executable = std::env::current_exe()?;
-        let quoted = format!(
-            "'{}'",
-            executable
-                .to_str()
-                .context("test executable")?
-                .replace('\'', "'\\''")
-        );
+        self.install_fake("fake_core_answers_without_dialing")?;
         let fake = self.root.0.join("fake-xray");
-        oxidom_core::fsutil::write_private_atomic(&fake, format!(
-            "#!/bin/sh\ncase \"$1\" in\nversion) printf 'Xray 26.3.27 (offline process fixture)\\n';;\nrun) export OXIDOM_TEST_CORE_CONFIG=\"$3\"; exec {quoted} --exact fake_core_answers_without_dialing --nocapture;;\n*) exit 1;;\nesac\n"
-        ).as_bytes())?;
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700))?;
         // Keep both reservations while selecting; production necessarily hands
         // released ports to the core rather than receiving listeners from us.
         let socks = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
@@ -438,8 +441,38 @@ impl Harness {
         Ok(())
     }
 
+    fn install_fake(&self, helper: &str) -> Result<()> {
+        let executable = std::env::current_exe()?;
+        let quoted = format!(
+            "'{}'",
+            executable
+                .to_str()
+                .context("test executable")?
+                .replace('\'', "'\\''")
+        );
+        let root = format!(
+            "'{}'",
+            self.root.0.display().to_string().replace('\'', "'\\''")
+        );
+        let helper = format!("'{}'", helper.replace('\'', "'\\''"));
+        let fake = self.root.0.join("fake-xray");
+        oxidom_core::fsutil::write_private_atomic(&fake, format!(
+            "#!/bin/sh\ncase \"$1\" in\nversion) printf 'Xray 26.3.27 (offline process fixture)\\n';;\nrun) if [ \"$2\" = '-test' ]; then exit 0; fi; export OXIDOM_TEST_ROOT={root}; export OXIDOM_TEST_CORE_CONFIG=\"$3\"; exec {quoted} --exact {helper} --nocapture --skip \"$3\";;\n*) exit 1;;\nesac\n"
+        ).as_bytes())?;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
+
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_oxidom"));
+        self.program(Path::new(env!("CARGO_BIN_EXE_oxidom")))
+    }
+
+    fn test_command(&self) -> Result<Command> {
+        Ok(self.program(&std::env::current_exe()?))
+    }
+
+    fn program(&self, executable: &Path) -> Command {
+        let mut command = Command::new(executable);
         command
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -460,6 +493,81 @@ impl Harness {
         command
     }
 
+    fn state(&self) -> Result<oxidom_core::state::State> {
+        Ok(toml::from_str(&fs::read_to_string(
+            self.data_dir().join("state.toml"),
+        )?)?)
+    }
+
+    fn core(&self, profile: &str) -> Result<(u32, ProcessFd)> {
+        let pid = self
+            .state()?
+            .sessions
+            .iter()
+            .find(|session| session.profile == profile)
+            .and_then(|session| session.xray_pid)
+            .context("durable session core PID")?;
+        Ok((pid, ProcessFd::open(pid)?))
+    }
+
+    fn daemon(&self) -> Result<(OwnedChild, zbus::blocking::Proxy<'static>, DaemonInfo)> {
+        self.daemon_at(&self.bus.address)
+    }
+
+    fn daemon_at(
+        &self,
+        address: &str,
+    ) -> Result<(OwnedChild, zbus::blocking::Proxy<'static>, DaemonInfo)> {
+        let serial = self.serial.fetch_add(1, Ordering::Relaxed);
+        let daemon = OwnedChild::spawn(
+            self.command()
+                .env("DBUS_SESSION_BUS_ADDRESS", address)
+                .arg("daemon"),
+            self.root.0.join(format!("daemon-{serial}.log")),
+        )?;
+        let connection = zbus::blocking::connection::Builder::address(address)?
+            .method_timeout(Duration::from_secs(1))
+            .build()?;
+        let bus = zbus::blocking::Proxy::new(
+            &connection,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )?;
+        let mut ready = None;
+        wait_until(|| {
+            ensure!(
+                !daemon.process.exited()?,
+                "daemon exited during readiness: {}",
+                daemon.log()
+            );
+            let Ok(owner) = bus.call::<_, _, String>("GetNameOwner", &(BUS_NAME,)) else {
+                return Ok(false);
+            };
+            let Ok(pid) = bus.call::<_, _, u32>("GetConnectionUnixProcessID", &(owner.as_str(),))
+            else {
+                return Ok(false);
+            };
+            if pid != daemon.child.id() {
+                return Ok(false);
+            }
+            let proxy = zbus::blocking::Proxy::new_owned(
+                connection.clone(),
+                owner,
+                OBJECT_PATH,
+                INTERFACE,
+            )?;
+            if let Ok(info) = json_call::<DaemonInfo>(&proxy, "DaemonInfo") {
+                info.validate()?;
+                ready = Some((proxy, info));
+                return Ok(true);
+            }
+            Ok(false)
+        })?;
+        let (proxy, info) = ready.context("owned daemon readiness")?;
+        Ok((daemon, proxy, info))
+    }
+
     fn spawn(&self, arguments: &[&str]) -> Result<OwnedChild> {
         let serial = self.serial.fetch_add(1, Ordering::Relaxed);
         OwnedChild::spawn(
@@ -469,7 +577,17 @@ impl Harness {
     }
 
     fn cli(&self, arguments: &[&str]) -> Result<String> {
-        let mut child = self.spawn(arguments)?;
+        self.cli_at(&self.bus.address, arguments)
+    }
+
+    fn cli_at(&self, address: &str, arguments: &[&str]) -> Result<String> {
+        let serial = self.serial.fetch_add(1, Ordering::Relaxed);
+        let mut child = OwnedChild::spawn(
+            self.command()
+                .env("DBUS_SESSION_BUS_ADDRESS", address)
+                .args(arguments),
+            self.root.0.join(format!("cli-{serial}.log")),
+        )?;
         let status = child.wait()?;
         ensure!(
             status.success(),
@@ -567,6 +685,7 @@ fn ready_sessions(proxy: &zbus::blocking::Proxy<'_>, names: &[&str]) -> Result<(
 #[test]
 fn one_store_owner_reaps_independent_sessions_and_restarts_without_permission_resumption()
 -> Result<()> {
+    let _serial = serial();
     let _subreaper = Subreaper::install()?;
     let mut harness = Harness::new()?;
     let sentinels = [
