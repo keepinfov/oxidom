@@ -9,6 +9,19 @@ use oxidom_core::diagnostics::Page;
 
 const ACTOR_SOCKET: &str = "OXIDOM_TEST_OWNER_SOCKET";
 
+fn protocol_line(reader: &mut impl BufRead, cap: usize) -> Result<Option<String>> {
+    let mut line = String::new();
+    let count = reader.take((cap + 1) as u64).read_line(&mut line)?;
+    if count == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        count <= cap && line.ends_with('\n'),
+        "private protocol record exceeded its bound or ended early"
+    );
+    Ok(Some(line))
+}
+
 struct Actor {
     child: OwnedChild,
     control: BufReader<UnixStream>,
@@ -70,14 +83,12 @@ impl Actor {
     }
 
     fn receive(&mut self) -> Result<serde_json::Value> {
-        let mut line = String::new();
-        if self.control.read_line(&mut line)? == 0 {
+        let Some(line) = protocol_line(&mut self.control, 4096)? else {
             // Keep the leader unreaped, but let libtest finish writing the
             // actual helper failure before collecting its diagnostic output.
             let _ = self.child.process.wait(LIMIT);
             bail!("actor closed control: {}", self.child.log());
-        }
-        ensure!(line.len() <= 4096, "bounded actor record");
+        };
         Ok(serde_json::from_str(&line)?)
     }
 
@@ -131,11 +142,8 @@ fn public_client_actor() -> Result<()> {
     control.get_ref().set_read_timeout(Some(LIMIT * 3))?;
     control.get_ref().set_write_timeout(Some(LIMIT))?;
     reply(control.get_mut(), serde_json::json!({"event": "ready"}))?;
-    let mut line = String::new();
-    ensure!(
-        control.read_line(&mut line)? != 0 && line.trim() == "connect",
-        "explicit actor connect"
-    );
+    let line = protocol_line(&mut control, 64)?.context("explicit actor connect command")?;
+    ensure!(line.trim() == "connect", "explicit actor connect");
     let original = if mode.starts_with("bootstrap") {
         DaemonClient::connect_any(|_| {})?
     } else {
@@ -150,12 +158,11 @@ fn public_client_actor() -> Result<()> {
     reply(control.get_mut(), hydrate(&original)?)?;
     let mut recovered = None;
     loop {
-        line.clear();
-        ensure!(
-            control.read_line(&mut line)? != 0,
-            "actor command channel closed"
-        );
+        let line = protocol_line(&mut control, 64)?.context("actor command channel closed")?;
         match line.trim() {
+            "observe" => {
+                reply(control.get_mut(), hydrate(&original)?)?;
+            }
             "stale" => {
                 ensure!(
                     original.validate_binding().is_err() && clone.validate_binding().is_err(),
@@ -590,11 +597,7 @@ fn registered_launcher(
     stream.set_read_timeout(Some(LIMIT))?;
     stream.set_write_timeout(Some(LIMIT))?;
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    ensure!(
-        reader.read_line(&mut line)? > 0 && line.len() <= 32,
-        "bounded launcher registration"
-    );
+    let line = protocol_line(&mut reader, 32)?.context("launcher registration ended early")?;
     let pid: u32 = line.trim().parse()?;
     let process = ProcessFd::open(pid)?;
     ensure!(
@@ -691,6 +694,30 @@ fn competing_portable_clients_leave_one_standalone_owner_after_both_clients_exit
         !winner.exited()?,
         "only the winning standalone daemon remains live"
     );
+    let members = import_work(&proxy)?;
+    harness.cli(&["up", "work"])?;
+    ready_sessions(&proxy, &["work"])?;
+    let (core_pid, core) = harness.core("work")?;
+    for actor in [&mut first, &mut second] {
+        let observed = actor.ask("observe")?;
+        ensure!(
+            observed["event"] == "hydrated"
+                && observed["subscriptions"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+                && observed["profile_names"]
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|name| name == "work"))
+                && observed["sessions"]
+                    .as_array()
+                    .is_some_and(|sessions| sessions
+                        .iter()
+                        .any(|session| session["profile"] == "work"
+                            && session["state"] == "connected"
+                            && session["server_id"] == members[0])),
+            "each original public client observes the winning owner's live session and catalog"
+        );
+    }
     first.finish()?;
     second.finish()?;
     ensure!(
@@ -702,10 +729,11 @@ fn competing_portable_clients_leave_one_standalone_owner_after_both_clients_exit
         current_owner == owner && json_call::<DaemonInfo>(&proxy, "DaemonInfo")? == identity,
         "client exit causes no owner replacement or automatic respawn"
     );
-    import_work(&proxy)?;
-    harness.cli(&["up", "work"])?;
+    ensure!(
+        !core.exited()? && harness.core("work")?.0 == core_pid,
+        "both client exits preserve the original core"
+    );
     ready_sessions(&proxy, &["work"])?;
-    let (_, core) = harness.core("work")?;
     winner.signal(libc::SIGTERM)?;
     winner.wait(LIMIT)?;
     core.wait(LIMIT)?;
