@@ -100,7 +100,24 @@ The GUI check also requires the real AT-SPI bridge to expose a visible main
 frame/window and the invented fixture label in its tree. Full screen-reader
 behavior, accessibility conformance, layout and focus need their own evidence.
 
-Privileged routing and packet-path fault evidence belongs to P15 in disposable
-VMs. Canned proxy responses do not demonstrate forwarding, no-leak behavior,
-continuous protection or interoperability with a real Xray release. Test and
-package CI success does not by itself establish privileged packet-path behavior.
+The `x86_64-linux` flake checks also include the
+[isolated routing-fault VM check](routing-vm.md), which uses the installed CLI
+and the locked Xray release. It requires a builder with working KVM; the CI
+build job checks access to `/dev/kvm` and the KVM API before running the single
+`nix flake check --print-build-logs` command. Missing virtualization fails that
+job rather than skipping the routing check. The existing CLI/GUI, module and
+GTK/AT checks remain in the same invocation and reuse their package derivations.
+
+On a disposable `x86_64-linux` KVM builder, run just this check with:
+
+```sh
+nix build .#checks.x86_64-linux.routing-faults --print-build-logs
+```
+
+This routing gate is not exposed on the other flake platforms, so its results do
+not establish cross-platform support. Its documented packet-path assertions are
+separate from the canned proxy responses in the process and GUI fixtures above.
+Those responses do not demonstrate forwarding, no-leak behavior, continuous
+protection or interoperability with a real Xray release. Tracker #216 records
+which P15 cases have actually run and the accepted CI head; adding a check is
+not evidence of its execution or completion of that stage.

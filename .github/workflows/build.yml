@@ -4,7 +4,8 @@ name: build
 # (which the systemd unit runs) and the wrapped GUI (which carries the icon
 # theme and the desktop files). The derivations run the crate tests the flake
 # names as they build, so a green check here is stronger than a green
-# `cargo build`.
+# `cargo build`. On x86_64 Linux this also boots the isolated routing-fault VMs;
+# missing KVM support fails the check rather than dropping that evidence.
 #
 # It does not replace lint.yml or format.yml. Nothing in the flake runs clippy
 # or rustfmt, so dropping those in favour of this would lose both — and they are
@@ -42,16 +43,42 @@ jobs:
   nix-build:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      # This permission change is confined to the disposable Actions runner.
+      # The runner owns the device and the existing kvm group retains access;
+      # world access and a login/group-membership refresh are unnecessary.
+      - name: Require usable KVM
+        run: |
+          if [ ! -c /dev/kvm ]; then
+            echo '::error::The routing-fault VM check requires /dev/kvm on this runner'
+            exit 1
+          fi
+          sudo chown "$(id -un):kvm" /dev/kvm
+          sudo chmod 0660 /dev/kvm
+          python3 - <<'PY'
+          import fcntl
+          import os
+
+          descriptor = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+          try:
+              api = fcntl.ioctl(descriptor, 0xAE00, 0)  # KVM_GET_API_VERSION
+              if api != 12:
+                  raise RuntimeError(f"Expected KVM API 12, got {api}")
+          finally:
+              os.close(descriptor)
+          PY
       # nix-quick-install rather than cachix/install-nix-action: cache-nix-action
       # saves and restores /nix/store as one archive, which needs the store to be
       # owned by the runner user — the multi-user daemon install is not.
       - uses: nixbuild/nix-quick-install-action@v30
         with:
+          # Access was checked above; the action's default adds world access.
+          enable_kvm: false
           nix_conf: |
             experimental-features = nix-command flakes
+            extra-system-features = kvm
             keep-env-derivations = true
             keep-outputs = true
       # The dependency graph has its own derivation whose inputs are the cargo
@@ -67,8 +94,8 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 6G
       # Not `nix build` as well: `checks.{cli,gui}` are the very derivations
-      # `packages.{oxidom-cli,oxidom-gui}` name, so building both realised each
-      # one twice for one answer. AGENTS.md has said "run one, not both" since
-      # before this workflow existed.
+      # `packages.{oxidom-cli,oxidom-gui}` name. GUI/AT and routing-fault checks
+      # consume those same derivations, so one invocation retains every gate
+      # without starting another package build or a second copy of the VM test.
       - name: nix flake check
         run: nix flake check --print-build-logs

@@ -172,6 +172,11 @@
             gui-smoke = import ./nix/checks/gui-smoke.nix {
               inherit pkgs lib oxidom-cli oxidom-gui;
             };
+          }
+          // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+            routing-faults = import ./nix/checks/routing-faults.nix {
+              inherit self pkgs lib oxidom-cli;
+            };
           };
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [pkg-config wrapGAppsHook4];
