@@ -159,7 +159,9 @@ with subtest("private topology and real unprivileged control"):
     defaults = kernel_json("ip -j -4 route show default")
     assert len(defaults) == 1 and defaults[0]["gateway"] == GATEWAY and defaults[0]["dev"] == "eth1"
     assert not json.loads(peer.succeed("ip -j -4 route show default"))
-    assert not kernel_json("ip -j -4 addr show dev eth0")[0]["addr_info"]
+    # iproute2 may omit a link entirely from an IPv4-only address dump when
+    # that link has no IPv4 address. The command must still succeed.
+    assert not any(item["addr_info"] for item in kernel_json("ip -j -4 addr show dev eth0"))
     assert client.succeed("xray version").startswith("Xray 26.3.27 ")
     assert peer.succeed("xray version").startswith("Xray 26.3.27 ")
     for address in [*CANDIDATES, SINK]:
