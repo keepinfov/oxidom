@@ -166,7 +166,8 @@ in
           boot.kernel.sysctl."net.ipv4.ip_forward" = 0;
           systemd.services.p15-http = {
             wantedBy = ["multi-user.target"];
-            after = ["network.target"];
+            requires = ["network-addresses-lo.service"];
+            after = ["network.target" "network-addresses-lo.service"];
             serviceConfig = {
               ExecStart = "${pkgs.python3}/bin/python3 -u ${fixtureServer}";
               DynamicUser = true;
@@ -177,7 +178,11 @@ in
           };
           systemd.services.p15-xray = {
             wantedBy = ["multi-user.target"];
-            after = ["network.target"];
+            # lo has no device unit pulling its scripted address service into
+            # the boot transaction. Require completion before binding the
+            # off-LAN candidate addresses, rather than relying on network.target.
+            requires = ["network-addresses-lo.service"];
+            after = ["network.target" "network-addresses-lo.service"];
             environment.XRAY_LOCATION_ASSET = toString geoAssets;
             serviceConfig = {
               ExecStart = "${pkgs.xray}/bin/xray run -config ${peerConfig}";
