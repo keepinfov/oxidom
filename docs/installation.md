@@ -448,8 +448,10 @@ Before installing or launching an older binary:
 Never downgrade while any owned recovery record remains. Do not delete state, strip ownership,
 or let an old writer "migrate" it. If cleanup cannot complete, retain the new binary and diagnose
 the [blocked recovery](troubleshooting.md#owned-tun-recovery-is-blocked). Package installation,
-service restart and source support are not VM evidence for the new TUN failover packet path;
-required P14/P15 validation remains separate and P12 is not declared complete here.
+service restart and source support do not substitute for packet-path evidence. Accepted isolated
+VM routing/fault observations and remaining P15 boundaries are recorded in
+[testing](testing.md#accepted-evidence-and-remaining-acceptance); they do not relax this downgrade
+procedure or promise uninterrupted hold through daemon crash/replacement.
 
 ## Tested distro matrix
 

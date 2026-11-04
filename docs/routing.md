@@ -190,8 +190,10 @@ is checked for immediate child liveness and its PID is persisted. One automatic 
 is allowed; repeated helper failure requires explicit teardown. These checks and HTTP confirmation
 through SOCKS are not continuous proof of packet forwarding through TUN. This remains scoped
 IPv4 capture with connected/private exceptions, no resolver rewrite and no whole-device promise.
-P12 is not complete merely because the source implements this path: P14/P15 validation remains
-required, and no VM packet-path or leak measurement is claimed here.
+Accepted isolated VM runs observe real HTTP through list/default owned routing, explicit cleanup,
+and endpoint A-to-B recovery and held states. Their finite captures do not exclude a release
+between sampled endpoints. Scoped nft/cgroup enforcement, IPv6 and final P15 acceptance remain
+separate; see the [evidence record](testing.md#accepted-evidence-and-remaining-acceptance).
 
 ## Per-process routing
 

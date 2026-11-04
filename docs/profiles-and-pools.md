@@ -228,8 +228,11 @@ interface or effective-policy changes revoke the grant; restoring them does not 
 Explicit Stop deletes this owned TUN, unlike ordinary legacy persistent TUN disconnect. Resolve
 any cleanup error before restarting; never erase its recovery records or downgrade around them.
 
-P14/P15 validation remains required; source support is not VM packet-path or leak evidence. Neither this mode nor status bookkeeping promises full-device protection, IPv6
-tunnelling, resolver containment or uninterrupted connections. See the binding [failover specification](spec/failover.md) and
+Accepted isolated VM runs observe list/default routing with real HTTP, explicit cleanup and
+endpoint failover/held states; [remaining P15 acceptance](testing.md#accepted-evidence-and-remaining-acceptance)
+includes scoped nft/cgroup and IPv6 evidence. Neither this mode nor status bookkeeping promises
+full-device protection, resolver containment or uninterrupted connections.
+See the binding [failover specification](spec/failover.md) and
 [failure diagnosis](troubleshooting.md#failover-does-not-try-another-server).
 
 ## Pools

@@ -8,8 +8,10 @@ The daemon also maintains a private `store.identity` seed in its data directory,
 before recovery. It is not a setting or credential and should not be edited. Invalid contents,
 unsafe permissions or unreadable identity stop daemon startup rather than silently assigning
 a new identity. Keep it with a store backup; relocating roots changes the advertised continuity
-identity. Identity does not prove equal contents or detect a restored older backup, and this
-foundation does not yet enable automatic client recovery after daemon replacement.
+identity. Identity does not prove equal contents or detect a restored older backup. After daemon
+replacement, the GUI verifies continuity on the selected endpoint and reads all required state
+before restoring control. Existing client bindings remain immutable and pending mutations are
+never replayed. See [selected-store recovery](gui.md).
 
 ## Contents
 
@@ -152,12 +154,15 @@ This is not a claim that proxy-only sessions protect traffic outside their proxy
 
 Failover is an optional `[failover]` table in a **profile**, not `config.toml`. It defaults to
 disabled and requires explicit saved-profile activation; enabling global reconnect does not opt
-in. Use `oxidom profile edit <name>` for manual TOML opt-in, then bring up that saved profile.
+in. Use `oxidom profile failover <name>` or the profile dialog's **Sequential failover** controls;
+`oxidom profile edit <name>` remains available for TOML editing. Saving does not start or rearm
+runtime; explicitly stop any retained session and bring up the saved profile to activate it.
 The [profile guide](profiles-and-pools.md#sequential-failover) gives the complete example, limits,
 cooldown and revocation rules. Enabled interfaces require the restricted
 [owned-TUN envelope](routing.md#owned-tun-failover): effective hold, supported literal IPv4
-candidates, no custom profile routing and exclusive TUN admission. Dedicated controls remain
-P13. Source implementation alone does not complete P12; P14/P15 validation is still required.
+candidates, no custom profile routing and exclusive TUN admission. The
+[acceptance record](testing.md#accepted-evidence-and-remaining-acceptance) describes the accepted
+finite routing/fault observations and remaining P15 validation.
 
 ### Where the geo data comes from
 

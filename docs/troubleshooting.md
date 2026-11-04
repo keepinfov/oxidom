@@ -199,8 +199,10 @@ group/pool activation, `oxidom run` and global reconnect do not authorize altern
 refused. An enabled interface needs the restricted [owned-TUN envelope](routing.md#owned-tun-failover):
 effective hold, all candidates supported literal unicast IPv4 endpoints, no custom profile
 routing, no existing device and no other configured TUN. Domains/IPv6, raw patches, composite
-profiles, XHTTP extras, ECH and port hopping cannot enter that envelope. Source implementation
-does not complete P12; required P14/P15 validation and VM evidence are not claimed.
+profiles, XHTTP extras, ECH and port hopping cannot enter that envelope. The
+[acceptance record](testing.md#accepted-evidence-and-remaining-acceptance) separates accepted
+finite routing/fault observations from remaining P15 validation; a status label does not prove
+continuous containment.
 
 Every member must resolve by exact canonical ID to a current noncomposite server, and the
 initial server must be among them. Changing selection or authorization, removing the profile,
