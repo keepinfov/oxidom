@@ -155,7 +155,7 @@ Enabled interfaces require the bounded owned-TUN contract in [interfaces.md](int
 effective hold, literal unicast IPv4 typed candidates, no custom routing and exclusive TUN
 admission. Proxy-only sessions may coexist. Exhaustion/revocation does not release held routing;
 explicit Stop is required. Source implementation and status presentation do not substitute for
-required P14/P15 validation.
+the [accepted observations and remaining P15 validation](../testing.md#accepted-evidence-and-remaining-acceptance).
 
 The text session table adds `PHASE HEALTH PROTECTION RETRY` when any row has runtime facts.
 Health includes outcome/source/timestamp, protection labels each recorded fact, and retry includes
