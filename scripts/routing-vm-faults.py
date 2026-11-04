@@ -210,7 +210,24 @@ def fault_capture(label):
 
 
 def fault_capture_reports_zero_kernel_drops(journal):
-    return "0 packets dropped by kernel" in journal
+    import re
+
+    reports = []
+    for line in journal.splitlines():
+        if "packets dropped by kernel" not in line:
+            continue
+        if line.count("packets dropped by kernel") != 1:
+            return False
+        report = re.fullmatch(
+            r"(?:(?:.*\s)?tcpdump\[[0-9]+\]:\s+)?([0-9]+) packets dropped by kernel",
+            line.strip(),
+        )
+        if report is None:
+            return False
+        reports.append(report[1])
+    # One unique capture unit must produce one canonical terminal zero count.
+    # Missing, malformed and repeated summaries cannot establish completeness.
+    return reports == ["0"]
 
 
 def fault_close_capture(captures, peer_markers, candidate_markers=(), tun_canary_ports=(), endpoint_syn_addresses=()):

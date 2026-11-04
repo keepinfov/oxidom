@@ -57,6 +57,7 @@ class CaptureCounts(unittest.TestCase):
             "Nov 04 10:20:00 client tcpdump[1020]: note '0 packets dropped by kernel'\n",
             "Nov 04 10:20:00 client tcpdump[1020]: 0 packets dropped by kernel (unverified)\n",
             "Nov 04 10:20:00 client tcpdump[1020]: -10 packets dropped by kernel\n",
+            "tcpdump[1]: 10 packets dropped by kernel tcpdump[2]: 0 packets dropped by kernel\n",
         ]
         for journal in journals:
             with self.subTest(journal=journal):
