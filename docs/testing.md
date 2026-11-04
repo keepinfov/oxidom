@@ -114,6 +114,14 @@ On a disposable `x86_64-linux` KVM builder, run just this check with:
 nix build .#checks.x86_64-linux.routing-faults --print-build-logs
 ```
 
+The same VM driver runs the [routing foundation](routing-vm.md) before the
+[real-core fault scenarios](routing-vm-faults.md). The latter observe A-to-B
+recovery, exhausted and revoked held endpoints, an independent proxy-only peer,
+and explicit daemon shutdown/restart. These endpoint observations do not
+exclude a brief traffic release between sampled states. Active transition
+traffic or kernel-route monitoring and the remaining P15 helper/nft/cgroup,
+IPv6 and ownership-cleanup cases require separate evidence.
+
 This routing gate is not exposed on the other flake platforms, so its results do
 not establish cross-platform support. Its documented packet-path assertions are
 separate from the canned proxy responses in the process and GUI fixtures above.
