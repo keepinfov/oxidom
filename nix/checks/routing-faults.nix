@@ -198,5 +198,7 @@ in
       testScript =
         builtins.readFile ../../scripts/routing-vm.py
         + "\n"
-        + builtins.readFile ../../scripts/routing-vm-faults.py;
+        + builtins.readFile ../../scripts/routing-vm-faults.py
+        + "\n"
+        + builtins.readFile ../../scripts/routing-vm-recovery.py;
     }

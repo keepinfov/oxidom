@@ -75,10 +75,20 @@ After these foundation scenarios, the same VM driver continues with the
 exhausted/revoked held endpoints, an independent proxy-only peer and explicit
 daemon shutdown/restart. Their endpoint observations and accepted CI results
 remain distinct from this baseline. They do not exclude a brief release window
-between sampled states; active transition traffic or kernel-route monitoring
-remains mandatory final P15 work.
+between sampled states.
 
-The combined check does not establish helper restoration, nft/cgroup
-enforcement, IPv6 containment, foreign-ownership collision recovery, daemon
-SIGKILL recovery, packet-loss bounds, continuous or whole-device protection.
-Those require the remaining isolated fault matrix and its recorded CI results.
+The driver then runs the [transition and recovery scenarios](routing-vm-recovery.md).
+They add a finite active window of fresh unbound IPv4 HTTP sockets across A-to-B
+switching; an initial real helper and one real exec replacement, followed by
+disarm/hold on repeated failure; coordinated foreign qualified route/rule
+preservation and dirty-alias cleanup retry; and daemon SIGKILL orphans observed
+before explicit replacement cleanup. The guest administrator installs the
+bounded helper exec observer only while all sessions and the daemon are stopped;
+ordinary clients retain the public binary-path guard.
+
+The cumulative check covers those recorded HTTP/TCP windows and checkpoints.
+It does not establish scoped nft/cgroup enforcement, IPv6 containment,
+packet-loss bounds, continuous or whole-device protection, or uninterrupted hold
+through daemon crash/restart. Direct traffic after explicit cleanup is an
+intentional release boundary. The remaining P15 cases and final release
+acceptance require separate evidence and recorded CI results.
