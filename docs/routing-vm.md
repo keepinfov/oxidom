@@ -57,9 +57,11 @@ A direct baseline proves that the sink is reachable over the data NIC before
 capture. After capture, a fresh HTTP canary must reach the real sink through
 candidate A. The same closed packet capture must contain its bytes in A's SOCKS
 stream and contain no direct TCP packets to the sink HTTP endpoint. The peer's
-actual inbound access log and HTTP receipt are additional evidence. The capture is observed
-ready before the canary, then stopped and flushed before analysis; an empty
-capture cannot satisfy the positive requirement.
+actual inbound access log and HTTP receipt are additional evidence. The capture
+is observed ready before the canary. Immediate packet delivery and per-packet
+pcap flushing are enabled; a bounded gate observes that same canary in the file
+before capture is stopped. The closed, flushed file is then checked again for
+both assertions. An empty capture cannot satisfy the positive requirement.
 
 The capture filter and negative assertion cover TCP to that HTTP endpoint;
 they do not establish UDP or ICMP containment.

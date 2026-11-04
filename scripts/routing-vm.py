@@ -71,7 +71,7 @@ def start_capture(mode):
     client.succeed(shlex.join([
         "systemd-run", "--unit=" + unit, "--service-type=exec",
         "--property=KillSignal=SIGINT", "--property=TimeoutStopSec=10",
-        "tcpdump", "-i", "eth1", "-s", "0", "-U", "-w", path, expression,
+        "tcpdump", "--immediate-mode", "-i", "eth1", "-s", "0", "-U", "-w", path, expression,
     ]))
     client.wait_until_succeeds("journalctl -u " + unit + " --no-pager | grep -F 'listening on eth1'", timeout=30)
     client.succeed("systemctl is-active " + unit)
@@ -79,10 +79,19 @@ def start_capture(mode):
 
 
 def finish_capture(unit, path, marker):
-    # systemctl waits for SIGINT/pcap flush; inspect only the closed capture.
-    client.succeed("systemctl stop " + unit)
+    candidate_filter = "dst host 192.0.2.10 and dst port 1080"
+    # Immediate mode drains kernel delivery without waiting for a buffer
+    # timeout; -U flushes each delivered packet to pcap. Observe the actual
+    # canary in that file before SIGINT, then recheck the closed file below.
+    observed = shlex.join(["tcpdump", "-nn", "-A", "-r", path, candidate_filter]) + " | " + shlex.join(["grep", "-F", "--", marker])
+    gate = "systemctl is-active --quiet " + quote(unit) + " && bash -o pipefail -c " + quote(observed)
+    try:
+        client.wait_until_succeeds(gate, timeout=30)
+    finally:
+        # Wait for SIGINT and output flush, including a failed observation.
+        client.succeed("systemctl stop " + unit)
     assert client.succeed("systemctl show -p ExecMainStatus --value " + unit).strip() == "0"
-    candidate = client.succeed("tcpdump -nn -A -r " + path + " 'dst host 192.0.2.10 and dst port 1080'")
+    candidate = client.succeed(shlex.join(["tcpdump", "-nn", "-A", "-r", path, candidate_filter]))
     assert marker in candidate, "the same capture must contain this HTTP canary inside candidate A's real SOCKS stream"
     direct = client.succeed("tcpdump -nn -r " + path + " 'dst host 203.0.113.10 and dst port 18080'")
     assert not direct.strip(), "direct TCP packets to the sink HTTP endpoint escaped onto the physical data NIC"
