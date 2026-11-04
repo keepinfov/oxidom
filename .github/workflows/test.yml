@@ -32,6 +32,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: capture kernel-drop counts are exact
+        run: python3 scripts/test_capture_counts.py
       - uses: cachix/install-nix-action@v27
         with:
           extra_nix_config: experimental-features = nix-command flakes

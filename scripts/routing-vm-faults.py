@@ -209,6 +209,10 @@ def fault_capture(label):
     return captures
 
 
+def fault_capture_reports_zero_kernel_drops(journal):
+    return "0 packets dropped by kernel" in journal
+
+
 def fault_close_capture(captures, peer_markers, candidate_markers=(), tun_canary_ports=(), endpoint_syn_addresses=()):
     def wait_for_packet(suffix, expression, marker=None):
         unit, path = captures[suffix]
@@ -246,7 +250,7 @@ def fault_close_capture(captures, peer_markers, candidate_markers=(), tun_canary
             raise RuntimeError("capture cleanup failed: " + "; ".join(failures))
     for unit, _path in captures.values():
         assert client.succeed("systemctl show -p ExecMainStatus --value " + unit).strip() == "0"
-        assert "0 packets dropped by kernel" in client.succeed("journalctl -u " + unit + " --no-pager")
+        assert fault_capture_reports_zero_kernel_drops(client.succeed("journalctl -u " + unit + " --no-pager"))
 
 
 def fault_packets(captures, expression, all_interfaces=False, ascii_payload=False):
