@@ -195,5 +195,8 @@ in
           };
         };
       };
-      testScript = builtins.readFile ../../scripts/routing-vm.py;
+      testScript =
+        builtins.readFile ../../scripts/routing-vm.py
+        + "\n"
+        + builtins.readFile ../../scripts/routing-vm-faults.py;
     }

@@ -70,7 +70,15 @@ Explicit Stop must remove the owned device, protocol-qualified routes/rule and
 recovery session, and terminate both core and helper before VM teardown. A new
 direct request then demonstrates the deliberate release boundary of Stop.
 
-This is the first P15 slice. It does not establish core/helper/daemon fault
-behavior, nft/cgroup enforcement, IPv6 containment, ownership collision recovery,
-exhaustion, revocation, packet-loss bounds, continuous or whole-device protection.
+After these foundation scenarios, the same VM driver continues with the
+[real-core fault scenarios](routing-vm-faults.md): A-to-B confirmation,
+exhausted/revoked held endpoints, an independent proxy-only peer and explicit
+daemon shutdown/restart. Their endpoint observations and accepted CI results
+remain distinct from this baseline. They do not exclude a brief release window
+between sampled states; active transition traffic or kernel-route monitoring
+remains mandatory final P15 work.
+
+The combined check does not establish helper restoration, nft/cgroup
+enforcement, IPv6 containment, foreign-ownership collision recovery, daemon
+SIGKILL recovery, packet-loss bounds, continuous or whole-device protection.
 Those require the remaining isolated fault matrix and its recorded CI results.
