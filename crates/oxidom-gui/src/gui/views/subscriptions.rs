@@ -5,6 +5,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use crate::gui::operation::{UiOperation, UiOperationKind};
+use crate::gui::reduce::connections_stopping_sentence;
 use oxidom_core::engine::LOCAL_ID;
 use oxidom_core::link;
 use oxidom_core::model::{Subscription, UserInfo};
@@ -33,6 +34,10 @@ pub struct SubscriptionCallbacks {
     pub groups_holding: Rc<dyn Fn(String) -> Vec<String>>,
     /// The same, for every server of a subscription: `(group name, count)`.
     pub groups_holding_any: Rc<dyn Fn(String) -> Vec<(String, usize)>>,
+    /// Profile names of active connections that would stop if a server were deleted.
+    pub sessions_holding: Rc<dyn Fn(String) -> Vec<String>>,
+    /// Profile names of active connections that would stop if a subscription were deleted.
+    pub sessions_holding_any: Rc<dyn Fn(String) -> Vec<String>>,
 }
 
 /// "It is also in Favourites and Germany." — appended to a deletion prompt.
@@ -161,6 +166,58 @@ impl SubscriptionsView {
             Pasted::Nothing => {}
         }
         pasted
+    }
+
+    pub fn open_add_dialog(&self) {
+        let Some(callbacks) = self.callbacks.borrow().clone() else {
+            return;
+        };
+        show_add_subscription(&self.root, callbacks, None);
+    }
+
+    pub fn open_import_dialog(&self) {
+        let Some(callbacks) = self.callbacks.borrow().clone() else {
+            return;
+        };
+        show_import_servers(&self.root, callbacks, None);
+    }
+
+    pub fn open_create_dialog(&self) {
+        let Some(callbacks) = self.callbacks.borrow().clone() else {
+            return;
+        };
+        super::server_dialog::show_server_dialog(
+            &self.root,
+            super::server_dialog::ServerDialogCallbacks {
+                create: callbacks.create.clone(),
+            },
+        );
+    }
+
+    pub fn open_details(&self, parent: &impl IsA<gtk::Widget>, subscription: Subscription) {
+        let Some(callbacks) = self.callbacks.borrow().clone() else {
+            return;
+        };
+        if subscription.id == LOCAL_ID {
+            show_local_servers(parent, subscription, callbacks);
+        } else {
+            show_subscription_details(parent, subscription, callbacks);
+        }
+    }
+
+    pub fn confirm_remove(&self, parent: &impl IsA<gtk::Widget>, subscription: &Subscription) {
+        let Some(callbacks) = self.callbacks.borrow().clone() else {
+            return;
+        };
+        confirm_remove_subscription(
+            parent,
+            subscription.id.clone(),
+            &subscription.name,
+            callbacks.remove,
+            &callbacks.groups_holding_any,
+            &callbacks.sessions_holding_any,
+            None,
+        );
     }
 
     pub fn rebuild(&self, subscriptions: &[Subscription], callbacks: SubscriptionCallbacks) {
@@ -684,15 +741,32 @@ fn show_subscription_details(
     let details = adw::PreferencesGroup::builder().title("Details").build();
     let url_row = adw::ActionRow::builder()
         .title("URL")
-        .subtitle(&subscription.url)
+        .subtitle(subscription_url_subtitle(&subscription.url, false))
         .subtitle_selectable(true)
         .subtitle_lines(3)
         .build();
+    let reveal = gtk::ToggleButton::builder()
+        .icon_name("view-reveal-symbolic")
+        .tooltip_text("Reveal")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "circular"])
+        .build();
+    reveal.update_property(&[gtk::accessible::Property::Label("Reveal")]);
+    let url_for_reveal = subscription.url.clone();
+    let row_for_reveal = url_row.clone();
+    reveal.connect_toggled(move |button| {
+        let active = button.is_active();
+        row_for_reveal.set_subtitle(&subscription_url_subtitle(&url_for_reveal, active));
+        let label = if active { "Hide" } else { "Reveal" };
+        button.set_tooltip_text(Some(label));
+        button.update_property(&[gtk::accessible::Property::Label(label)]);
+    });
     let copy = icon_button("edit-copy-symbolic", "Copy subscription URL");
     let url_for_copy = subscription.url.clone();
     copy.connect_clicked(move |button| {
         button.display().clipboard().set_text(&url_for_copy);
     });
+    url_row.add_suffix(&reveal);
     url_row.add_suffix(&copy);
     details.add(&url_row);
 
@@ -861,35 +935,67 @@ fn show_subscription_details(
     let remove_name = subscription.name.clone();
     let remove = callbacks.remove.clone();
     let holding_any = callbacks.groups_holding_any.clone();
+    let sessions_any = callbacks.sessions_holding_any.clone();
     let details_window = window.clone();
     delete.connect_clicked(move |_| {
-        let affected = holding_any(remove_id.clone());
-        let dialog = adw::AlertDialog::new(
-            Some("Remove subscription?"),
-            Some(&format!(
-                "“{remove_name}” and all of its servers will be removed.{}",
-                groups_losing_servers(&affected)
-            )),
+        confirm_remove_subscription(
+            &details_window,
+            remove_id.clone(),
+            &remove_name,
+            remove.clone(),
+            &holding_any,
+            &sessions_any,
+            Some(details_window.clone()),
         );
-        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Remove")]);
-        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        let remove = remove.clone();
-        let remove_id = remove_id.clone();
-        let closing = details_window.clone();
-        dialog.connect_response(None, move |_, response| {
-            if response == "delete" {
-                remove(remove_id.clone());
-                closing.close();
-            }
-        });
-        // An `AdwDialog` is presented *into* a widget rather than parented to a
-        // window at construction, so the window is still needed after the
-        // handler has taken its own reference.
-        dialog.present(Some(&details_window));
     });
     window.present();
+}
+
+const MASKED_SECRET: &str = "••••••••";
+
+fn subscription_url_subtitle(url: &str, revealed: bool) -> String {
+    if revealed {
+        gtk::glib::markup_escape_text(url).to_string()
+    } else {
+        MASKED_SECRET.to_string()
+    }
+}
+
+fn confirm_remove_subscription(
+    parent: &impl IsA<gtk::Widget>,
+    remove_id: String,
+    remove_name: &str,
+    remove: Rc<dyn Fn(String)>,
+    holding_any: &Rc<dyn Fn(String) -> Vec<(String, usize)>>,
+    sessions_holding_any: &Rc<dyn Fn(String) -> Vec<String>>,
+    close_on_delete: Option<adw::Window>,
+) {
+    let affected = holding_any(remove_id.clone());
+    let stopping = sessions_holding_any(remove_id.clone());
+    let dialog = adw::AlertDialog::new(
+        Some("Remove subscription?"),
+        Some(&format!(
+            "“{remove_name}” and all of its servers will be removed.{}{}",
+            groups_losing_servers(&affected),
+            connections_stopping_sentence(&stopping)
+        )),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Remove")]);
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |_, response| {
+        if response == "delete" {
+            remove(remove_id.clone());
+            if let Some(closing) = &close_on_delete {
+                closing.close();
+            }
+        }
+    });
+    // An `AdwDialog` is presented *into* a widget rather than parented to a
+    // window at construction, so the window is still needed after the
+    // handler has taken its own reference.
+    dialog.present(Some(parent));
 }
 
 fn show_local_servers(
@@ -938,6 +1044,7 @@ fn show_local_servers(
         let server_name = server.name.clone();
         let callback = callbacks.remove_server.clone();
         let holding = callbacks.groups_holding.clone();
+        let sessions_holding = callbacks.sessions_holding.clone();
         let window_for_remove = window.clone();
         remove.connect_clicked(move |_| {
             // Deleting is irreversible (there is no undo), so mirror the
@@ -945,8 +1052,9 @@ fn show_local_servers(
             let dialog = adw::AlertDialog::new(
                 Some("Remove server?"),
                 Some(&format!(
-                    "“{server_name}” will be removed permanently.{}",
-                    also_in_groups(&holding(server_id.clone()))
+                    "“{server_name}” will be removed permanently.{}{}",
+                    also_in_groups(&holding(server_id.clone())),
+                    connections_stopping_sentence(&sessions_holding(server_id.clone()))
                 )),
             );
             dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
@@ -1172,7 +1280,9 @@ fn format_timestamp(timestamp: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pasted, also_in_groups, classify_pasted, groups_losing_servers};
+    use super::{
+        Pasted, also_in_groups, classify_pasted, groups_losing_servers, subscription_url_subtitle,
+    };
 
     const VLESS: &str = "vless://3f7c1a52-9d84-4b6e-8c21-5ea7f0d93b18@example.net:443\
         ?encryption=none&security=tls&type=tcp#node";
@@ -1242,6 +1352,16 @@ mod tests {
         assert_eq!(
             groups_losing_servers(&[("Europe".to_string(), 8), ("Favourites".to_string(), 1)]),
             " Servers in your groups will go with them: 8 in “Europe”, 1 in “Favourites”."
+        );
+    }
+
+    #[test]
+    fn a_subscription_url_stays_masked_until_revealed_and_escapes_query_separators() {
+        let url = "https://panel.example.invalid/sub?token=abc&format=xray";
+        assert_eq!(subscription_url_subtitle(url, false), "••••••••");
+        assert_eq!(
+            subscription_url_subtitle(url, true),
+            "https://panel.example.invalid/sub?token=abc&amp;format=xray"
         );
     }
 }

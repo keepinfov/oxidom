@@ -334,6 +334,7 @@ impl XrayCore {
         // `assets::location_override` for why either condition alone is not
         // enough.
         crate::xray::assets::point_at_our_assets(&mut command);
+        crate::proc::ignore_sigpipe(&mut command);
         let mut child = command
             .spawn()
             .with_context(|| format!("spawning xray ({})", xray.path.display()))?;

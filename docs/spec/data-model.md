@@ -57,7 +57,11 @@ failover authorization, unlike the nonfatal missing-member behavior of an ordina
 2. Read response headers: `subscription-userinfo` (`upload=..; download=..; total=..; expire=..`),
    `profile-title` (may be base64 with `base64:` prefix), `profile-update-interval`.
 3. Body may be base64-encoded; if it decodes to text lines, use that, else use raw text.
-4. Split into lines; parse each non-empty line as a share link (below). Skip unparseable lines.
+4. Parse the body as a share-link list, Xray or sing-box JSON, or Clash YAML. Skip unparseable
+   share-link lines and unsupported proxy entries in structured JSON/YAML configs (ignoring
+   built-in plumbing outbounds such as `direct`, `block`, `dns`, `selector`, `urltest`, `freedom`,
+   `blackhole`, `loopback` and `dokodemo-door`), recording both the count and the lowercased
+   scheme or protocol names in `Skipped`.
 
 ### Concurrent subscription updates (binding)
 
@@ -189,8 +193,9 @@ express (a pinned certificate, an `outbound_patch`, a vmess gRPC `authority`). T
 the list are the same code, and the copy action announces the list rather than handing over a
 server that works for one person and not the other.
 
-Derive `country` from a leading flag emoji, or from a leading two-letter token that is an
-assigned ISO 3166-1 alpha-2 code — `🇩🇪 Frankfurt` and `DE-2 HYSTERIA2` both give `DE`. Only the
+Derive `country` from a leading flag emoji whose regional indicators form an assigned ISO 3166-1
+alpha-2 code, or from a leading two-letter token that is an assigned ISO 3166-1 alpha-2 code —
+`🇩🇪 Frankfurt` and `DE-2 HYSTERIA2` both give `DE`, while `🇪🇺 Europe` stays `None`. Only the
 **first** token counts, and only a real code (binding): `IS`, `IT`, `NO`, `ME`, `AT` and `WS` are
 countries *and* ordinary words, so matching one anywhere in a name would put wrong flags across
 half a provider's list. A name that says nothing stays `None`; nothing is inferred from the

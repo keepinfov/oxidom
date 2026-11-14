@@ -32,6 +32,7 @@ SHARUN_URL=${SHARUN_URL:-https://github.com/VHSgunzo/sharun/releases/download/v0
 LIB4BIN_URL=${LIB4BIN_URL:-https://raw.githubusercontent.com/VHSgunzo/sharun/v0.8.1/lib4bin}
 URUNTIME_URL=${URUNTIME_URL:-https://github.com/VHSgunzo/uruntime/releases/download/v0.5.9/uruntime-appimage-squashfs-lite-x86_64}
 XRAY_URL=${XRAY_URL:-https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip}
+XRAY_SHA256=${XRAY_SHA256:-23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae}
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
@@ -46,7 +47,7 @@ need() { command -v "$1" >/dev/null || { echo "error: $1 is required" >&2; exit 
 # lib4bin names its own dependencies when it is missing one, but it does so
 # after the build has already run, so check them here where the message costs
 # nothing: file binutils patchelf findutils grep sed coreutils.
-for t in cargo curl unzip mksquashfs glib-compile-schemas patchelf file strip find; do need "$t"; done
+for t in cargo curl unzip sha256sum mksquashfs glib-compile-schemas patchelf file strip find; do need "$t"; done
 
 echo "== binaries =="
 cargo build --release --locked -p oxidom -p oxidom-gui
@@ -59,7 +60,8 @@ export PATH="$work:$PATH"
 
 echo "== the core, which oxidom drives but does not build =="
 curl -sSfL -o "$work/xray.zip" "$XRAY_URL"
-unzip -q -o "$work/xray.zip" xray -d "$work"
+echo "$XRAY_SHA256  $work/xray.zip" | sha256sum -c -
+unzip -q -o "$work/xray.zip" xray geoip.dat geosite.dat -d "$work"
 chmod +x "$work/xray"
 
 APPDIR="$work/AppDir"
@@ -108,6 +110,12 @@ install -Dm644 data/dev.keepinfov.oxidom.desktop "$APPDIR/dev.keepinfov.oxidom.d
 install -Dm644 data/dev.keepinfov.oxidom.svg "$APPDIR/dev.keepinfov.oxidom.svg"
 ln -sf dev.keepinfov.oxidom.svg "$APPDIR/.DirIcon"
 
+# Every generated configuration references geoip:private and geosite:private;
+# ship both lists from the verified Xray archive so the AppImage connects and
+# probes offline on first launch.
+install -Dm644 "$work/geoip.dat" "$APPDIR/share/xray/geoip.dat"
+install -Dm644 "$work/geosite.dat" "$APPDIR/share/xray/geosite.dat"
+
 echo "== entry point =="
 # sharun reads .app to know which of the packed binaries is the application, and
 # AppRun is a hard link to sharun rather than a script so /proc/self/exe resolves.
@@ -120,6 +128,7 @@ ln -f "$APPDIR/sharun" "$APPDIR/AppRun"
 cat > "$APPDIR/.env" <<'ENV'
 OXIDOM_BIN=${SHARUN_DIR}/bin/oxidom
 OXIDOM_XRAY_BIN=${SHARUN_DIR}/bin/xray
+XRAY_LOCATION_ASSET=${SHARUN_DIR}/share/xray
 XDG_DATA_DIRS=${SHARUN_DIR}/share:/usr/local/share:/usr/share
 ENV
 
@@ -143,3 +152,14 @@ echo "built $target ($(du -h "$target" | cut -f1))"
 # the bundle and not whether the build host happens to allow FUSE.
 echo "== checking it runs =="
 "$target" --appimage-extract-and-run --version
+[ -s "$APPDIR/share/xray/geoip.dat" ] || { echo "error: geoip.dat is missing from AppDir" >&2; exit 1; }
+[ -s "$APPDIR/share/xray/geosite.dat" ] || { echo "error: geosite.dat is missing from AppDir" >&2; exit 1; }
+cat > "$work/geo-probe.json" <<'JSON'
+{"log":{"loglevel":"error"},
+ "outbounds":[{"protocol":"freedom","tag":"direct"}],
+ "dns":{"servers":[{"address":"1.1.1.1","domains":["geosite:private"],"skipFallback":true}]},
+ "routing":{"rules":[{"type":"field","ip":["geoip:private"],"outboundTag":"direct"}]}}
+JSON
+mkdir -p "$work/empty-home"
+HOME="$work/empty-home" XRAY_LOCATION_ASSET="$APPDIR/share/xray" \
+    "$work/xray" run -test -c "$work/geo-probe.json"

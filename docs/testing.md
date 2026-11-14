@@ -116,14 +116,30 @@ nix build .#checks.x86_64-linux.scoped-routing --print-build-logs
 ```
 
 The first VM driver runs the [routing foundation](routing-vm.md) before the
-[real-core fault scenarios](routing-vm-faults.md). The latter observe A-to-B
-recovery, exhausted and revoked held endpoints, an independent proxy-only peer,
-and explicit daemon shutdown/restart. The second runs the
-[scoped routing check](scoped-routing-vm.md), exercising a persistent
-`oxidom run` user scope, cgroup nftables marking and IPv6 refusal, core-loss
-and Down request windows, same-scope Up recovery, and departed-scope pruning.
-The remaining P15 helper, A-to-B bound-scope restoration and crash-recovery
-cases require separate evidence.
+[real-core fault scenarios](routing-vm-faults.md), then the
+[transition and recovery scenarios](routing-vm-recovery.md). The endpoint fault
+scenarios observe A-to-B recovery, exhausted and revoked held endpoints,
+an independent proxy-only peer,
+and explicit daemon shutdown/restart. The recovery continuation adds a finite
+active window of fresh unbound IPv4 HTTP sockets across A-to-B switching,
+one real helper replacement followed by disarm/hold on repeated failure,
+preservation of coordinated foreign qualified routes/rules, dirty-alias cleanup
+retry, and daemon SIGKILL orphans observed before explicit replacement cleanup.
+The observer records helper admissions; real executable identity and forwarding
+verify the initial helper and replacement. The guest administrator installs its
+configuration with all sessions and the daemon stopped, preserving the public
+binary-path guard.
+
+The second VM driver runs the [scoped routing check](scoped-routing-vm.md),
+exercising a persistent `oxidom run` user scope, cgroup nftables marking and
+IPv6 refusal, core-loss and Down request windows, same-scope Up recovery, and
+departed-scope pruning.
+
+These assertions cover the recorded HTTP/TCP windows and checkpoints. They do
+not establish packet-loss bounds, continuous or whole-device protection, or
+uninterrupted hold across daemon crash/restart. Direct traffic after explicit
+cleanup measures deliberate release. Final release acceptance requires recorded
+CI results.
 
 This routing gate is not exposed on the other flake platforms, so its results do
 not establish cross-platform support. Its documented packet-path assertions are

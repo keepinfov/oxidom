@@ -325,6 +325,11 @@ pub enum ProbeFailure {
 pub struct LatencyReading {
     /// Round-trip in milliseconds, when the probe produced one.
     pub value: Option<u32>,
+    /// Cold-start setup time in milliseconds (DNS, TCP/QUIC dial, TLS/REALITY
+    /// handshake and first HTTP response) when a second keep-alive request on
+    /// the same connection measured the live round-trip in [`Self::value`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_ms: Option<u32>,
     /// Wall clock, not `Instant`: this crosses a process boundary, where a
     /// monotonic clock reading from another process means nothing.
     pub measured_at_unix_ms: u64,
@@ -437,6 +442,7 @@ impl LatencyReading {
     pub fn ok(value: u32, route: ProbeRoute, method: LatencyMethod) -> Self {
         LatencyReading {
             value: Some(value),
+            setup_ms: None,
             measured_at_unix_ms: now_unix_ms(),
             route,
             method,
@@ -445,9 +451,15 @@ impl LatencyReading {
         }
     }
 
+    pub fn with_setup_ms(mut self, setup_ms: Option<u32>) -> Self {
+        self.setup_ms = if self.value.is_some() { setup_ms } else { None };
+        self
+    }
+
     pub fn failed(failure: ProbeFailure, route: ProbeRoute, method: LatencyMethod) -> Self {
         LatencyReading {
             value: None,
+            setup_ms: None,
             measured_at_unix_ms: now_unix_ms(),
             route,
             method,
@@ -1169,8 +1181,32 @@ mod tests {
         let reading: LatencyReading =
             serde_json::from_str(r#"{"value":41,"measured_at_unix_ms":1700000000000}"#).unwrap();
         assert_eq!(reading.value, Some(41));
+        assert_eq!(reading.setup_ms, None);
         assert_eq!(reading.route, ProbeRoute::Direct);
         assert_eq!(reading.failure, None);
+    }
+
+    #[test]
+    fn a_reading_with_setup_ms_round_trips_and_omits_setup_ms_when_absent() {
+        let mut with_setup = LatencyReading::ok(41, ProbeRoute::Direct, LatencyMethod::HttpGet)
+            .with_setup_ms(Some(420));
+        with_setup.measured_at_unix_ms = 1_700_000_000_000;
+        let json = serde_json::to_string(&with_setup).unwrap();
+        assert_eq!(
+            json,
+            r#"{"value":41,"setup_ms":420,"measured_at_unix_ms":1700000000000,"route":"direct","method":"http_get","failure":null,"detail":null}"#
+        );
+        let parsed: LatencyReading = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, with_setup);
+
+        let without_setup = with_setup.with_setup_ms(None);
+        let legacy_json = serde_json::to_string(&without_setup).unwrap();
+        assert_eq!(
+            legacy_json,
+            r#"{"value":41,"measured_at_unix_ms":1700000000000,"route":"direct","method":"http_get","failure":null,"detail":null}"#
+        );
+        let parsed_legacy: LatencyReading = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(parsed_legacy.setup_ms, None);
     }
 
     /// The one thing every consumer may assume: a number and a reason are

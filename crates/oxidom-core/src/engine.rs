@@ -531,7 +531,8 @@ impl Registry {
     }
 
     /// Drop one override and take back what the provider last sent for the
-    /// field. Any other override stays.
+    /// field, or clear a certificate pin set on this machine. Any other
+    /// override stays.
     pub fn drop_server_override(&mut self, server_id: &str, field: &str) -> Result<Server> {
         let (sub_index, server_index) = self
             .subscriptions
@@ -545,6 +546,27 @@ impl Registry {
             })
             .ok_or_else(|| anyhow!("server not found"))?;
         let stored = self.subscriptions[sub_index].servers[server_index].clone();
+        if matches!(
+            field,
+            "stream.pin_sha256" | "hysteria2.pin_sha256" | "pin_sha256"
+        ) && stored
+            .overrides
+            .as_ref()
+            .is_none_or(|overrides| !overrides.provider.contains_key(field))
+        {
+            if stored.spec.pin_sha256().is_none() {
+                bail!("{field:?} is not overridden");
+            }
+            let mut effective = stored;
+            effective.spec.set_pin_sha256(None);
+            if let Some(mut overrides) = effective.overrides.take() {
+                overrides.values.remove(field);
+                effective.overrides = (!overrides.values.is_empty()).then_some(overrides);
+            }
+            self.subscriptions[sub_index].servers[server_index] = effective;
+            store::save(&self.subscriptions)?;
+            return Ok(self.subscriptions[sub_index].servers[server_index].clone());
+        }
         let mut overrides = stored
             .overrides
             .clone()
@@ -6418,6 +6440,46 @@ add rule inet oxidom restore_work ct mark 0x6f21 counter meta mark set 0x6f21 co
             Some(1),
             "only the one decision was dropped"
         );
+        Ok(())
+    }
+
+    /// A certificate pin set via `trust_certificate` is a local mark rather
+    /// than a provider override; `drop_server_override` clears it and persists
+    /// the unpinned server.
+    #[test]
+    fn dropping_a_pinned_certificate_clears_the_local_pin() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("drop-pin")?;
+        let link = "trojan://invented@example.com:443?security=tls&sni=example.com#Pinnable";
+        let mut subscription = old_subscription("https://subscription.example/token", &[link]);
+        subscription.servers[0]
+            .spec
+            .set_pin_sha256(Some("a".repeat(64)));
+        crate::state::store::save(&[subscription])?;
+
+        let mut engine = Engine::load();
+        let stored = engine
+            .registry
+            .subscriptions
+            .iter()
+            .flat_map(|sub| sub.servers.iter())
+            .find(|server| server.address == "example.com")
+            .ok_or_else(|| anyhow!("the subscription server is missing"))?
+            .clone();
+        assert_eq!(stored.spec.pin_sha256(), Some("a".repeat(64).as_str()));
+
+        let cleared = engine.drop_server_override(&stored.id, "stream.pin_sha256")?;
+        assert!(cleared.spec.pin_sha256().is_none());
+
+        let reloaded = Engine::load();
+        let reloaded_server = reloaded
+            .registry
+            .subscriptions
+            .iter()
+            .flat_map(|sub| sub.servers.iter())
+            .find(|server| server.id == stored.id)
+            .expect("the server stays in the store");
+        assert!(reloaded_server.spec.pin_sha256().is_none());
         Ok(())
     }
 
