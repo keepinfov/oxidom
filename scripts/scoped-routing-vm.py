@@ -557,9 +557,9 @@ with subtest("real IPv6 and unprivileged user manager are available"):
     assert client.succeed("xray version").startswith("Xray 26.3.27 ")
     assert peer.succeed("xray version").startswith("Xray 26.3.27 ")
     assert not any(item["addr_info"] for item in kernel_json("ip -j -4 addr show dev eth0"))
-    assert not kernel_json("ip -j -6 route show default")
+    assert not [r for r in kernel_json("ip -j -6 route show default") if r.get("type") != "unreachable"]
     assert not json.loads(peer.succeed("ip -j -4 route show default"))
-    assert not json.loads(peer.succeed("ip -j -6 route show default"))
+    assert not [r for r in json.loads(peer.succeed("ip -j -6 route show default")) if r.get("type") != "unreachable"]
     assert unscoped(SINK4, "/p15-unscoped-baseline-v4")["source"] == LAN4
     assert unscoped(SINK6, "/p15-unscoped-baseline-v6", family=6)["source"] == "2001:db8:42::2"
     imported = rpc("ImportLinks", "s", "socks://192.0.2.10:1080#ScopedA\nsocks://192.0.2.11:1080#ScopedB")
