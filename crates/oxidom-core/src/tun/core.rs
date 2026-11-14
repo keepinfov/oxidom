@@ -113,6 +113,8 @@ pub(crate) fn arguments(device: &str, proxy: SocketAddrV4, mtu: u16) -> Vec<Stri
         format!("socks5://{proxy}"),
         "--mtu".to_string(),
         mtu.to_string(),
+        "--loglevel".to_string(),
+        "warn".to_string(),
     ]
 }
 
@@ -151,6 +153,8 @@ mod tests {
                 "socks5://127.91.37.1:10808",
                 "--mtu",
                 "1500",
+                "--loglevel",
+                "warn",
             ]
         );
     }

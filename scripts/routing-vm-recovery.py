@@ -256,10 +256,13 @@ def recovery_save(mode="default"):
         "on_core_exit": "hold",
         "failover": {"enabled": True, "members": ids, "max_attempts": 1, "cooldown_secs": 1},
     }
+    if mode == "crash":
+        profile["interface"]["routes"] = "default"
+        profile["core"] = {"log_level": "none"}
     rpc("SaveProfile", "ss", RECOVERY_PROFILE, json.dumps(profile))
     cli("up", RECOVERY_PROFILE)
     fault_wait_session(RECOVERY_PROFILE, fault_current_predicate(0))
-    interface = check_owned_plan(RECOVERY_PROFILE, mode)
+    interface = check_owned_plan(RECOVERY_PROFILE, "default" if mode == "crash" else mode)
     return interface, fault_core_identity(RECOVERY_PROFILE), recovery_helper_identity()
 
 
@@ -759,7 +762,7 @@ with subtest("dirty identity refuses reuse and explicit cleanup remains retryabl
 
 
 with subtest("daemon crash leaves identifiable orphans before explicit non-pool recovery cleanup"):
-    interface, core, helper = recovery_save()
+    interface, core, helper = recovery_save(mode="crash")
     before_info = fault_rpc_json("DaemonInfo")
     daemon = recovery_daemon_identity()
     original_restart = client.succeed("systemctl show -p Restart --value oxidom").strip()
@@ -775,6 +778,10 @@ with subtest("daemon crash leaves identifiable orphans before explicit non-pool 
     injected = recovery_signal(daemon)
     # Observe only kernel/proc/store state until explicit replacement. A bus
     # request here could activate the packaged service and erase this boundary.
+    client.wait_until_succeeds(
+        "python3 -c " + quote("import pathlib; assert int((pathlib.Path('/proc')/" + repr(str(core["pid"])) + "/'stat').read_text().rsplit(')',1)[1].split()[1]) == 1"),
+        timeout=10,
+    )
     recovery_assert_alive(core, parent=1)
     recovery_assert_alive(helper, parent=1)
     link = kernel_json("ip -j -d link show dev " + interface["device"])[0]
