@@ -289,7 +289,9 @@ def recovery_capture(label):
             "[Unit]", "Description=Isolated P15 recovery capture",
             "[Service]", "Type=exec", "KillSignal=SIGINT", "TimeoutStopSec=10",
             "Environment=LC_ALL=C", "ExecStart=/run/current-system/sw/bin/" + shlex.join([
-                "tcpdump", "--immediate-mode", "-i", device, "-B", "4096",
+                # The helper window emits enough blocked and retransmitted
+                # traffic that a 4 MiB ring dropped packets on loaded guests.
+                "tcpdump", "--immediate-mode", "-i", device, "-B", "16384",
                 "-s", "0", "-U", "-w", path, expression,
             ]), "",
         ])
