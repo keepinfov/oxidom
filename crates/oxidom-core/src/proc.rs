@@ -200,6 +200,22 @@ pub fn output_timeout(
     result
 }
 
+/// Ignore `SIGPIPE` before `exec` so a managed tunnel process (`xray`,
+/// `tun2socks`) that outlives a crashed daemon (`KillMode=process`) receives
+/// `EPIPE` on its log pipes instead of dying on the first line it writes.
+pub(crate) fn ignore_sigpipe(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `signal(SIGPIPE, SIG_IGN)` is async-signal-safe before `exec`.
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::signal(nix::libc::SIGPIPE, nix::libc::SIG_IGN) == nix::libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Drain one of a child's pipes into the process log book, tagging every line
 /// with the program that wrote it and the profile whose session owns it.
 pub(crate) fn spawn_reader<R: std::io::Read + Send + 'static>(
@@ -338,5 +354,25 @@ mod tests {
             "{arguments:?}"
         );
         assert_eq!(super::cmdline(u32::MAX), None);
+    }
+
+    #[test]
+    fn a_child_ignoring_sigpipe_survives_writing_to_a_closed_stdout_pipe() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "printf 'first\\n' 2>/dev/null; read line"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        super::ignore_sigpipe(&mut command);
+        let mut child = command.spawn().expect("spawning child");
+        drop(child.stdout.take());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            child.try_wait().expect("checking child").is_none(),
+            "child should survive EPIPE on closed stdout"
+        );
+        drop(child.stdin.take());
+        child.wait().expect("waiting for child");
     }
 }

@@ -115,12 +115,26 @@ nix build .#checks.x86_64-linux.routing-faults --print-build-logs
 ```
 
 The same VM driver runs the [routing foundation](routing-vm.md) before the
-[real-core fault scenarios](routing-vm-faults.md). The latter observe A-to-B
-recovery, exhausted and revoked held endpoints, an independent proxy-only peer,
-and explicit daemon shutdown/restart. These endpoint observations do not
-exclude a brief traffic release between sampled states. Active transition
-traffic or kernel-route monitoring and the remaining P15 helper/nft/cgroup,
-IPv6 and ownership-cleanup cases require separate evidence.
+[real-core fault scenarios](routing-vm-faults.md), then the
+[transition and recovery scenarios](routing-vm-recovery.md). The endpoint fault
+scenarios observe A-to-B recovery, exhausted and revoked held endpoints,
+an independent proxy-only peer,
+and explicit daemon shutdown/restart. The recovery continuation adds a finite
+active window of fresh unbound IPv4 HTTP sockets across A-to-B switching,
+one real helper replacement followed by disarm/hold on repeated failure,
+preservation of coordinated foreign qualified routes/rules, dirty-alias cleanup
+retry, and daemon SIGKILL orphans observed before explicit replacement cleanup.
+The observer records helper admissions; real executable identity and forwarding
+verify the initial helper and replacement. The guest administrator installs its
+configuration with all sessions and the daemon stopped, preserving the public
+binary-path guard.
+
+These assertions cover the recorded HTTP/TCP windows and checkpoints. They do
+not establish scoped nft/cgroup enforcement, IPv6 containment, packet-loss
+bounds, continuous or whole-device protection, or uninterrupted hold across
+daemon crash/restart. Direct traffic after explicit cleanup measures deliberate
+release. The remaining P15 cases and final release acceptance require separate
+evidence.
 
 This routing gate is not exposed on the other flake platforms, so its results do
 not establish cross-platform support. Its documented packet-path assertions are

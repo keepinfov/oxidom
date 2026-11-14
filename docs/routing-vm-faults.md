@@ -5,8 +5,10 @@ This script continues the same disposable NixOS guests after the
 adding its source does not establish that it ran. The tracker and pull request
 record the accepted CI head and actual results.
 
-The Nix VM `testScript` concatenates `scripts/routing-vm.py`, a newline and
-`scripts/routing-vm-faults.py`. No separate package build,
+The Nix VM `testScript` concatenates `scripts/routing-vm.py`,
+`scripts/routing-vm-faults.py` and `scripts/routing-vm-recovery.py`, with a newline
+between each script. The [transition and recovery continuation](routing-vm-recovery.md)
+runs after the scenarios below. No separate package build,
 developer daemon, host tunnel or external provider is a fixture.
 
 ## Separate real upstream processes
@@ -91,14 +93,24 @@ These are endpoint observations before faults and after confirmed recovery or
 stable held states. Although capture spans a transition, this slice does not
 issue a continuous sequence of fresh TUN requests or monitor every kernel route
 change during that transition. It therefore does not exclude a brief release
-window between the observed states. An active transition packet series or
-kernel-route monitor, with corresponding positive controls, remains mandatory
-final P15 work before claiming no unintended release during switching.
+window between the observed states. The subsequent
+[transition and recovery continuation](routing-vm-recovery.md) adds a finite
+active window of fresh unbound IPv4 HTTP sockets across A-to-B switching, with
+positive packet controls. Its assertion is limited to that recorded window.
 
 The foundation's declared synthetic geo classification remains in use. These
 checks cover observed HTTP/TCP paths, not packaged geo data, UDP/ICMP or IPv6.
-They do not establish helper restoration, cgroup/nft enforcement, foreign-owned
-resource collision recovery, daemon SIGKILL recovery, packet-loss bounds or
-continuous/whole-device protection. In particular, the current daemon restart
-contract cleans non-pool owned TUN records; no uninterrupted hold through
-daemon crash/restart is claimed here.
+This endpoint slice does not establish helper restoration, foreign-owned
+resource collision recovery or daemon SIGKILL recovery. The continuation adds
+one real helper exec replacement followed by repeated-failure disarm/hold,
+coordinated foreign qualified route/rule preservation, dirty-alias cleanup retry,
+and identifiable orphans before explicit replacement cleanup. Its helper exec
+observer is an offline guest-administrator fixture; public binary-path guards
+remain in force.
+
+The cumulative check does not establish scoped cgroup/nft enforcement, IPv6
+containment, packet-loss bounds or continuous/whole-device protection. The
+daemon restart contract cleans non-pool owned TUN records; direct traffic after
+that explicit recovery is deliberate release, and no uninterrupted hold through
+daemon crash/restart is claimed. Remaining P15 cases and final release acceptance
+need separate evidence and recorded CI results.
