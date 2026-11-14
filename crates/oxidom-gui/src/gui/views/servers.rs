@@ -91,6 +91,12 @@ pub struct CardCallbacks {
     pub show_logs: Rc<dyn Fn(String)>,
     /// Start a problem report about this server, from the log narrowed to it.
     pub report: Rc<dyn Fn(String)>,
+    /// Open the subscription's details dialog (or the local servers dialog).
+    pub subscription_details: Rc<dyn Fn(String)>,
+    /// Copy the subscription's URL to the clipboard.
+    pub copy_subscription_url: Rc<dyn Fn(String)>,
+    /// Confirm and remove a subscription from its Servers-page header menu.
+    pub remove_subscription: Rc<dyn Fn(String)>,
 }
 
 /// One subscription block. Cards live in independent vertical column boxes
@@ -829,12 +835,12 @@ impl ServersView {
             });
             let reorder = gtk::MenuButton::builder()
                 .icon_name("view-more-symbolic")
-                .tooltip_text("Move subscription")
+                .tooltip_text("Subscription actions")
                 .valign(gtk::Align::Center)
                 .css_classes(["flat", "circular", "server-action"])
                 .build();
-            reorder.update_property(&[gtk::accessible::Property::Label("Move subscription")]);
-            reorder.set_popover(Some(&self.move_subscription_menu(&subscription.id)));
+            reorder.update_property(&[gtk::accessible::Property::Label("Subscription actions")]);
+            reorder.set_popover(Some(&self.move_subscription_menu(subscription, &callbacks)));
             let collapsed = Rc::new(Cell::new(
                 self.prefs
                     .borrow()
@@ -1158,7 +1164,7 @@ impl ServersView {
             scopes.add(
                 adw::Toggle::builder()
                     .name(&group.id)
-                    .label(group.label())
+                    .label(group.chip_label(count, false))
                     .tooltip(group_chip_tooltip(group, count))
                     .build(),
             );
@@ -3060,22 +3066,16 @@ impl ServersView {
         let Some(toggle) = scopes.toggle_by_name(&id) else {
             return;
         };
+        let count = group_member_ids(&group, &self.subscriptions.borrow()).len();
         let modified = self.group_is_modified(&group);
-        toggle.set_label(Some(&if modified {
-            format!("{} ·", group.label())
-        } else {
-            group.label()
-        }));
+        toggle.set_label(Some(&group.chip_label(count, modified)));
         toggle.set_tooltip(&if modified {
             format!(
                 "Showing a narrowed view of “{}”. Save it to keep the change.",
                 group.name
             )
         } else {
-            group_chip_tooltip(
-                &group,
-                group_member_ids(&group, &self.subscriptions.borrow()).len(),
-            )
+            group_chip_tooltip(&group, count)
         });
     }
 
@@ -3730,27 +3730,36 @@ impl ServersView {
         self.build_chip_bar();
     }
 
-    fn move_subscription_menu(&self, subscription_id: &str) -> gtk::Popover {
+    fn move_subscription_menu(
+        &self,
+        subscription: &Subscription,
+        callbacks: &CardCallbacks,
+    ) -> gtk::Popover {
         let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
         list.set_margin_top(6);
         list.set_margin_bottom(6);
         list.set_margin_start(6);
         list.set_margin_end(6);
         let popover = gtk::Popover::builder().child(&list).build();
-        for (label, icon, delta) in [
-            ("Move up", "go-up-symbolic", -1_isize),
-            ("Move down", "go-down-symbolic", 1),
-        ] {
+        let item = |label: &str, icon: &str| {
             let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             content.append(&gtk::Image::from_icon_name(icon));
-            content.append(&gtk::Label::new(Some(label)));
+            content.append(&gtk::Label::builder().label(label).xalign(0.0).build());
             let button = gtk::Button::builder()
                 .child(&content)
                 .css_classes(["flat"])
                 .build();
+            button.update_property(&[gtk::accessible::Property::Label(label)]);
+            button
+        };
+        for (label, icon, delta) in [
+            ("Move up", "go-up-symbolic", -1_isize),
+            ("Move down", "go-down-symbolic", 1),
+        ] {
+            let button = item(label, icon);
             button.connect_clicked({
                 let view = self.clone();
-                let subscription_id = subscription_id.to_string();
+                let subscription_id = subscription.id.clone();
                 let popover = popover.clone();
                 move |_| {
                     popover.popdown();
@@ -3758,6 +3767,47 @@ impl ServersView {
                 }
             });
             list.append(&button);
+        }
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let details = item(
+            subscription_details_label(&subscription.id),
+            "dialog-information-symbolic",
+        );
+        details.connect_clicked({
+            let cb = callbacks.subscription_details.clone();
+            let subscription_id = subscription.id.clone();
+            let popover = popover.clone();
+            move |_| {
+                popover.popdown();
+                cb(subscription_id.clone());
+            }
+        });
+        list.append(&details);
+        if !subscription.url.is_empty() {
+            let copy_url = item("Copy subscription URL", "edit-copy-symbolic");
+            copy_url.connect_clicked({
+                let cb = callbacks.copy_subscription_url.clone();
+                let url = subscription.url.clone();
+                let popover = popover.clone();
+                move |_| {
+                    popover.popdown();
+                    cb(url.clone());
+                }
+            });
+            list.append(&copy_url);
+            list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            let remove = item("Remove subscription…", "user-trash-symbolic");
+            remove.add_css_class("destructive-action");
+            remove.connect_clicked({
+                let cb = callbacks.remove_subscription.clone();
+                let subscription_id = subscription.id.clone();
+                let popover = popover.clone();
+                move |_| {
+                    popover.popdown();
+                    cb(subscription_id.clone());
+                }
+            });
+            list.append(&remove);
         }
         popover
     }
@@ -4381,6 +4431,14 @@ fn collapse_tooltip(collapsed: bool) -> &'static str {
     if collapsed { "Expand" } else { "Collapse" }
 }
 
+fn subscription_details_label(subscription_id: &str) -> &'static str {
+    if subscription_id == oxidom_core::engine::LOCAL_ID {
+        "Local servers…"
+    } else {
+        "Subscription details…"
+    }
+}
+
 /// The sort key a badge contributes, if any: a number, a definite failure, or
 /// nothing to say. Only [`sorted_by_latency`] consumes this — the badge itself
 /// renders from the [`LatencyState`] directly.
@@ -4723,5 +4781,17 @@ mod tests {
             assert_eq!(columns_for_width_with_hysteresis(width, 3, 16), 3);
             assert_eq!(columns_for_width_with_hysteresis(width, 4, 16), 4);
         }
+    }
+
+    #[test]
+    fn subscription_menu_details_label_distinguishes_local_servers_from_remote_subscriptions() {
+        assert_eq!(
+            super::subscription_details_label(oxidom_core::engine::LOCAL_ID),
+            "Local servers…"
+        );
+        assert_eq!(
+            super::subscription_details_label("remote-sub"),
+            "Subscription details…"
+        );
     }
 }

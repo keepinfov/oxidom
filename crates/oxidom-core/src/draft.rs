@@ -435,19 +435,21 @@ fn set_dotted(
     }
 }
 
-/// One line of the expanded card's parameter listing.
+/// One line of the server details parameter listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parameter {
-    /// The dialog group the field sits in, so the card and the editor read
-    /// as one thing rather than as two spellings of the same fields.
+    /// The dialog group the field sits in, so the details listing and the
+    /// editor read as one thing rather than as two spellings of the same fields.
     pub group: &'static str,
-    /// The JSON key the editor labels the field with.
-    pub key: &'static str,
+    /// The JSON key the editor labels the field with, or the outbound tag on a
+    /// balanced composite profile.
+    pub key: std::borrow::Cow<'static, str>,
     /// The value as a person reads it.
     pub value: String,
     /// A credential: shown masked until revealed.
     pub secret: bool,
-    /// The user overrode this field against what the provider sends.
+    /// The user overrode this field against what the provider sends, or pinned
+    /// a certificate on this machine.
     pub overridden: bool,
 }
 
@@ -468,17 +470,19 @@ const SERVER: &str = "Server";
 const CREDENTIALS: &str = "Credentials";
 const TRANSPORT: &str = "Transport and TLS";
 const HYSTERIA2: &str = "hysteria2";
+const BALANCER: &str = "Balancer";
+const BALANCED_OUTBOUNDS: &str = "Balanced outbounds";
 const PATCH: &str = "outbound_patch";
 
 /// Every parameter the stored server carries, spelled the way the editor
 /// spells them.
 ///
 /// Only what is present is listed — an optional the server does not carry is
-/// not a parameter of it. A composite Xray profile is deliberately not
-/// listed: it is provider JSON with no fields of its own, and a listing that
-/// pretends otherwise would be a third spelling nobody can edit.
+/// not a parameter of it. A composite Xray profile lists its balancer settings
+/// and the proxy outbounds it balances across.
 pub fn parameters(server: &Server) -> Vec<Parameter> {
     use crate::model::OutboundSpec;
+    use std::borrow::Cow;
 
     let overridden_keys: std::collections::BTreeSet<String> = server
         .overrides
@@ -489,7 +493,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
     let mut plain = |key: &'static str, value: String| {
         rows.push(Parameter {
             group: SERVER,
-            key,
+            key: Cow::Borrowed(key),
             value,
             secret: false,
             overridden: false,
@@ -502,7 +506,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
     let credential = |key: &'static str, value: String, rows: &mut Vec<Parameter>| {
         rows.push(Parameter {
             group: CREDENTIALS,
-            key,
+            key: Cow::Borrowed(key),
             value,
             secret: true,
             overridden: false,
@@ -519,7 +523,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
             if encryption != "none" {
                 rows.push(Parameter {
                     group: CREDENTIALS,
-                    key: "encryption",
+                    key: Cow::Borrowed("encryption"),
                     value: encryption.clone(),
                     secret: false,
                     overridden: false,
@@ -537,7 +541,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
             if *alter_id != 0 {
                 rows.push(Parameter {
                     group: CREDENTIALS,
-                    key: "alter_id",
+                    key: Cow::Borrowed("alter_id"),
                     value: alter_id.to_string(),
                     secret: false,
                     overridden: false,
@@ -546,7 +550,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
             if security != "auto" {
                 rows.push(Parameter {
                     group: CREDENTIALS,
-                    key: "security",
+                    key: Cow::Borrowed("security"),
                     value: security.clone(),
                     secret: false,
                     overridden: false,
@@ -561,7 +565,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
         OutboundSpec::Shadowsocks { method, password } => {
             rows.push(Parameter {
                 group: CREDENTIALS,
-                key: "method",
+                key: Cow::Borrowed("method"),
                 value: method.clone(),
                 secret: false,
                 overridden: false,
@@ -581,7 +585,7 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
             let mut field = |key: &'static str, value: String, secret: bool| {
                 hysteria_rows.push(Parameter {
                     group: HYSTERIA2,
-                    key,
+                    key: Cow::Borrowed(key),
                     value,
                     secret,
                     overridden: false,
@@ -631,21 +635,89 @@ pub fn parameters(server: &Server) -> Vec<Parameter> {
                 field("pin_sha256", pin.clone(), false);
             }
         }
-        OutboundSpec::XrayProfile { .. } => {}
+        OutboundSpec::XrayProfile {
+            proxy_outbounds,
+            balancers,
+            burst_observatory,
+            balancer_tag,
+        } => {
+            let mut balancer_field = |key: &'static str, value: String| {
+                rows.push(Parameter {
+                    group: BALANCER,
+                    key: Cow::Borrowed(key),
+                    value,
+                    secret: false,
+                    overridden: false,
+                });
+            };
+            balancer_field("balancer_tag", balancer_tag.clone());
+            let chosen = balancers
+                .iter()
+                .find(|balancer| {
+                    balancer.get("tag").and_then(serde_json::Value::as_str)
+                        == Some(balancer_tag.as_str())
+                })
+                .or_else(|| balancers.first());
+            if let Some(strategy) = chosen
+                .and_then(|balancer| balancer.pointer("/strategy/type"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|strategy| !strategy.is_empty())
+            {
+                balancer_field("strategy", strategy.to_string());
+            }
+            if let Some(destination) = burst_observatory
+                .as_ref()
+                .and_then(|obs| obs.pointer("/pingConfig/destination"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|destination| !destination.is_empty())
+            {
+                balancer_field("probe_destination", destination.to_string());
+            }
+            balancer_field("outbounds", proxy_outbounds.len().to_string());
+
+            for (index, outbound) in proxy_outbounds.iter().enumerate() {
+                let tag = outbound
+                    .get("tag")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("#{}", index + 1));
+                let summary =
+                    match crate::subscription_format::server_from_xray_outbound("", outbound) {
+                        Some(parsed) => format!(
+                            "{} · {}:{}",
+                            parsed.transport_label, parsed.address, parsed.port
+                        ),
+                        None => outbound
+                            .get("protocol")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    };
+                rows.push(Parameter {
+                    group: BALANCED_OUTBOUNDS,
+                    key: Cow::Owned(tag),
+                    value: summary,
+                    secret: false,
+                    overridden: false,
+                });
+            }
+        }
     }
 
     if let Some(patch) = &server.outbound_patch {
         rows.push(Parameter {
             group: PATCH,
-            key: "outbound_patch",
+            key: Cow::Borrowed("outbound_patch"),
             value: serde_json::to_string_pretty(patch).unwrap_or_default(),
             secret: false,
             overridden: false,
         });
     }
     for row in &mut rows {
-        if let Some(path) = override_key(row.group, row.key) {
-            row.overridden = overridden_keys.contains(&path);
+        if let Some(path) = override_key(row.group, &row.key) {
+            row.overridden = overridden_keys.contains(&path)
+                || (row.key == "pin_sha256" && server.spec.pin_sha256().is_some());
         }
     }
     rows
@@ -658,7 +730,7 @@ fn stream_parameters(stream: &StreamSettings, rows: &mut Vec<Parameter>) {
     let mut field = |key: &'static str, value: String| {
         rows.push(Parameter {
             group: TRANSPORT,
-            key,
+            key: std::borrow::Cow::Borrowed(key),
             value,
             secret: false,
             overridden: false,
@@ -945,8 +1017,8 @@ mod tests {
         let server = resolve(&draft).expect("resolves");
         assert_eq!(
             parameters(&server)
-                .into_iter()
-                .map(|parameter| (parameter.group, parameter.key, parameter.secret))
+                .iter()
+                .map(|parameter| (parameter.group, parameter.key.as_ref(), parameter.secret))
                 .collect::<Vec<_>>(),
             vec![
                 ("Server", "protocol", false),
@@ -975,8 +1047,8 @@ mod tests {
         let server = resolve(&draft).expect("resolves");
         assert_eq!(
             parameters(&server)
-                .into_iter()
-                .map(|parameter| (parameter.group, parameter.key))
+                .iter()
+                .map(|parameter| (parameter.group, parameter.key.as_ref()))
                 .collect::<Vec<_>>(),
             vec![
                 ("Server", "protocol"),
@@ -1019,7 +1091,7 @@ mod tests {
         let listed = parameters(&server);
         let pairs = listed
             .iter()
-            .map(|parameter| (parameter.key, parameter.secret))
+            .map(|parameter| (parameter.key.as_ref(), parameter.secret))
             .collect::<Vec<_>>();
         assert_eq!(
             pairs,
@@ -1277,5 +1349,80 @@ mod tests {
         assert!(!address.overridden);
         let uuid = listed.iter().find(|p| p.key == "uuid").expect("listed");
         assert!(!uuid.overridden);
+    }
+
+    /// A composite Xray profile lists its balancer settings and every proxy
+    /// outbound it balances across so the details dialog is informative on a
+    /// balanced server too.
+    #[test]
+    fn a_composite_xray_profile_lists_its_balancer_and_outbounds() {
+        let body = r#"[{
+          "remarks": "Auto",
+          "outbounds": [
+            {"tag":"proxy-1","protocol":"vless","settings":{"vnext":[{"address":"one.example.invalid","port":443,"users":[{"id":"11111111-2222-3333-4444-555555555555","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"tls"}},
+            {"tag":"proxy-2","protocol":"trojan","settings":{"servers":[{"address":"two.example.invalid","port":8443,"password":"invented"}]},"streamSettings":{"network":"ws","security":"tls"}}
+          ],
+          "routing":{"rules":[{"type":"field","network":"tcp,udp","balancerTag":"balance"}],"balancers":[{"tag":"balance","selector":["proxy"],"strategy":{"type":"leastPing"}}]},
+          "burstObservatory":{"subjectSelector":["proxy"],"pingConfig":{"destination":"https://cp.cloudflare.com/generate_204"}}
+        }]"#;
+        let (servers, _) = crate::subscription_format::parse(body).expect("parses");
+        let listed = parameters(&servers[0]);
+        let rows: Vec<(&str, &str, &str)> = listed
+            .iter()
+            .map(|p| (p.group, p.key.as_ref(), p.value.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Server", "protocol", "vless"),
+                ("Server", "address", "one.example.invalid"),
+                ("Server", "port", "443"),
+                ("Balancer", "balancer_tag", "balance"),
+                ("Balancer", "strategy", "leastPing"),
+                (
+                    "Balancer",
+                    "probe_destination",
+                    "https://cp.cloudflare.com/generate_204"
+                ),
+                ("Balancer", "outbounds", "2"),
+                (
+                    "Balanced outbounds",
+                    "proxy-1",
+                    "vless + tls · one.example.invalid:443"
+                ),
+                (
+                    "Balanced outbounds",
+                    "proxy-2",
+                    "trojan + ws + tls · two.example.invalid:8443"
+                ),
+            ]
+        );
+    }
+
+    /// A certificate pinned via the trust dialog is a local mark, not an entry
+    /// in `overrides`, yet the parameter listing marks `pin_sha256` so the
+    /// details dialog offers the action that clears it.
+    #[test]
+    fn a_pinned_certificate_is_marked_removable_in_the_listing() {
+        let mut draft = base(Protocol::Vless);
+        draft.uuid = Some("11111111-2222-3333-4444-555555555555".to_string());
+        draft.stream = Some(StreamSettings {
+            network: "tcp".to_string(),
+            security: "tls".to_string(),
+            ..StreamSettings::default()
+        });
+        let mut server = resolve(&draft).expect("resolves");
+        server.spec.set_pin_sha256(Some("a".repeat(64)));
+
+        let listed = parameters(&server);
+        let pin = listed
+            .iter()
+            .find(|p| p.key == "pin_sha256")
+            .expect("pin_sha256 is listed");
+        assert!(pin.overridden);
+        assert_eq!(
+            override_key(pin.group, &pin.key).as_deref(),
+            Some("stream.pin_sha256")
+        );
     }
 }

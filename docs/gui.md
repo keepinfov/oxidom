@@ -127,7 +127,8 @@ clicking one opens its details inline rather than in a dialog.
 
 Above the grid is a **chip row** — a segmented control over one list, not several
 lists. Its head is the `Filter` pill; the rest are your saved groups plus
-`Favourites`.
+`Favourites`, each labelled with its current matching server count (`Name · N`, or
+`Name · N (modified)` when narrowed on screen).
 
 ### Filters and groups
 
@@ -201,7 +202,9 @@ rotation at once, default 6. It is deliberately not stored on the group: a group
 8 or 12, or explicitly **All**. A width larger than the pool uses all its members,
 not extra nodes, and does not change the saved profile.
 
-Per-subscription latency checks and sorting live on this page too.
+Per-subscription latency checks, sorting, and subscription actions (`⋮` for moving
+up/down, opening subscription details, copying the subscription URL, or removing the
+subscription) live on this page too.
 
 ### Latency
 
@@ -228,7 +231,12 @@ Hysteria2 is QUIC over UDP and has no TCP port to open.
 The first HTTP request after connecting gets a **6-second cold-start budget** for
 DNS, TCP and TLS/REALITY setup, just like a direct HTTP check using a throwaway
 core. Periodic checks through an established session keep their **3-second**
-budget. Confirmation always goes through SOCKS using HTTP, even when Settings
+budget. When the probe target keeps the HTTP/1.1 connection open, a second
+request on the same connection measures the live round-trip for the badge and
+sorting (`value`), while the initial cold-start request is retained as
+`setup_ms` and shown alongside the round-trip in **Server details** (**Recent
+checks** column tooltips) and the expanded session's **Latency** row (`41 ms
+(setup 420 ms)`). Confirmation always goes through SOCKS using HTTP, even when Settings
 chooses ICMP or TCP: a host answering ping or accepting TCP does not prove its
 proxy carries traffic. Failed confirmation reports a recognised outbound cause,
 such as a handshake timeout, reset or DNS failure, or the measured timeout/local
@@ -236,26 +244,31 @@ failure when no more specific cause is available.
 
 **An expanded card says more than the badge can.** The badge has a glyph and a
 tooltip to work with, and "the server did not answer" covers a refused handshake,
-a wrong TLS parameter and a dead network alike. Between the server's identity and
-the checks, the expanded card lists every parameter the stored server carries —
-the transport, the TLS or Reality settings, the flow, everything — under the same
-JSON key names the server dialog labels its rows with, so the listing and the
-editor read as one thing. Credentials (passwords, UUIDs, auth) are masked until
-you press the 👁 next to them, and every value is selectable text, like the
-address. Only fields the server actually carries are listed.
+a wrong TLS parameter and a dead network alike. The expanded card stays compact in
+the grid — showing the server's identity, any trust or local-edit marks, and why
+the last check failed — while ℹ **Server details** (on the card's action row and
+right-click menu) opens the full inspection dialog. That dialog draws **Recent
+checks** at the top and lists every parameter the stored server carries — the
+transport, the TLS or Reality settings, the flow, or, for a composite balanced
+profile, its balancer settings and outbounds — under the same JSON key names the
+server dialog labels its rows with. Credentials (passwords, UUIDs, auth) are
+masked until you press the 👁 next to them, and every value is selectable text,
+like the address. Overridden fields and locally pinned certificates (`pin_sha256`)
+carry an undo button next to them to restore the provider's value or remove the
+certificate pin.
 
 Opening a card whose last check
 produced no number shows the reason the daemon gave, how the check was made — the
-method really used, and whether it went through the tunnel — and how long ago. It
-sits under the recent checks rather than above them, so everything the card says
-about checks is in one place. On the reason's own line are two icons: 👁 **Show in
-logs** opens the log page narrowed to that server's address, which is what the
-core and the prober write into their lines, and ⚠ **Report a problem** builds the
-redacted report from it. Both name themselves when pointed at. A check you stopped
+method really used, and whether it went through the tunnel — and how long ago. On
+the reason's own line are action icons: 👁 **Show in logs** opens the log page
+narrowed to that server's address, which is what the core and the prober write
+into their lines, ⚠ **Report a problem** builds the redacted report from it, and
+when a TLS or Hysteria2 server failed because its certificate was rejected, a
+🔒 **Trust certificate…** button appears right beside them. A check you stopped
 is reported as stopped, not as a fault; a check still running shows nothing,
 because the only reason it could show is about the measurement being replaced.
 
-**Recent checks** above it draws the last ten as a chart, oldest at the left. One
+**Recent checks** in **Server details** draws the last ten as a chart, oldest at the left. One
 number says whether a server answered once; it cannot say whether it answers
 reliably, and that is usually the question — which is a question about spread and
 outliers, and those are easier to see than to read.
@@ -320,7 +333,12 @@ Selecting a profile makes the header, the cards and the tray follow it, so
 "connected" always means *this* profile.
 
 A profile connected to a group shows its live exit rather than naming the group's
-first server, because the first server is not the exit.
+first server, because the first server is not the exit; expanding the row lists the
+group's members (split into **In rotation** and **Out of rotation** when rotation
+membership is reported, or **Members** otherwise). Expanding any connected session
+also offers an on-demand **Egress IP** row with a refresh button to query and copy
+the public IP address observed through that session's tunnel without background
+polling.
 
 Per-profile interface settings are edited from here, including what happens to
 the tunnel's routes if Xray exits — hold them and drop the traffic, release them
@@ -344,7 +362,8 @@ logs use for it.
 ## Subscriptions
 
 Add by URL, refresh, reorder, collapse, remove. Quota and expiry appear when the
-provider sends them.
+provider sends them. In a subscription's details dialog, the subscription URL is
+masked by default with a reveal toggle beside Copy.
 
 A subscription fetch does not block the session Stop controls. One disconnect can run alongside
 Add/Update/Update All, and activity names both operations until each completes. Stopping the tunnel

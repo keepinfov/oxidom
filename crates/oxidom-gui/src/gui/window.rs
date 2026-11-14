@@ -25,12 +25,13 @@ use super::logfeed::LogFeed;
 use super::operation::{UiOperation, UiOperationKind};
 use super::recovery::{Generation, RecoveryState, RetiredWork};
 use super::reduce::{
-    CardAction, ControlPlan, Effect, PolledSnapshot, PoolAction, ProbePhase, ProbeWait,
-    SessionAction, SessionRowState, SnapshotState, SwitcherItem, SystemProxyState, about_comments,
-    activation_ids, active_latency_for, card_plan, check_can_be_stopped, compact_status_visible,
-    geo_download_prompt, history_chart, human_bytes, latency_states, missing_core_message,
-    other_profiles_message, pool_plan, pool_short_label, press_stops, reduce, runtime_presentation,
-    selected_status, session_for, session_rows, stop_report, switcher_items, switcher_visible,
+    CardAction, ControlPlan, Effect, EgressEntry, PolledSnapshot, PoolAction, ProbePhase,
+    ProbeWait, SessionAction, SessionRowState, SnapshotState, SwitcherItem, SystemProxyState,
+    about_comments, activation_ids, active_latency_for, card_plan, check_can_be_stopped,
+    compact_status_visible, geo_download_prompt, history_chart, human_bytes, latency_states,
+    missing_core_message, other_profiles_message, pool_plan, pool_short_label, press_stops, reduce,
+    runtime_presentation, selected_status, session_for, session_rows, sessions_carrying_server,
+    sessions_carrying_subscription, stop_report, switcher_items, switcher_visible,
 };
 use super::server_card::{self, LatencyState};
 use super::sidebar::{Page, Sidebar};
@@ -2103,10 +2104,99 @@ impl Controller {
                     }
                 })
             },
+            check_egress: {
+                let weak = self.bound();
+                Rc::new(move |profile, fresh| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.check_egress_ip(profile, fresh);
+                    }
+                })
+            },
         };
         self.sessions.rebuild(&profiles, &rows, callbacks);
         self.sessions.set_operation(operation);
         self.sync_profile_switcher();
+    }
+
+    fn check_egress_ip(self: &Rc<Self>, profile: String, fresh: bool) {
+        if !self.admitted() {
+            return;
+        }
+        let (client, server_id) = {
+            let mut state = self.state.borrow_mut();
+            let Some(session) = state
+                .ui
+                .sessions
+                .iter()
+                .find(|session| session.profile == profile && session.state == "connected")
+            else {
+                return;
+            };
+            let server_id = session.server_id.clone();
+            if state
+                .ui
+                .egress_ips
+                .get(&profile)
+                .is_some_and(|entry| entry.checking)
+            {
+                return;
+            }
+            state.ui.egress_ips.insert(
+                profile.clone(),
+                EgressEntry {
+                    server_id: server_id.clone(),
+                    ip: None,
+                    checking: true,
+                },
+            );
+            (state.client.clone(), server_id)
+        };
+        self.sync_session_rows();
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let target_profile = profile.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(client.egress_address(&target_profile, fresh));
+        });
+        let weak = self.bound();
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            let result = match poll_worker(&receiver) {
+                WorkerPoll::Waiting => return glib::ControlFlow::Continue,
+                WorkerPoll::Ready(result) => result,
+                WorkerPoll::Lost => Err(anyhow!(WorkerLost)),
+            };
+            let Some(controller) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            match result {
+                Ok(ip) => {
+                    let mut state = controller.state.borrow_mut();
+                    let still_same = state.ui.sessions.iter().any(|session| {
+                        session.profile == profile
+                            && session.state == "connected"
+                            && session.server_id == server_id
+                    });
+                    if still_same {
+                        state.ui.egress_ips.insert(
+                            profile.clone(),
+                            EgressEntry {
+                                server_id: server_id.clone(),
+                                ip: Some(ip.to_string()),
+                                checking: false,
+                            },
+                        );
+                    } else {
+                        state.ui.egress_ips.remove(&profile);
+                    }
+                }
+                Err(error) => {
+                    controller.state.borrow_mut().ui.egress_ips.remove(&profile);
+                    controller.show_error("Could not check egress IP", &format!("{error:#}"));
+                }
+            }
+            controller.sync_session_rows();
+            glib::ControlFlow::Break
+        });
     }
 
     /// Reread the profile from the daemon before showing its editor. The
@@ -2451,6 +2541,53 @@ impl Controller {
                     }
                 })
             },
+            subscription_details: {
+                let weak = self.bound();
+                Rc::new(move |id: String| {
+                    if let Some(controller) = weak.upgrade() {
+                        let sub = controller
+                            .state
+                            .borrow()
+                            .subscriptions
+                            .iter()
+                            .find(|sub| sub.id == id)
+                            .cloned();
+                        if let Some(sub) = sub {
+                            controller
+                                .subscriptions
+                                .open_details(&controller.window, sub);
+                        }
+                    }
+                })
+            },
+            copy_subscription_url: {
+                let weak = self.bound();
+                Rc::new(move |url: String| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.window.clipboard().set_text(&url);
+                        controller.show_message("Copied subscription URL");
+                    }
+                })
+            },
+            remove_subscription: {
+                let weak = self.bound();
+                Rc::new(move |id: String| {
+                    if let Some(controller) = weak.upgrade() {
+                        let sub = controller
+                            .state
+                            .borrow()
+                            .subscriptions
+                            .iter()
+                            .find(|sub| sub.id == id)
+                            .cloned();
+                        if let Some(sub) = sub {
+                            controller
+                                .subscriptions
+                                .confirm_remove(&controller.window, &sub);
+                        }
+                    }
+                })
+            },
         };
         self.servers.rebuild(
             &subscriptions,
@@ -2554,6 +2691,32 @@ impl Controller {
                 Rc::new(move |id: String| {
                     weak.upgrade()
                         .map(|controller| controller.servers.groups_holding_any(&id))
+                        .unwrap_or_default()
+                })
+            },
+            sessions_holding: {
+                let weak = self.bound();
+                Rc::new(move |id: String| {
+                    weak.upgrade()
+                        .map(|controller| {
+                            let state = controller.state.borrow();
+                            sessions_carrying_server(&state.ui.sessions, &id)
+                        })
+                        .unwrap_or_default()
+                })
+            },
+            sessions_holding_any: {
+                let weak = self.bound();
+                Rc::new(move |id: String| {
+                    weak.upgrade()
+                        .map(|controller| {
+                            let state = controller.state.borrow();
+                            sessions_carrying_subscription(
+                                &state.ui.sessions,
+                                &state.subscriptions,
+                                &id,
+                            )
+                        })
                         .unwrap_or_default()
                 })
             },
@@ -6142,8 +6305,9 @@ fn install_css() {
         .latency-spinner { color: @accent_color; }
         .latency-reachable { color: @accent_color; background: alpha(@accent_color, 0.12); }
         /* Measured through the tunnel: a fact about the connection in use, not
-           about the server on its own. Worth its own colour. */
-        .latency-tunnel { color: @success_color; background: alpha(@success_color, 0.14); }
+           about the server on its own. Kept on the accent palette so green
+           remains reserved for connected state. */
+        .latency-tunnel { color: @accent_color; background: alpha(@accent_color, 0.16); }
         /* Scoped to the card badge on purpose — the .latency-stale rule above
            is scoped to the headerbar and the sidebar and does not reach here. */
         .latency-badge.latency-stale { opacity: 0.55; }
@@ -6164,7 +6328,7 @@ fn install_css() {
            now. */
         .session-chip { border-radius: 999px; padding: 3px 8px; font-size: 0.75em; background: alpha(@window_fg_color, 0.07); }
         .session-chip-stale { color: @warning_color; background: alpha(@warning_color, 0.13); }
-        .session-chip-latency { color: @success_color; background: alpha(@success_color, 0.14); }
+        .session-chip-latency { color: @accent_color; background: alpha(@accent_color, 0.16); }
         .dns-leak-row { background: alpha(@warning_color, 0.10); }
         .dns-leak-row > box > box > label.title { color: @warning_color; }
         .dns-leak-icon { color: @warning_color; }
