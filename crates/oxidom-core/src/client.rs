@@ -655,6 +655,17 @@ impl DaemonClient {
             .map_err(friendly)
     }
 
+    /// Observe the public IP address seen through `profile`'s connected tunnel.
+    pub fn egress_address(&self, profile: &str, fresh: bool) -> Result<std::net::IpAddr> {
+        let ip: String = self
+            .proxy
+            .call("EgressAddress", &(profile, fresh))
+            .map_err(|error| unknown_method(error, "check the egress address"))?;
+        ip.trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("the daemon returned an invalid egress address"))
+    }
+
     /// Profiles arrived after the first daemons shipped, so every call below
     /// can meet an `UnknownMethod` from a daemon that predates them. Say so in
     /// those words rather than passing the bus error through.
@@ -1599,6 +1610,27 @@ mod tests {
             error
                 .to_string()
                 .contains("too old to read persistent diagnostics")
+        );
+        let egress_call = zbus::Message::method_call(super::OBJECT_PATH, "EgressAddress")
+            .unwrap()
+            .build(&("work", true))
+            .unwrap();
+        assert_eq!(egress_call.body().signature().to_string(), "(sb)");
+        let egress_unknown = zbus::Message::error(
+            &egress_call.header(),
+            "org.freedesktop.DBus.Error.UnknownMethod",
+        )
+        .unwrap()
+        .build(&"invented old daemon")
+        .unwrap();
+        let egress_error = super::unknown_method(
+            zbus::Error::from(egress_unknown),
+            "check the egress address",
+        );
+        assert!(
+            egress_error
+                .to_string()
+                .contains("too old to check the egress address")
         );
     }
 

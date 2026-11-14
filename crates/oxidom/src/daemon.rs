@@ -1832,6 +1832,7 @@ impl Shared {
                     // passing a handshake off as the user's chosen probe.
                     probe::ProbeOutcome::Reachable(measured) => {
                         LatencyReading::ok(measured.ms, ProbeRoute::Direct, measured.method)
+                            .with_setup_ms(measured.setup_ms)
                     }
                     outcome => wire_reading(&outcome, ProbeRoute::Direct, method),
                 };
@@ -1995,6 +1996,7 @@ impl Shared {
         let reading = match &outcome {
             Some((probe::ProbeOutcome::Reachable(measured), _)) => {
                 LatencyReading::ok(measured.ms, ProbeRoute::Proxied, measured.method)
+                    .with_setup_ms(measured.setup_ms)
             }
             Some((outcome, attempted_method)) => {
                 wire_reading(outcome, ProbeRoute::Proxied, *attempted_method)
@@ -3879,6 +3881,39 @@ impl Service {
         let presented =
             oxidom_core::tls_pin::present(&address, port, sni.as_deref()).map_err(failed)?;
         Ok(presented.sha256)
+    }
+
+    /// Observe the public IP address seen through a connected session's SOCKS
+    /// listener, releasing the engine lock before the network round trip.
+    fn egress_address(&self, profile: String, fresh: bool) -> fdo::Result<String> {
+        let _request = self.shared.admit()?;
+        let profile = if profile.is_empty() {
+            "default".to_string()
+        } else {
+            profile
+        };
+        let (bind, socks_port, server_id) = {
+            let engine = oxidom_core::sync::lock(&self.shared.engine);
+            let session = engine
+                .sessions
+                .get(&profile)
+                .filter(|session| session.status() == Status::Connected)
+                .ok_or_else(|| failed(format!("profile {profile:?} is not connected")))?;
+            let server_id = match session.selection.as_ref() {
+                Some(SessionSelection::Server(server_id)) => Some(server_id.clone()),
+                Some(SessionSelection::Pool { .. }) => None,
+                None => return Err(failed(format!("profile {profile:?} is not connected"))),
+            };
+            (session.address, session.socks_port, server_id)
+        };
+        let ip = match server_id {
+            Some(server_id) => {
+                oxidom_core::egress::address(&profile, &server_id, bind, socks_port, fresh)
+            }
+            None => oxidom_core::egress::uncached_address(bind, socks_port),
+        }
+        .map_err(failed)?;
+        Ok(ip.to_string())
     }
 
     /// Pin `sha256` for this server, so its certificate is accepted from now on
@@ -5955,10 +5990,8 @@ mod tests {
             start_attributed_fake_session(&service, "default", &ids[1], Some(first.generation))?;
         assert_eq!(first.generation, replacement.generation);
         assert_ne!(first.core, replacement.core);
-        let reachable = probe::ProbeOutcome::Reachable(probe::Measurement {
-            ms: 7,
-            method: LatencyMethod::HttpGet,
-        });
+        let reachable =
+            probe::ProbeOutcome::Reachable(probe::Measurement::new(7, LatencyMethod::HttpGet));
         assert!(service.shared.apply_session_probe_result(
             "default",
             replacement,
@@ -8171,10 +8204,7 @@ mod tests {
     }
 
     fn reachable() -> probe::ProbeOutcome {
-        probe::ProbeOutcome::Reachable(probe::Measurement {
-            ms: 42,
-            method: LatencyMethod::HttpGet,
-        })
+        probe::ProbeOutcome::Reachable(probe::Measurement::new(42, LatencyMethod::HttpGet))
     }
 
     fn subscription_response() -> oxidom_core::subscription::FetchResult {
@@ -11263,6 +11293,46 @@ mod tests {
         service.stop_profile("default")?;
         assert!(probe::socks_up(Ipv4Addr::LOCALHOST, socks_port));
         service.shared.stop_standby();
+        Ok(())
+    }
+
+    #[test]
+    fn egress_address_requires_a_connected_session_and_reads_the_profile_cache() -> Result<()> {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("egress-address-dbus")?;
+        let service = for_test();
+        configure_fake_core(&service, &root)?;
+
+        let err = service
+            .egress_address("work".to_string(), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("not connected"));
+
+        let server_id = oxidom_core::sync::lock(&service.shared.engine)
+            .all_servers()
+            .next()
+            .context("test server")?
+            .id
+            .clone();
+        service.connect(server_id.clone())?;
+        confirm_live_session(&service, "default")?;
+
+        let cache_path = oxidom_core::paths::cache_dir()?.join("egress.json");
+        let cache = HashMap::from([(
+            "default".to_string(),
+            oxidom_core::cli_json::EgressCache {
+                server_id,
+                ip: "198.51.100.42".to_string(),
+                at_unix_ms: oxidom_core::ipc::now_unix_ms(),
+            },
+        )]);
+        oxidom_core::fsutil::write_private_atomic(&cache_path, &serde_json::to_vec(&cache)?)?;
+
+        assert_eq!(
+            service.egress_address(String::new(), false)?,
+            "198.51.100.42"
+        );
+        service.stop_profile("default")?;
         Ok(())
     }
 }

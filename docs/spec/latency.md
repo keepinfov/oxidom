@@ -17,8 +17,14 @@ Both successful and failed readings record the method actually attempted.
 The first HTTP request in a direct probe or connection confirmation gets a **6-second**
 `REAL_DELAY_TIMEOUT` budget for DNS, TCP and TLS/REALITY setup. A direct probe core's readiness
 wait is separate (up to 4 seconds). Periodic latency-display requests through an established
-session keep their **3-second** budget. Separate watchdog requests use the policy below. Pool
-confirmation retains its bounded confirmation window, using the cold-start request budget
+session keep their **3-second** budget. When an HTTP/1.1 probe response does not close the
+connection (`Connection: close` is absent) and at least 150 ms of the probe budget remains after
+draining the first response body, `probe::http_ping` issues a second request on the same
+keep-alive `ureq::Agent`. When that second request succeeds on the pooled connection, `value`
+records the live round-trip (`ms`) and `setup_ms` records the cold-start first request; if the
+origin closes the connection or the second request does not complete, the probe falls back to the
+first request in `value` with `setup_ms = None`. Separate watchdog requests use the policy below.
+Pool confirmation retains its bounded confirmation window, using the cold-start request budget
 within it rather than treating an unready balancer as a successful connection.
 
 All legacy lifecycle status surfaces report `connecting` until the SOCKS-path confirmation succeeds and
@@ -141,8 +147,10 @@ Timeout | NoNetwork | Internal(ProbeDetail)`. The distinction is the point — a
 ## The reading contract (binding)
 
 A latency number without its context is a lie waiting to be told, so a measurement crosses D-Bus
-as `ipc::LatencyReading { value, measured_at_unix_ms, route, method, failure }` — never as a bare
-`Option<u32>`, and never in `Server`.
+as `ipc::LatencyReading { value, setup_ms, measured_at_unix_ms, route, method, failure, detail }` —
+never as a bare `Option<u32>`, and never in `Server`. `setup_ms` is additive, serde-defaulted and
+omitted when `None` (`skip_serializing_if = "Option::is_none"`), so `PROBE_STATE_VERSION` stays `1`
+and older or newer peers interoperate without schema drift.
 
 - **`route`** is `Direct` or `Proxied`. Only the server the tunnel is *currently* carrying may be
   measured `Proxied` (`daemon::Shared::probe_target`), and only a `Proxied` reading may be shown
@@ -214,22 +222,20 @@ for this check beside the reason from the one before it.
   other source: the card opens the log page narrowed to the server's **address**, because that is
   what the prober and the core write. A name is the user's word for a server and appears in no log
   line. The narrowing is the log page's own search entry, so it is visible and can be widened.
-- **The block's two actions are icons on the reason's own line.** Two labelled buttons on a row of
-  their own made this the tallest thing on an expanded card once the recent checks stopped being
-  it. Every icon here carries a tooltip *and* an accessible label, which is the whole of what keeps
-  an icon from being a guess — and the report's icon is a warning rather than a send, because
-  nothing leaves the machine and an arrow would promise a transmission that does not happen.
-- **It sits under the record, not over it.** The count of failures and the reason for the newest
-  one are both about checks, and either side of the chart they read as two blocks that happen to
-  share a subject. Together they read as one statement: this many of the last ten failed, and the
-  last of them was tried this way, this recently.
+- **The block's actions are icons on the reason's own line.** Every icon here carries a tooltip
+  *and* an accessible label, which is the whole of what keeps an icon from being a guess — the
+  report's icon is a warning rather than a send, because nothing leaves the machine and an arrow
+  would promise a transmission that does not happen, and when a TLS or Hysteria2 server failed for
+  a certificate reason (`CertificateRejected` or `InsecureTlsUnsupported`), a **Trust
+  certificate…** icon sits beside them to open the certificate inspection dialog directly.
 
 ## What the recent checks say (binding)
 
 One number is the weakest possible basis for choosing between servers: a server that is fast half
 the time and one that is steady are indistinguishable through their newest reading alone. The
-daemon therefore keeps the last `ipc::PROBE_HISTORY_LIMIT` readings per server, and the expanded
-card **draws** them as a chart with the numbers, the direction and the failures written underneath.
+daemon therefore keeps the last `ipc::PROBE_HISTORY_LIMIT` readings per server, and the server
+details dialog (`show_server_details_dialog`) **draws** them as a chart with the numbers, the
+direction and the failures written underneath, keeping the expanded card in the grid compact.
 
 - **The history is fetched, never polled.** `ProbeHistory` is asked for one server at a time, when
   a card opens and when something about that server changes, the way `RuntimeInfo` is asked for

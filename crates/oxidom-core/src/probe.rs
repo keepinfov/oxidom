@@ -1,5 +1,5 @@
 use std::error::Error as _;
-use std::io;
+use std::io::{self, Read as _};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -54,7 +54,30 @@ pub enum Route {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Measurement {
     pub ms: u32,
+    /// Cold-start setup time in milliseconds (DNS, SOCKS5 negotiation, TCP/QUIC
+    /// dial, TLS/REALITY handshake and first HTTP response) when a second
+    /// keep-alive request on the same connection measured the live round-trip
+    /// in [`Self::ms`].
+    pub setup_ms: Option<u32>,
     pub method: LatencyMethod,
+}
+
+impl Measurement {
+    pub const fn new(ms: u32, method: LatencyMethod) -> Self {
+        Self {
+            ms,
+            setup_ms: None,
+            method,
+        }
+    }
+
+    pub const fn with_setup(ms: u32, setup_ms: u32, method: LatencyMethod) -> Self {
+        Self {
+            ms,
+            setup_ms: Some(setup_ms),
+            method,
+        }
+    }
 }
 
 /// Why a probe produced no number. Everything except `Reachable` used to be
@@ -472,10 +495,10 @@ pub fn tcp_ping(host: &str, port: u16) -> ProbeOutcome {
         let start = Instant::now();
         match TcpStream::connect_timeout(&address, TIMEOUT) {
             Ok(_) => {
-                return ProbeOutcome::Reachable(Measurement {
-                    ms: start.elapsed().as_millis() as u32,
-                    method: LatencyMethod::Tcp,
-                });
+                return ProbeOutcome::Reachable(Measurement::new(
+                    start.elapsed().as_millis() as u32,
+                    LatencyMethod::Tcp,
+                ));
             }
             // Keep the first verdict: it describes the address the resolver
             // preferred, which is the one ordinary traffic would have used.
@@ -540,15 +563,19 @@ pub fn icmp_ping(host: &str) -> ProbeOutcome {
         .take_while(|c| c.is_ascii_digit() || *c == '.')
         .collect();
     match num.parse::<f64>() {
-        Ok(ms) => ProbeOutcome::Reachable(Measurement {
-            ms: ms.round() as u32,
-            method: LatencyMethod::Icmp,
-        }),
+        Ok(ms) => ProbeOutcome::Reachable(Measurement::new(ms.round() as u32, LatencyMethod::Icmp)),
         Err(_) => ProbeOutcome::Unreachable,
     }
 }
 
 /// Time an HTTP request to `url` routed through the local SOCKS inbound.
+///
+/// The first request through a fresh probe core or newly started session pays
+/// for DNS, SOCKS5 negotiation, TCP/QUIC dial, TLS/REALITY handshake and the
+/// first HTTP response (`setup_ms`). When the origin keeps the HTTP/1.1
+/// connection open and enough of `timeout` remains, a second request on the
+/// same [`ureq::Agent`] reuses the pooled keep-alive stream to measure the
+/// live round-trip in [`Measurement::ms`].
 pub fn http_ping(
     address: Ipv4Addr,
     socks_port: u16,
@@ -573,15 +600,43 @@ pub fn http_ping(
         .proxy(proxy)
         .timeout(timeout)
         .build();
+    let recorded_method = http_method(method);
     let start = Instant::now();
-    match agent.request(method, url).call() {
+    let response = match agent.request(method, url).call() {
         // Any response (including an HTTP error status) counts.
-        Ok(_) | Err(ureq::Error::Status(_, _)) => ProbeOutcome::Reachable(Measurement {
-            ms: start.elapsed().as_millis() as u32,
-            method: http_method(method),
-        }),
-        Err(ureq::Error::Transport(transport)) => classify_http_transport(&transport),
+        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+        Err(ureq::Error::Transport(transport)) => return classify_http_transport(&transport),
+    };
+    let first_ms = start.elapsed().as_millis() as u32;
+    let keep_alive = response_keeps_connection_alive(&response);
+    drain_http_body(response);
+    if keep_alive && timeout.saturating_sub(start.elapsed()) >= Duration::from_millis(150) {
+        let rtt_start = Instant::now();
+        if let Ok(second) | Err(ureq::Error::Status(_, second)) = agent.request(method, url).call()
+        {
+            let live_ms = rtt_start.elapsed().as_millis() as u32;
+            drain_http_body(second);
+            return ProbeOutcome::Reachable(Measurement::with_setup(
+                live_ms,
+                first_ms,
+                recorded_method,
+            ));
+        }
     }
+    ProbeOutcome::Reachable(Measurement::new(first_ms, recorded_method))
+}
+
+fn response_keeps_connection_alive(response: &ureq::Response) -> bool {
+    response.http_version() == "HTTP/1.1"
+        && !response.header("connection").is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("close"))
+        })
+}
+
+fn drain_http_body(response: ureq::Response) {
+    let _ = io::copy(&mut response.into_reader().take(64 * 1024), &mut io::sink());
 }
 
 fn http_method(method: &str) -> LatencyMethod {
@@ -627,7 +682,45 @@ fn classify_http_transport(transport: &ureq::Transport) -> ProbeOutcome {
 
 #[cfg(test)]
 mod local_http_configuration_tests {
+    use std::io::Write as _;
+
     use super::*;
+
+    fn finish_socks5_handshake(stream: &mut TcpStream) -> io::Result<()> {
+        let mut greeting = [0; 2];
+        stream.read_exact(&mut greeting)?;
+        stream.read_exact(&mut vec![0; usize::from(greeting[1])])?;
+        stream.write_all(&[5, 0])?;
+        let mut request = [0; 4];
+        stream.read_exact(&mut request)?;
+        let address_len = match request[3] {
+            1 => 4,
+            4 => 16,
+            3 => {
+                let mut length = [0];
+                stream.read_exact(&mut length)?;
+                usize::from(length[0])
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected SOCKS5 atyp {other}"),
+                ));
+            }
+        };
+        stream.read_exact(&mut vec![0; address_len + 2])?;
+        stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+    }
+
+    fn read_http_request_headers(stream: &mut TcpStream) -> io::Result<()> {
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") && headers.len() < 4096 {
+            let mut byte = [0];
+            stream.read_exact(&mut byte)?;
+            headers.push(byte[0]);
+        }
+        Ok(())
+    }
 
     #[test]
     fn malformed_http_probe_configuration_is_not_remote_failure_evidence() {
@@ -641,6 +734,89 @@ mod local_http_configuration_tests {
                 ProbeOutcome::Internal(_)
             ));
         }
+    }
+
+    #[test]
+    fn an_http_probe_reuses_its_keep_alive_agent_to_separate_setup_from_live_rtt() -> io::Result<()>
+    {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> io::Result<usize> {
+            let (mut first, _) = listener.accept()?;
+            first.set_read_timeout(Some(Duration::from_secs(2)))?;
+            std::thread::sleep(Duration::from_millis(60));
+            finish_socks5_handshake(&mut first)?;
+            read_http_request_headers(&mut first)?;
+            first.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
+
+            let (mut second, _) = listener.accept()?;
+            second.set_read_timeout(Some(Duration::from_secs(2)))?;
+            finish_socks5_handshake(&mut second)?;
+            read_http_request_headers(&mut second)?;
+            second.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
+            Ok(2)
+        });
+
+        let outcome = http_ping(
+            Ipv4Addr::LOCALHOST,
+            port,
+            "http://example.invalid/generate_204",
+            "GET",
+            Duration::from_secs(3),
+        );
+        let requests = server.join().expect("server thread")?;
+        assert_eq!(requests, 2);
+        let ProbeOutcome::Reachable(measured) = outcome else {
+            panic!("expected reachable measurement, got {outcome:?}");
+        };
+        let setup_ms = measured
+            .setup_ms
+            .expect("second request records cold-start setup time");
+        assert!(
+            setup_ms >= 50,
+            "setup_ms ({setup_ms}) should include the cold-start delay"
+        );
+        assert!(
+            measured.ms < setup_ms,
+            "live RTT ({}) on the second request should be smaller than setup ({setup_ms})",
+            measured.ms
+        );
+        assert_eq!(measured.method, LatencyMethod::HttpGet);
+        Ok(())
+    }
+
+    #[test]
+    fn an_http_probe_whose_origin_closes_the_connection_falls_back_to_the_first_request()
+    -> io::Result<()> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> io::Result<usize> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            finish_socks5_handshake(&mut stream)?;
+            read_http_request_headers(&mut stream)?;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+            Ok(1)
+        });
+
+        let outcome = http_ping(
+            Ipv4Addr::LOCALHOST,
+            port,
+            "http://example.invalid/generate_204",
+            "HEAD",
+            Duration::from_secs(3),
+        );
+        let requests = server.join().expect("server thread")?;
+        assert_eq!(requests, 1);
+        let ProbeOutcome::Reachable(measured) = outcome else {
+            panic!("expected reachable measurement, got {outcome:?}");
+        };
+        assert_eq!(measured.setup_ms, None);
+        assert_eq!(measured.method, LatencyMethod::HttpHead);
+        Ok(())
     }
 }
 

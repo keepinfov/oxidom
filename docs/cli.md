@@ -342,13 +342,18 @@ wait for a free slot as well as the measurement — on a busy queue a probe can
 still be running when the command gives up.
 
 Direct HTTP checks and the initial connection confirmation each allow **6 seconds**
-for the cold request, including DNS, TCP and TLS/REALITY handshakes. The temporary
-core's startup has a separate readiness wait; periodic checks through an established
-session retain a **3-second** request budget. Confirmation uses HTTP through SOCKS
-even if the configured direct method is ICMP or TCP. A passing host ping or TCP
-connect does not prove the proxy outbound carries requests; a failure reports a
-recognised core cause (handshake timeout, reset, refusal or DNS failure), otherwise
-the measured timeout, closed connection or local failure.
+for the cold request, including DNS, TCP and TLS/REALITY handshakes. When the
+probe target keeps the HTTP/1.1 connection open and budget remains, a second
+request on the same connection measures the live round-trip that `oxidom ping`
+prints on stdout (recording the cold-start first request as `setup_ms` on the
+reading); if the server closes the connection after the first response, the first
+request's time is reported directly. The temporary core's startup has a separate
+readiness wait; periodic checks through an established session retain a
+**3-second** request budget. Confirmation uses HTTP through SOCKS even if the
+configured direct method is ICMP or TCP. A passing host ping or TCP connect does
+not prove the proxy outbound carries requests; a failure reports a recognised
+core cause (handshake timeout, reset, refusal or DNS failure), otherwise the
+measured timeout, closed connection or local failure.
 
 Failures are distinguished, because "the server is down" and "this laptop has no
 network" deserve different reactions. Everything below goes to stderr, and every
