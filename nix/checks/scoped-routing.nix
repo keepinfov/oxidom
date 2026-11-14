@@ -110,6 +110,7 @@
       "net.ipv6.conf.default.accept_ra" = 0;
       "net.ipv6.conf.all.autoconf" = 0;
       "net.ipv6.conf.default.autoconf" = 0;
+      "net.ipv6.conf.eth0.disable_ipv6" = 1;
       "net.ipv4.conf.all.rp_filter" = 1;
       "net.ipv4.conf.default.rp_filter" = 1;
     };

@@ -557,6 +557,8 @@ with subtest("real IPv6 and unprivileged user manager are available"):
     assert client.succeed("xray version").startswith("Xray 26.3.27 ")
     assert peer.succeed("xray version").startswith("Xray 26.3.27 ")
     assert not any(item["addr_info"] for item in kernel_json("ip -j -4 addr show dev eth0"))
+    client.succeed("ip -6 route flush default dev eth0 || true")
+    peer.succeed("ip -6 route flush default dev eth0 || true")
     assert not [r for r in kernel_json("ip -j -6 route show default") if r.get("gateway")]
     assert not json.loads(peer.succeed("ip -j -4 route show default"))
     assert not [r for r in json.loads(peer.succeed("ip -j -6 route show default")) if r.get("gateway")]
