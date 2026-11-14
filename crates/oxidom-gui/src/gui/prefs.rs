@@ -73,6 +73,14 @@ impl ServerGroup {
             format!("{} {}", self.icon, self.name)
         }
     }
+
+    pub fn chip_label(&self, count: usize, modified: bool) -> String {
+        if modified {
+            format!("{} · {count} (modified)", self.label())
+        } else {
+            format!("{} · {count}", self.label())
+        }
+    }
 }
 
 /// Which colour scheme the window asks libadwaita for.
@@ -326,5 +334,13 @@ mod tests {
         assert!(text.contains("color_scheme = \"dark\""), "{text}");
         let parsed: GuiPrefs = toml::from_str(&text).expect("parses");
         assert_eq!(parsed.color_scheme, ColorScheme::Dark);
+    }
+
+    #[test]
+    fn a_group_chip_label_shows_its_member_count_and_modified_state() {
+        let group = ServerGroup::favourites();
+        assert_eq!(group.chip_label(0, false), "★ Favourites · 0");
+        assert_eq!(group.chip_label(7, false), "★ Favourites · 7");
+        assert_eq!(group.chip_label(7, true), "★ Favourites · 7 (modified)");
     }
 }

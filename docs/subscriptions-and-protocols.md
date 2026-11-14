@@ -211,8 +211,9 @@ servers on their own; pools defined as lists do not.
 | `ssh://` | Out of scope. |
 | Shadowsocks SIP003 plugins (`plugin=`) | Xray cannot run them. The link imports, with a warning that the server will likely not work. |
 
-Unsupported schemes in an import are **counted and reported**, so you are told
-that eight of forty links were dropped rather than silently losing them.
+Unsupported schemes or proxy outbounds in an import (whether in a share-link list,
+Xray/sing-box JSON, or Clash YAML) are **counted and reported**, so you are told
+that eight of forty entries were dropped rather than silently losing them.
 
 One more thing worth knowing, since links in the wild still carry it:
 `allowInsecure` no longer does anything — Xray 26.x removed it. A link asking to

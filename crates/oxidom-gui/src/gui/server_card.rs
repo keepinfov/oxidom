@@ -513,10 +513,8 @@ pub struct ServerCard {
     failure: gtk::Box,
     failure_reason: gtk::Label,
     failure_attempt: gtk::Label,
-    history: gtk::Box,
-    history_chart: ProbeChart,
-    history_summary: gtk::Label,
-    history_failures: gtk::Label,
+    failure_trust: gtk::Button,
+    pinnable: bool,
     expanded: Rc<Cell<bool>>,
     /// What the badge is currently showing. The age sweep re-pushes a state for
     /// every card every 15 s, so without this the whole grid would re-fade on
@@ -530,9 +528,8 @@ pub struct ServerCard {
     latency_generation: Rc<Cell<u64>>,
     height_generation: Rc<Cell<u64>>,
     /// Guards the fade separately from the height. One generation for both
-    /// meant that re-measuring the card — which happens on every selection,
-    /// because the history arrives a poll later — cancelled the fade that had
-    /// just started, and nothing ever wrote the opacity again.
+    /// meant that re-measuring the card cancelled the fade that had just
+    /// started, and nothing ever wrote the opacity again.
     opacity_generation: Rc<Cell<u64>>,
     /// Whether a height animation is running, so a re-measure can aim it
     /// somewhere else instead of cancelling it.
@@ -541,11 +538,11 @@ pub struct ServerCard {
     /// measurement to tell a real content change from the animation's own
     /// progress.
     height_target: Rc<Cell<i32>>,
-    /// What the failure block and the recent-checks list are drawing. The
-    /// re-measure used to be gated on `is_expanded()` alone, so opening a card
-    /// re-measured it whether or not anything had changed.
+    /// What the failure block is drawing, and the recent-checks record kept for
+    /// the server details dialog (`show_server_details_dialog`).
     failure_shown: Rc<RefCell<Option<FailureReport>>>,
     history_shown: Rc<RefCell<Option<HistoryChart>>>,
+    details_history: Rc<RefCell<Option<DetailsHistory>>>,
 }
 
 impl ServerCard {
@@ -758,8 +755,8 @@ impl ServerCard {
             show_alias_dialog(button, current_alias.as_deref(), on_set_alias.clone());
         });
         // The same dialog a server is created in, prefilled. A composite
-        // profile has no fields to edit, so it gets no button rather than a
-        // dialog that cannot be filled.
+        // profile has no fields to edit, so it gets no edit button, while its
+        // details dialog still shows its balancer configuration and outbounds.
         let editable = !matches!(
             server.spec,
             oxidom_core::model::OutboundSpec::XrayProfile { .. }
@@ -768,14 +765,28 @@ impl ServerCard {
         edit_button.add_css_class("server-action");
         edit_button.set_visible(editable);
         edit_button.connect_clicked(move |_| on_edit());
+        let history_shown: Rc<RefCell<Option<HistoryChart>>> = Rc::new(RefCell::new(None));
+        let details_history: Rc<RefCell<Option<DetailsHistory>>> = Rc::new(RefCell::new(None));
         let details_button = icon_button("dialog-information-symbolic", "Server details");
         details_button.add_css_class("server-action");
-        details_button.set_visible(editable);
         {
             let server_snapshot = server.clone();
             let on_drop_override = on_drop_override.clone();
+            let history_shown = history_shown.clone();
+            let details_history = details_history.clone();
+            let expanded_for_details = expanded.clone();
+            let on_select_for_details = on_select.clone();
             details_button.connect_clicked(move |button| {
-                show_server_details_dialog(button, &server_snapshot, on_drop_override.clone());
+                if !expanded_for_details.get() {
+                    on_select_for_details();
+                }
+                show_server_details_dialog(
+                    button,
+                    &server_snapshot,
+                    &history_shown,
+                    &details_history,
+                    on_drop_override.clone(),
+                );
             });
         }
         // A server with no link of its own still has one to give: the
@@ -813,10 +824,6 @@ impl ServerCard {
             .build();
         ping_button.update_property(&[gtk::accessible::Property::Label(ping_label(false))]);
         ping_button.connect_clicked(move |_| on_ping());
-        // Never shown on the card itself: it exists so the context menu has a
-        // button to borrow, the way every other item there does.
-        let trust_button = gtk::Button::builder().visible(false).build();
-        trust_button.connect_clicked(move |_| on_trust());
         // Ordinary TLS and Hysteria2 both carry a server certificate that can
         // be pinned. REALITY authenticates by public key and presents a
         // borrowed chain nobody should pin, and a plain protocol presents
@@ -829,6 +836,20 @@ impl ServerCard {
                 server.spec,
                 oxidom_core::model::OutboundSpec::Hysteria2 { .. }
             );
+        let trust_button = icon_button(
+            "channel-secure-symbolic",
+            if server.spec.pin_sha256().is_some() {
+                "Replace certificate pin…"
+            } else {
+                "Trust certificate…"
+            },
+        );
+        trust_button.add_css_class("server-action");
+        trust_button.set_visible(pinnable);
+        trust_button.connect_clicked({
+            let on_trust = on_trust.clone();
+            move |_| on_trust()
+        });
         // Starring is the one way into the Favourites group, and Favourites is
         // the answer to "the four servers I actually use are somewhere in six
         // hundred".
@@ -858,6 +879,7 @@ impl ServerCard {
         action_row.append(&edit_alias);
         action_row.append(&copy_button);
         action_row.append(&ping_button);
+        action_row.append(&trust_button);
         let action_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         action_spacer.set_hexpand(true);
         action_row.append(&action_spacer);
@@ -886,6 +908,10 @@ impl ServerCard {
             .selectable(true)
             .css_classes(["dim-label", "server-meta"])
             .build();
+        let failure_trust = icon_button("channel-secure-symbolic", "Trust certificate…");
+        failure_trust.add_css_class("server-action");
+        failure_trust.set_visible(false);
+        failure_trust.connect_clicked(move |_| on_trust());
         let failure_logs = icon_button("utilities-terminal-symbolic", "Show in logs");
         failure_logs.add_css_class("server-action");
         failure_logs.connect_clicked(move |_| on_show_logs());
@@ -905,6 +931,7 @@ impl ServerCard {
         // buttons that drifted to the middle of a three-line reason would read
         // as belonging to the line they happened to land on.
         failure_actions.set_valign(gtk::Align::Start);
+        failure_actions.append(&failure_trust);
         failure_actions.append(&failure_logs);
         failure_actions.append(&failure_report);
         let failure_head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -916,60 +943,11 @@ impl ServerCard {
         failure.append(&failure_head);
         failure.append(&failure_attempt);
 
-        // The record behind the badge. One number cannot tell a steady server
-        // from one that is fast half the time, and choosing between servers is
-        // what the page is for. Spread, outliers and failures are shape, so
-        // they are drawn; the numbers behind the heights ride on the heading,
-        // and only the failures are worth a line of their own.
-        let history_title = gtk::Label::builder()
-            .xalign(0.0)
-            .hexpand(true)
-            .label("Recent checks")
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["server-meta", "server-history-title"])
-            .build();
-        // Selectable, because a range is a number somebody copies into an
-        // issue. Right-aligned against the title so the two read as one line
-        // rather than as a heading with an afterthought.
-        let history_summary = gtk::Label::builder()
-            .xalign(1.0)
-            .selectable(true)
-            .css_classes(["dim-label", "server-meta"])
-            .build();
-        let history_heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        history_heading.append(&history_title);
-        history_heading.append(&history_summary);
-        // Which way the chart runs, and how much of it is kept: the one part of
-        // the block that is identical on every card of every server forever. It
-        // spent two lines of card as a caption, which is rent a legend does not
-        // earn. The numbers and the reasons stay on the card, because those
-        // describe the server rather than the drawing.
-        history_heading.set_tooltip_text(Some(&history_legend()));
-        let history_chart = ProbeChart::new();
-        // The block above states the newest failure in full; this owes the
-        // older ones, and it is a label rather than a tooltip because a check
-        // that failed is the case the whole block exists for.
-        let history_failures = gtk::Label::builder()
-            .xalign(0.0)
-            .hexpand(true)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(1)
-            .selectable(true)
-            .visible(false)
-            .css_classes(["server-meta", "server-history-failures"])
-            .build();
-        let history = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        history.set_visible(false);
-        history.set_css_classes(&["server-history"]);
-        history.append(&history_heading);
-        history.append(&history_chart);
-        history.append(&history_failures);
-
-        // The expanded card states what identifies a server and any trust or
-        // override marks on it; the complete field-by-field parameter listing
-        // opens in its own dialog (`show_server_details_dialog`) so the card
-        // remains compact and never traps wheel scrolling inside the grid.
+        // The expanded card states what identifies a server, any trust or
+        // override marks on it, and why the last check failed if it produced
+        // no number; the recent-checks chart and the complete field-by-field
+        // parameter listing open in their own dialog (`show_server_details_dialog`)
+        // so the card remains compact in the grid.
         let trust_marks = server_trust_marks(server);
         let metadata = gtk::Box::new(gtk::Orientation::Vertical, 6);
         metadata.append(&full_name);
@@ -988,7 +966,6 @@ impl ServerCard {
                 .build();
             metadata.append(&marks);
         }
-        metadata.append(&history);
         metadata.append(&failure);
 
         let detail = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -1012,10 +989,7 @@ impl ServerCard {
 
         let context_menu: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
         let primary_revision = Rc::new(Cell::new(0));
-        let secondary_click = gtk::GestureClick::new();
-        secondary_click.set_button(gtk::gdk::BUTTON_SECONDARY);
-        secondary_click.set_propagation_phase(gtk::PropagationPhase::Bubble);
-        secondary_click.connect_pressed({
+        let open_context_menu: Rc<dyn Fn(i32, i32)> = {
             let context_menu = context_menu.clone();
             let primary_revision = primary_revision.clone();
             let shell = shell.clone();
@@ -1026,16 +1000,12 @@ impl ServerCard {
             let edit_alias = edit_alias.clone();
             let copy_button = copy_button.clone();
             let ping_button = ping_button.clone();
-            move |_, n_press, x, y| {
-                if click_plan_for_press(gtk::gdk::BUTTON_SECONDARY, n_press)
-                    != ClickPlan::ContextMenu
-                {
-                    return;
-                }
+            let trust_button = trust_button.clone();
+            Rc::new(move |x, y| {
                 let buttons = ContextButtons {
                     connect: &connect_button,
                     favourite: favourite_button.upcast_ref(),
-                    details: editable.then_some(&details_button),
+                    details: &details_button,
                     edit: editable.then_some(&edit_button),
                     alias: &edit_alias,
                     copy: &copy_button,
@@ -1049,11 +1019,41 @@ impl ServerCard {
                     popover
                 });
                 sync_context_labels(popover, &items(&buttons));
-                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x, y, 1, 1)));
                 popover.popup();
+            })
+        };
+        let secondary_click = gtk::GestureClick::new();
+        secondary_click.set_button(gtk::gdk::BUTTON_SECONDARY);
+        secondary_click.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        secondary_click.connect_pressed({
+            let open_context_menu = open_context_menu.clone();
+            move |_, n_press, x, y| {
+                if click_plan_for_press(gtk::gdk::BUTTON_SECONDARY, n_press)
+                    == ClickPlan::ContextMenu
+                {
+                    open_context_menu(x as i32, y as i32);
+                }
             }
         });
         shell.add_controller(secondary_click);
+
+        let menu_key = gtk::EventControllerKey::new();
+        menu_key.connect_key_pressed({
+            let header = header.clone();
+            let open_context_menu = open_context_menu.clone();
+            move |_, key, _, state| {
+                if is_context_menu_key(key, state) {
+                    let x = (header.width() / 2).max(1);
+                    let y = COMPACT_CARD_HEIGHT / 2;
+                    open_context_menu(x, y);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        });
+        shell.add_controller(menu_key);
 
         let root = CardFrame::new(&shell);
         root.set_hexpand(true);
@@ -1079,10 +1079,8 @@ impl ServerCard {
             failure,
             failure_reason,
             failure_attempt,
-            history,
-            history_chart,
-            history_summary,
-            history_failures,
+            failure_trust,
+            pinnable,
             expanded,
             last_latency: Rc::new(Cell::new(latency_state)),
             last_connection: Rc::new(Cell::new(CardConnectionState::Disconnected)),
@@ -1093,7 +1091,8 @@ impl ServerCard {
             height_animating: Rc::new(Cell::new(false)),
             height_target: Rc::new(Cell::new(COMPACT_CARD_HEIGHT)),
             failure_shown: Rc::new(RefCell::new(None)),
-            history_shown: Rc::new(RefCell::new(None)),
+            history_shown,
+            details_history,
         };
         card.apply_latency(latency_state);
         card.set_connection_state(connection_state);
@@ -1196,10 +1195,13 @@ impl ServerCard {
             Some(report) => {
                 self.failure_reason.set_label(&report.reason);
                 self.failure_attempt.set_label(&report.attempt);
+                self.failure_trust
+                    .set_visible(self.pinnable && report.certificate_rejected);
                 self.failure.set_visible(true);
             }
             None => {
                 self.failure.set_visible(false);
+                self.failure_trust.set_visible(false);
                 // Cleared rather than left standing behind the hidden box: the
                 // labels are selectable, and a reason from two checks ago is
                 // worse than none at all if anything ever reveals them again.
@@ -1210,41 +1212,21 @@ impl ServerCard {
         true
     }
 
-    /// Show, or stop showing, what the recent checks measured.
+    /// Record what the recent checks measured, and update the server details
+    /// dialog if it is currently open.
     ///
-    /// Pushed only for the card that is open, like the failure block above it
-    /// and for a sharper version of the same reason: this one is fetched from
-    /// the daemon by a call of its own rather than taken from the snapshot the
-    /// grid polls, so asking for every card would be one D-Bus round trip per
-    /// card twice a second.
-    ///
-    /// Returns whether what is drawn changed, for the same reason as
-    /// [`Self::set_failure_report`] — and with more force here, since the poll
-    /// that feeds this block runs twice a second and rebuilding the columns
-    /// would otherwise re-measure the card on every tick.
+    /// Returns `false` because the chart lives in [`show_server_details_dialog`]
+    /// rather than on the expanded card, so a history update never alters the
+    /// card's height in the grid.
     pub fn set_history(&self, chart: Option<&HistoryChart>) -> bool {
         if self.history_shown.borrow().as_ref() == chart {
             return false;
         }
         self.history_shown.replace(chart.cloned());
-        let Some(chart) = chart else {
-            self.history.set_visible(false);
-            return true;
-        };
-        self.history_chart.set_slots(&chart.slots);
-        self.history_summary.set_label(&chart.summary);
-        match chart.failures.as_deref() {
-            Some(failures) => {
-                self.history_failures.set_label(failures);
-                self.history_failures.set_visible(true);
-            }
-            None => {
-                self.history_failures.set_visible(false);
-                self.history_failures.set_label("");
-            }
+        if let Some(details) = self.details_history.borrow().as_ref() {
+            details.apply(chart);
         }
-        self.history.set_visible(true);
-        true
+        false
     }
 
     fn apply_latency(&self, state: LatencyState) {
@@ -1352,6 +1334,7 @@ impl ServerCard {
         }
         self.status.remove_css_class("status-working");
         self.status.remove_css_class("status-neutral");
+        self.status.remove_css_class("status-connected");
         self.status.remove_css_class("status-error");
         self.root.remove_css_class("failed-server");
         let accessible_status = match state {
@@ -1365,46 +1348,30 @@ impl ServerCard {
         };
         self.header
             .update_property(&[gtk::accessible::Property::Description(accessible_status)]);
+        let (badge, active_server) = connection_badge(state);
+        if let Some((label, css_class)) = badge {
+            self.status.set_label(label);
+            self.status.add_css_class(css_class);
+            self.status.set_visible(true);
+        } else {
+            self.status.set_visible(false);
+        }
+        if active_server {
+            self.root.add_css_class("active-server");
+        } else {
+            self.root.remove_css_class("active-server");
+        }
         match state {
-            CardConnectionState::Disconnected => {
-                self.status.set_visible(false);
+            CardConnectionState::Disconnected
+            | CardConnectionState::ConnectedHere
+            | CardConnectionState::InPool
+            | CardConnectionState::ConnectedElsewhere => {
                 self.latency_display.set_visible(true);
-                self.root.remove_css_class("active-server");
-            }
-            CardConnectionState::ConnectedHere => {
-                // The success-coloured card and the global status already show
-                // that this is the active tunnel. Keeping a second text pill
-                // here only steals the space the server name needs.
-                self.status.set_visible(false);
-                // Kept visible: this is the one card whose number describes the
-                // connection the user is actually on, and hiding it is why the
-                // active server was the only one you could not see a ping for.
-                self.latency_display.set_visible(true);
-                self.root.add_css_class("active-server");
-            }
-            CardConnectionState::InPool => {
-                self.status.set_label("In use");
-                self.status.add_css_class("status-neutral");
-                self.status.set_visible(true);
-                self.latency_display.set_visible(true);
-                self.root.remove_css_class("active-server");
-            }
-            CardConnectionState::ConnectedElsewhere => {
-                self.status.set_visible(false);
-                self.latency_display.set_visible(true);
-                self.root.remove_css_class("active-server");
             }
             CardConnectionState::Connecting => {
-                self.status.set_label("Connecting");
-                self.status.add_css_class("status-working");
-                self.status.set_visible(true);
                 self.latency_display.set_visible(false);
-                self.root.remove_css_class("active-server");
             }
             CardConnectionState::Failed => {
-                self.status.set_label("Error");
-                self.status.add_css_class("status-error");
-                self.status.set_visible(true);
                 // A number taken *before* the attempt reads beside "Error" as
                 // "the tunnel is fine, 84 ms" — the exact lie — so it stays
                 // hidden. A number taken after it is the opposite: it is how
@@ -1412,7 +1379,6 @@ impl ServerCard {
                 // brings the badge straight back.
                 self.latency_display
                     .set_visible(!self.latency_predates_failure.get());
-                self.root.remove_css_class("active-server");
                 self.root.add_css_class("failed-server");
             }
         }
@@ -1838,9 +1804,82 @@ fn server_trust_marks(server: &Server) -> Option<String> {
     (!marks.is_empty()).then(|| marks.join("  ·  "))
 }
 
+struct DetailsHistory {
+    root: gtk::Box,
+    chart: ProbeChart,
+    summary: gtk::Label,
+    failures: gtk::Label,
+}
+
+impl DetailsHistory {
+    fn new() -> Self {
+        let title = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .label("Recent checks")
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["server-meta", "server-history-title"])
+            .build();
+        let summary = gtk::Label::builder()
+            .xalign(1.0)
+            .selectable(true)
+            .css_classes(["dim-label", "server-meta"])
+            .build();
+        let heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        heading.append(&title);
+        heading.append(&summary);
+        heading.set_tooltip_text(Some(&history_legend()));
+        let chart = ProbeChart::new();
+        let failures = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(1)
+            .selectable(true)
+            .visible(false)
+            .css_classes(["server-meta", "server-history-failures"])
+            .build();
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        root.set_visible(false);
+        root.set_css_classes(&["server-history"]);
+        root.append(&heading);
+        root.append(&chart);
+        root.append(&failures);
+        Self {
+            root,
+            chart,
+            summary,
+            failures,
+        }
+    }
+
+    fn apply(&self, history: Option<&HistoryChart>) {
+        let Some(history) = history else {
+            self.root.set_visible(false);
+            return;
+        };
+        self.chart.set_slots(&history.slots);
+        self.summary.set_label(&history.summary);
+        match history.failures.as_deref() {
+            Some(failures) => {
+                self.failures.set_label(failures);
+                self.failures.set_visible(true);
+            }
+            None => {
+                self.failures.set_visible(false);
+                self.failures.set_label("");
+            }
+        }
+        self.root.set_visible(true);
+    }
+}
+
 fn show_server_details_dialog(
     parent: &impl IsA<gtk::Widget>,
     server: &Server,
+    history_shown: &Rc<RefCell<Option<HistoryChart>>>,
+    details_history: &Rc<RefCell<Option<DetailsHistory>>>,
     on_drop_override: Rc<dyn Fn(String)>,
 ) {
     let window = adw::Window::builder()
@@ -1860,6 +1899,17 @@ fn show_server_details_dialog(
     content.set_margin_bottom(18);
     content.set_margin_start(18);
     content.set_margin_end(18);
+
+    let history = DetailsHistory::new();
+    history.apply(history_shown.borrow().as_ref());
+    content.append(&history.root);
+    details_history.replace(Some(history));
+    window.connect_unrealize({
+        let details_history = details_history.clone();
+        move |_| {
+            details_history.replace(None);
+        }
+    });
 
     let mut current_group: Option<(&'static str, adw::PreferencesGroup)> = None;
     for parameter in oxidom_core::draft::parameters(server) {
@@ -1881,24 +1931,40 @@ fn show_server_details_dialog(
             parameter.value.clone()
         };
         let row = adw::ActionRow::builder()
-            .title(parameter.key)
+            .title(parameter.key.as_ref())
             .subtitle(&*glib::markup_escape_text(&shown))
             .subtitle_selectable(true)
             .css_classes(["property"])
             .build();
-        if parameter.overridden {
-            row.set_tooltip_text(Some("Edited here; the provider sends another value"));
-            if let Some(field) = oxidom_core::draft::override_key(parameter.group, parameter.key) {
-                let take_back = icon_button("edit-undo-symbolic", "Use the provider's value");
-                take_back.set_valign(gtk::Align::Center);
-                let on_drop_override = on_drop_override.clone();
-                let window_for_drop = window.clone();
-                take_back.connect_clicked(move |_| {
-                    on_drop_override(field.clone());
-                    window_for_drop.close();
-                });
-                row.add_suffix(&take_back);
-            }
+        if parameter.overridden
+            && let Some(field) = oxidom_core::draft::override_key(parameter.group, &parameter.key)
+        {
+            let in_provider_overrides = server
+                .overrides
+                .as_ref()
+                .is_some_and(|overrides| overrides.provider.contains_key(&field));
+            let is_local_pin = parameter.key == "pin_sha256" && !in_provider_overrides;
+            row.set_tooltip_text(Some(if is_local_pin {
+                "Pinned on this machine"
+            } else {
+                "Edited here; the provider sends another value"
+            }));
+            let take_back = icon_button(
+                "edit-undo-symbolic",
+                if is_local_pin {
+                    "Remove certificate pin"
+                } else {
+                    "Use the provider's value"
+                },
+            );
+            take_back.set_valign(gtk::Align::Center);
+            let on_drop_override = on_drop_override.clone();
+            let window_for_drop = window.clone();
+            take_back.connect_clicked(move |_| {
+                on_drop_override(field.clone());
+                window_for_drop.close();
+            });
+            row.add_suffix(&take_back);
         }
         if parameter.secret {
             let secret = parameter.value.clone();
@@ -1952,7 +2018,7 @@ type ContextItem<'a> = (&'a gtk::Button, Option<&'static str>);
 struct ContextButtons<'a> {
     connect: &'a gtk::Button,
     favourite: &'a gtk::Button,
-    details: Option<&'a gtk::Button>,
+    details: &'a gtk::Button,
     edit: Option<&'a gtk::Button>,
     alias: &'a gtk::Button,
     copy: &'a gtk::Button,
@@ -1961,12 +2027,11 @@ struct ContextButtons<'a> {
 }
 
 fn items<'a>(buttons: &ContextButtons<'a>) -> Vec<ContextItem<'a>> {
-    let mut items = vec![(buttons.connect, None), (buttons.favourite, None)];
-    items.extend(
-        buttons
-            .details
-            .map(|details| (details, Some("Server details…"))),
-    );
+    let mut items = vec![
+        (buttons.connect, None),
+        (buttons.favourite, None),
+        (buttons.details, Some("Server details…")),
+    ];
     items.extend(buttons.edit.map(|edit| (edit, Some("Edit server…"))));
     items.extend([
         (buttons.alias, None),
@@ -2063,6 +2128,11 @@ fn click_plan_for_press(button: u32, n_press: i32) -> ClickPlan {
     }
 }
 
+pub fn is_context_menu_key(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
+    keyval == gtk::gdk::Key::Menu
+        || (keyval == gtk::gdk::Key::F10 && state.contains(gtk::gdk::ModifierType::SHIFT_MASK))
+}
+
 thread_local! {
     /// Decoded flags, keyed by normalized country code. `rebuild()` recreates
     /// every card, so without this a subscription with hundreds of servers
@@ -2107,12 +2177,24 @@ pub(crate) fn flag_widget(country: Option<&str>, flag_size: i32, globe_size: i32
     }
 }
 
+fn connection_badge(state: CardConnectionState) -> (Option<(&'static str, &'static str)>, bool) {
+    match state {
+        CardConnectionState::Disconnected | CardConnectionState::ConnectedElsewhere => {
+            (None, false)
+        }
+        CardConnectionState::ConnectedHere => (Some(("Connected", "status-connected")), true),
+        CardConnectionState::InPool => (Some(("In use", "status-neutral")), false),
+        CardConnectionState::Connecting => (Some(("Connecting", "status-working")), false),
+        CardConnectionState::Failed => (Some(("Error", "status-error")), false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ALIAS_ERROR, COMPACT_CARD_HEIGHT, CardConnectionState, ClickPlan, HeightRefresh,
         LatencyAge, LatencyMethod, LatencyState, ProbeDetail, alias_validation,
-        click_plan_for_press, height_refresh, not_run_badge,
+        click_plan_for_press, connection_badge, height_refresh, is_context_menu_key, not_run_badge,
     };
 
     /// A re-measure that arrives while the card is opening must aim the
@@ -2177,6 +2259,26 @@ mod tests {
     }
 
     #[test]
+    fn context_menu_opens_on_menu_key_or_shift_f10() {
+        assert!(is_context_menu_key(
+            gtk::gdk::Key::Menu,
+            gtk::gdk::ModifierType::empty()
+        ));
+        assert!(is_context_menu_key(
+            gtk::gdk::Key::F10,
+            gtk::gdk::ModifierType::SHIFT_MASK
+        ));
+        assert!(!is_context_menu_key(
+            gtk::gdk::Key::F10,
+            gtk::gdk::ModifierType::empty()
+        ));
+        assert!(!is_context_menu_key(
+            gtk::gdk::Key::Return,
+            gtk::gdk::ModifierType::SHIFT_MASK
+        ));
+    }
+
+    #[test]
     fn connection_states_cover_each_explicit_card_action() {
         assert_ne!(
             CardConnectionState::Disconnected,
@@ -2195,6 +2297,18 @@ mod tests {
         assert_ne!(
             CardConnectionState::Failed,
             CardConnectionState::Disconnected
+        );
+        assert_eq!(
+            connection_badge(CardConnectionState::ConnectedHere),
+            (Some(("Connected", "status-connected")), true)
+        );
+        assert_eq!(
+            connection_badge(CardConnectionState::InPool),
+            (Some(("In use", "status-neutral")), false)
+        );
+        assert_eq!(
+            connection_badge(CardConnectionState::Disconnected),
+            (None, false)
         );
     }
 

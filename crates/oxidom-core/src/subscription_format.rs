@@ -21,20 +21,18 @@ pub fn parse(body: &str) -> Result<(Vec<Server>, Skipped)> {
     }
 
     if let Ok(value) = serde_json::from_str::<Value>(&text) {
-        let servers = parse_json(&value);
+        let (servers, skipped) = parse_json(&value);
         if !servers.is_empty() {
-            // A config document is all-or-nothing: an outbound this app cannot
-            // read is not a line it skipped, it is a document it misread.
-            return Ok((servers, Skipped::default()));
+            return Ok((servers, skipped));
         }
     }
 
     if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text)
         && let Ok(value) = serde_json::to_value(value)
     {
-        let servers = parse_clash(&value);
+        let (servers, skipped) = parse_clash(&value);
         if !servers.is_empty() {
-            return Ok((servers, Skipped::default()));
+            return Ok((servers, skipped));
         }
     }
 
@@ -224,18 +222,42 @@ fn decode_body(body: &str) -> String {
     body.to_string()
 }
 
-fn parse_json(value: &Value) -> Vec<Server> {
+fn record_skipped(skipped: &mut Skipped, raw_scheme: Option<&str>) {
+    skipped.lines += 1;
+    if let Some(scheme) = raw_scheme {
+        let scheme = scheme.trim().to_ascii_lowercase();
+        if !scheme.is_empty() && !skipped.schemes.contains(&scheme) {
+            skipped.schemes.push(scheme);
+        }
+    }
+}
+
+fn is_xray_plumbing_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol.trim().to_ascii_lowercase().as_str(),
+        "freedom" | "blackhole" | "dns" | "loopback" | "dokodemo-door"
+    )
+}
+
+fn is_sing_box_plumbing_type(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "direct" | "block" | "dns" | "selector" | "urltest"
+    )
+}
+
+fn parse_json(value: &Value) -> (Vec<Server>, Skipped) {
     if let Some(configs) = value.as_array() {
         return parse_xray_configs(configs);
     }
     let Some(object) = value.as_object() else {
-        return Vec::new();
+        return (Vec::new(), Skipped::default());
     };
     if object.get("proxies").and_then(Value::as_array).is_some() {
         return parse_clash(value);
     }
     let Some(outbounds) = object.get("outbounds").and_then(Value::as_array) else {
-        return Vec::new();
+        return (Vec::new(), Skipped::default());
     };
     if outbounds
         .iter()
@@ -247,17 +269,27 @@ fn parse_json(value: &Value) -> Vec<Server> {
     }
 }
 
-fn parse_xray_configs(configs: &[Value]) -> Vec<Server> {
+fn parse_xray_configs(configs: &[Value]) -> (Vec<Server>, Skipped) {
     let mut servers = Vec::new();
+    let mut skipped = Skipped::default();
     for config in configs {
         let Some(outbounds) = config.get("outbounds").and_then(Value::as_array) else {
             continue;
         };
-        let proxy_outbounds: Vec<Value> = outbounds
-            .iter()
-            .filter(|outbound| xray_outbound_protocol(outbound).is_some())
-            .cloned()
-            .collect();
+        let mut proxy_outbounds = Vec::new();
+        for outbound in outbounds {
+            let Some(protocol) = outbound.get("protocol").and_then(Value::as_str) else {
+                continue;
+            };
+            if is_xray_plumbing_protocol(protocol) {
+                continue;
+            }
+            if xray_outbound_protocol(outbound).is_some() {
+                proxy_outbounds.push(outbound.clone());
+            } else {
+                record_skipped(&mut skipped, Some(protocol));
+            }
+        }
         if proxy_outbounds.is_empty() {
             continue;
         }
@@ -308,10 +340,15 @@ fn parse_xray_configs(configs: &[Value]) -> Vec<Server> {
             };
             if let Some(server) = server_from_xray_outbound(&item_name, outbound) {
                 servers.push(server);
+            } else {
+                record_skipped(
+                    &mut skipped,
+                    outbound.get("protocol").and_then(Value::as_str),
+                );
             }
         }
     }
-    servers
+    (servers, skipped)
 }
 
 fn xray_profile_server(
@@ -351,7 +388,7 @@ fn xray_profile_server(
     Some(server)
 }
 
-fn server_from_xray_outbound(name: &str, outbound: &Value) -> Option<Server> {
+pub(crate) fn server_from_xray_outbound(name: &str, outbound: &Value) -> Option<Server> {
     let protocol = xray_outbound_protocol(outbound)?;
     if protocol == Protocol::Hysteria2 {
         return hysteria2_from_xray(name, outbound);
@@ -432,7 +469,17 @@ fn stream_from_xray(value: Option<&Value>) -> StreamSettings {
         };
     };
     let network = string(value, "network").unwrap_or_else(|| "tcp".to_string());
-    let security = string(value, "security").unwrap_or_else(|| "none".to_string());
+    let security = match string(value, "security") {
+        None => "none".to_string(),
+        Some(sec)
+            if sec.is_empty()
+                || sec.eq_ignore_ascii_case("none")
+                || sec.eq_ignore_ascii_case("false") =>
+        {
+            "none".to_string()
+        }
+        Some(sec) => sec,
+    };
     let tls = value
         .get(if security == "reality" {
             "realitySettings"
@@ -511,14 +558,27 @@ fn stream_from_xray(value: Option<&Value>) -> StreamSettings {
     }
 }
 
-fn parse_sing_box(config: &Value) -> Vec<Server> {
-    config
+fn parse_sing_box(config: &Value) -> (Vec<Server>, Skipped) {
+    let mut servers = Vec::new();
+    let mut skipped = Skipped::default();
+    for outbound in config
         .get("outbounds")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(server_from_sing_box)
-        .collect()
+    {
+        let Some(kind) = outbound.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if is_sing_box_plumbing_type(kind) {
+            continue;
+        }
+        match server_from_sing_box(outbound) {
+            Some(server) => servers.push(server),
+            None => record_skipped(&mut skipped, Some(kind)),
+        }
+    }
+    (servers, skipped)
 }
 
 fn server_from_sing_box(outbound: &Value) -> Option<Server> {
@@ -614,14 +674,25 @@ fn stream_from_sing_box(outbound: &Value) -> StreamSettings {
     }
 }
 
-fn parse_clash(config: &Value) -> Vec<Server> {
-    config
+fn parse_clash(config: &Value) -> (Vec<Server>, Skipped) {
+    let mut servers = Vec::new();
+    let mut skipped = Skipped::default();
+    for proxy in config
         .get("proxies")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(server_from_clash)
-        .collect()
+    {
+        match server_from_clash(proxy) {
+            Some(server) => servers.push(server),
+            None => {
+                if let Some(kind) = proxy.get("type").and_then(Value::as_str) {
+                    record_skipped(&mut skipped, Some(kind));
+                }
+            }
+        }
+    }
+    (servers, skipped)
 }
 
 fn server_from_clash(proxy: &Value) -> Option<Server> {
@@ -1934,7 +2005,8 @@ proxies:
         /// The same panel, the same servers, a Clash client string.
         #[test]
         fn a_marzban_clash_body_carries_the_same_three_servers() {
-            let (servers, _skipped) = parse(MARZBAN_CLASH).unwrap();
+            let (servers, skipped) = parse(MARZBAN_CLASH).unwrap();
+            assert!(skipped.is_empty());
             let seen: Vec<_> = servers
                 .iter()
                 .map(|server| (server.protocol, server.address.as_str(), server.port))
@@ -1953,7 +2025,8 @@ proxies:
         /// itself a server; counting it would show a node nobody can connect to.
         #[test]
         fn a_marzban_sing_box_body_skips_the_selector_that_names_its_nodes() {
-            let (servers, _skipped) = parse(MARZBAN_SING_BOX).unwrap();
+            let (servers, skipped) = parse(MARZBAN_SING_BOX).unwrap();
+            assert!(skipped.is_empty());
             assert_eq!(servers.len(), 2);
             assert_eq!(servers[0].address, "nl1.panel.example");
             assert_eq!(servers[1].address, "de1.panel.example");
@@ -1975,7 +2048,8 @@ proxies:
         /// configurations that are one balanced server each.
         #[test]
         fn a_remnawave_link_list_is_one_server_per_node() {
-            let (servers, _skipped) = parse(REMNAWAVE_LINKS).unwrap();
+            let (servers, skipped) = parse(REMNAWAVE_LINKS).unwrap();
+            assert!(skipped.is_empty());
             assert_eq!(servers.len(), 2);
             assert!(
                 servers.iter().all(|server| server.link.is_some()),
@@ -1985,7 +2059,8 @@ proxies:
 
         #[test]
         fn a_remnawave_xray_config_is_one_balanced_server_with_no_link() {
-            let (servers, _skipped) = parse(REMNAWAVE_XRAY).unwrap();
+            let (servers, skipped) = parse(REMNAWAVE_XRAY).unwrap();
+            assert!(skipped.is_empty());
             assert_eq!(
                 servers.len(),
                 1,
@@ -2012,7 +2087,8 @@ proxies:
         /// different place from every other protocol's.
         #[test]
         fn a_hiddify_manager_sing_box_body_keeps_its_hysteria2_parameters() {
-            let (servers, _skipped) = parse(HIDDIFY_SING_BOX).unwrap();
+            let (servers, skipped) = parse(HIDDIFY_SING_BOX).unwrap();
+            assert!(skipped.is_empty());
             assert_eq!(servers.len(), 2);
             assert_eq!(servers[0].protocol, Protocol::Hysteria2);
             assert_eq!(servers[0].address, "hy2.hiddify.example");
@@ -2022,7 +2098,8 @@ proxies:
 
         #[test]
         fn a_v2board_clash_body_carries_both_of_its_protocols() {
-            let (servers, _skipped) = parse(V2BOARD_CLASH).unwrap();
+            let (servers, skipped) = parse(V2BOARD_CLASH).unwrap();
+            assert!(skipped.is_empty());
             assert_eq!(servers.len(), 2);
             assert_eq!(servers[0].protocol, Protocol::Shadowsocks);
             assert_eq!(servers[0].address, "la.v2board.example");
@@ -2198,6 +2275,94 @@ proxies:
             assert_eq!(stream.path.as_deref(), Some("/xhttp"));
             assert_eq!(stream.host.as_deref(), Some("cdn.example"));
             assert_eq!(stream.xhttp_mode.as_deref(), Some("packet-up"));
+        }
+
+        #[test]
+        fn xray_stream_security_false_normalizes_to_none() {
+            let body = r#"[{
+              "remarks": "Plain",
+              "outbounds": [{
+                "protocol": "vless",
+                "settings": {"vnext": [{
+                  "address": "plain.example", "port": 443,
+                  "users": [{"id": "00000000-0000-4000-8000-000000000001", "encryption": "none"}]
+                }]},
+                "streamSettings": {"network": "tcp", "security": "false"}
+              }]
+            }]"#;
+            let (servers, skipped) = parse(body).unwrap();
+            assert!(skipped.is_empty());
+            assert_eq!(servers.len(), 1);
+            assert_eq!(servers[0].spec.stream().unwrap().security, "none");
+            assert_eq!(servers[0].transport_label, "vless");
+        }
+
+        #[test]
+        fn structured_configs_report_unsupported_proxy_outbounds_without_counting_plumbing() {
+            let sing_box = r#"{
+              "outbounds": [
+                {"type": "selector", "tag": "PROXY", "outbounds": ["de", "tuic-node"]},
+                {"type": "urltest", "tag": "AUTO", "outbounds": ["de"]},
+                {"type": "vless", "tag": "de", "server": "203.0.113.9", "server_port": 443,
+                 "uuid": "00000000-0000-4000-8000-000000000001"},
+                {"type": "tuic", "tag": "tuic-node", "server": "203.0.113.10", "server_port": 443},
+                {"type": "wireguard", "tag": "wg-node", "server": "203.0.113.11", "server_port": 51820},
+                {"type": "direct", "tag": "direct"},
+                {"type": "block", "tag": "block"},
+                {"type": "dns", "tag": "dns-out"}
+              ]
+            }"#;
+            let (servers, skipped) = parse(sing_box).unwrap();
+            assert_eq!(servers.len(), 1);
+            assert_eq!(skipped.lines, 2);
+            assert_eq!(skipped.schemes, ["tuic", "wireguard"]);
+
+            let clash = r#"
+proxies:
+  - name: "DE"
+    type: vless
+    server: 203.0.113.9
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000001
+  - name: "TUIC"
+    type: tuic
+    server: 203.0.113.10
+    port: 443
+  - name: "WG"
+    type: wireguard
+    server: 203.0.113.11
+    port: 51820
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: ["DE", "TUIC", "WG"]
+"#;
+            let (servers, skipped) = parse(clash).unwrap();
+            assert_eq!(servers.len(), 1);
+            assert_eq!(skipped.lines, 2);
+            assert_eq!(skipped.schemes, ["tuic", "wireguard"]);
+
+            let xray = r#"[{
+              "remarks": "Mixed",
+              "outbounds": [
+                {"tag": "vless-1", "protocol": "vless", "settings": {"vnext": [
+                  {"address": "203.0.113.9", "port": 443, "users": [
+                    {"id": "00000000-0000-4000-8000-000000000001", "encryption": "none"}
+                  ]}
+                ]}},
+                {"tag": "hy1", "protocol": "hysteria", "settings": {"version": 1, "address": "203.0.113.10", "port": 443}},
+                {"tag": "wg", "protocol": "wireguard", "settings": {}},
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "block", "protocol": "blackhole"},
+                {"tag": "dns-out", "protocol": "dns"},
+                {"tag": "loop", "protocol": "loopback"},
+                {"tag": "in-redir", "protocol": "dokodemo-door"}
+              ]
+            }]"#;
+            let (servers, skipped) = parse(xray).unwrap();
+            assert_eq!(servers.len(), 1);
+            assert_eq!(skipped.lines, 2);
+            assert_eq!(skipped.schemes, ["hysteria", "wireguard"]);
         }
     }
 }
