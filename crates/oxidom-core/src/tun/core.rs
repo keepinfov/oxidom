@@ -42,10 +42,13 @@ impl Tun2socks {
 
     fn try_start(&mut self, device: &str, proxy: SocketAddrV4, mtu: u16) -> Result<()> {
         let resolved = self.resolve_binary()?;
-        let mut child = Command::new(&resolved.path)
+        let mut command = Command::new(&resolved.path);
+        command
             .args(arguments(device, proxy, mtu))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::proc::ignore_sigpipe(&mut command);
+        let mut child = command
             .spawn()
             .with_context(|| format!("spawning tun2socks ({})", resolved.path.display()))?;
 
