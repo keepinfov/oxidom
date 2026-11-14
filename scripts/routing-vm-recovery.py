@@ -415,6 +415,9 @@ def produce(state):
                     if expected == 'blocked' and not item['ok'] or expected == 'success' and item['ok']:
                         state['last'] = item
                         return
+                remaining = 0.02 - (item['finished_ns'] - item['started_ns']) / 1_000_000_000 if not item['ok'] else 0
+            if remaining > 0:
+                time.sleep(remaining)
         raise RuntimeError('producer exceeded its request bound')
     except BaseException as error:
         state['error'] = str(error)
@@ -723,7 +726,7 @@ with subtest("dirty identity refuses reuse and explicit cleanup remains retryabl
     first = recovery_actor_begin("dirty", capture)
     injected = recovery_now()
     client.succeed("ip link set dev " + interface["device"] + " alias p15-invented-foreign-alias")
-    code, output = client.execute(user_command("oxidom down " + RECOVERY_PROFILE))
+    code, output = client.execute(user_command("oxidom down " + RECOVERY_PROFILE) + " 2>&1")
     assert code != 0 and "identity" in output
     dirty = recovery_session_state()["interface"]["ownership"]
     assert dirty["cleanup_dirty"]
@@ -736,7 +739,7 @@ with subtest("dirty identity refuses reuse and explicit cleanup remains retryabl
     stable = recovery_now()
     series = recovery_actor_end(stable, injected, expected="blocked", minimum_after_ms=2000)
     assert recovery_kernel_plan() == kernel_before
-    code, _output = client.execute(user_command("oxidom up " + RECOVERY_PROFILE))
+    code, _output = client.execute(user_command("oxidom up " + RECOVERY_PROFILE) + " 2>&1")
     assert code != 0
     assert len(recovery_observer_records()) == before_records
     assert recovery_session_state()["interface"]["ownership"] == dirty
