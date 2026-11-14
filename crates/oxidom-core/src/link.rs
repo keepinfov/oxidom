@@ -61,10 +61,24 @@ fn xhttp_extra(raw: String) -> Option<Value> {
     serde_json::from_str(&raw).ok().filter(Value::is_object)
 }
 
+fn normalize_security(raw: Option<String>) -> String {
+    match raw {
+        None => "none".to_string(),
+        Some(value)
+            if value.is_empty()
+                || value.eq_ignore_ascii_case("none")
+                || value.eq_ignore_ascii_case("false") =>
+        {
+            "none".to_string()
+        }
+        Some(value) => value,
+    }
+}
+
 fn stream_from_query(q: &HashMap<String, String>) -> StreamSettings {
     let get = |k: &str| q.get(k).cloned().filter(|s| !s.is_empty());
     let network = get("type").unwrap_or_else(|| "tcp".to_string());
-    let security = get("security").unwrap_or_else(|| "none".to_string());
+    let security = normalize_security(get("security"));
     let mode = get("mode");
     let path = if matches!(network.as_str(), "kcp" | "mkcp") {
         get("path").or_else(|| get("seed"))
@@ -329,18 +343,14 @@ fn parse_vmess(link: &str) -> Option<Server> {
     };
     let security = s("scy").unwrap_or_else(|| "auto".to_string());
     let net = s("net").unwrap_or_else(|| "tcp".to_string());
-    let tls = s("tls").unwrap_or_default();
+    let tls = normalize_security(s("tls"));
     let name = s("ps").unwrap_or_else(|| host.clone());
     let vmess_type = s("type");
     let is_xhttp = matches!(net.as_str(), "xhttp" | "splithttp");
 
     let stream = StreamSettings {
         network: net.clone(),
-        security: if tls.is_empty() {
-            "none".to_string()
-        } else {
-            tls
-        },
+        security: tls,
         sni: s("sni").or_else(|| s("host")),
         alpn: s("alpn").map(|a| a.split(',').map(|x| x.trim().to_string()).collect()),
         fingerprint: s("fp"),
@@ -1129,6 +1139,30 @@ mod tests {
     fn trojan_explicit_security_none_is_preserved() {
         let plain = parse_link("trojan://pw@example.com:443?type=tcp&security=none#Plain").unwrap();
         assert_eq!(stream_of(&plain).security, "none");
+    }
+
+    #[test]
+    fn security_false_and_none_normalize_to_none_across_links_and_vmess() {
+        let vless = parse_link(&format!(
+            "vless://{UUID}@example.com:443?type=tcp&security=false#Plain"
+        ))
+        .unwrap();
+        assert_eq!(stream_of(&vless).security, "none");
+        assert_eq!(vless.transport_label, "vless");
+
+        let vmess_str = vmess_link(&format!(
+            r#"{{"add":"example.com","port":"443","id":"{UUID}","tls":"false","ps":"Plain"}}"#
+        ));
+        let vmess = parse_link(&vmess_str).unwrap();
+        assert_eq!(stream_of(&vmess).security, "none");
+        assert_eq!(vmess.transport_label, "vmess");
+
+        let vmess_bool = vmess_link(&format!(
+            r#"{{"add":"example.com","port":"443","id":"{UUID}","tls":false,"ps":"Plain"}}"#
+        ));
+        let vmess_bool_srv = parse_link(&vmess_bool).unwrap();
+        assert_eq!(stream_of(&vmess_bool_srv).security, "none");
+        assert_eq!(vmess_bool_srv.transport_label, "vmess");
     }
 
     #[test]

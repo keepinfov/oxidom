@@ -21,6 +21,8 @@ pub struct SessionCallbacks {
     pub edit: Rc<dyn Fn(String)>,
     /// Open the editor for a profile that does not exist yet.
     pub create: Rc<dyn Fn()>,
+    /// Query the public egress IP seen through a connected session (`(profile, fresh)`).
+    pub check_egress: Rc<dyn Fn(String, bool)>,
 }
 
 #[derive(Clone)]
@@ -40,6 +42,7 @@ struct RowControls {
     state: gtk::Label,
     toggle: gtk::Switch,
     edit: adw::ButtonRow,
+    check_egress: Rc<dyn Fn(String, bool)>,
     /// Detail rows currently hanging off the expander, so they can be removed
     /// before the next set is added — `AdwExpanderRow` has no "clear".
     details: Rc<RefCell<Vec<adw::ActionRow>>>,
@@ -197,6 +200,9 @@ impl SessionsView {
             .valign(gtk::Align::Center)
             .active(model.toggle_on)
             .build();
+        toggle.update_property(&[gtk::accessible::Property::Label(
+            &profile_switch_accessible_label(&model.profile, model.toggle_on),
+        )]);
         row.add_suffix(&toggle);
 
         let spinner = gtk::Spinner::builder()
@@ -267,6 +273,7 @@ impl SessionsView {
             state,
             toggle,
             edit,
+            check_egress: callbacks.check_egress.clone(),
             details: Rc::new(RefCell::new(Vec::new())),
             syncing_toggle,
             applied,
@@ -378,6 +385,11 @@ fn apply_row(controls: &RowControls, row: &SessionRow) {
     controls.syncing_toggle.set(true);
     controls.toggle.set_active(row.toggle_on);
     controls.syncing_toggle.set(false);
+    controls
+        .toggle
+        .update_property(&[gtk::accessible::Property::Label(
+            &profile_switch_accessible_label(&row.profile, row.toggle_on),
+        )]);
     // A switch asserts a position. Against a state this build cannot read there
     // is no position to assert, and an off switch would claim the session is
     // down. The rest of the row stays usable — Edit profile… still applies.
@@ -426,6 +438,27 @@ fn set_details(controls: &RowControls, details: &[SessionDetail]) {
             });
             row.add_suffix(&copy);
         }
+        if let Some(profile) = &detail.egress_profile {
+            let button_tooltip = if detail.copyable {
+                "Refresh egress IP"
+            } else {
+                "Check egress IP"
+            };
+            let refresh = gtk::Button::builder()
+                .icon_name("view-refresh-symbolic")
+                .tooltip_text(button_tooltip)
+                .valign(gtk::Align::Center)
+                .sensitive(!detail.checking)
+                .css_classes(["flat"])
+                .build();
+            refresh.update_property(&[gtk::accessible::Property::Label("Check egress IP")]);
+            refresh.connect_clicked({
+                let check_egress = controls.check_egress.clone();
+                let profile = profile.clone();
+                move |_| check_egress(profile.clone(), true)
+            });
+            row.add_suffix(&refresh);
+        }
         controls.row.add_row(&row);
         built.push(row);
     }
@@ -453,6 +486,14 @@ fn set_state_label(label: &gtk::Label, state: SessionRowState) {
     };
     label.set_label(text);
     label.add_css_class(class);
+}
+
+pub fn profile_switch_accessible_label(profile: &str, toggle_on: bool) -> String {
+    if toggle_on {
+        format!("Disconnect profile {profile}")
+    } else {
+        format!("Connect profile {profile}")
+    }
 }
 
 #[cfg(test)]
@@ -504,5 +545,17 @@ mod tests {
         // The badge is the number alone; its age lives in the detail rows,
         // where there is room to read it.
         assert_eq!(stale.latency.as_deref(), Some("210 ms"));
+    }
+
+    #[test]
+    fn profile_switch_accessible_label_identifies_the_connection_it_controls() {
+        assert_eq!(
+            profile_switch_accessible_label("work", false),
+            "Connect profile work"
+        );
+        assert_eq!(
+            profile_switch_accessible_label("work", true),
+            "Disconnect profile work"
+        );
     }
 }

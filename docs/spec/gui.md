@@ -152,6 +152,15 @@ a selected runtime-only session disappears, select a remaining default/first ent
 leaving controls bound to an invisible missing key. Recovery retains selection if either saved
 profile or runtime session still exists. Inventory placeholders are never saved as profiles.
 
+An expanded connected session row includes an on-demand **Egress IP** detail row (`Not checked`
+until requested, `Checking…` while in flight, or the observed public IP with Copy and Refresh
+actions). It is never polled automatically in the background: pressing Check/Refresh calls the
+additive D-Bus method `EgressAddress(profile: String, fresh: bool) -> String` on a background
+worker (which releases the daemon engine lock before querying through the session's SOCKS
+listener, using `egress::address` for a single server and `egress::uncached_address` for a pool;
+older daemons remain supported and report `UnknownMethod` as an upgrade message), and any
+recorded egress IP is dropped when the session leaves `Connected` or changes its `server_id`.
+
 Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
 - **`adw::NavigationSplitView`** (or `OverlaySplitView`) for the adaptive sidebar.
   - **Sidebar:** app/logo area at top; a nav list — at least "Servers" (the server browser) plus
@@ -168,11 +177,13 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   control offers a stop unless the read-only handshake advertises probe cancellation: a button that
   says it will stop something and then cannot is worse than the second press being ignored.
  - **Server card** (custom widget): country **flag**, server **name**, protocol **subtitle**
-   (`transport_label`, e.g. "vless + xhttp + reality"), optional **latency badge** (green when
-   low). The **expanded** card shows the server's identity, any trust or local-edit marks, the
-   recent checks as a chart with the range on its heading and the failures under it, and why the
-   last check produced no number, while the complete parameter listing (`draft::parameters`) opens
-   in its own details dialog from the card's action row or context menu.
+   (`transport_label`, e.g. "vless + xhttp + reality"), **status badge** (`Connected`, `In use`,
+   `Connecting`, `Error`) and optional **latency badge** (accent-coloured so green remains reserved
+   for `Connected`). The **expanded** card shows the server's identity, any trust or local-edit marks, and why
+   the last check produced no number (with an action to inspect and pin the certificate when a TLS
+   or Hysteria2 server failed for a certificate reason), while the recent checks chart and the
+   complete parameter listing (`draft::parameters`) open in their own details dialog from the
+   card's action row or context menu.
   `docs/spec/latency.md` governs both, and the record is fetched per server rather than polled
   with the grid. Whole card is a click target →
   selects that server. Every server carried by a connected profile is visually marked; the
@@ -196,9 +207,11 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
      while holding actions that exist nowhere else at that moment. The popover points at the press.
    - **Editing opens the creation dialog prefilled** (`show_server_edit_dialog`), and a
      subscription's server has its protocol row locked. In the parameter listing, an overridden
-     field is marked and carries a per-row action that drops the override and takes the
-     provider's value back — the drop is `DropOverride`, not a local repaint, so the store and
-     the card cannot disagree. A composite profile shows no edit action: it has no fields.
+     field or a locally pinned certificate (`pin_sha256`) is marked and carries a per-row action
+     that drops the override or removes the pin — the drop is `DropOverride`, not a local repaint,
+     so the store and the card cannot disagree. A composite profile shows no edit action: it has no
+     editable fields, while its details dialog remains available and lists its balancer settings
+     and balanced outbounds.
    - **The copy action hands over a link and names its limits.** A server without a link of its
      own — typed by hand — gets the canonical form of its stored fields. When the link cannot
      carry something the server has, the action says so after copying, in the field names the
@@ -226,9 +239,10 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
     measurement targets a height the late-arriving pushes then correct, so every block added to
     the card either has a fixed height or scrolls — a block that grows with its data re-opens
     that correction visibly.
-  - **A secret is masked wherever it is shown.** A password, UUID or pre-shared key renders
-    masked with an explicit reveal, and a revealed value never reaches a log line.
-- **Groups:** a chip row above the grid — `All`, one chip per saved group, `+`. A group narrows
+  - **A secret is masked wherever it is shown.** A subscription URL, password, UUID or pre-shared
+    key renders masked with an explicit reveal, and a revealed value never reaches a log line.
+- **Groups:** a chip row above the grid — `All`, one chip per saved group (`Name · N`, or
+  `Name · N (modified)` while the visible filter differs from the saved group), `+`. A group narrows
   **the one list**, and is never a second block of cards: rendering it as its own block
   shows the same server two or three times and leaves no way to tell which card is real, and
   "show it only in its highest-priority group" makes a starred server vanish from its
@@ -279,7 +293,9 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   **Apply** shows the draft on the page; **Save** stores a named group. Profile creation remains
   in the selection menu, separate from Connect; connecting never saves a profile.
 - **Server grid:** a top block of "loose"/favorite servers, then one **block per subscription**:
-  each block shows its **title** + **description** (name + quota/expiry from userinfo) followed by
+  each block shows its **title** + **description** (name + quota/expiry from userinfo), header
+  controls (refresh, latency sweep, sort by latency, `⋮` subscription actions for moving up/down,
+  opening details, copying the URL or removing the subscription, and collapse) followed by
   that subscription's server cards. In the code a block is `SubscriptionBlock` — never a "group",
   which the window uses only for the saved selections in the chip row. Multi-column grid in wide mode, single column in narrow
   (use `adw::WrapBox`/`FlowBox` with a breakpoint via `adw::Breakpoint`).

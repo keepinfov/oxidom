@@ -49,6 +49,14 @@ struct RouteTarget {
     server_id: String,
 }
 
+/// On-demand public egress IP observation for one connected profile session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct EgressEntry {
+    pub server_id: Option<String>,
+    pub ip: Option<String>,
+    pub checking: bool,
+}
+
 /// Everything a poll snapshot reads or writes. No widgets, no `Rc`, no D-Bus —
 /// the fields the window keeps beside this one (`client`, `subscriptions`,
 /// `selected_id`) are deliberately absent because [`reduce`] never touches them.
@@ -76,6 +84,8 @@ pub(super) struct SnapshotState {
     pub readings: HashMap<String, LatencyReading>,
     /// Connection measurements keyed by profile.
     pub proxied: HashMap<String, LatencyReading>,
+    /// On-demand egress IP observations keyed by profile.
+    pub egress_ips: HashMap<String, EgressEntry>,
     /// Last successful measurement of the connected server, tagged with the
     /// server id it belongs to. Shown (dimmed) in the status chips whenever
     /// no probe has confirmed a fresh reading for the *current* connection
@@ -218,6 +228,7 @@ impl SnapshotState {
             connected_profiles: connected_profiles(status),
             readings: HashMap::new(),
             proxied: HashMap::new(),
+            egress_ips: HashMap::new(),
             last_active_latency: None,
             checking: HashMap::new(),
             notify_probe: HashSet::new(),
@@ -585,6 +596,13 @@ pub(super) fn reduce(
     state.standby_proxy = snapshot.status.standby_proxy;
     state.active_profile = snapshot.status.active_profile.clone();
     state.sessions.clone_from(&snapshot.status.sessions);
+    state.egress_ips.retain(|profile, entry| {
+        state.sessions.iter().any(|session| {
+            session.profile == *profile
+                && session.state == "connected"
+                && session.server_id == entry.server_id
+        })
+    });
     state.connected_profiles = connected_profiles(&snapshot.status);
     // Only the daemon's override path knows which server a failure belongs to;
     // failures that never reached the daemon are named by the connect handler
@@ -1191,6 +1209,73 @@ pub(super) fn groups_holding<'a>(
         })
         .map(|group| group.name.as_str())
         .collect()
+}
+
+fn session_is_active_or_held(session: &SessionInfo) -> bool {
+    matches!(session.state.as_str(), "connected" | "connecting" | "error")
+        || session.holding_traffic
+}
+
+fn session_carries_server(session: &SessionInfo, server_id: &str) -> bool {
+    session_is_active_or_held(session)
+        && (session.server_id.as_deref() == Some(server_id)
+            || session
+                .selection
+                .members
+                .iter()
+                .any(|member| member.server_id == server_id))
+}
+
+/// Profiles whose active, connecting or held session carries `server_id` directly
+/// or as a pool member — matching `Engine::disconnect_if_active_within`.
+pub(super) fn sessions_carrying_server(sessions: &[SessionInfo], server_id: &str) -> Vec<String> {
+    let mut profiles = Vec::new();
+    for session in sessions {
+        if session_carries_server(session, server_id) && !profiles.contains(&session.profile) {
+            profiles.push(session.profile.clone());
+        }
+    }
+    profiles
+}
+
+/// Profiles whose active, connecting or held session carries any server in `subscription_id`.
+pub(super) fn sessions_carrying_subscription(
+    sessions: &[SessionInfo],
+    subscriptions: &[Subscription],
+    subscription_id: &str,
+) -> Vec<String> {
+    let Some(subscription) = subscriptions.iter().find(|sub| sub.id == subscription_id) else {
+        return Vec::new();
+    };
+    let mut profiles = Vec::new();
+    for session in sessions {
+        if subscription
+            .servers
+            .iter()
+            .any(|server| session_carries_server(session, &server.id))
+            && !profiles.contains(&session.profile)
+        {
+            profiles.push(session.profile.clone());
+        }
+    }
+    profiles
+}
+
+/// Sentence appended to a server or subscription removal prompt when deleting
+/// it will also tear down one or more running connections.
+pub(super) fn connections_stopping_sentence(profiles: &[String]) -> String {
+    match profiles {
+        [] => String::new(),
+        [one] => format!("\n\nThis will also stop the connection in “{one}”."),
+        many => {
+            let list = many
+                .iter()
+                .map(|profile| format!("“{profile}”"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("\n\nThis will also stop the connections in {list}.")
+        }
+    }
 }
 
 /// Apply a saved display order to the daemon's subscription list.
@@ -1871,6 +1956,10 @@ pub(super) struct SessionDetail {
     /// self-evident. Never a restatement of the value: a tooltip that says the
     /// same thing louder is a tooltip nobody reads twice.
     pub tooltip: Option<String>,
+    /// Profile whose live tunnel can be queried on demand for its public egress IP.
+    pub egress_profile: Option<String>,
+    /// True while an on-demand egress IP query is in flight for this row.
+    pub checking: bool,
 }
 
 impl SessionDetail {
@@ -1880,6 +1969,8 @@ impl SessionDetail {
             value: value.into(),
             copyable: false,
             tooltip: None,
+            egress_profile: None,
+            checking: false,
         }
     }
 
@@ -1891,6 +1982,32 @@ impl SessionDetail {
     fn explained(mut self, tooltip: impl Into<String>) -> Self {
         self.tooltip = Some(tooltip.into());
         self
+    }
+
+    fn with_egress(mut self, profile: impl Into<String>, checking: bool) -> Self {
+        self.egress_profile = Some(profile.into());
+        self.checking = checking;
+        self
+    }
+}
+
+fn egress_detail(state: &SnapshotState, profile: &str, session: &SessionInfo) -> SessionDetail {
+    match state
+        .egress_ips
+        .get(profile)
+        .filter(|entry| entry.server_id == session.server_id)
+    {
+        Some(entry) if entry.checking => {
+            SessionDetail::new("Egress IP", "Checking…").with_egress(profile, true)
+        }
+        Some(entry) if entry.ip.is_some() => {
+            SessionDetail::new("Egress IP", entry.ip.clone().unwrap_or_default())
+                .copyable()
+                .with_egress(profile, false)
+        }
+        _ => SessionDetail::new("Egress IP", "Not checked")
+            .explained("Query the public IP address seen by websites through this tunnel")
+            .with_egress(profile, false),
     }
 }
 
@@ -2019,9 +2136,13 @@ fn latency_parts(
     else {
         return (None, None);
     };
+    let measured = match reading.and_then(|reading| reading.setup_ms) {
+        Some(setup_ms) => format!("{ms} ms (setup {setup_ms} ms)"),
+        None => format!("{ms} ms"),
+    };
     let detail = match age {
-        LatencyAge::Stale(minutes) => format!("{ms} ms · measured {minutes} min ago"),
-        _ => format!("{ms} ms"),
+        LatencyAge::Stale(minutes) => format!("{measured} · measured {minutes} min ago"),
+        _ => measured,
     };
     (
         Some(format!("{ms} ms")),
@@ -2044,6 +2165,18 @@ fn rotation_count(selection: &SelectionInfo) -> Option<usize> {
         .collect::<Vec<_>>();
     (known.len() == selection.members.len() && !known.is_empty())
         .then(|| known.into_iter().filter(|value| *value).count())
+}
+
+fn pool_member_label(member: &oxidom_core::ipc::PoolMember) -> &str {
+    if !member.name.is_empty() {
+        &member.name
+    } else if let Some(alias) = member.alias.as_deref().filter(|alias| !alias.is_empty()) {
+        alias
+    } else if !member.tag.is_empty() {
+        &member.tag
+    } else {
+        &member.server_id
+    }
 }
 
 /// The pool in as few characters as it can honestly be put.
@@ -2346,7 +2479,41 @@ pub(super) fn session_rows(
                     SessionDetail::new("Nodes", nodes)
                         .explained(rotation_help(&selection.strategy)),
                 );
+                if rotation_count(selection).is_some() {
+                    let active = selection
+                        .members
+                        .iter()
+                        .filter(|member| member.in_rotation == Some(true))
+                        .map(pool_member_label)
+                        .collect::<Vec<_>>();
+                    if !active.is_empty() {
+                        details.push(SessionDetail::new("In rotation", active.join(", ")));
+                    }
+                    let standby = selection
+                        .members
+                        .iter()
+                        .filter(|member| member.in_rotation == Some(false))
+                        .map(pool_member_label)
+                        .collect::<Vec<_>>();
+                    if !standby.is_empty() {
+                        details.push(SessionDetail::new("Out of rotation", standby.join(", ")));
+                    }
+                } else {
+                    let members = selection
+                        .members
+                        .iter()
+                        .map(pool_member_label)
+                        .collect::<Vec<_>>();
+                    if !members.is_empty() {
+                        details.push(SessionDetail::new("Members", members.join(", ")));
+                    }
+                }
                 details.push(SessionDetail::new("Strategy", selection.strategy.clone()));
+            }
+            if row_state == SessionRowState::Connected
+                && let Some(session) = session
+            {
+                details.push(egress_detail(state, &entry.name, session));
             }
             details.extend(latency_detail);
             if !entry.description.is_empty() {
@@ -3218,6 +3385,10 @@ pub(super) struct FailureReport {
     /// minutes — a refusal measured through a tunnel that has since gone down
     /// says nothing about the server at all.
     pub attempt: String,
+    /// Whether the failure is a rejected certificate (`CertificateRejected` or
+    /// `InsecureTlsUnsupported`), so a TLS-capable card can offer to inspect
+    /// and pin the server's certificate beside the reason.
+    pub certificate_rejected: bool,
 }
 
 /// The report for the last reading, or `None` when there is nothing to explain.
@@ -3245,9 +3416,14 @@ pub(super) fn failure_report(
             )
         }
     };
+    let certificate_rejected = matches!(
+        reading.detail,
+        Some(ProbeDetail::CertificateRejected | ProbeDetail::InsecureTlsUnsupported)
+    );
     Some(FailureReport {
         reason,
         attempt: format!("{how} · {}", when_text(reading, now_unix_ms)),
+        certificate_rejected,
     })
 }
 
@@ -3278,9 +3454,10 @@ fn check_line(reading: &LatencyReading, now_unix_ms: u64) -> String {
     // "No number" rather than the em dash the list used. A dash is legible in a
     // column of them, next to the numbers it lines up with; alone in a tooltip
     // it reads as a rendering fault.
-    let mut line = match reading.value {
-        Some(ms) => format!("{ms} ms"),
-        None => "No number".to_string(),
+    let mut line = match (reading.value, reading.setup_ms) {
+        (Some(ms), Some(setup_ms)) => format!("{ms} ms (setup {setup_ms} ms)"),
+        (Some(ms), None) => format!("{ms} ms"),
+        (None, _) => "No number".to_string(),
     };
     line.push_str(" · ");
     line.push_str(method_text(reading.method));
@@ -6177,6 +6354,7 @@ mod tests {
                 ("Reported status", "connected"),
                 ("Proxy", "127.91.37.1:10808"),
                 ("Interface", "oxi-work · 198.18.7.1 · manual"),
+                ("Egress IP", "Not checked"),
                 ("Latency", "71 ms · measured 3 min ago"),
                 ("Description", "Office"),
             ]
@@ -6299,6 +6477,18 @@ mod tests {
             rows[0]
                 .details
                 .iter()
+                .any(|detail| detail.label == "In rotation" && detail.value == "One")
+        );
+        assert!(
+            rows[0]
+                .details
+                .iter()
+                .any(|detail| detail.label == "Out of rotation" && detail.value == "Two")
+        );
+        assert!(
+            rows[0]
+                .details
+                .iter()
                 .any(|detail| detail.label == "Strategy" && detail.value == "roundRobin")
         );
         assert!(
@@ -6338,6 +6528,12 @@ mod tests {
                 .details
                 .iter()
                 .any(|detail| detail.label == "Nodes" && detail.value == "2 in the group")
+        );
+        assert!(
+            rows[0]
+                .details
+                .iter()
+                .any(|detail| detail.label == "Members" && detail.value == "One, Two")
         );
         assert!(nodes(&rows).contains("One node carries traffic"));
     }
@@ -8327,6 +8523,7 @@ mod tests {
         .expect("a failure has a report");
         assert_eq!(report.reason, "The server did not answer");
         assert_eq!(report.attempt, "Tried by TCP handshake · just now");
+        assert!(!report.certificate_rejected);
     }
 
     /// A refusal, a wrong TLS parameter and a dead network all read as "the
@@ -8346,6 +8543,7 @@ mod tests {
         )
         .expect("a failure has a report");
         assert_eq!(report.reason, "The server's certificate was rejected");
+        assert!(report.certificate_rejected);
     }
 
     /// The route decides whether the reason is about the server at all: a
@@ -8654,6 +8852,31 @@ mod tests {
             ],
             "each column carries the whole of its own check"
         );
+    }
+
+    #[test]
+    fn two_phase_http_readings_surface_setup_time_in_chart_and_session_details_while_keeping_badge_compact()
+     {
+        let reading =
+            measured_at(41, LatencyMethod::HttpGet, NOW_MS - 3 * 60_000).with_setup_ms(Some(420));
+        let chart = history_chart(
+            &ProbeHistory {
+                readings: vec![reading],
+            },
+            NOW_MS,
+        )
+        .expect("one reading draws a chart");
+        assert_eq!(
+            chart.slots[HISTORY_SLOTS - 1].detail.as_deref(),
+            Some("41 ms (setup 420 ms) · HTTP GET · 3 minutes ago")
+        );
+
+        let proxied_reading = proxied(38, NOW_MS - 2 * 60_000).with_setup_ms(Some(390));
+        let (badge, detail) = latency_parts(Some(&proxied_reading), NOW_MS);
+        assert_eq!(badge.as_deref(), Some("38 ms"));
+        let detail = detail.expect("proxied tunnel reading produces a session detail");
+        assert_eq!(detail.label, "Latency");
+        assert_eq!(detail.value, "38 ms (setup 390 ms) · measured 2 min ago");
     }
 
     /// Nothing on the old list said it stopped at ten, so it read as unbounded.
@@ -9099,5 +9322,164 @@ mod tests {
         assert!(text.contains("about 2 MB"), "{text}");
         assert!(text.contains("Through the tunnel"), "{text}");
         assert!(text.contains("/var/lib/oxidom/assets/geoip.dat"), "{text}");
+    }
+
+    #[test]
+    fn connected_session_rows_expose_on_demand_egress_ip_and_drop_stale_entries_on_server_change() {
+        let work = profile("work", "node-a");
+        let mut state = state();
+        state.sessions = vec![session("work", "connected", "node-a")];
+
+        let rows = session_rows(std::slice::from_ref(&work), &state, NOW_MS);
+        let detail = rows[0]
+            .details
+            .iter()
+            .find(|detail| detail.label == "Egress IP")
+            .expect("connected session row offers an Egress IP detail");
+        assert_eq!(detail.value, "Not checked");
+        assert!(!detail.copyable);
+        assert!(!detail.checking);
+        assert_eq!(detail.egress_profile.as_deref(), Some("work"));
+
+        state.egress_ips.insert(
+            "work".to_string(),
+            EgressEntry {
+                server_id: Some("node-a".to_string()),
+                ip: None,
+                checking: true,
+            },
+        );
+        let rows = session_rows(std::slice::from_ref(&work), &state, NOW_MS);
+        let detail = rows[0]
+            .details
+            .iter()
+            .find(|detail| detail.label == "Egress IP")
+            .unwrap();
+        assert_eq!(detail.value, "Checking…");
+        assert!(detail.checking);
+        assert!(!detail.copyable);
+
+        state.egress_ips.insert(
+            "work".to_string(),
+            EgressEntry {
+                server_id: Some("node-a".to_string()),
+                ip: Some("198.51.100.7".to_string()),
+                checking: false,
+            },
+        );
+        let rows = session_rows(std::slice::from_ref(&work), &state, NOW_MS);
+        let detail = rows[0]
+            .details
+            .iter()
+            .find(|detail| detail.label == "Egress IP")
+            .unwrap();
+        assert_eq!(detail.value, "198.51.100.7");
+        assert!(detail.copyable);
+        assert!(!detail.checking);
+
+        // Switching to another server invalidates the previous server's egress IP.
+        let mut status = StatusInfo::from_status(&Status::Connected, Some("node-b".to_string()));
+        status.sessions = vec![session("work", "connected", "node-b")];
+        fold(&mut state, &snapshot(status, idle()), Instant::now(), true);
+        assert!(!state.egress_ips.contains_key("work"));
+        let rows = session_rows(std::slice::from_ref(&work), &state, NOW_MS);
+        let detail = rows[0]
+            .details
+            .iter()
+            .find(|detail| detail.label == "Egress IP")
+            .unwrap();
+        assert_eq!(detail.value, "Not checked");
+        assert!(!detail.copyable);
+    }
+
+    #[test]
+    fn removal_confirmations_name_single_server_and_pool_connections_that_will_stop() {
+        let subscriptions = vec![
+            filter_group(
+                "sub-eu",
+                "Europe",
+                &[
+                    (
+                        "berlin",
+                        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.example:443#Berlin",
+                        Some("de"),
+                    ),
+                    ("zurich", "trojan://secret@z.example:443#Zurich", Some("ch")),
+                ],
+            ),
+            filter_group(
+                "sub-us",
+                "America",
+                &[(
+                    "boston",
+                    "vless://b831381d-6324-4d53-ad4f-8cda48b30811@b.example:443#Boston",
+                    Some("us"),
+                )],
+            ),
+        ];
+
+        let mut pool_session = SessionInfo {
+            profile: "pool-work".to_string(),
+            state: "connected".to_string(),
+            ..SessionInfo::default()
+        };
+        pool_session.selection = SelectionInfo {
+            kind: "pool".to_string(),
+            members: vec![
+                PoolMember {
+                    server_id: "zurich".to_string(),
+                    ..PoolMember::default()
+                },
+                PoolMember {
+                    server_id: "boston".to_string(),
+                    ..PoolMember::default()
+                },
+            ],
+            ..SelectionInfo::default()
+        };
+
+        let mut held_session = session("held", "disconnected", "berlin");
+        held_session.holding_traffic = true;
+
+        let sessions = vec![
+            session("default", "connected", "berlin"),
+            session("idle", "disconnected", "berlin"),
+            pool_session,
+            held_session,
+        ];
+
+        assert_eq!(
+            sessions_carrying_server(&sessions, "berlin"),
+            vec!["default".to_string(), "held".to_string()]
+        );
+        assert_eq!(
+            sessions_carrying_server(&sessions, "zurich"),
+            vec!["pool-work".to_string()]
+        );
+        assert!(sessions_carrying_server(&sessions, "unknown").is_empty());
+
+        assert_eq!(
+            sessions_carrying_subscription(&sessions, &subscriptions, "sub-eu"),
+            vec![
+                "default".to_string(),
+                "pool-work".to_string(),
+                "held".to_string()
+            ]
+        );
+        assert_eq!(
+            sessions_carrying_subscription(&sessions, &subscriptions, "sub-us"),
+            vec!["pool-work".to_string()]
+        );
+        assert!(sessions_carrying_subscription(&sessions, &subscriptions, "missing").is_empty());
+
+        assert_eq!(connections_stopping_sentence(&[]), "");
+        assert_eq!(
+            connections_stopping_sentence(&["default".to_string()]),
+            "\n\nThis will also stop the connection in “default”."
+        );
+        assert_eq!(
+            connections_stopping_sentence(&["default".to_string(), "pool-work".to_string()]),
+            "\n\nThis will also stop the connections in “default”, “pool-work”."
+        );
     }
 }

@@ -84,10 +84,14 @@ pub struct LogsView {
     save: gtk::Button,
     report: gtk::Button,
     follow: gtk::Button,
-    /// Level and search, so they can move into `overflow` when the window is
-    /// too narrow to hold them in the toolbar.
+    /// Source, level and search controls, so they can move into `overflow` when
+    /// the window is too narrow to hold four text toggles alongside the action
+    /// buttons in the toolbar.
+    sources: adw::ToggleGroup,
+    source_slot: gtk::Box,
     filters: gtk::Box,
     filter_slot: gtk::Box,
+    overflow_box: gtk::Box,
     /// Held so another view can narrow the page to what it is asking about.
     /// The text is set on the widget rather than on `filter` directly, so the
     /// entry shows what is being filtered on and the user can clear or widen
@@ -189,20 +193,34 @@ impl LogsView {
         filters.append(&levels);
         filters.append(&search);
 
+        let source_slot = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .build();
+        source_slot.append(&sources);
+
         let filter_slot = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .hexpand(true)
             .build();
         filter_slot.append(&filters);
 
+        let overflow_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
         let overflow_popover = gtk::Popover::builder().build();
         let overflow = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
-            .tooltip_text("Level and search")
+            .tooltip_text(overflow_tooltip())
             .popover(&overflow_popover)
             .visible(false)
             .css_classes(["flat"])
             .build();
+        overflow.update_property(&[gtk::accessible::Property::Label(overflow_tooltip())]);
 
         let copy = icon_button("edit-copy-symbolic", "Copy the visible log");
         let clear = icon_button("edit-clear-all-symbolic", "Clear the log");
@@ -232,9 +250,9 @@ impl LogsView {
             .margin_start(18)
             .margin_end(18)
             .build();
-        toolbar.append(&sources);
-        toolbar.append(&filter_slot);
+        toolbar.append(&source_slot);
         toolbar.append(&overflow);
+        toolbar.append(&filter_slot);
         toolbar.append(&follow);
         toolbar.append(&report);
         toolbar.append(&save);
@@ -259,8 +277,11 @@ impl LogsView {
             save,
             report,
             follow,
+            sources: sources.clone(),
+            source_slot,
             filters,
             filter_slot,
+            overflow_box,
             search: search.clone(),
             overflow,
             overflow_popover,
@@ -651,26 +672,13 @@ impl LogsView {
         chooser.show();
     }
 
-    /// Fold the level and search controls into a menu when the window is too
-    /// narrow for them. The source switcher stays out: it is the one control
-    /// this page exists for.
-    /// Narrow the page to lines carrying `needle`, as though it had been
-    /// typed into the search entry.
-    ///
-    /// Both halves are done here, and neither is enough alone. The entry's text
-    /// is set so the page shows what it is filtered by and the user can widen
-    /// it again; the filter is applied **without waiting for the entry's own
-    /// signal**, which a `GtkSearchEntry` emits after a delay so that typing
-    /// does not redraw on every keystroke. A caller that narrowed and then read
-    /// the page in the same turn — which is exactly what starting a report
-    /// about one server does — would otherwise read the log it had just asked
-    /// to leave behind.
     pub fn show_only(&self, needle: &str) {
         {
             let mut filter = self.filter.borrow_mut();
             filter.source = None;
             filter.severity = Severity::Debug;
         }
+        self.sources.set_active_name(Some(""));
         if self.search.text() == needle {
             self.redraw();
             return;
@@ -688,24 +696,29 @@ impl LogsView {
         self.redraw();
     }
 
+    /// Fold the source, level and search controls into a menu when the window
+    /// is too narrow to hold the source toggles alongside the action buttons.
     pub fn set_ultra_compact(&self, enabled: bool) {
         if self.compact.get() == enabled {
             return;
         }
         self.compact.set(enabled);
+        let (sources_inline, overflow_visible) = compact_toolbar_visibility(enabled);
         if enabled {
+            self.source_slot.remove(&self.sources);
             self.filter_slot.remove(&self.filters);
-            self.filters.set_margin_top(6);
-            self.filters.set_margin_bottom(6);
-            self.filters.set_margin_start(6);
-            self.filters.set_margin_end(6);
-            self.overflow_popover.set_child(Some(&self.filters));
+            self.overflow_box.append(&self.sources);
+            self.overflow_box.append(&self.filters);
+            self.overflow_popover.set_child(Some(&self.overflow_box));
         } else {
             self.overflow_popover.set_child(gtk::Widget::NONE);
+            self.overflow_box.remove(&self.sources);
+            self.overflow_box.remove(&self.filters);
+            self.source_slot.append(&self.sources);
             self.filter_slot.append(&self.filters);
         }
-        self.overflow.set_visible(enabled);
-        self.filter_slot.set_visible(!enabled);
+        self.source_slot.set_visible(sources_inline);
+        self.overflow.set_visible(overflow_visible);
     }
 
     /// Re-derive the tag colours for the current light/dark setting.
@@ -825,10 +838,19 @@ fn is_at_bottom(adjustment: &gtk::Adjustment) -> bool {
     adjustment.value() + adjustment.page_size() >= adjustment.upper() - 2.0
 }
 
+fn overflow_tooltip() -> &'static str {
+    "Source, level and search"
+}
+
+fn compact_toolbar_visibility(compact: bool) -> (bool, bool) {
+    (!compact, compact)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Filter, TRIM_CHUNK, VIEW_LINES, gap_notice, render_line, save_failure_detail, trim_cut,
+        Filter, TRIM_CHUNK, VIEW_LINES, compact_toolbar_visibility, gap_notice, overflow_tooltip,
+        render_line, save_failure_detail, trim_cut,
     };
     use oxidom_core::logbook::{LogRecord, LogSource, Severity};
 
@@ -1008,5 +1030,12 @@ mod tests {
 
         let without = render_line(&record(LogSource::Oxidom, Severity::Info, "", "starting"));
         assert!(without.contains("  oxidom  starting"), "{without}");
+    }
+
+    #[test]
+    fn narrow_toolbar_folds_source_level_and_search_into_overflow() {
+        assert_eq!(compact_toolbar_visibility(false), (true, false));
+        assert_eq!(compact_toolbar_visibility(true), (false, true));
+        assert_eq!(overflow_tooltip(), "Source, level and search");
     }
 }

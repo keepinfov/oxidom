@@ -282,6 +282,78 @@ pub fn values_issue(values: &DialogValues) -> Option<String> {
     }
 }
 
+/// Which field key a validator sentence names, so the offending row can carry
+/// the error state alongside the top banner.
+pub fn invalid_field(issue: Option<&str>) -> Option<&'static str> {
+    match issue?.split_whitespace().next()? {
+        "address" => Some("address"),
+        "port" => Some("port"),
+        "uuid" => Some("uuid"),
+        "password" => Some("password"),
+        "method" => Some("method"),
+        "auth" => Some("auth"),
+        "public_key" => Some("public_key"),
+        "short_id" => Some("short_id"),
+        "sni" => Some("sni"),
+        "up_mbps" => Some("up_mbps"),
+        "down_mbps" => Some("down_mbps"),
+        "outbound_patch" => Some("outbound_patch"),
+        _ => None,
+    }
+}
+
+/// Whether a transport/TLS detail row belongs on screen for `(protocol, network,
+/// security)`. Any row that already holds a value stays visible regardless, so
+/// editing a stored server never hides a populated field behind another
+/// transport choice.
+pub fn stream_field_visible(
+    field: &str,
+    protocol: Protocol,
+    network: &str,
+    security: &str,
+    current_value: &str,
+) -> bool {
+    if !current_value.trim().is_empty() {
+        return true;
+    }
+    match field {
+        "sni" | "fingerprint" => matches!(security, "tls" | "reality"),
+        "alpn" => security == "tls",
+        "public_key" | "short_id" | "spider_x" => security == "reality",
+        "flow" => protocol == Protocol::Vless && matches!(security, "tls" | "reality"),
+        "path" => matches!(
+            network,
+            "ws" | "xhttp" | "splithttp" | "httpupgrade" | "h2" | "tcp" | "kcp"
+        ),
+        "host" => matches!(
+            network,
+            "ws" | "xhttp" | "splithttp" | "httpupgrade" | "h2" | "tcp"
+        ),
+        "service_name" => network == "grpc",
+        "header_type" => matches!(network, "tcp" | "kcp"),
+        _ => true,
+    }
+}
+
+fn mark_field_error(widget: &impl IsA<gtk::Widget>, active: bool, issue: Option<&str>) {
+    let widget = widget.upcast_ref::<gtk::Widget>();
+    if active {
+        widget.add_css_class("error");
+        widget.update_state(&[gtk::accessible::State::Invalid(
+            gtk::AccessibleInvalidState::True,
+        )]);
+        if let Some(issue) = issue {
+            widget.update_property(&[gtk::accessible::Property::Description(issue)]);
+        }
+    } else {
+        widget.remove_css_class("error");
+        widget.update_state(&[gtk::accessible::State::Invalid(
+            gtk::AccessibleInvalidState::False,
+        )]);
+        widget.update_property(&[gtk::accessible::Property::Description("")]);
+    }
+}
+
 pub fn show_server_dialog(parent: &impl IsA<gtk::Widget>, callbacks: ServerDialogCallbacks) {
     build_dialog(
         parent,
@@ -464,6 +536,7 @@ fn build_dialog(
     content.set_margin_bottom(24);
     content.set_margin_start(24);
     content.set_margin_end(24);
+    content.append(&validation);
     for group in [
         &server_group,
         &credentials_group,
@@ -473,7 +546,6 @@ fn build_dialog(
     ] {
         content.append(group);
     }
-    content.append(&validation);
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
@@ -635,6 +707,8 @@ fn build_dialog(
         let collect = collect.clone();
         let create = create.clone();
         let validation = validation.clone();
+        let address = address.clone();
+        let port = port.clone();
         let credentials_rows = (
             uuid.clone(),
             alter_id.clone(),
@@ -643,6 +717,21 @@ fn build_dialog(
             password.clone(),
             auth.clone(),
         );
+        let stream_rows = (
+            sni.clone(),
+            alpn.clone(),
+            fingerprint.clone(),
+            path.clone(),
+            host.clone(),
+            service_name.clone(),
+            header_type.clone(),
+            flow.clone(),
+            public_key.clone(),
+            short_id.clone(),
+            spider_x.clone(),
+        );
+        let h2_rows = (h2_sni.clone(), h2_up.clone(), h2_down.clone());
+        let patch_frame = patch_frame.clone();
         let stream_group = stream_group.clone();
         let hysteria2_group = hysteria2_group.clone();
         Rc::new(move || {
@@ -650,6 +739,20 @@ fn build_dialog(
             let values = values.borrow();
             let protocol = values.protocol();
             let (uuid, alter_id, vmess_security, method, password, auth) = &credentials_rows;
+            let (
+                sni,
+                alpn,
+                fingerprint,
+                path,
+                host,
+                service_name,
+                header_type,
+                flow,
+                public_key,
+                short_id,
+                spider_x,
+            ) = &stream_rows;
+            let (h2_sni, h2_up, h2_down) = &h2_rows;
             uuid.set_visible(matches!(protocol, Protocol::Vless | Protocol::Vmess));
             alter_id.set_visible(matches!(protocol, Protocol::Vmess));
             vmess_security.set_visible(matches!(protocol, Protocol::Vmess));
@@ -662,12 +765,65 @@ fn build_dialog(
             ));
             hysteria2_group.set_visible(matches!(protocol, Protocol::Hysteria2));
 
+            let net = NETWORKS.get(values.network_index).copied().unwrap_or("tcp");
+            let sec = SECURITIES
+                .get(values.security_index)
+                .copied()
+                .unwrap_or("none");
+            for (field, row, current) in [
+                ("sni", sni, values.sni.as_str()),
+                ("alpn", alpn, values.alpn.as_str()),
+                ("fingerprint", fingerprint, values.fingerprint.as_str()),
+                ("path", path, values.path.as_str()),
+                ("host", host, values.host.as_str()),
+                ("service_name", service_name, values.service_name.as_str()),
+                ("header_type", header_type, values.header_type.as_str()),
+                ("flow", flow, values.flow.as_str()),
+                ("public_key", public_key, values.public_key.as_str()),
+                ("short_id", short_id, values.short_id.as_str()),
+                ("spider_x", spider_x, values.spider_x.as_str()),
+            ] {
+                row.set_visible(stream_field_visible(field, protocol, net, sec, current));
+            }
+
             let issue = values_issue(&values);
             create.set_sensitive(issue.is_none());
             // An untouched dialog is incomplete, not wrong: the sentence would
             // open red on "address is empty" before anything was typed.
-            let touched = !values.address.trim().is_empty();
-            set_validation(&validation, issue.as_deref().filter(|_| touched));
+            let touched = !values.address.trim().is_empty()
+                || !values.uuid.trim().is_empty()
+                || !values.password.trim().is_empty()
+                || !values.method.trim().is_empty()
+                || !values.auth.trim().is_empty()
+                || !values.patch.trim().is_empty();
+            let visible_issue = issue.as_deref().filter(|_| touched);
+            set_validation(&validation, visible_issue);
+            let bad_field = invalid_field(visible_issue);
+            mark_field_error(&address, bad_field == Some("address"), visible_issue);
+            mark_field_error(&port, bad_field == Some("port"), visible_issue);
+            mark_field_error(uuid, bad_field == Some("uuid"), visible_issue);
+            mark_field_error(password, bad_field == Some("password"), visible_issue);
+            mark_field_error(method, bad_field == Some("method"), visible_issue);
+            mark_field_error(auth, bad_field == Some("auth"), visible_issue);
+            mark_field_error(public_key, bad_field == Some("public_key"), visible_issue);
+            mark_field_error(short_id, bad_field == Some("short_id"), visible_issue);
+            mark_field_error(
+                sni,
+                bad_field == Some("sni") && protocol != Protocol::Hysteria2,
+                visible_issue,
+            );
+            mark_field_error(
+                h2_sni,
+                bad_field == Some("sni") && protocol == Protocol::Hysteria2,
+                visible_issue,
+            );
+            mark_field_error(h2_up, bad_field == Some("up_mbps"), visible_issue);
+            mark_field_error(h2_down, bad_field == Some("down_mbps"), visible_issue);
+            mark_field_error(
+                &patch_frame,
+                bad_field == Some("outbound_patch"),
+                visible_issue,
+            );
         })
     };
     refresh();
@@ -840,6 +996,202 @@ mod tests {
         assert_eq!(
             stream.xhttp_extra,
             Some(serde_json::json!({"xPaddingBytes": "100-200"}))
+        );
+    }
+
+    #[test]
+    fn validation_errors_identify_the_field_that_prevents_saving() {
+        assert_eq!(invalid_field(None), None);
+        assert_eq!(invalid_field(Some("address is empty")), Some("address"));
+        assert_eq!(invalid_field(Some("port is 0")), Some("port"));
+        assert_eq!(
+            invalid_field(Some("uuid is required for vless")),
+            Some("uuid")
+        );
+        assert_eq!(
+            invalid_field(Some("password is required for trojan")),
+            Some("password")
+        );
+        assert_eq!(
+            invalid_field(Some("method is required for shadowsocks")),
+            Some("method")
+        );
+        assert_eq!(
+            invalid_field(Some("auth is required for hysteria2")),
+            Some("auth")
+        );
+        assert_eq!(
+            invalid_field(Some("outbound_patch does not parse as JSON: EOF")),
+            Some("outbound_patch")
+        );
+        assert_eq!(
+            invalid_field(Some("outbound_patch is not a JSON object")),
+            Some("outbound_patch")
+        );
+        assert_eq!(
+            invalid_field(Some(
+                "outbound_patch must not set \"tag\"; that is what the typed fields are for"
+            )),
+            Some("outbound_patch")
+        );
+        assert_eq!(
+            invalid_field(Some("the draft does not generate an outbound")),
+            None
+        );
+    }
+
+    #[test]
+    fn transport_editing_shows_applicable_fields_while_preserving_populated_rows() {
+        assert!(stream_field_visible(
+            "sni",
+            Protocol::Vless,
+            "ws",
+            "tls",
+            ""
+        ));
+        assert!(stream_field_visible(
+            "alpn",
+            Protocol::Vless,
+            "ws",
+            "tls",
+            ""
+        ));
+        assert!(stream_field_visible(
+            "path",
+            Protocol::Vless,
+            "ws",
+            "tls",
+            ""
+        ));
+        assert!(stream_field_visible(
+            "host",
+            Protocol::Vless,
+            "ws",
+            "tls",
+            ""
+        ));
+        assert!(stream_field_visible(
+            "flow",
+            Protocol::Vless,
+            "ws",
+            "tls",
+            ""
+        ));
+        assert!(!stream_field_visible(
+            "service_name",
+            Protocol::Vless,
+            "ws",
+            "tls",
+            ""
+        ));
+        assert!(!stream_field_visible(
+            "header_type",
+            Protocol::Vless,
+            "ws",
+            "tls",
+            ""
+        ));
+        assert!(!stream_field_visible(
+            "public_key",
+            Protocol::Vless,
+            "ws",
+            "tls",
+            ""
+        ));
+
+        assert!(stream_field_visible(
+            "service_name",
+            Protocol::Vless,
+            "grpc",
+            "reality",
+            ""
+        ));
+        assert!(stream_field_visible(
+            "public_key",
+            Protocol::Vless,
+            "grpc",
+            "reality",
+            ""
+        ));
+        assert!(stream_field_visible(
+            "short_id",
+            Protocol::Vless,
+            "grpc",
+            "reality",
+            ""
+        ));
+        assert!(stream_field_visible(
+            "spider_x",
+            Protocol::Vless,
+            "grpc",
+            "reality",
+            ""
+        ));
+        assert!(!stream_field_visible(
+            "alpn",
+            Protocol::Vless,
+            "grpc",
+            "reality",
+            ""
+        ));
+        assert!(!stream_field_visible(
+            "path",
+            Protocol::Vless,
+            "grpc",
+            "reality",
+            ""
+        ));
+        assert!(!stream_field_visible(
+            "host",
+            Protocol::Vless,
+            "grpc",
+            "reality",
+            ""
+        ));
+
+        assert!(stream_field_visible(
+            "header_type",
+            Protocol::Vless,
+            "tcp",
+            "none",
+            ""
+        ));
+        assert!(stream_field_visible(
+            "path",
+            Protocol::Vless,
+            "tcp",
+            "none",
+            ""
+        ));
+        assert!(stream_field_visible(
+            "host",
+            Protocol::Vless,
+            "tcp",
+            "none",
+            ""
+        ));
+        assert!(!stream_field_visible(
+            "sni",
+            Protocol::Vless,
+            "tcp",
+            "none",
+            ""
+        ));
+        assert!(!stream_field_visible(
+            "flow",
+            Protocol::Trojan,
+            "tcp",
+            "tls",
+            ""
+        ));
+
+        assert!(
+            stream_field_visible("service_name", Protocol::Vless, "ws", "tls", "retained-svc"),
+            "a populated field must stay visible even when another transport is selected"
+        );
+        assert!(
+            stream_field_visible("public_key", Protocol::Vless, "tcp", "none", "invented-pbk"),
+            "a populated reality key must stay visible when security is switched"
         );
     }
 }

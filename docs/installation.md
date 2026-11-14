@@ -153,8 +153,10 @@ chmod +x oxidom-*-x86_64.AppImage
 ```
 
 About 45 MB. It carries its own GTK, libadwaita, icon theme **and glibc**, so
-the host's versions do not matter, and it carries an Xray core and the `oxidom`
-daemon binary — nothing else to install. It needs no root and no special kernel
+the host's versions do not matter, and it carries an Xray core, its
+`geoip.dat` and `geosite.dat` lists (`XRAY_LOCATION_ASSET`), and the `oxidom`
+daemon binary — nothing else to install, and first launch works offline. It
+needs no root and no special kernel
 permission, which is why it works on Ubuntu 24.04, where a bundle that mounted
 itself through a user namespace would not.
 
@@ -539,9 +541,9 @@ Failed to start: main: failed to load config files: [...]
   > infra/conf: failed to open file: geoip.dat
 ```
 
-Nix and the AUR's `xray-bin` both supply the files, so this bites exactly the
-people who installed a core by hand. Install them where every Xray build looks,
-which needs no environment variable:
+Nix, the AppImage and the AUR's `xray-bin` all supply the files, so this bites
+only a core installed by hand without its assets. Install them where every Xray
+build looks, which needs no environment variable:
 
 ```sh
 curl -LO https://github.com/v2fly/geoip/releases/latest/download/geoip.dat

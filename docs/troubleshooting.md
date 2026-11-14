@@ -176,7 +176,9 @@ works, so these messages are the account of *why* it was torn down:
 Initial HTTP confirmation allows **6 seconds** for the cold request, like a direct
 HTTP latency check using a fresh core; periodic session checks use **3 seconds**.
 DNS, TCP and TLS/REALITY handshakes can make the first request slower than later
-ones. If an ICMP or TCP check passes but connecting fails, those checks proved
+ones, which is why an HTTP probe that keeps its connection open issues a second
+request on the same connection to report the live round-trip while recording the
+initial request as `setup_ms`. If an ICMP or TCP check passes but connecting fails, those checks proved
 only that the host or port answered. Confirmation still has to carry an HTTP
 request through the proxy. Recognised Xray diagnostics take priority over a
 generic timeout, so inspect the appended cause and the Logs page before changing

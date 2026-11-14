@@ -129,8 +129,25 @@ jobs:
           test -x "$d/bin/oxidom"
           test -x "$d/bin/oxidom-gui"
           test -x "$d/bin/xray"
+          test -s "$d/share/xray/geoip.dat"
+          test -s "$d/share/xray/geosite.dat"
+          grep -q '^XRAY_LOCATION_ASSET=\${SHARUN_DIR}/share/xray$' "$d/.env"
           test -f "$d/share/glib-2.0/schemas/gschemas.compiled"
           test -d "$d/share/icons/Adwaita"
+          # Every generated configuration references geoip:private and
+          # geosite:private; verify the bundled core loads both offline from
+          # share/xray in a fresh HOME with no host or user geo files.
+          probe_home=$(mktemp -d)
+          work_cfg="$probe_home/geo-probe.json"
+          cat > "$work_cfg" <<'JSON'
+          {"log":{"loglevel":"error"},
+           "outbounds":[{"protocol":"freedom","tag":"direct"}],
+           "dns":{"servers":[{"address":"1.1.1.1","domains":["geosite:private"],"skipFallback":true}]},
+           "routing":{"rules":[{"type":"field","ip":["geoip:private"],"outboundTag":"direct"}]}}
+          JSON
+          HOME="$probe_home" XRAY_LOCATION_ASSET="$PWD/$d/share/xray" \
+            "$d/bin/xray" run -test -c "$work_cfg"
+          rm -rf "$probe_home"
           # The bundled loader is the whole point: an absolute interpreter would
           # mean the binary is still asking this host for its glibc, which is
           # exactly what it cannot have. patchelf answers this precisely; the

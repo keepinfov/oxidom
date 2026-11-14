@@ -554,7 +554,8 @@ pub fn country_from_name(name: &str) -> Option<String> {
             regional_indicator_to_letter(b),
         )
     {
-        return Some(format!("{ai}{bi}"));
+        let code = format!("{ai}{bi}");
+        return crate::country::is_alpha2(&code).then_some(code);
     }
     let token = trimmed
         .split(|c: char| c.is_whitespace() || matches!(c, '-' | '_' | '|' | '·' | '.' | '[' | '('))
@@ -607,7 +608,7 @@ pub fn transport_label(protocol: Protocol, spec: &OutboundSpec) -> String {
             parts.push(s.network.clone());
         }
         match s.security.as_str() {
-            "" | "none" => {}
+            "" | "none" | "false" => {}
             other => parts.push(other.to_string()),
         }
     }
@@ -635,6 +636,26 @@ mod tests {
     fn a_flag_emoji_still_wins_and_still_reads_uppercase() {
         assert_eq!(country_from_name("🇳🇱 Node").as_deref(), Some("NL"));
         assert_eq!(country_from_name("  🇨🇭 Trojan").as_deref(), Some("CH"));
+    }
+
+    #[test]
+    fn a_non_country_flag_emoji_does_not_produce_an_invalid_alpha2_code() {
+        assert_eq!(country_from_name("🇪🇺 Europe"), None);
+        assert_eq!(country_from_name("🇩🇪 Frankfurt"), Some("DE".to_string()));
+    }
+
+    #[test]
+    fn transport_label_ignores_false_security_like_none() {
+        let spec = OutboundSpec::Vless {
+            uuid: "00000000-0000-4000-8000-000000000000".to_string(),
+            encryption: "none".to_string(),
+            stream: StreamSettings {
+                network: "tcp".to_string(),
+                security: "false".to_string(),
+                ..Default::default()
+            },
+        };
+        assert_eq!(transport_label(Protocol::Vless, &spec), "vless");
     }
 
     /// Two-letter words that are also countries — `IS`, `IT`, `NO`, `ME`, `AT`,
