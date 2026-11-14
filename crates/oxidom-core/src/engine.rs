@@ -1817,8 +1817,25 @@ impl Engine {
             self.sessions.release_system_proxy(profile);
             return false;
         }
+        let verdict = self.teardown_verdict(profile);
         if let Some(session) = self.sessions.get_mut(profile) {
             session.holding_traffic = true;
+            if let (Some(interface), Verdict::Block(slice)) = (session.interface.as_mut(), &verdict)
+                && interface.up
+            {
+                match set_chain(profile, &interface.nft_binary, interface.chain, &verdict) {
+                    Ok(chain) => {
+                        interface.chain = chain;
+                        interface.cgroup = Some(slice.clone());
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "could not block the bound cgroup after profile {profile:?}'s core \
+                             exited: {error:#}"
+                        );
+                    }
+                }
+            }
         }
         log::warn!(
             "profile {profile:?} lost its core and is holding its routes: traffic for this \
@@ -1830,9 +1847,28 @@ impl Engine {
     /// The core has been confirmed to carry traffic, ending pending confirmation
     /// and any hold on its routes.
     pub fn confirm_traffic(&mut self, profile: &str) {
+        let live_slice = self
+            .run_cgroup(profile)
+            .filter(|slice| crate::paths::cgroup_dir(&slice.path).exists());
         let Some(session) = self.sessions.get_mut(profile) else {
             return;
         };
+        if let (Some(interface), Some(slice)) = (session.interface.as_mut(), live_slice)
+            && interface.up
+            && (session.holding_traffic || interface.chain == ChainState::Block)
+        {
+            if let Err(error) =
+                Nft::new(interface.nft_binary.clone()).install(profile, &slice, interface.mark)
+            {
+                log::warn!(
+                    "could not restore the cgroup mark after profile {profile:?} confirmed \
+                     traffic: {error:#}"
+                );
+                return;
+            }
+            interface.chain = ChainState::Mark;
+            interface.cgroup = Some(slice);
+        }
         session.confirmation_pending = false;
         session.holding_traffic = false;
     }
@@ -2288,10 +2324,21 @@ impl Engine {
                 .interface = Some(interface);
             return Err(error);
         }
-        let result =
-            Nft::new(interface.nft_binary.clone()).install(profile, &slice, interface.mark);
+        let session_held_or_pending = self
+            .sessions
+            .get(profile)
+            .is_some_and(|session| session.holding_traffic || session.confirmation_pending);
+        let result = if session_held_or_pending {
+            Nft::new(interface.nft_binary.clone()).block(profile, &slice)
+        } else {
+            Nft::new(interface.nft_binary.clone()).install(profile, &slice, interface.mark)
+        };
         if result.is_ok() {
-            interface.chain = ChainState::Mark;
+            interface.chain = if session_held_or_pending {
+                ChainState::Block
+            } else {
+                ChainState::Mark
+            };
         } else {
             interface.chain = ChainState::Off;
             interface.cgroup = None;
@@ -5588,6 +5635,173 @@ mod tests {
         }
         engine.bind_run_cgroup("work", &slice)?;
         Ok((engine, slice))
+    }
+
+    const BOUND_WORK_BLOCK: &str = r#"add table inet oxidom
+add chain inet oxidom profile_work { type route hook output priority mangle; policy accept; }
+flush chain inet oxidom profile_work
+add rule inet oxidom profile_work socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/oxidom\x2dwork.slice" counter drop comment "oxidom profile work blocked"
+add chain inet oxidom restore_work { type filter hook prerouting priority mangle; policy accept; }
+flush chain inet oxidom restore_work
+"#;
+
+    const BOUND_WORK_MARK: &str = r#"add table inet oxidom
+add chain inet oxidom profile_work { type route hook output priority mangle; policy accept; }
+flush chain inet oxidom profile_work
+add rule inet oxidom profile_work socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/oxidom\x2dwork.slice" counter meta mark set 0x6f21 ct mark set 0x6f21 comment "oxidom profile work"
+add rule inet oxidom profile_work socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/oxidom\x2dwork.slice" ip6 daddr fe80::/10 counter accept comment "oxidom profile work: IPv6 is not tunnelled"
+add rule inet oxidom profile_work socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/oxidom\x2dwork.slice" ip6 daddr ff00::/8 counter accept comment "oxidom profile work: IPv6 is not tunnelled"
+add rule inet oxidom profile_work socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/oxidom\x2dwork.slice" meta nfproto ipv6 counter reject comment "oxidom profile work: IPv6 is not tunnelled"
+add chain inet oxidom restore_work { type filter hook prerouting priority mangle; policy accept; }
+flush chain inet oxidom restore_work
+add rule inet oxidom restore_work ct mark 0x6f21 counter meta mark set 0x6f21 comment "oxidom profile work"
+"#;
+
+    fn engine_with_recorded_run_mark(
+        root: &std::path::Path,
+    ) -> Result<(Engine, crate::run::CgroupSlice)> {
+        let (mut engine, slice) = engine_bound_to_run_cgroup(root, true)?;
+        let server = parse_link("socks://192.0.2.10:1080#Invented").context("invented server")?;
+        let session = engine.sessions.get_mut("work").context("session")?;
+        session.core.xray_binary = fake_core_binary(root)?;
+        session.connect(&server)?;
+        engine.confirm_traffic("work");
+        let mut interface = held_interface("work");
+        interface.nft_binary = engine.registry.config.nft_binary.clone();
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .interface = Some(interface);
+        engine.sync_session("work");
+        assert_eq!(engine.mark_cgroup("work", 1000)?, slice);
+        assert_eq!(recorded_ruleset(root)?, BOUND_WORK_MARK);
+        Ok((engine, slice))
+    }
+
+    fn seed_recorded_run_block(engine: &mut Engine, slice: &crate::run::CgroupSlice) -> Result<()> {
+        let session = engine.sessions.get_mut("work").context("session")?;
+        session.core.disconnect();
+        session.holding_traffic = true;
+        let interface = session.interface.as_mut().context("interface")?;
+        crate::nft::Nft::new(interface.nft_binary.clone()).block("work", slice)?;
+        interface.chain = ChainState::Block;
+        Ok(())
+    }
+
+    #[test]
+    fn a_dead_core_blocks_its_bound_run_cgroup_without_replanning() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("core-death-emits-run-block")?;
+        let (mut engine, slice) = engine_with_recorded_run_mark(&root.path)?;
+        let before = engine
+            .sessions
+            .get("work")
+            .and_then(|session| session.interface.as_ref())
+            .context("marked interface")?
+            .state();
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .core
+            .disconnect();
+
+        assert!(engine.note_core_exit("work"));
+
+        assert_eq!(recorded_ruleset(&root.path)?, BOUND_WORK_BLOCK);
+        let session = engine.sessions.get("work").context("held session")?;
+        let interface = session.interface.as_ref().context("retained interface")?;
+        assert!(session.holding_traffic);
+        assert!(interface.up);
+        assert_eq!(interface.chain, ChainState::Block);
+        assert_eq!(interface.state(), before);
+        assert_eq!(engine.run_cgroup("work"), Some(slice));
+        Ok(())
+    }
+
+    #[test]
+    fn a_current_confirmation_restores_the_bound_run_cgroup_after_hold() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("confirmation-restores-run-mark")?;
+        let (mut engine, slice) = engine_with_recorded_run_mark(&root.path)?;
+        seed_recorded_run_block(&mut engine, &slice)?;
+        let before = engine
+            .sessions
+            .get("work")
+            .and_then(|session| session.interface.as_ref())
+            .context("held interface")?
+            .state();
+        let server = parse_link("socks://192.0.2.10:1080#Invented").context("invented server")?;
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .connect(&server)?;
+        assert_eq!(recorded_ruleset(&root.path)?, BOUND_WORK_BLOCK);
+        assert!(
+            engine
+                .sessions
+                .get("work")
+                .context("pending session")?
+                .confirmation_pending
+        );
+
+        engine.confirm_traffic("work");
+
+        assert_eq!(recorded_ruleset(&root.path)?, BOUND_WORK_MARK);
+        let session = engine.sessions.get("work").context("confirmed session")?;
+        let interface = session.interface.as_ref().context("retained interface")?;
+        assert!(!session.holding_traffic);
+        assert!(!session.confirmation_pending);
+        assert!(interface.up);
+        assert_eq!(interface.chain, ChainState::Mark);
+        assert_eq!(interface.state(), before);
+        assert_eq!(engine.run_cgroup("work"), Some(slice));
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_scope_cannot_unblock_the_bound_run_cgroup_during_hold() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("new-run-preserves-held-block")?;
+        let (mut engine, slice) = engine_with_recorded_run_mark(&root.path)?;
+        seed_recorded_run_block(&mut engine, &slice)?;
+        assert_eq!(recorded_ruleset(&root.path)?, BOUND_WORK_BLOCK);
+
+        assert_eq!(engine.mark_cgroup("work", 1000)?, slice);
+
+        assert_eq!(recorded_ruleset(&root.path)?, BOUND_WORK_BLOCK);
+        let session = engine.sessions.get("work").context("held session")?;
+        assert!(session.holding_traffic);
+        let interface = session.interface.as_ref().context("retained interface")?;
+        assert!(interface.up);
+        assert_eq!(interface.chain, ChainState::Block);
+        assert_eq!(engine.run_cgroup("work"), Some(slice));
+        let server = parse_link("socks://192.0.2.10:1080#Invented").context("invented server")?;
+        engine
+            .sessions
+            .get_mut("work")
+            .context("session")?
+            .connect(&server)?;
+        assert!(
+            engine
+                .sessions
+                .get("work")
+                .context("pending replacement")?
+                .confirmation_pending
+        );
+
+        engine.mark_cgroup("work", 1000)?;
+
+        assert_eq!(recorded_ruleset(&root.path)?, BOUND_WORK_BLOCK);
+        let session = engine.sessions.get("work").context("pending session")?;
+        assert!(session.holding_traffic && session.confirmation_pending);
+        assert_eq!(
+            session.interface.as_ref().context("interface")?.chain,
+            ChainState::Block
+        );
+        Ok(())
     }
 
     #[test]

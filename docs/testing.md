@@ -108,19 +108,22 @@ build job checks access to `/dev/kvm` and the KVM API before running the single
 job rather than skipping the routing check. The existing CLI/GUI, module and
 GTK/AT checks remain in the same invocation and reuse their package derivations.
 
-On a disposable `x86_64-linux` KVM builder, run just this check with:
+On a disposable `x86_64-linux` KVM builder, run just these checks with:
 
 ```sh
 nix build .#checks.x86_64-linux.routing-faults --print-build-logs
+nix build .#checks.x86_64-linux.scoped-routing --print-build-logs
 ```
 
-The same VM driver runs the [routing foundation](routing-vm.md) before the
+The first VM driver runs the [routing foundation](routing-vm.md) before the
 [real-core fault scenarios](routing-vm-faults.md). The latter observe A-to-B
 recovery, exhausted and revoked held endpoints, an independent proxy-only peer,
-and explicit daemon shutdown/restart. These endpoint observations do not
-exclude a brief traffic release between sampled states. Active transition
-traffic or kernel-route monitoring and the remaining P15 helper/nft/cgroup,
-IPv6 and ownership-cleanup cases require separate evidence.
+and explicit daemon shutdown/restart. The second runs the
+[scoped routing check](scoped-routing-vm.md), exercising a persistent
+`oxidom run` user scope, cgroup nftables marking and IPv6 refusal, core-loss
+and Down request windows, same-scope Up recovery, and departed-scope pruning.
+The remaining P15 helper, A-to-B bound-scope restoration and crash-recovery
+cases require separate evidence.
 
 This routing gate is not exposed on the other flake platforms, so its results do
 not establish cross-platform support. Its documented packet-path assertions are
