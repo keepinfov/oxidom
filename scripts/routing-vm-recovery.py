@@ -383,7 +383,7 @@ def request(label, ordinal):
         body = json.loads(response.read(4097))
         assert response.status == 200 and body['path'] == marker
         result.update(ok=True, source=body['source'])
-    except (OSError, http.client.HTTPException) as error:
+    except (OSError, http.client.HTTPException, ValueError, AssertionError) as error:
         result.update(ok=False, error=type(error).__name__)
     finally:
         connection.close()
