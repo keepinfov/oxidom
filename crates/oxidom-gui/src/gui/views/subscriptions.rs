@@ -168,6 +168,32 @@ impl SubscriptionsView {
         pasted
     }
 
+    pub fn open_add_dialog(&self) {
+        let Some(callbacks) = self.callbacks.borrow().clone() else {
+            return;
+        };
+        show_add_subscription(&self.root, callbacks, None);
+    }
+
+    pub fn open_import_dialog(&self) {
+        let Some(callbacks) = self.callbacks.borrow().clone() else {
+            return;
+        };
+        show_import_servers(&self.root, callbacks, None);
+    }
+
+    pub fn open_create_dialog(&self) {
+        let Some(callbacks) = self.callbacks.borrow().clone() else {
+            return;
+        };
+        super::server_dialog::show_server_dialog(
+            &self.root,
+            super::server_dialog::ServerDialogCallbacks {
+                create: callbacks.create.clone(),
+            },
+        );
+    }
+
     pub fn open_details(&self, parent: &impl IsA<gtk::Widget>, subscription: Subscription) {
         let Some(callbacks) = self.callbacks.borrow().clone() else {
             return;

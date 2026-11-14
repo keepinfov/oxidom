@@ -1395,6 +1395,10 @@ fn refresh_state(widgets: &SettingsWidgets, model: &Rc<RefCell<SettingsModel>>) 
     let state = model.state();
     drop(model);
 
+    set_field_error(&widgets.socks, validation.ports);
+    set_field_error(&widgets.http, validation.ports);
+    set_field_error(&widgets.test_url, validation.latency_url);
+    set_field_error(&widgets.xray_binary, validation.xray_binary);
     set_validation_message(&widgets.ports_error, validation.ports);
     set_validation_message(&widgets.url_error, validation.latency_url);
     set_validation_message(&widgets.xray_error, validation.xray_binary);
@@ -1403,6 +1407,23 @@ fn refresh_state(widgets: &SettingsWidgets, model: &Rc<RefCell<SettingsModel>>) 
         .apply
         .set_sensitive(state.dirty && state.valid && !state.applying);
     widgets.reset.set_sensitive(state.dirty && !state.applying);
+}
+
+fn set_field_error(widget: &impl IsA<gtk::Widget>, message: Option<&str>) {
+    let widget = widget.upcast_ref::<gtk::Widget>();
+    if let Some(message) = message {
+        widget.add_css_class("error");
+        widget.update_state(&[gtk::accessible::State::Invalid(
+            gtk::AccessibleInvalidState::True,
+        )]);
+        widget.update_property(&[gtk::accessible::Property::Description(message)]);
+    } else {
+        widget.remove_css_class("error");
+        widget.update_state(&[gtk::accessible::State::Invalid(
+            gtk::AccessibleInvalidState::False,
+        )]);
+        widget.update_property(&[gtk::accessible::Property::Description("")]);
+    }
 }
 
 fn set_validation_message(label: &gtk::Label, message: Option<&str>) {

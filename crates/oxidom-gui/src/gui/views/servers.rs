@@ -332,12 +332,13 @@ pub struct ServersView {
     active_group: Rc<RefCell<Option<String>>>,
     /// Mirror of `prefs.groups`, so the chip row and the popover read one list.
     saved_groups: Rc<RefCell<Vec<ServerGroup>>>,
-    /// The selected chip's widget, so the "modified" mark can be updated on a
-    /// keystroke without rebuilding the row under the pointer.
     /// The scope switcher, rebuilt whenever the set of groups changes. Held so
-    /// `sync_chip_modified` can relabel one toggle without rebuilding the row
-    /// under the pointer.
+    /// `sync_scope_bar` and `sync_chip_modified` can update toggles in place
+    /// without rebuilding the row under the pointer.
     scopes: Rc<RefCell<Option<adw::ToggleGroup>>>,
+    /// Selection actions menu button beside `scopes`, updated in place when the
+    /// active scope changes so `scopes` is never unparented on selection.
+    scope_menu_button: gtk::MenuButton,
     /// Set while the row is being repopulated, so `active-name` changes made by
     /// the code do not re-enter `select_group` and rebuild the row from inside
     /// its own construction.
@@ -346,6 +347,9 @@ pub struct ServersView {
     /// for it. Only [`Self::sync_chip_modified`] reads it, and only to keep quiet
     /// about a difference that is its own doing.
     switching_scope: Rc<Cell<bool>>,
+    /// Incremented on every scope cross-fade and catalog rebuild so superseded
+    /// fade-out animations never swap the view or start a competing fade-in.
+    fade_generation: Rc<Cell<u64>>,
     /// Set on every rebuild; the popover's "Create pool" needs it long after
     /// the callbacks that carried it went out of scope.
     on_create_pool: PoolCallback,
@@ -401,9 +405,11 @@ pub struct ServersView {
     /// Shown when a search hides every card. Kept as one persistent widget
     /// rather than rebuilt, so toggling it costs nothing on each keystroke.
     no_matches: adw::StatusPage,
-    /// Invoked by the "no servers yet" page; the window routes it to the
-    /// Subscriptions page.
+    /// Invoked by the "no servers yet" page; opens the Add subscription,
+    /// Import server, or Create server dialog directly.
     on_browse_subscriptions: BrowseCallback,
+    on_import_server: BrowseCallback,
+    on_create_server: BrowseCallback,
     /// Which subscription blocks are collapsed, persisted to disk so it
     /// survives restarts.
     prefs: Rc<RefCell<GuiPrefs>>,
@@ -537,6 +543,12 @@ impl ServersView {
         filter_button.set_child(Some(&filter_content));
         filter_button.update_property(&[gtk::accessible::Property::Label("Filter servers")]);
         filter_button.update_property(&[gtk::accessible::Property::HasPopup(true)]);
+        let scope_menu_button = gtk::MenuButton::builder()
+            .tooltip_text("What to do with the selection on screen")
+            .css_classes(["flat", "group-chip-menu"])
+            .build();
+        scope_menu_button.set_child(Some(&gtk::Image::from_icon_name("view-more-symbolic")));
+        scope_menu_button.update_property(&[gtk::accessible::Property::Label("Selection actions")]);
         let servers_area = gtk::Box::new(gtk::Orientation::Vertical, 20);
         servers_area.set_hexpand(true);
 
@@ -568,8 +580,10 @@ impl ServersView {
             active_group: Rc::new(RefCell::new(None)),
             saved_groups: Rc::new(RefCell::new(Vec::new())),
             scopes: Rc::new(RefCell::new(None)),
+            scope_menu_button,
             syncing_scopes: Rc::new(Cell::new(false)),
             switching_scope: Rc::new(Cell::new(false)),
+            fade_generation: Rc::new(Cell::new(0)),
             on_create_pool: Rc::new(RefCell::new(None)),
             on_connect_pool: Rc::new(RefCell::new(None)),
             on_connect_selection: Rc::new(RefCell::new(None)),
@@ -578,6 +592,8 @@ impl ServersView {
             direct_latencies: Rc::new(RefCell::new(HashMap::new())),
             picker_refresh: Rc::new(RefCell::new(None)),
             on_browse_subscriptions: Rc::new(RefCell::new(None)),
+            on_import_server: Rc::new(RefCell::new(None)),
+            on_create_server: Rc::new(RefCell::new(None)),
             cards: Rc::new(RefCell::new(HashMap::new())),
             control_context: Rc::new(RefCell::new(None)),
             card_plans: Rc::new(RefCell::new(HashMap::new())),
@@ -698,6 +714,7 @@ impl ServersView {
         // arrangement is a display preference layered on top of it, so every
         // rebuild re-applies it rather than the widget order being the only
         // record of it.
+        let preserved_scroll = self.root.vadjustment().value();
         let ordered = ordered_subscriptions(subscriptions, &self.prefs.borrow().subscription_order);
         let subscriptions = &ordered[..];
         while let Some(child) = self.content.first_child() {
@@ -706,6 +723,8 @@ impl ServersView {
         // The area survives the page rebuild as a widget, so its opacity — which
         // an interrupted fade could have left below 1.0 — is reset rather than
         // inherited.
+        self.fade_generation
+            .set(next_fade_generation(self.fade_generation.get()));
         while let Some(child) = self.servers_area.first_child() {
             self.servers_area.remove(&child);
         }
@@ -736,26 +755,44 @@ impl ServersView {
             let empty = adw::StatusPage::builder()
                 .icon_name("network-server-symbolic")
                 .title("No servers yet")
-                .description("Add a subscription to start browsing servers.")
+                .description("Add a subscription, paste a share link, or enter a server by hand.")
                 .vexpand(true)
                 .build();
-            // Without this the user has to discover the Subscriptions page
-            // unaided; an empty state that names the next step should offer it.
-            let action = gtk::Button::builder()
-                .label("Add a subscription")
+            // Offer all three first-run entry points right on the empty page so
+            // adding a subscription, pasting a share link, or typing a server
+            // does not require hunting for the + menu on another page.
+            let actions = adw::WrapBox::builder()
+                .child_spacing(8)
+                .line_spacing(8)
+                .align(0.5)
                 .halign(gtk::Align::Center)
-                .css_classes(["suggested-action", "pill"])
                 .build();
-            action.connect_clicked({
-                let callback = self.on_browse_subscriptions.clone();
-                move |_| {
-                    let callback = callback.borrow().clone();
-                    if let Some(callback) = callback {
-                        callback();
+            for ((label, suggested), callback) in empty_state_actions().into_iter().zip([
+                &self.on_browse_subscriptions,
+                &self.on_import_server,
+                &self.on_create_server,
+            ]) {
+                let button = gtk::Button::builder()
+                    .label(label)
+                    .halign(gtk::Align::Center)
+                    .css_classes(if suggested {
+                        vec!["suggested-action", "pill"]
+                    } else {
+                        vec!["pill"]
+                    })
+                    .build();
+                button.connect_clicked({
+                    let callback = callback.clone();
+                    move |_| {
+                        let callback = callback.borrow().clone();
+                        if let Some(callback) = callback {
+                            callback();
+                        }
                     }
-                }
-            });
-            empty.set_child(Some(&action));
+                });
+                actions.append(&button);
+            }
+            empty.set_child(Some(&actions));
             self.content.append(&empty);
             return;
         }
@@ -1108,6 +1145,18 @@ impl ServersView {
         if let Some(server_id) = selected_id {
             self.set_selected_immediately(server_id);
         }
+        if preserved_scroll > 0.0 {
+            let vadjustment = self.root.vadjustment();
+            vadjustment.set_value(preserved_scroll);
+            let root = self.root.clone();
+            glib::idle_add_local_once(move || {
+                let vadjustment = root.vadjustment();
+                if vadjustment.value() == 0.0 {
+                    let max = (vadjustment.upper() - vadjustment.page_size()).max(0.0);
+                    vadjustment.set_value(preserved_scroll.min(max));
+                }
+            });
+        }
         self.schedule_expanded_remeasure();
         let refresh = self
             .picker_refresh
@@ -1190,24 +1239,8 @@ impl ServersView {
         // with the selection — and it removes the rule that only the selected
         // chip has a menu, which was itself only there to stop five identical
         // buttons appearing in a row.
-        let manage = gtk::MenuButton::builder()
-            .tooltip_text("What to do with the selection on screen")
-            .css_classes(["flat", "group-chip-menu"])
-            .build();
-        manage.set_child(Some(&gtk::Image::from_icon_name("view-more-symbolic")));
-        manage.update_property(&[gtk::accessible::Property::Label("Selection actions")]);
-        // Never insensitive, because it no longer means "the selected group": it
-        // acts on the scope that is on screen, saved or not, and making a profile
-        // out of that is exactly what somebody looking at an unsaved filter wants.
-        // The items that need a saved group disable themselves instead.
-        let position = active
-            .as_deref()
-            .and_then(|id| saved.iter().position(|group| group.id == id));
-        manage.set_popover(Some(&self.scope_menu(
-            position.map(|index| (saved[index].clone(), index, saved.len())),
-        )));
-        self.chip_bar.append(&manage);
-        self.sync_chip_modified();
+        self.scope_menu_button.unparent();
+        self.chip_bar.append(&self.scope_menu_button);
 
         // Labelled, not a bare "+": a circle with a plus in it was read as
         // "add a subscription" by everyone who was asked, and the word is the
@@ -1227,12 +1260,57 @@ impl ServersView {
         });
         self.chip_bar.append(&add);
 
+        self.sync_scope_bar();
+        self.syncing_scopes.set(false);
+    }
+
+    /// Update the active toggle, chip labels, and selection menu in place when
+    /// the set of saved group IDs has not changed, or rebuild the row when a
+    /// group was added, removed, or reordered. Keeping the `AdwToggleGroup`
+    /// widget alive across scope selection preserves keyboard focus and lets
+    /// its sliding indicator animate to the newly chosen chip.
+    fn sync_scope_bar(&self) {
+        let next_groups = self.prefs.borrow().groups.clone();
+        let can_reuse = self.scopes.borrow().is_some()
+            && scope_toggles_match(&self.saved_groups.borrow(), &next_groups);
+        if !can_reuse {
+            self.build_chip_bar();
+            return;
+        }
+        let was_syncing = self.syncing_scopes.replace(true);
+        *self.saved_groups.borrow_mut() = next_groups.clone();
+        let active = self.active_group.borrow().clone();
+        let active_name = scope_toggle_name(active.as_deref());
+        if let Some(scopes) = self.scopes.borrow().clone() {
+            if scopes.active_name().as_deref() != Some(active_name) {
+                scopes.set_active_name(Some(active_name));
+            }
+            let subscriptions = self.subscriptions.borrow();
+            for group in &next_groups {
+                if let Some(toggle) = scopes.toggle_by_name(&group.id) {
+                    let count = group_member_ids(group, &subscriptions).len();
+                    toggle.set_label(Some(&group.chip_label(count, false)));
+                    toggle.set_tooltip(&group_chip_tooltip(group, count));
+                }
+            }
+        }
+        // Never insensitive, because it no longer means "the selected group": it
+        // acts on the scope that is on screen, saved or not, and making a profile
+        // out of that is exactly what somebody looking at an unsaved filter wants.
+        // The items that need a saved group disable themselves instead.
+        let position = active
+            .as_deref()
+            .and_then(|id| next_groups.iter().position(|group| group.id == id));
+        self.scope_menu_button.set_popover(Some(&self.scope_menu(
+            position.map(|index| (next_groups[index].clone(), index, next_groups.len())),
+        )));
+        self.sync_chip_modified();
         // Until the first group exists, the row is two chips whose purpose is
         // not obvious from their labels alone. One line says what the row is
         // for; it goes away as soon as the answer is on screen.
         self.chip_hint
-            .set_visible(saved.iter().all(|group| group.id == FAVOURITES_ID));
-        self.syncing_scopes.set(false);
+            .set_visible(next_groups.iter().all(|group| group.id == FAVOURITES_ID));
+        self.syncing_scopes.set(was_syncing);
     }
 
     /// Everything that can be done to one group, hung off its own chip.
@@ -2769,7 +2847,7 @@ impl ServersView {
         if let Some(clear_search) = clear_search {
             clear_search();
         }
-        self.build_chip_bar();
+        self.sync_scope_bar();
         self.apply_filter();
     }
 
@@ -2778,8 +2856,9 @@ impl ServersView {
         // Cleared by `apply_filter`, at the far end of the cross-fade.
         self.switching_scope.set(true);
         let group = id.and_then(|id| {
-            self.saved_groups
+            self.prefs
                 .borrow()
+                .groups
                 .iter()
                 .find(|group| group.id == id)
                 .cloned()
@@ -2816,7 +2895,7 @@ impl ServersView {
         if let Some(clear_search) = clear_search {
             clear_search();
         }
-        self.build_chip_bar();
+        self.sync_scope_bar();
         self.fade_through(|view| view.apply_filter());
     }
 
@@ -2832,21 +2911,26 @@ impl ServersView {
     /// before it repacks, so this never fights `server_card`'s own height
     /// animation.
     fn fade_through(&self, swap: impl Fn(&Self) + 'static) {
+        let generation = next_fade_generation(self.fade_generation.get());
+        self.fade_generation.set(generation);
         let target = self.servers_area.clone();
         let out = adw::TimedAnimation::builder()
             .widget(&target)
-            .value_from(1.0)
+            .value_from(target.opacity())
             .value_to(0.35)
             .duration(90)
             .target(&adw::PropertyAnimationTarget::new(&target, "opacity"))
             .build();
         let view = self.clone();
         out.connect_done(move |_| {
+            if view.fade_generation.get() != generation {
+                return;
+            }
             swap(&view);
             let target = view.servers_area.clone();
             adw::TimedAnimation::builder()
                 .widget(&target)
-                .value_from(0.35)
+                .value_from(target.opacity())
                 .value_to(1.0)
                 .duration(130)
                 .target(&adw::PropertyAnimationTarget::new(&target, "opacity"))
@@ -2948,7 +3032,6 @@ impl ServersView {
                         log::warn!("could not save gui prefs: {error:#}");
                     }
                 }
-                *view.saved_groups.borrow_mut() = view.prefs.borrow().groups.clone();
                 view.select_group(None);
             }
         });
@@ -2974,9 +3057,10 @@ impl ServersView {
         }
         // The chip's count changed, and if Favourites is the active scope the
         // card the user just starred has to appear or leave right now.
-        self.build_chip_bar();
         if self.active_group.borrow().as_deref() == Some(FAVOURITES_ID) {
             self.select_group(Some(FAVOURITES_ID));
+        } else {
+            self.sync_scope_bar();
         }
     }
 
@@ -3030,7 +3114,6 @@ impl ServersView {
                 log::warn!("could not save gui prefs: {error:#}");
             }
         }
-        *self.saved_groups.borrow_mut() = self.prefs.borrow().groups.clone();
         self.select_group(Some(&id));
     }
 
@@ -3123,9 +3206,17 @@ impl ServersView {
         self.apply_filter();
     }
 
-    /// Wires the "no servers yet" page's action button.
+    /// Wires the "no servers yet" page's action buttons.
     pub fn connect_browse_subscriptions(&self, callback: impl Fn() + 'static) {
         *self.on_browse_subscriptions.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    pub fn connect_import_server(&self, callback: impl Fn() + 'static) {
+        *self.on_import_server.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    pub fn connect_create_server(&self, callback: impl Fn() + 'static) {
+        *self.on_create_server.borrow_mut() = Some(Rc::new(callback));
     }
 
     fn apply_filter(&self) {
@@ -3552,25 +3643,62 @@ impl ServersView {
     fn collapse_others(&self, keep: Option<&str>) {
         let keep_position = keep.and_then(|id| self.position_of(id));
         let vadjustment = self.root.vadjustment();
-        let columns = self.columns.get();
+        let columns = self.columns.get().max(1);
         for (id, card) in self.cards.borrow().iter() {
             if Some(id.as_str()) == keep || !card.is_expanded() {
                 continue;
             }
-            let shifts_kept_card = match (self.position_of(id), keep_position) {
-                (Some(prev), Some(next)) => collapse_would_shift(prev, next, columns),
-                _ => false,
-            };
-            if shifts_kept_card {
-                let vadjustment = vadjustment.clone();
-                card.collapse(Some(Rc::new(move |delta: i32| {
-                    let value = (vadjustment.value() - f64::from(delta)).max(0.0);
-                    vadjustment.set_value(value);
-                })));
-            } else {
+            let Some((prev, next)) = self.position_of(id).zip(keep_position) else {
                 card.collapse(None);
+                continue;
+            };
+            if !collapse_would_shift(prev, next, columns) {
+                card.collapse(None);
+                continue;
             }
+            let same_block = prev.0 == next.0;
+            let (collapsing_column_height, other_columns_max_height) = if same_block {
+                (0, 0)
+            } else {
+                self.block_column_heights(prev.0, prev.1 % columns)
+            };
+            let vadjustment = vadjustment.clone();
+            let collapsing_height = Cell::new(collapsing_column_height);
+            card.collapse(Some(Rc::new(move |delta: i32| {
+                let current_column_height = collapsing_height.get();
+                collapsing_height.set((current_column_height - delta).max(0));
+                let shift = effective_collapse_delta(
+                    same_block,
+                    current_column_height,
+                    other_columns_max_height,
+                    delta,
+                );
+                if shift > 0 {
+                    let value = (vadjustment.value() - f64::from(shift)).max(0.0);
+                    vadjustment.set_value(value);
+                }
+            })));
         }
+    }
+
+    fn block_column_heights(&self, block_index: usize, column: usize) -> (i32, i32) {
+        let blocks = self.blocks.borrow();
+        let Some(block) = blocks.get(block_index) else {
+            return (0, 0);
+        };
+        let boxes = block.column_boxes.borrow();
+        let collapsing = boxes
+            .get(column)
+            .map(|column_box| column_box.allocated_height())
+            .unwrap_or(0);
+        let other_max = boxes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != column)
+            .map(|(_, column_box)| column_box.allocated_height())
+            .max()
+            .unwrap_or(0);
+        (collapsing, other_max)
     }
 
     /// (group index, index within the group's ordered visible cards).
@@ -4274,6 +4402,58 @@ fn collapse_would_shift(prev: (usize, usize), next: (usize, usize), columns: usi
     prev.0 < next.0 || (prev.0 == next.0 && prev.1 % columns == next.1 % columns && prev.1 < next.1)
 }
 
+/// How much a collapse step of `delta` pixels actually moves the kept card
+/// upward. Within the same column of the same block, the kept card sits
+/// directly below the collapsing card and moves by the full `delta`. When the
+/// collapsing card is in an earlier block, that block's `columns_box` is as
+/// tall as its tallest column, so shrinking one column moves the following
+/// blocks only by the amount that column stood above its siblings.
+fn effective_collapse_delta(
+    same_block: bool,
+    collapsing_column_height: i32,
+    other_columns_max_height: i32,
+    delta: i32,
+) -> i32 {
+    if delta <= 0 {
+        return 0;
+    }
+    if same_block || (collapsing_column_height <= 0 && other_columns_max_height <= 0) {
+        return delta;
+    }
+    let before = collapsing_column_height.max(other_columns_max_height);
+    let after = (collapsing_column_height - delta)
+        .max(0)
+        .max(other_columns_max_height);
+    (before - after).max(0)
+}
+
+/// How many leading items in `current` already match `desired` in place, so
+/// repacking a column after a filter or health-reading change can keep those
+/// widgets attached and preserve their keyboard focus and pointer state.
+fn column_repack_keep_prefix<T: PartialEq>(current: &[T], desired: &[T]) -> usize {
+    current
+        .iter()
+        .zip(desired.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn scope_toggle_name(active_group: Option<&str>) -> &str {
+    active_group.unwrap_or("")
+}
+
+fn scope_toggles_match(existing: &[ServerGroup], next: &[ServerGroup]) -> bool {
+    existing.len() == next.len()
+        && existing
+            .iter()
+            .zip(next.iter())
+            .all(|(left, right)| left.id == right.id)
+}
+
+fn next_fade_generation(current: u64) -> u64 {
+    current.wrapping_add(1)
+}
+
 /// Lay the group's visible cards out into its column boxes. Skips all widget
 /// churn when the assignment already matches, so running height animations
 /// and keyboard focus survive unrelated calls.
@@ -4331,14 +4511,37 @@ fn repack_block(block: &SubscriptionBlock, columns: usize) {
         return;
     }
 
+    let mut target_column: HashMap<&gtk::Widget, usize> = HashMap::with_capacity(ordered.len());
+    for (column, items) in desired.iter().enumerate() {
+        for &item in items {
+            target_column.insert(ordered[item], column);
+        }
+    }
     for (_, card) in &block.cards {
-        if let Some(parent) = card.parent().and_downcast::<gtk::Box>() {
+        let desired_parent = target_column
+            .get(card)
+            .map(|&column| boxes[column].upcast_ref::<gtk::Widget>());
+        if card.parent().as_ref() != desired_parent
+            && let Some(parent) = card.parent().and_downcast::<gtk::Box>()
+        {
             parent.remove(card);
         }
     }
     for (column, items) in desired.iter().enumerate() {
-        for &item in items {
-            boxes[column].append(ordered[item]);
+        let desired_widgets: Vec<&gtk::Widget> = items.iter().map(|&item| ordered[item]).collect();
+        let mut current_widgets: Vec<gtk::Widget> = Vec::new();
+        let mut child = boxes[column].first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            current_widgets.push(widget);
+        }
+        let current_refs: Vec<&gtk::Widget> = current_widgets.iter().collect();
+        let keep = column_repack_keep_prefix(&current_refs, &desired_widgets);
+        for widget in &current_widgets[keep..] {
+            boxes[column].remove(widget);
+        }
+        for &widget in &desired_widgets[keep..] {
+            boxes[column].append(widget);
         }
     }
 }
@@ -4437,6 +4640,14 @@ fn subscription_details_label(subscription_id: &str) -> &'static str {
     } else {
         "Subscription details…"
     }
+}
+
+fn empty_state_actions() -> [(&'static str, bool); 3] {
+    [
+        ("Add subscription…", true),
+        ("Import server…", false),
+        ("Create server…", false),
+    ]
 }
 
 /// The sort key a badge contributes, if any: a number, a definite failure, or
@@ -4792,6 +5003,78 @@ mod tests {
         assert_eq!(
             super::subscription_details_label("remote-sub"),
             "Subscription details…"
+        );
+    }
+
+    #[test]
+    fn first_run_empty_state_offers_subscription_import_and_creation_directly() {
+        assert_eq!(
+            super::empty_state_actions(),
+            [
+                ("Add subscription…", true),
+                ("Import server…", false),
+                ("Create server…", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_health_filtering_preserves_stable_card_prefixes_within_columns() {
+        assert_eq!(
+            super::column_repack_keep_prefix(&["a", "b", "c"], &["a", "b", "c"]),
+            3
+        );
+        assert_eq!(
+            super::column_repack_keep_prefix(&["a", "b"], &["a", "b", "d"]),
+            2
+        );
+        assert_eq!(
+            super::column_repack_keep_prefix(&["a", "c"], &["a", "b", "c"]),
+            1
+        );
+        assert_eq!(
+            super::column_repack_keep_prefix(&["b", "c"], &["a", "b", "c"]),
+            0
+        );
+    }
+
+    #[test]
+    fn collapse_scroll_compensation_follows_actual_block_displacement() {
+        // Same column in the same block always shifts by the full collapse step.
+        assert_eq!(super::effective_collapse_delta(true, 320, 600, 80), 80);
+        // Earlier block where a sibling column is taller than the collapsing column
+        // does not shrink the block at all.
+        assert_eq!(super::effective_collapse_delta(false, 320, 600, 80), 0);
+        // Earlier block where the collapsing column starts taller than its sibling
+        // and crosses below it mid-step shrinks the block only by the overhang.
+        assert_eq!(super::effective_collapse_delta(false, 450, 400, 80), 50);
+        // Earlier block where the collapsing column remains tallest shifts by the full step.
+        assert_eq!(super::effective_collapse_delta(false, 520, 400, 50), 50);
+        // Single-column earlier block shifts by the full step.
+        assert_eq!(super::effective_collapse_delta(false, 520, 0, 50), 50);
+    }
+
+    #[test]
+    fn choosing_a_group_retains_its_toggle_widget_when_group_ids_match() {
+        let mut first = super::ServerGroup::favourites();
+        let mut second = super::ServerGroup {
+            id: "de".into(),
+            name: "Germany".into(),
+            icon: "🇩🇪".into(),
+            kind: GroupKind::Rule,
+            query: oxidom_core::pool::PoolQuery::default(),
+        };
+        let existing = vec![first.clone(), second.clone()];
+        first.query.members.push("srv-1".into());
+        second.name = "DE".into();
+        let updated_in_place = vec![first.clone(), second.clone()];
+        assert!(super::scope_toggles_match(&existing, &updated_in_place));
+        assert!(!super::scope_toggles_match(&existing, &[second, first]));
+        assert_eq!(super::scope_toggle_name(None), "");
+        assert_eq!(super::scope_toggle_name(Some("de")), "de");
+        assert_ne!(
+            super::next_fade_generation(4),
+            super::next_fade_generation(5)
         );
     }
 }
