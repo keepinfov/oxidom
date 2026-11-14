@@ -328,10 +328,14 @@ def matches_cgroup(rule):
     matches = [item["match"] for item in rule["expr"] if "match" in item and "socket" in item["match"].get("left", {})]
     assert len(matches) == 1
     match = matches[0]
-    # nftables 1.1.6 omits the socket level from JSON and emits the cgroup
-    # constant as its kernel inode. The text dump below pins level/path too.
-    assert match["op"] == "==" and match["left"]["socket"] == {"key": "cgroupv2"}
-    assert number(match["right"]) == pinned_inode
+    # nftables may emit the cgroup constant either as its resolved path string
+    # or as its numeric kernel inode depending on the nftables version.
+    assert match["op"] == "==" and match["left"]["socket"].get("key") == "cgroupv2"
+    right = match["right"]
+    if isinstance(right, str) and not right.startswith(("0x", "0X")) and not right.isdecimal():
+        assert right == pinned_record["path"]
+    else:
+        assert number(right) == pinned_inode
 
 
 def nft_snapshot(blocked=False):
