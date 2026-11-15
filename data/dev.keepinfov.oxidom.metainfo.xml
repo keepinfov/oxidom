@@ -43,6 +43,38 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.6.0" date="2026-11-15">
+      <description>
+        <p>
+          Recovery and session control now report what is actually true.
+          Lifecycle, the last health check, the traffic a session protects and
+          any automatic retry are shown separately, saved profiles can
+          authorize a bounded, ordered set of standby servers, and a tunnel
+          that loses its core keeps its routes and its bound oxidom run scope
+          blocked until a confirmed replacement carries traffic. Clients stay
+          bound to the daemon they selected, and the interface verifies and
+          reloads that store before restoring control.
+        </p>
+        <p>
+          Servers and subscriptions are easier to manage in place. Subscription
+          menus move, inspect, copy or remove a subscription; group chips count
+          their matching servers; removal warnings name connections that will
+          stop; certificate pins can be trusted or removed from cards and
+          failure rows; and composite profiles have their own details view.
+          Connected sessions can copy their public egress IP on demand, HTTP
+          checks show cold-start setup beside the live round-trip, and the
+          AppImage now carries verified geo data so it starts and probes
+          offline.
+        </p>
+        <p>
+          This release changes the on-disk format of owned TUN recovery records.
+          Stop every owned TUN with this version and confirm no owned recovery
+          records remain before downgrading; older binaries can discard the
+          records needed to clean up. The installation guide describes the
+          procedure.
+        </p>
+      </description>
+    </release>
     <release version="0.5.1" date="2026-10-14">
       <description>
         <p>
