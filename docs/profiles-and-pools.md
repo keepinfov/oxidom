@@ -229,9 +229,10 @@ Explicit Stop deletes this owned TUN, unlike ordinary legacy persistent TUN disc
 any cleanup error before restarting; never erase its recovery records or downgrade around them.
 
 Accepted isolated VM runs observe list/default routing with real HTTP, explicit cleanup and
-endpoint failover/held states; [remaining P15 acceptance](testing.md#accepted-evidence-and-remaining-acceptance)
-includes scoped nft/cgroup and IPv6 evidence. Neither this mode nor status bookkeeping promises
-full-device protection, resolver containment or uninterrupted connections.
+endpoint failover/held states; [the evidence record](testing.md#accepted-evidence-and-remaining-acceptance)
+adds scoped cgroup marking and IPv6 refusal and distinguishes those finite checks from the
+remaining P15 acceptance. Neither this mode nor status bookkeeping promises full-device
+protection, resolver containment or uninterrupted connections.
 See the binding [failover specification](spec/failover.md) and
 [failure diagnosis](troubleshooting.md#failover-does-not-try-another-server).
 

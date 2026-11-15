@@ -192,8 +192,9 @@ through SOCKS are not continuous proof of packet forwarding through TUN. This re
 IPv4 capture with connected/private exceptions, no resolver rewrite and no whole-device promise.
 Accepted isolated VM runs observe real HTTP through list/default owned routing, explicit cleanup,
 and endpoint A-to-B recovery and held states. Their finite captures do not exclude a release
-between sampled endpoints. Scoped nft/cgroup enforcement, IPv6 and final P15 acceptance remain
-separate; see the [evidence record](testing.md#accepted-evidence-and-remaining-acceptance).
+between sampled endpoints. The [scoped routing check](scoped-routing-vm.md) adds cgroup marking
+and IPv6 refusal for a persistent `oxidom run` scope; final P15 acceptance remains separate and
+is recorded in the [evidence record](testing.md#accepted-evidence-and-remaining-acceptance).
 
 ## Per-process routing
 

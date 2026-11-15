@@ -4,6 +4,8 @@ The `scoped-routing` check uses two disposable Linux guests, real Xray 26.3.27,
 tun2socks and nftables. It exercises the installed CLI and system-daemon module
 with a real systemd user manager. Source readiness is separate from execution:
 the tracker and pull request must record the accepted CI head and actual result.
+The accepted head and run are recorded in the
+[evidence and remaining acceptance](testing.md#accepted-evidence-and-remaining-acceptance).
 
 The check is intended to be imported with `self`, `pkgs`, `lib` and
 `oxidom-cli`, alongside the existing x86-64 Linux routing check. Its standalone

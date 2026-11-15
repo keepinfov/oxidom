@@ -90,4 +90,6 @@ cleanup measures the intentional release boundary. No uninterrupted hold
 through daemon crash/restart is promised. A later explicit Up creates a new
 owned activation, and the fixture restores the original restart policy.
 
-The remaining scoped nft/cgroup, IPv6 and final release acceptance are separate.
+Final release acceptance is separate; the
+[scoped routing check](scoped-routing-vm.md) carries the scoped cgroup and IPv6
+observations.

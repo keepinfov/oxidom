@@ -198,13 +198,36 @@ code actually exercised; later source additions do not inherit their evidence.
   sampled states, and uninterrupted hold through daemon crash/restart is not
   promised.
 
-Scoped cgroup/nft enforcement and the enabled-IPv6 scoped controls are proposed
-in draft #267 and are not accepted evidence in this record. Final P15
-acceptance also remains outstanding; the complete P15 stage is not established
-by the merged slices above.
+- [Scoped routing #267](https://github.com/keepinfov/oxidom/pull/267),
+  merged as `c914c2d`, exercised head `c298d64` passed
+  [scoped-routing build 43709848740](https://github.com/keepinfov/oxidom/actions/runs/43709848740).
+  The [scoped routing check](scoped-routing-vm.md) observed a persistent
+  `oxidom run` user scope whose PID, unified cgroup and level-4 profile-slice
+  inode stayed fixed through core loss, explicit Down and same-scope Up. The
+  scoped actor had no effective capabilities. Marked IPv4 requests appeared in
+  the candidate's real SOCKS stream and reached the real HTTP service; the JSON
+  nftables rules matched the recorded cgroup and current mark; mark,
+  conntrack-mark and prerouting-restore counters advanced; and an output rule
+  kept a finished flow's kernel-generated reset on the tunnel side. A scoped
+  global IPv6 request was refused with no sink receipt or direct data-NIC TCP,
+  while an unscoped request and a scoped link-local request succeeded. Bounded
+  core-loss and Down windows retained the drop chain, durable record and IPv4
+  and IPv6 refusal until Up restored marking, with a live canary in both
+  captures before each operation and fresh requests still completing after the
+  stable observation; the next public teardown pruned the departed scope's
+  record and chains. Closed captures required positive IPv4/IPv6 controls,
+  zero kernel drops and no direct TCP to the scoped HTTP endpoints during the
+  recorded windows. The check did not validate packaged geo data, multicast or
+  neighbour discovery, ambient-capability removal from helper children, or mark
+  restoration during automatic A-to-B recovery on a retained interface. Its
+  reverse-path and TUN readings are not strict-filtering claims.
+
+Final P15 acceptance remains outstanding; the complete P15 stage is not
+established by the merged slices above.
 
 No accepted result here establishes universal no-leak behavior, atomic route
-transitions, packet-loss bounds, resolver containment or continuous whole-device
-protection. No uninterrupted hold through daemon crash/replacement is promised;
-direct traffic after explicit cleanup is deliberate release. The VM fixture's
-synthetic geo classification and HTTP/TCP scope remain part of its boundary.
+transitions, packet-loss bounds, UDP containment, resolver containment or
+continuous whole-device protection. No uninterrupted hold through daemon
+crash/replacement is promised; direct traffic after explicit cleanup is
+deliberate release. The VM fixtures' synthetic geo classifications and HTTP/TCP
+scope remain part of their boundary.
