@@ -115,9 +115,11 @@ including during the recorded request windows. nft drop counters and actor
 attempts provide source evidence when packets are discarded before interface
 capture.
 
-After the actor exits, its launcher and empty profile slice are stopped through
-the user manager. The next public teardown must prune the departed scope's
-record and chains. No immediate automatic pruning guarantee is inferred.
+After the actor exits, the test confirms its transient launcher has left the
+user manager and stops the empty profile slice there; a launcher the manager
+already collected is accepted rather than treated as a stop request that
+failed. The next public teardown must prune the departed scope's record and
+chains. No immediate automatic pruning guarantee is inferred.
 
 This is bounded evidence for the observed HTTP/TCP windows and recorded rules.
 It does not prove universal atomicity, packet-loss limits, all-device coverage,

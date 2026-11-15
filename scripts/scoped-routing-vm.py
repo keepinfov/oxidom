@@ -221,6 +221,20 @@ def user_systemctl(*arguments):
     return client.succeed(user_command(shlex.join(["systemctl", "--user", *arguments]))).strip()
 
 
+def user_systemctl_stop_if_loaded(unit):
+    state = user_systemctl("show", "-p", "LoadState", "--value", unit)
+    assert state in {"loaded", "not-found"}, (unit, state)
+    if state != "loaded":
+        return
+    code, output = client.execute(
+        user_command(shlex.join(["systemctl", "--user", "stop", unit])) + " 2>&1"
+    )
+    if code != 0:
+        # The manager may collect the unit between the probe and the stop.
+        state = user_systemctl("show", "-p", "LoadState", "--value", unit)
+        assert state == "not-found", output or (unit, state)
+
+
 def rpc(method, signature, *arguments):
     command = [
         "busctl", "--system", "--timeout=30", "--json=short", "call",
@@ -712,8 +726,15 @@ with subtest("explicit Down blocks a live scope before releasing its IPv4 routin
 with subtest("the next teardown prunes a scope that has actually ended"):
     assert actor("quit") == {"quitting": True}
     client.wait_until_fails("test -e /proc/" + str(pinned_actor["pid"]), timeout=15)
-    user_systemctl("stop", "p15-scoped-launcher.service")
-    user_systemctl("stop", "oxidom\\x2dscoped.slice")
+    user_systemctl_stop_if_loaded("p15-scoped-launcher.service")
+    user_systemctl_stop_if_loaded("oxidom\\x2dscoped.slice")
+    client.wait_until_succeeds(
+        user_command(shlex.join([
+            "systemctl", "--user", "show", "-p", "LoadState", "--value",
+            "p15-scoped-launcher.service",
+        ])) + " | grep -qx not-found",
+        timeout=15,
+    )
     client.wait_until_fails("test -d " + quote("/sys/fs/cgroup/" + pinned_record["path"]), timeout=15)
     cli("down", PROFILE)
     assert not any(item["profile"] == PROFILE for item in saved_state().get("run_cgroups", []))
