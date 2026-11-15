@@ -390,9 +390,8 @@ fn dns_block(dns: &ResolvedDns) -> Value {
 /// are the same two keys on all eight protocol shapes; threading them through
 /// the match would repeat the logic once per arm and let the arms drift.
 fn apply_outbound_core(outbound: &mut Value, core: &ResolvedCore) {
-    let is_hysteria = outbound.get("protocol").and_then(Value::as_str) == Some("hysteria");
     if let Some(mux) = &core.mux
-        && !is_hysteria
+        && multiplexable(outbound)
         && outbound.get("mux").is_none_or(Value::is_null)
     {
         outbound["mux"] = mux_block(mux);
@@ -404,6 +403,36 @@ fn apply_outbound_core(outbound: &mut Value, core: &ResolvedCore) {
         // so an imported profile's own sockopt keys survive.
         outbound["streamSettings"]["sockopt"]["dialerProxy"] = json!(DIALER_TAG);
     }
+}
+
+/// Whether this outbound can carry Mux.Cool at all.
+///
+/// Hysteria is QUIC, and the core's mux rides on TCP. XTLS Vision is a
+/// per-connection flow: a server hands a mux request to the Vision reader as
+/// though `v1.mux.cool` were the tunnel's own destination, and a provider's
+/// Reality/Vision node closed the connection as soon as the first request was
+/// dispatched through one. Mux is a machine-wide setting, so the exemption has
+/// to be per outbound: a profile that selects among servers cannot be asked to
+/// choose between the ones that survive multiplexing and the ones that do not.
+fn multiplexable(outbound: &Value) -> bool {
+    if outbound.get("protocol").and_then(Value::as_str) == Some("hysteria") {
+        return false;
+    }
+    // Every entry, not only the first: a composite profile imported from a
+    // provider may carry several users or servers in one outbound, and mux
+    // applies to the connection rather than to one of them.
+    let vision = |entries: Option<&Value>| {
+        entries.and_then(Value::as_array).is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("flow")
+                    .and_then(Value::as_str)
+                    .is_some_and(|flow| flow.starts_with("xtls-rprx-vision"))
+            })
+        })
+    };
+    !(vision(outbound.pointer("/settings/vnext/0/users"))
+        || vision(outbound.pointer("/settings/servers")))
 }
 
 fn mux_block(mux: &ResolvedMux) -> Value {
@@ -649,9 +678,13 @@ fn stream_settings(s: &StreamSettings) -> Value {
             }));
         }
         "grpc" => {
+            // The service name is a path segment the server matches literally.
+            // A leading slash is not decoration: a provider whose server
+            // registers `/api/v1/stream` answers `unknown service` to a client
+            // that sends `api/v1/stream`, and the tunnel dies on the first
+            // request. Pass the link's spelling through unchanged.
             v["grpcSettings"] = trim_obj(json!({
-                "serviceName": s.service_name.clone().or_else(|| s.path.clone())
-                    .map(|name| name.trim_start_matches('/').to_string()),
+                "serviceName": s.service_name.clone().or_else(|| s.path.clone()),
                 "authority": s.grpc_authority,
                 "multiMode": s.grpc_multi_mode.then_some(true)
             }));
@@ -1383,6 +1416,42 @@ mod tests {
         assert_eq!(outbounds[2]["mux"], json!(null));
     }
 
+    /// A provider's Reality/Vision node accepted the connection and then
+    /// closed it as soon as the first request came through `v1.mux.cool`; the
+    /// same node carried traffic with mux off. Since mux is machine-wide, the
+    /// exception belongs to the outbound rather than to the user.
+    #[test]
+    fn mux_is_withheld_from_a_vision_outbound() {
+        let core = from_profile(CoreOptions {
+            mux: MuxOptions {
+                enabled: Some(true),
+                ..MuxOptions::default()
+            },
+            ..CoreOptions::default()
+        });
+
+        for flow in ["xtls-rprx-vision", "xtls-rprx-vision-udp443"] {
+            let mut server = tls_vless(false, None);
+            let OutboundSpec::Vless { stream, .. } = &mut server.spec else {
+                unreachable!("tls_vless builds a VLESS server");
+            };
+            stream.flow = Some(flow.to_string());
+            let config = generate(&server, Ipv4Addr::LOCALHOST, 10808, 10809, &core);
+            assert_eq!(config["outbounds"][0]["mux"], json!(null), "{flow}");
+        }
+
+        // The exemption is the flow, not the protocol: a VLESS server without
+        // Vision still receives the machine-wide mux.
+        let config = generate(
+            &tls_vless(false, None),
+            Ipv4Addr::LOCALHOST,
+            10808,
+            10809,
+            &core,
+        );
+        assert_eq!(config["outbounds"][0]["mux"]["enabled"], json!(true));
+    }
+
     #[test]
     fn sniffing_says_route_only_just_when_it_was_asked_for() {
         let quiet = generate(
@@ -1831,9 +1900,11 @@ mod tests {
             10809,
             &ResolvedCore::default(),
         );
+        // `serviceName` is matched by the server as written. The slash belongs
+        // to the provider's service name, not to an Xray path prefix.
         assert_eq!(
             generated["outbounds"][0]["streamSettings"]["grpcSettings"],
-            json!({ "serviceName": "connect", "authority": "edge.example", "multiMode": true })
+            json!({ "serviceName": "/connect", "authority": "edge.example", "multiMode": true })
         );
 
         let httpupgrade = crate::link::parse_link(

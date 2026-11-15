@@ -179,7 +179,7 @@ does not reset the rest; `CoreOptions::resolve` folds profile over global over b
 | `domain_strategy` | `routing.domainStrategy` |
 | `sniffing.{enabled,dest_override,route_only}` | both inbounds |
 | `dns.{server,direct_server,query_strategy}` | top-level `dns`, absent unless `server` is set |
-| `mux.*` | **every** proxy outbound — in Xray this is an outbound field, so a pool carries it per member |
+| `mux.*` | **every proxy outbound that can carry Mux.Cool** — never hysteria2 and never an XTLS Vision outbound. In Xray this is an outbound field, so a pool carries it per member, and the exemption is per member too |
 | `fragment.*`, `noises` | a `freedom` outbound tagged `dialer`, plus `sockopt.dialerProxy` on every proxy outbound |
 
 Three invariants:

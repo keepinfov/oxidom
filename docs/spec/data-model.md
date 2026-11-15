@@ -158,8 +158,9 @@ by that id.
   `security` (none/tls/reality), `sni`, `pbk`, `sid`, `fp`, `flow` (xtls-rprx-vision),
   `path`, `host`, `serviceName`, `authority`, `mode`, `extra`, `alpn`, `encryption`. XHTTP preserves
   its `mode` (`auto`, `packet-up`, `stream-up`, `stream-one`) and object-valued `extra` settings
-  such as XMUx and padding; gRPC preserves `authority` and `mode=multi`, while a leading slash in
-  `serviceName` is removed only when generating Xray JSON.
+  such as XMUx and padding; gRPC preserves `authority`, `mode=multi` and the `serviceName` exactly
+  as the link spells it, including a leading slash. The server matches that name literally: it is
+  not an Xray path prefix, so removing the slash turns a working node into `unknown service`.
   Build `transport_label` like
   `"vless + xhttp + reality"`.
 - `vmess://<base64 json>` — JSON with `add/port/id/aid/net/tls/host/path/sni/scy/ps`.
