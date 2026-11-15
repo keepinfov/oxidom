@@ -111,6 +111,8 @@ all owned children even if closing X11 or D-Bus
 fails; diagnostic output is bounded and a cleanup failure retains its private
 root. An ordinary scenario failure prints its fixture logs before cleanup.
 
-This check is part of tracker #216 P14. It does not complete the remaining
-cross-boundary fault matrix or the P15 disposable-VM packet-path tests, and does
-not demonstrate real Xray forwarding, no-leak behavior or continuous protection.
+This check is part of tracker #216 P14. Its accepted #261 CI head and run are
+recorded with the separate merged VM slices in the
+[acceptance record](testing.md#accepted-evidence-and-remaining-acceptance).
+The GUI fixture does not demonstrate real Xray forwarding, no-leak behavior or
+continuous protection; remaining P15 acceptance is separate.

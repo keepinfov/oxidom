@@ -102,7 +102,9 @@ not unrestricted TUN failover. Effective hold, supported literal IPv4 candidates
 routing and exclusive TUN admission are required. Expanded session details show the activation
 grant, exact ordered IDs, current/next candidate, episode budget and cooldown separately from
 saved configuration. Missing/unknown progress never establishes disabled policy. Required
-P14/P15 validation and VM evidence are not implied by status presentation.
+P14/P15 validation and VM evidence are not implied by status presentation. Accepted GUI and
+separate finite VM observations are recorded in
+[testing](../testing.md#accepted-evidence-and-remaining-acceptance).
 
 Profiles, header, sidebar and tray share a pure presentation of independent runtime dimensions.
 Phase is stopped, starting, verifying, running or failed. Running is accepted lifecycle state,

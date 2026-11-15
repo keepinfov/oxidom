@@ -84,8 +84,10 @@ effective hold, supported literal unicast IPv4 candidates, no custom profile rou
 other configured TUN. Proxy-only sessions may coexist. Expanded session details show the
 activation grant, ordered IDs, current/next candidate, consumed attempts, budget and cooldown.
 These can differ from the saved policy after revocation; missing progress means unreported.
-P14/P15 validation remains required and no VM
-packet-path or leak measurement is claimed.
+Accepted CI covers selected-store GUI recovery and a bounded real AT-SPI tree observation,
+plus separate VM routing and endpoint fault observations. See the
+[evidence and remaining acceptance](testing.md#accepted-evidence-and-remaining-acceptance);
+status presentation alone establishes no packet-path guarantee.
 
 Owned TUN holds remain through alternate starts, exhaustion, revocation and removal of the
 current catalog member. Stop removes that owned device after qualified cleanup, unlike legacy

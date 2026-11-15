@@ -108,9 +108,10 @@ and identifiable orphans before explicit replacement cleanup. Its helper exec
 observer is an offline guest-administrator fixture; public binary-path guards
 remain in force.
 
-The cumulative check does not establish scoped cgroup/nft enforcement, IPv6
-containment, packet-loss bounds or continuous/whole-device protection. The
-daemon restart contract cleans non-pool owned TUN records; direct traffic after
-that explicit recovery is deliberate release, and no uninterrupted hold through
-daemon crash/restart is claimed. Remaining P15 cases and final release acceptance
-need separate evidence and recorded CI results.
+The cumulative check does not establish packet-loss bounds or
+continuous/whole-device protection. Scoped cgroup marking and IPv6 refusal are
+the separate [scoped routing check](scoped-routing-vm.md). The daemon restart
+contract cleans non-pool owned TUN records; direct traffic after that explicit
+recovery is deliberate release, and no uninterrupted hold through daemon
+crash/restart is claimed. Remaining P15 cases and final release acceptance need
+separate evidence and recorded CI results.

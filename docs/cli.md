@@ -305,7 +305,8 @@ the latest saved primary, ports, routing and core options.
 See [Sequential failover](profiles-and-pools.md#sequential-failover). TUN still requires effective
 hold, supported literal IPv4 endpoints, an exclusive interface and a fixed routing envelope.
 Unsupported endpoints fail explicitly. Owned recovery requires new-binary cleanup before
-downgrade; isolated routing evidence remains P15.
+downgrade; the [acceptance record](testing.md#accepted-evidence-and-remaining-acceptance) distinguishes
+accepted isolated routing/fault observations from remaining P15 validation.
 
 `STATE` reads `direct` for active standby service on the configured local ports.
 It has no remote server, tunnel latency or interface, and does not own the system

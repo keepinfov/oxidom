@@ -87,8 +87,9 @@ bounded helper exec observer only while all sessions and the daemon are stopped;
 ordinary clients retain the public binary-path guard.
 
 The cumulative check covers those recorded HTTP/TCP windows and checkpoints.
-It does not establish scoped nft/cgroup enforcement, IPv6 containment,
-packet-loss bounds, continuous or whole-device protection, or uninterrupted hold
-through daemon crash/restart. Direct traffic after explicit cleanup is an
-intentional release boundary. The remaining P15 cases and final release
-acceptance require separate evidence and recorded CI results.
+It does not establish packet-loss bounds, continuous or whole-device protection,
+or uninterrupted hold through daemon crash/restart. Scoped cgroup marking and
+IPv6 refusal are the separate [scoped routing check](scoped-routing-vm.md).
+Direct traffic after explicit cleanup is an intentional release boundary. The
+remaining P15 cases and final release acceptance require separate evidence and
+recorded CI results.

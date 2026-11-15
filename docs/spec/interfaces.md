@@ -132,5 +132,9 @@ explicit teardown. Local failure disarms recovery while retaining the hold. Neit
 process observation nor HTTP through SOCKS continuously proves TUN forwarding. Protection is only
 the configured IPv4 route/cgroup scope, not all device traffic or DNS/IPv6 containment.
 
-Source implementation does not mark P12 complete. P14/P15 validation remains required; no VM
-packet-path, crash-recovery or leak measurement is established by this contract text.
+The [acceptance record](../testing.md#accepted-evidence-and-remaining-acceptance) identifies accepted
+isolated VM observations for list/default routing, real HTTP, explicit cleanup and endpoint
+failover/hold states. This contract text does not establish uninterrupted transition or daemon
+crash/replacement hold. Scoped cgroup marking and IPv6 refusal are accepted for their recorded
+HTTP/TCP windows; automatic A-to-B mark restoration on a retained interface and final P15
+acceptance remain separate.

@@ -148,3 +148,86 @@ Those responses do not demonstrate forwarding, no-leak behavior, continuous
 protection or interoperability with a real Xray release. Tracker #216 records
 which P15 cases have actually run and the accepted CI head; adding a check is
 not evidence of its execution or completion of that stage.
+
+## Accepted evidence and remaining acceptance
+
+The following merged slices have accepted CI results. The heads identify the
+code actually exercised; later source additions do not inherit their evidence.
+
+- [P14 process/GUI slice #261](https://github.com/keepinfov/oxidom/pull/261),
+  head `cdee957bfc51b7eb44a7e320e74d223feb642917`, passed
+  [Nix/GTK/AT run 41495597588](https://github.com/keepinfov/oxidom/actions/runs/41495597588).
+  The [GUI smoke](gui-smoke.md) observed startup main-window mapping,
+  selected-store owner recovery and resumed polling, a real AT-SPI bridge/tree,
+  navigation dispatch, hide/reactivate and Quit preserving the daemon/session.
+  The accessibility observation is a pre-fault main-window tree and fixture
+  label; it does not establish recovery announcements, focus order, visual
+  geometry or full accessibility conformance. Its fake core does not establish
+  real Xray forwarding.
+- [Routing foundation #262](https://github.com/keepinfov/oxidom/pull/262),
+  head `cc84ceb5968eefcc6b3fd34e530d215e6012ae9b`, passed
+  [Nix run 41747002983](https://github.com/keepinfov/oxidom/actions/runs/41747002983).
+  The [foundation](routing-vm.md) observed `list` and `default` owned routing,
+  real HTTP through candidate A, qualified device/route/rule identity and
+  candidate bypasses, then explicit process/resource cleanup and deliberate
+  direct release. Positive canary bytes in a finite capture accompany the
+  absence of direct TCP to the fixture HTTP sink.
+- [Real-core faults #263](https://github.com/keepinfov/oxidom/pull/263),
+  head `ae2c43cd0d4243654b5e2ff5b970395f3679029c`, passed
+  [Nix run 41812043075](https://github.com/keepinfov/oxidom/actions/runs/41812043075).
+  The [endpoint scenarios](routing-vm-faults.md) observed real A-to-B recovery,
+  finite held exhaustion, revocation across its cooldown deadline, an
+  independent proxy-only peer and SIGTERM cleanup before explicit restart.
+  Closed captures required positive controls and zero kernel drops. These
+  finite HTTP/TCP captures and endpoint snapshots do not exclude a brief
+  release between sampled states.
+
+- [Recovery continuation #264](https://github.com/keepinfov/oxidom/pull/264),
+  merged as `fb06e59`, exercised head `5468b2d` passed
+  [routing-faults build 43610231920](https://github.com/keepinfov/oxidom/actions/runs/43610231920).
+  The [recovery continuation](routing-vm-recovery.md) observed a fresh-socket
+  A-to-B transition with the same owned plan and helper, one durable real
+  helper replacement followed by repeated-failure disarming with no third
+  admission, qualified foreign-resource preservation and dirty-alias cleanup
+  retry, and a daemon SIGKILL whose live orphan forwarded before explicit
+  replacement cleanup. Closed captures required positive controls and exact
+  zero kernel drops. The head above includes the capture-ring fix merged as
+  `6a14b9a`: #264 merged while its own VM run still failed on the helper
+  window's dropped packets, so that earlier run is not the accepted
+  observation. Endpoint snapshots do not exclude a brief release between
+  sampled states, and uninterrupted hold through daemon crash/restart is not
+  promised.
+
+- [Scoped routing #267](https://github.com/keepinfov/oxidom/pull/267),
+  merged as `c914c2d`, exercised head `c298d64` passed
+  [scoped-routing build 43709848740](https://github.com/keepinfov/oxidom/actions/runs/43709848740).
+  The [scoped routing check](scoped-routing-vm.md) observed a persistent
+  `oxidom run` user scope whose PID, unified cgroup and level-4 profile-slice
+  inode stayed fixed through core loss, explicit Down and same-scope Up. The
+  scoped actor had no effective capabilities. Marked IPv4 requests appeared in
+  the candidate's real SOCKS stream and reached the real HTTP service; the JSON
+  nftables rules matched the recorded cgroup and current mark; mark,
+  conntrack-mark and prerouting-restore counters advanced; and an output rule
+  kept a finished flow's kernel-generated reset on the tunnel side. A scoped
+  global IPv6 request was refused with no sink receipt or direct data-NIC TCP,
+  while an unscoped request and a scoped link-local request succeeded. Bounded
+  core-loss and Down windows retained the drop chain, durable record and IPv4
+  and IPv6 refusal until Up restored marking, with a live canary in both
+  captures before each operation and fresh requests still completing after the
+  stable observation; the next public teardown pruned the departed scope's
+  record and chains. Closed captures required positive IPv4/IPv6 controls,
+  zero kernel drops and no direct TCP to the scoped HTTP endpoints during the
+  recorded windows. The check did not validate packaged geo data, multicast or
+  neighbour discovery, ambient-capability removal from helper children, or mark
+  restoration during automatic A-to-B recovery on a retained interface. Its
+  reverse-path and TUN readings are not strict-filtering claims.
+
+Final P15 acceptance remains outstanding; the complete P15 stage is not
+established by the merged slices above.
+
+No accepted result here establishes universal no-leak behavior, atomic route
+transitions, packet-loss bounds, UDP containment, resolver containment or
+continuous whole-device protection. No uninterrupted hold through daemon
+crash/replacement is promised; direct traffic after explicit cleanup is
+deliberate release. The VM fixtures' synthetic geo classifications and HTTP/TCP
+scope remain part of their boundary.
