@@ -177,12 +177,25 @@ code actually exercised; later source additions do not inherit their evidence.
   finite HTTP/TCP captures and endpoint snapshots do not exclude a brief
   release between sampled states.
 
-The proposed recovery continuation in
-[draft #264](https://github.com/keepinfov/oxidom/pull/264) is not accepted
-evidence in this record. Active transition traffic, real helper restoration,
-foreign-resource/dirty-cleanup cases and daemon SIGKILL recovery need their own
-accepted observations. Scoped nft/cgroup enforcement, IPv6 and final P15
-acceptance also remain outstanding; the complete P15 stage is not established
+- [Recovery continuation #264](https://github.com/keepinfov/oxidom/pull/264),
+  merged as `fb06e59`, exercised head `5468b2d` passed
+  [routing-faults build 43610231920](https://github.com/keepinfov/oxidom/actions/runs/43610231920).
+  The [recovery continuation](routing-vm-recovery.md) observed a fresh-socket
+  A-to-B transition with the same owned plan and helper, one durable real
+  helper replacement followed by repeated-failure disarming with no third
+  admission, qualified foreign-resource preservation and dirty-alias cleanup
+  retry, and a daemon SIGKILL whose live orphan forwarded before explicit
+  replacement cleanup. Closed captures required positive controls and exact
+  zero kernel drops. The head above includes the capture-ring fix merged as
+  `6a14b9a`: #264 merged while its own VM run still failed on the helper
+  window's dropped packets, so that earlier run is not the accepted
+  observation. Endpoint snapshots do not exclude a brief release between
+  sampled states, and uninterrupted hold through daemon crash/restart is not
+  promised.
+
+Scoped cgroup/nft enforcement and the enabled-IPv6 scoped controls are proposed
+in draft #267 and are not accepted evidence in this record. Final P15
+acceptance also remains outstanding; the complete P15 stage is not established
 by the merged slices above.
 
 No accepted result here establishes universal no-leak behavior, atomic route
