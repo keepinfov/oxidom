@@ -177,6 +177,9 @@
             routing-faults = import ./nix/checks/routing-faults.nix {
               inherit self pkgs lib oxidom-cli;
             };
+            scoped-routing = import ./nix/checks/scoped-routing.nix {
+              inherit self pkgs lib oxidom-cli;
+            };
           };
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [pkg-config wrapGAppsHook4];

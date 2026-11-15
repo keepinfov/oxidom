@@ -136,6 +136,7 @@ pub fn install_ruleset(profile: &str, slice: &CgroupSlice, mark: u32) -> Result<
     let restore = restore_chain_name(profile)?;
     let comment = quote(&format!("oxidom profile {profile}"))?;
     let ipv6 = quote(&format!("oxidom profile {profile}: IPv6 is not tunnelled"))?;
+    let connection = quote(&format!("oxidom profile {profile}: connection mark"))?;
     let net = format!(
         "socket cgroupv2 level {} {}",
         slice.level,
@@ -149,6 +150,7 @@ pub fn install_ruleset(profile: &str, slice: &CgroupSlice, mark: u32) -> Result<
          add rule inet oxidom {chain} {net} ip6 daddr fe80::/10 counter accept comment {ipv6}\n\
          add rule inet oxidom {chain} {net} ip6 daddr ff00::/8 counter accept comment {ipv6}\n\
          add rule inet oxidom {chain} {net} meta nfproto ipv6 counter reject comment {ipv6}\n\
+         add rule inet oxidom {chain} ct mark {mark:#x} counter meta mark set {mark:#x} comment {connection}\n\
          add chain inet oxidom {restore} {{ type filter hook prerouting priority mangle; policy accept; }}\n\
          flush chain inet oxidom {restore}\n\
          add rule inet oxidom {restore} ct mark {mark:#x} counter meta mark set {mark:#x} comment {comment}\n"
@@ -219,6 +221,8 @@ mod tests {
              add rule inet oxidom profile_work socket cgroupv2 level 4 \
              \"user.slice/user-1000.slice/user@1000.service/oxidom\\x2dwork.slice\" meta nfproto ipv6 \
              counter reject comment \"oxidom profile work: IPv6 is not tunnelled\"\n\
+             add rule inet oxidom profile_work ct mark 0x6f21 counter meta mark set 0x6f21 comment \
+             \"oxidom profile work: connection mark\"\n\
              add chain inet oxidom restore_work { type filter hook prerouting priority mangle; policy accept; }\n\
              flush chain inet oxidom restore_work\n\
              add rule inet oxidom restore_work ct mark 0x6f21 counter meta mark set 0x6f21 comment \
@@ -231,6 +235,29 @@ mod tests {
             1,
             "exactly one rule may assign the mark"
         );
+    }
+
+    /// A reset generated for a flow whose socket has gone has no cgroup to
+    /// match. The conntrack mark is the only identity left, and restoring it
+    /// is what keeps that reset on the tunnel side instead of the ordinary
+    /// route.
+    #[test]
+    fn kernel_generated_packets_keep_this_profiles_mark() {
+        let slice = crate::run::user_slice("work", 1000).unwrap();
+        let ruleset = install_ruleset("work", &slice, 0x6f21).unwrap();
+        assert!(
+            ruleset.contains(
+                "profile_work ct mark 0x6f21 counter meta mark set 0x6f21 comment \
+                 \"oxidom profile work: connection mark\""
+            ),
+            "{ruleset}"
+        );
+        assert_eq!(
+            ruleset.matches("ct mark set 0x6f21").count(),
+            1,
+            "only the cgroup rule assigns the conntrack mark"
+        );
+        assert!(!ruleset.contains("meta mark set ct mark"), "{ruleset}");
     }
 
     #[test]
