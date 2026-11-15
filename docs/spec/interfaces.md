@@ -61,9 +61,11 @@ the daemon's own signal handler, and anything that leaks is reaped on the next s
   is worse than the release this holding prevents.
 - Per-process routing uses a transient `systemd --user` scope below
   `oxidom-<profile>.slice`. The daemon atomically owns one `socket cgroupv2` mark rule per session
-  in `table inet oxidom`; the CLI verifies `/proc/self/cgroup` inside the scope before `exec`.
-  Cleanup removes the profile chain before taking down its routing domain, so traffic is never
-  silently released onto the ordinary default route.
+  in `table inet oxidom`, plus an output rule restoring the profile's exact conntrack mark on
+  packets whose socket no longer exists (a reset for a closed flow). The CLI verifies
+  `/proc/self/cgroup` inside the scope before `exec`. Cleanup removes the profile chain before
+  taking down its routing domain, so traffic is never silently released onto the ordinary default
+  route.
 - **IPv6 is not tunnelled, and a marked cgroup cannot reach it (binding).** The fwmark rule and
   the private table are IPv4: `plan_routes` plans `Ipv4Addr` routes and `Net::rule_add` adds a
   `.v4()` rule, so an IPv6 packet from a marked cgroup would keep its mark and be routed by the

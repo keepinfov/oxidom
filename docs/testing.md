@@ -108,13 +108,14 @@ build job checks access to `/dev/kvm` and the KVM API before running the single
 job rather than skipping the routing check. The existing CLI/GUI, module and
 GTK/AT checks remain in the same invocation and reuse their package derivations.
 
-On a disposable `x86_64-linux` KVM builder, run just this check with:
+On a disposable `x86_64-linux` KVM builder, run just these checks with:
 
 ```sh
 nix build .#checks.x86_64-linux.routing-faults --print-build-logs
+nix build .#checks.x86_64-linux.scoped-routing --print-build-logs
 ```
 
-The same VM driver runs the [routing foundation](routing-vm.md) before the
+The first VM driver runs the [routing foundation](routing-vm.md) before the
 [real-core fault scenarios](routing-vm-faults.md), then the
 [transition and recovery scenarios](routing-vm-recovery.md). The endpoint fault
 scenarios observe A-to-B recovery, exhausted and revoked held endpoints,
@@ -129,12 +130,16 @@ verify the initial helper and replacement. The guest administrator installs its
 configuration with all sessions and the daemon stopped, preserving the public
 binary-path guard.
 
+The second VM driver runs the [scoped routing check](scoped-routing-vm.md),
+exercising a persistent `oxidom run` user scope, cgroup nftables marking and
+IPv6 refusal, core-loss and Down request windows, same-scope Up recovery, and
+departed-scope pruning.
+
 These assertions cover the recorded HTTP/TCP windows and checkpoints. They do
-not establish scoped nft/cgroup enforcement, IPv6 containment, packet-loss
-bounds, continuous or whole-device protection, or uninterrupted hold across
-daemon crash/restart. Direct traffic after explicit cleanup measures deliberate
-release. The remaining P15 cases and final release acceptance require separate
-evidence.
+not establish packet-loss bounds, continuous or whole-device protection, or
+uninterrupted hold across daemon crash/restart. Direct traffic after explicit
+cleanup measures deliberate release. Final release acceptance requires recorded
+CI results.
 
 This routing gate is not exposed on the other flake platforms, so its results do
 not establish cross-platform support. Its documented packet-path assertions are
