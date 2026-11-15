@@ -274,6 +274,12 @@ applies it to every member. Note that holding one connection open works against
 spreading activity across exit addresses, which is the reason pools exist — think
 before combining the two.
 
+An XTLS Vision outbound and a hysteria2 outbound are never multiplexed, even
+when this is on. Hysteria is QUIC and has no Mux.Cool; a Vision server treats
+`v1.mux.cool` as the vision stream's own destination and closes the connection
+on the first request. Because the setting is machine-wide, oxidom withholds it
+from those outbounds instead of making every Vision profile unusable.
+
 ### `[core.fragment]` and `noises`
 
 Splits the TLS hello across packets, and optionally sends decoy traffic. This is
