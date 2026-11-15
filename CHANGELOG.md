@@ -12,7 +12,7 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
-## [Unreleased]
+## [0.6.0] - 2026-11-15
 
 ### Added
 - **Expanded connected sessions check and copy their public egress IP on demand.** Expanding a connected row on the Profiles page shows an **Egress IP** line with a check/refresh button that queries the tunnel's public address through the daemon (`EgressAddress` on D-Bus) without background polling, offers a one-click copy button once resolved, and clears the cached display when the session disconnects or switches servers.
