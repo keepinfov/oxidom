@@ -83,7 +83,10 @@ Fresh IPv4 sockets from the scope must appear inside the expected candidate's
 real SOCKS TCP stream and reach the real HTTP service. Ordinary IPv4 controls
 demonstrate the independent direct path. The actual JSON nftables rules must
 match the recorded cgroup and current mark; mark, conntrack-mark and prerouting
-restore counters must advance with the scoped request.
+restore counters must advance with the scoped request. The profile chain also
+carries a rule that restores the same exact conntrack mark on output, so a
+kernel-generated reset for a flow whose socket has gone still leaves through
+the tunnel instead of the ordinary route.
 
 An unscoped global IPv6 request succeeds. The same scoped request must fail,
 advance the profile's IPv6 reject counter and produce neither a sink receipt

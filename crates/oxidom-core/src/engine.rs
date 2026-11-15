@@ -5674,6 +5674,7 @@ add rule inet oxidom profile_work socket cgroupv2 level 4 "user.slice/user-1000.
 add rule inet oxidom profile_work socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/oxidom\x2dwork.slice" ip6 daddr fe80::/10 counter accept comment "oxidom profile work: IPv6 is not tunnelled"
 add rule inet oxidom profile_work socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/oxidom\x2dwork.slice" ip6 daddr ff00::/8 counter accept comment "oxidom profile work: IPv6 is not tunnelled"
 add rule inet oxidom profile_work socket cgroupv2 level 4 "user.slice/user-1000.slice/user@1000.service/oxidom\x2dwork.slice" meta nfproto ipv6 counter reject comment "oxidom profile work: IPv6 is not tunnelled"
+add rule inet oxidom profile_work ct mark 0x6f21 counter meta mark set 0x6f21 comment "oxidom profile work: connection mark"
 add chain inet oxidom restore_work { type filter hook prerouting priority mangle; policy accept; }
 flush chain inet oxidom restore_work
 add rule inet oxidom restore_work ct mark 0x6f21 counter meta mark set 0x6f21 comment "oxidom profile work"

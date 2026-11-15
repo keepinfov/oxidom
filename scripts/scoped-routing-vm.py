@@ -52,13 +52,24 @@ def request(host, path, family=4, timeout=2.0):
         connection.connect(address)
         connection.sendall(("GET " + path + " HTTP/1.1\r\nHost: " + authority + "\r\nConnection: close\r\n\r\n").encode())
         response = bytearray()
-        while True:
+        while b"\r\n\r\n" not in response:
             chunk = connection.recv(4096)
-            if not chunk:
-                break
+            assert chunk
             response.extend(chunk)
             assert len(response) <= 32768
         headers, body = bytes(response).split(b"\r\n\r\n", 1)
+        lengths = [
+            line.split(b":", 1)[1].strip()
+            for line in headers.split(b"\r\n")
+            if line.lower().startswith(b"content-length:")
+        ]
+        assert len(lengths) == 1
+        length = int(lengths[0])
+        while len(body) < length:
+            chunk = connection.recv(4096)
+            assert chunk
+            body += chunk
+        assert len(body) == length
         assert headers.split(b"\r\n", 1)[0] == b"HTTP/1.1 200 OK"
         value = json.loads(body)
         assert value["path"] == path
@@ -346,20 +357,31 @@ def nft_snapshot(blocked=False):
     assert chains["profile_scoped"]["type"] == "route" and chains["profile_scoped"]["hook"] == "output"
     assert chains["restore_scoped"]["type"] == "filter" and chains["restore_scoped"]["hook"] == "prerouting"
     assert number(chains["profile_scoped"]["prio"]) == -150 and number(chains["restore_scoped"]["prio"]) == -150
+    cgroup_rules = []
+    connection_rules = []
     for rule in output:
-        matches_cgroup(rule)
+        if any("match" in item and "socket" in item["match"].get("left", {}) for item in rule["expr"]):
+            matches_cgroup(rule)
+            cgroup_rules.append(rule)
+        else:
+            connection_rules.append(rule)
     rendered = client.succeed("nft list chain inet oxidom profile_scoped")
     selectors = [line for line in rendered.splitlines() if "socket cgroupv2" in line]
-    assert len(selectors) == len(output)
+    assert len(selectors) == len(cgroup_rules)
     expected_selector = 'socket cgroupv2 level 4 "' + pinned_record["path"] + '"'
     assert all(expected_selector in line for line in selectors)
     if blocked:
-        assert len(output) == 1 and not restore
-        assert any("drop" in item for item in output[0]["expr"])
-        assert not any("mangle" in item for item in output[0]["expr"])
-        return {"drop": rule_counter(output[0])}
-    assert len(output) == 4 and len(restore) == 1
+        assert len(cgroup_rules) == 1 and not connection_rules and not restore
+        assert any("drop" in item for item in cgroup_rules[0]["expr"])
+        assert not any("mangle" in item for item in cgroup_rules[0]["expr"])
+        return {"drop": rule_counter(cgroup_rules[0])}
+    assert len(cgroup_rules) == 4 and len(connection_rules) == 1 and len(restore) == 1
     mark = state_session()["interface"]["mark"]
+    connection = connection_rules[0]
+    connection_matches = [item["match"] for item in connection["expr"] if "match" in item]
+    assert connection_matches == [{"op": "==", "left": {"ct": {"key": "mark"}}, "right": mark}]
+    connection_marks = [item["mangle"] for item in connection["expr"] if "mangle" in item]
+    assert connection_marks == [{"key": {"meta": {"key": "mark"}}, "value": mark}]
     marks = [item["mangle"] for item in output[0]["expr"] if "mangle" in item]
     assert len(marks) == 2
     assert marks[0]["key"] == {"meta": {"key": "mark"}} and number(marks[0]["value"]) == mark
@@ -374,8 +396,9 @@ def nft_snapshot(blocked=False):
     restore_marks = [item["mangle"] for item in restore[0]["expr"] if "mangle" in item]
     assert restore_marks == [{"key": {"meta": {"key": "mark"}}, "value": mark}]
     return {
-        "mark": rule_counter(output[0]), "link_local": rule_counter(output[1]),
-        "reject": rule_counter(output[3]), "restore": rule_counter(restore[0]),
+        "mark": rule_counter(cgroup_rules[0]), "link_local": rule_counter(cgroup_rules[1]),
+        "reject": rule_counter(cgroup_rules[3]), "restore": rule_counter(restore[0]),
+        "connection": rule_counter(connection),
     }
 
 
@@ -384,7 +407,10 @@ def start_capture(label):
     for suffix, device in [("nic", "eth1"), ("all", "any")]:
         unit = "p15-scoped-cap-" + label + "-" + suffix
         path = "/var/tmp/" + unit + ".pcap"
-        command = ["tcpdump", "--immediate-mode", "-i", device, "-s", "0", "-U", "-w", path, "tcp"]
+        command = [
+            "tcpdump", "--immediate-mode", "-i", device, "-B", "16384",
+            "-s", "0", "-U", "-w", path, "tcp",
+        ]
         definition = "\n".join([
             "[Unit]", "Description=Private P15 scoped capture",
             "[Service]", "Type=exec", "KillSignal=SIGINT", "TimeoutStopSec=10",
@@ -447,14 +473,20 @@ def finish_capture(captures, controls, candidate_markers=()):
     for unit, _path in captures.values():
         client.succeed("systemctl stop " + unit)
         assert client.succeed("systemctl show -p ExecMainStatus --value " + unit).strip() == "0"
-        assert fault_capture_reports_zero_kernel_drops(client.succeed("journalctl -u " + unit + " --no-pager"))
+        journal = client.succeed("journalctl -u " + unit + " --no-pager")
+        assert fault_capture_reports_zero_kernel_drops(journal), journal
+        statistics = [line for line in journal.splitlines() if line.partition(" ")[0].isdecimal() and " packets " in line]
+        print("Scoped routing capture statistics: " + unit + " " + json.dumps(statistics))
     for _unit, path in captures.values():
         for address, marker in [*controls, *candidate_markers]:
             port = 1080 if address in CANDIDATES else 18080
             assert marker in capture_read(path, "dst host " + address + " and dst port " + str(port), ascii_payload=True)
     nic = captures["nic"][1]
     for address in [SINK4, SINK6, CANDIDATES[0]]:
-        assert not capture_read(nic, "dst host " + address + " and dst port 18080").strip(), "direct scoped HTTP escaped on the data NIC"
+        expression = "dst host " + address + " and dst port 18080"
+        escaped = capture_read(nic, expression).strip()
+        print("Scoped data-NIC check " + address + ": " + repr(escaped))
+        assert not escaped, "direct scoped HTTP escaped on the data NIC: " + escaped
 
 
 def scoped_success(host, path, family=4):
