@@ -88,8 +88,10 @@ ordinary clients retain the public binary-path guard.
 
 The cumulative check covers those recorded HTTP/TCP windows and checkpoints.
 It does not establish packet-loss bounds, continuous or whole-device protection,
-or uninterrupted hold through daemon crash/restart. Scoped cgroup marking and
-IPv6 refusal are the separate [scoped routing check](scoped-routing-vm.md).
-Direct traffic after explicit cleanup is an intentional release boundary. The
-remaining P15 cases and final release acceptance require separate evidence and
-recorded CI results.
+or uninterrupted hold through daemon crash/restart. Scoped cgroup marking,
+IPv6 refusal and automatic A-to-B recovery are the separate
+[scoped routing check](scoped-routing-vm.md). Direct traffic after explicit
+cleanup is an intentional release boundary. The boundaries above remain
+outside the recorded finite observations; the accepted runs and their limits
+are in the
+[evidence record](testing.md#accepted-evidence-and-remaining-acceptance).

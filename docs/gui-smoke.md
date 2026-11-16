@@ -115,4 +115,4 @@ This check is part of tracker #216 P14. Its accepted #261 CI head and run are
 recorded with the separate merged VM slices in the
 [acceptance record](testing.md#accepted-evidence-and-remaining-acceptance).
 The GUI fixture does not demonstrate real Xray forwarding, no-leak behavior or
-continuous protection; remaining P15 acceptance is separate.
+continuous protection; those remain outside the recorded evidence.

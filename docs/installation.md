@@ -451,7 +451,7 @@ Never downgrade while any owned recovery record remains. Do not delete state, st
 or let an old writer "migrate" it. If cleanup cannot complete, retain the new binary and diagnose
 the [blocked recovery](troubleshooting.md#owned-tun-recovery-is-blocked). Package installation,
 service restart and source support do not substitute for packet-path evidence. Accepted isolated
-VM routing/fault observations and remaining P15 boundaries are recorded in
+VM routing/fault observations and their boundaries are recorded in
 [testing](testing.md#accepted-evidence-and-remaining-acceptance); they do not relax this downgrade
 procedure or promise uninterrupted hold through daemon crash/replacement.
 

@@ -59,7 +59,7 @@ candidates, no custom profile routing, exclusive TUN admission and qualified rec
 Proxy-only sessions may coexist with that TUN. Its hold and plan survive switches, exhaustion,
 revocation and current-member removal; explicit Stop deletes its owned device, unlike a legacy
 persistent TUN. Dirty cleanup must be resolved before reuse. Accepted finite VM routing and
-endpoint fault observations, and remaining P15 boundaries, are recorded in
+endpoint fault observations and their boundaries are recorded in
 [testing](../testing.md#accepted-evidence-and-remaining-acceptance); source alone is not acceptance.
 Explicit CLI/GUI
 controls and their compatibility boundary are specified in

@@ -134,4 +134,5 @@ chains. No immediate automatic pruning guarantee is inferred.
 This is bounded evidence for the observed HTTP/TCP windows and recorded rules.
 It does not prove universal atomicity, packet-loss limits, all-device coverage,
 UDP containment, helper restoration, foreign-resource cleanup or uninterrupted
-protection through daemon SIGKILL/restart. Those require their own P15 evidence.
+protection through daemon SIGKILL/restart. Those remain outside this check's
+recorded observations.
