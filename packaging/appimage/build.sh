@@ -163,3 +163,142 @@ JSON
 mkdir -p "$work/empty-home"
 HOME="$work/empty-home" XRAY_LOCATION_ASSET="$APPDIR/share/xray" \
     "$work/xray" run -test -c "$work/geo-probe.json"
+
+# Loading the lists is not the same as the client showing they loaded. The first
+# window is assembled from daemon-side facts, and a core that cannot load the
+# bundled lists replaces it with a warning, so the screen a user meets is the
+# only end-to-end evidence. Xvfb and a private session bus reach that screen
+# without a desktop; a build host lacking them skips the check rather than
+# failing the bundle for a missing test dependency.
+if command -v xvfb-run >/dev/null && command -v dbus-daemon >/dev/null && command -v gdbus >/dev/null; then
+    echo "== the first GUI state reports usable geo data =="
+    # sockaddr_un holds 108 bytes. $TMPDIR on a CI runner is long enough that
+    # the bus socket below it would no longer fit, so pin the root under /tmp.
+    smoke=$(mktemp -d /tmp/oxidom-appimage-smoke.XXXXXX)
+    gui_pid=
+    bus_pid=
+    cleanup_smoke() {
+        kill "$gui_pid" "$bus_pid" 2>/dev/null || true
+        rm -rf "$work" "$smoke"
+    }
+    trap cleanup_smoke EXIT
+
+    mkdir -p "$smoke/home" "$smoke/run"
+    chmod 700 "$smoke/run"
+    # One socket, external auth, and the ordinary session policy. No system bus
+    # is reachable below, so the only daemon that can own the name here is the
+    # one the client under test spawns.
+    cat > "$smoke/bus.conf" <<BUS
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=$smoke/bus</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+BUS
+    bus_pid=$(dbus-daemon --config-file="$smoke/bus.conf" --fork --print-pid)
+    i=0
+    while [ "$i" -lt 100 ]; do
+        [ -S "$smoke/bus" ] && break
+        sleep 0.1
+        i=$((i + 1))
+    done
+    [ -S "$smoke/bus" ] || { echo "error: the private session bus did not start" >&2; exit 1; }
+
+    # xvfb-run owns a shell of its own, and $! names that shell rather than the
+    # application beneath it. Record the PID after `exec`, so cleanup stops the
+    # client and not a wrapper that has already gone.
+    cat > "$smoke/run-gui" <<'SH'
+#!/bin/sh
+echo "$$" > "$OXIDOM_SMOKE_PIDFILE"
+exec "$@"
+SH
+    chmod +x "$smoke/run-gui"
+
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$smoke/bus"
+    export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$smoke/no-system-bus"
+    HOME="$smoke/home" \
+    XDG_CONFIG_HOME="$smoke/home/.config" \
+    XDG_DATA_HOME="$smoke/home/.local/share" \
+    XDG_STATE_HOME="$smoke/home/.local/state" \
+    XDG_CACHE_HOME="$smoke/home/.cache" \
+    XDG_RUNTIME_DIR="$smoke/run" \
+    GSETTINGS_BACKEND=memory \
+    GDK_BACKEND=x11 \
+    GSK_RENDERER=cairo \
+    GTK_A11Y=none \
+    NO_AT_BRIDGE=1 \
+    OXIDOM_SMOKE_PIDFILE="$smoke/gui.pid" \
+        xvfb-run -a "$smoke/run-gui" "$APPDIR/AppRun" --debug \
+        >"$smoke/gui.out" 2>"$smoke/gui.err" &
+    i=0
+    while [ "$i" -lt 200 ] && [ ! -s "$smoke/gui.pid" ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    [ -s "$smoke/gui.pid" ] || { echo "error: the GUI did not start under Xvfb" >&2; exit 1; }
+    gui_pid=$(cat "$smoke/gui.pid")
+
+    gui_log="$smoke/home/.local/share/oxidom/oxidom-gui.log"
+    i=0
+    while [ "$i" -lt 200 ] && ! grep -qs 'Loading daemon state' "$gui_log"; do
+        if ! kill -0 "$gui_pid" 2>/dev/null; then
+            echo "error: the GUI exited before loading daemon state" >&2
+            cat "$smoke/gui.err" >&2 || true
+            exit 1
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if ! grep -qs 'Loading daemon state' "$gui_log"; then
+        echo "error: the GUI never reached the first daemon state" >&2
+        cat "$smoke/gui.err" >&2 || true
+        exit 1
+    fi
+
+    # Wait for the spawned daemon to own the name, then ask it once. Asking in
+    # a loop would hide the interesting failure — a started daemon that cannot
+    # answer — behind a retry count.
+    owned=
+    i=0
+    while [ "$i" -lt 200 ]; do
+        if gdbus call --session --dest org.freedesktop.DBus \
+                --object-path /org/freedesktop/DBus \
+                --method org.freedesktop.DBus.NameHasOwner \
+                dev.keepinfov.oxidom.Daemon 2>/dev/null | grep -q 'true'; then
+            owned=1
+            break
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    [ -n "$owned" ] || { echo "error: no daemon answered on the private session bus" >&2; exit 1; }
+
+    # RuntimeInfo runs the core against the bundled lists before it answers, so
+    # this single call is the wait for that probe as well.
+    if ! info=$(timeout 20 gdbus call --session \
+            --dest dev.keepinfov.oxidom.Daemon \
+            --object-path /dev/keepinfov/oxidom/Daemon \
+            --method dev.keepinfov.oxidom1.RuntimeInfo); then
+        echo "error: the daemon did not answer RuntimeInfo" >&2
+        cat "$smoke/gui.err" >&2 || true
+        exit 1
+    fi
+    echo "$info"
+    case "$info" in
+        *'"usable":true'*) ;;
+        *) echo "error: the daemon reports the bundled geo data unusable: $info" >&2; exit 1 ;;
+    esac
+    case "$info" in
+        *'"xray_error":null'*) ;;
+        *) echo "error: the daemon resolved no core for the first state: $info" >&2; exit 1 ;;
+    esac
+    kill -0 "$gui_pid" 2>/dev/null || { echo "error: the GUI did not survive its first state" >&2; exit 1; }
+    echo "first GUI state: geo data usable, no core error"
+fi
