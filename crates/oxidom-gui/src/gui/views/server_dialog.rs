@@ -24,15 +24,16 @@ pub struct ServerDialogCallbacks {
     pub create: Rc<dyn Fn(ServerDraft)>,
 }
 
-/// The protocols the dialog offers, in combo order. Socks and http exist in
-/// the model but are plain proxies with no fields of their own; the CLI
-/// template covers them, and offering them here would double the combo for
-/// two rows nobody types.
-const PROTOCOLS: [(Protocol, &str); 5] = [
+/// The protocols the dialog offers, in combo order: every non-composite
+/// protocol the model carries. Socks and http are plain proxies, but they have
+/// credentials of their own, so the dialog edits them like the rest.
+const PROTOCOLS: [(Protocol, &str); 7] = [
     (Protocol::Vless, "vless"),
     (Protocol::Vmess, "vmess"),
     (Protocol::Trojan, "trojan"),
     (Protocol::Shadowsocks, "shadowsocks"),
+    (Protocol::Socks, "socks"),
+    (Protocol::Http, "http"),
     (Protocol::Hysteria2, "hysteria2"),
 ];
 
@@ -61,6 +62,7 @@ pub struct DialogValues {
     pub vmess_security: String,
     pub method: String,
     pub password: String,
+    pub username: String,
     pub auth: String,
     pub network_index: usize,
     pub security_index: usize,
@@ -140,6 +142,7 @@ pub fn values_from_server(server: &Server) -> DialogValues {
         vmess_security: option(&draft.security),
         method: option(&draft.method),
         password: option(&draft.password),
+        username: option(&draft.username),
         auth: option(&draft.auth),
         network_index: combo_index(&NETWORKS, &stream.network),
         security_index: combo_index(&SECURITIES, &stream.security),
@@ -261,10 +264,7 @@ pub fn draft_from_values(values: &DialogValues) -> Result<ServerDraft, String> {
         security: opt(&values.vmess_security),
         method: opt(&values.method),
         password: opt(&values.password),
-        username: values
-            .base_draft
-            .as_ref()
-            .and_then(|draft| draft.username.clone()),
+        username: opt(&values.username),
         auth: opt(&values.auth),
         stream,
         hysteria2,
@@ -446,11 +446,13 @@ fn build_dialog(
     let vmess_security = entry("security");
     let method = entry("method");
     let password = secret("password");
+    let username = entry("username");
     let auth = secret("auth");
     credentials_group.add(&uuid);
     credentials_group.add(&alter_id);
     credentials_group.add(&vmess_security);
     credentials_group.add(&method);
+    credentials_group.add(&username);
     credentials_group.add(&password);
     credentials_group.add(&auth);
 
@@ -582,6 +584,7 @@ fn build_dialog(
         vmess_security.set_text(&prefill.vmess_security);
         method.set_text(&prefill.method);
         password.set_text(&prefill.password);
+        username.set_text(&prefill.username);
         auth.set_text(&prefill.auth);
         network.set_selected(prefill.network_index as u32);
         security.set_selected(prefill.security_index as u32);
@@ -618,6 +621,7 @@ fn build_dialog(
                 alter_id.clone(),
                 vmess_security.clone(),
                 method.clone(),
+                username.clone(),
                 password.clone(),
                 auth.clone(),
             ),
@@ -648,7 +652,7 @@ fn build_dialog(
         move || {
             let (name, protocol, address, port, credentials, stream, hysteria2, patch_buffer) =
                 &widgets;
-            let (uuid, alter_id, vmess_security, method, password, auth) = credentials;
+            let (uuid, alter_id, vmess_security, method, username, password, auth) = credentials;
             let (
                 network,
                 security,
@@ -676,6 +680,7 @@ fn build_dialog(
                 vmess_security: vmess_security.text().to_string(),
                 method: method.text().to_string(),
                 password: password.text().to_string(),
+                username: username.text().to_string(),
                 auth: auth.text().to_string(),
                 network_index: network.selected() as usize,
                 security_index: security.selected() as usize,
@@ -714,6 +719,7 @@ fn build_dialog(
             alter_id.clone(),
             vmess_security.clone(),
             method.clone(),
+            username.clone(),
             password.clone(),
             auth.clone(),
         );
@@ -738,7 +744,8 @@ fn build_dialog(
             collect();
             let values = values.borrow();
             let protocol = values.protocol();
-            let (uuid, alter_id, vmess_security, method, password, auth) = &credentials_rows;
+            let (uuid, alter_id, vmess_security, method, username, password, auth) =
+                &credentials_rows;
             let (
                 sni,
                 alpn,
@@ -757,7 +764,11 @@ fn build_dialog(
             alter_id.set_visible(matches!(protocol, Protocol::Vmess));
             vmess_security.set_visible(matches!(protocol, Protocol::Vmess));
             method.set_visible(matches!(protocol, Protocol::Shadowsocks));
-            password.set_visible(matches!(protocol, Protocol::Trojan | Protocol::Shadowsocks));
+            username.set_visible(matches!(protocol, Protocol::Socks | Protocol::Http));
+            password.set_visible(matches!(
+                protocol,
+                Protocol::Trojan | Protocol::Shadowsocks | Protocol::Socks | Protocol::Http
+            ));
             auth.set_visible(matches!(protocol, Protocol::Hysteria2));
             stream_group.set_visible(matches!(
                 protocol,
@@ -793,6 +804,7 @@ fn build_dialog(
             let touched = !values.address.trim().is_empty()
                 || !values.uuid.trim().is_empty()
                 || !values.password.trim().is_empty()
+                || !values.username.trim().is_empty()
                 || !values.method.trim().is_empty()
                 || !values.auth.trim().is_empty()
                 || !values.patch.trim().is_empty();
@@ -833,6 +845,7 @@ fn build_dialog(
         &address,
         &vmess_security,
         &method,
+        &username,
         &sni,
         &alpn,
         &fingerprint,
@@ -958,7 +971,7 @@ mod tests {
     fn list_and_bandwidth_rows_are_normalized_like_imports() {
         let values = DialogValues {
             name: "Typed".to_string(),
-            protocol_index: 4, // hysteria2
+            protocol_index: 6, // hysteria2
             address: "server.example.invalid".to_string(),
             port: 443,
             auth: "invented".to_string(),
@@ -997,6 +1010,58 @@ mod tests {
             stream.xhttp_extra,
             Some(serde_json::json!({"xPaddingBytes": "100-200"}))
         );
+    }
+
+    #[test]
+    fn an_imported_socks_or_http_server_opens_with_its_protocol_and_round_trips_its_credentials() {
+        for (link, expected, host, port, username, password) in [
+            (
+                "socks://alice:secret@proxy.example.invalid:1080#SocksProxy",
+                Protocol::Socks,
+                "proxy.example.invalid",
+                1080,
+                "alice",
+                "secret",
+            ),
+            (
+                "http://bob:pass@proxy.example.invalid:8080#HttpProxy",
+                Protocol::Http,
+                "proxy.example.invalid",
+                8080,
+                "bob",
+                "pass",
+            ),
+        ] {
+            let server = oxidom_core::link::parse_link(link).expect("parses");
+            let values = values_from_server(&server);
+            assert_eq!(values.protocol(), expected, "{link}");
+            assert_eq!(values.address, host);
+            assert_eq!(values.port, port);
+            assert_eq!(values.username, username);
+            assert_eq!(values.password, password);
+            assert_eq!(values_issue(&values), None);
+
+            let draft = draft_from_values(&values).expect("assembles");
+            assert_eq!(draft.protocol, expected);
+            assert_eq!(draft.address, host);
+            assert_eq!(draft.port, port);
+            assert_eq!(draft.username.as_deref(), Some(username));
+            assert_eq!(draft.password.as_deref(), Some(password));
+        }
+
+        let server = oxidom_core::link::parse_link("socks://proxy.example.invalid:1080#OpenSocks")
+            .expect("parses");
+        let mut values = values_from_server(&server);
+        assert_eq!(values.protocol(), Protocol::Socks);
+        assert!(values.username.is_empty());
+        assert!(values.password.is_empty());
+        assert_eq!(values_issue(&values), None);
+
+        values.username = "alice".to_string();
+        values.password = "secret".to_string();
+        let edited = draft_from_values(&values).expect("assembles");
+        assert_eq!(edited.username.as_deref(), Some("alice"));
+        assert_eq!(edited.password.as_deref(), Some("secret"));
     }
 
     #[test]
