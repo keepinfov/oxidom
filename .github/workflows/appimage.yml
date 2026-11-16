@@ -39,6 +39,8 @@ jobs:
         run: |
           set -eux
           apt-get update
+          # fonts-dejavu-core: build.sh runs the same Xvfb smoke as the jobs
+          # below, and a bare container has no fonts for Pango to measure.
           apt-get install -y --no-install-recommends \
             build-essential pkg-config curl ca-certificates git unzip \
             libgtk-4-dev libadwaita-1-dev \
@@ -46,7 +48,8 @@ jobs:
             dbus-daemon xvfb xauth \
             file binutils findutils \
             locales \
-            adwaita-icon-theme hicolor-icon-theme desktop-file-utils
+            adwaita-icon-theme hicolor-icon-theme desktop-file-utils \
+            fonts-dejavu-core
 
       - uses: actions/checkout@v4
 
@@ -181,8 +184,13 @@ jobs:
         run: |
           set -eu
           apt-get update
+          # A bare container ships no fonts. Pango then reports metrics nothing
+          # can lay out against, and GTK has died on the first ConfigureWindow
+          # under Xvfb because of it. The font and the UTF-8 locale below are
+          # the environment a desktop provides, so a failure here is the
+          # bundle's rather than the container's.
           apt-get install -y --no-install-recommends \
-            patchelf dbus-daemon xvfb xauth libglib2.0-bin
+            patchelf dbus-daemon xvfb xauth libglib2.0-bin fonts-dejavu-core
           for t in dbus-daemon xvfb-run gdbus; do
             command -v "$t" > /dev/null || {
               echo "::error::$t is missing from ${{ matrix.image }}"
@@ -254,6 +262,7 @@ jobs:
           GSETTINGS_BACKEND=memory \
           GDK_BACKEND=x11 \
           GSK_RENDERER=cairo \
+          LANG=C.UTF-8 \
           GTK_A11Y=none \
           NO_AT_BRIDGE=1 \
           OXIDOM_SMOKE_PIDFILE="$smoke/gui.pid" \
@@ -272,6 +281,11 @@ jobs:
           while [ "$i" -lt 200 ] && ! grep -qs 'Loading daemon state' "$gui_log"; do
             if ! kill -0 "$gui_pid" 2> /dev/null; then
               echo "::error::the GUI exited before loading daemon state"
+              # GTK writes fatal errors to stdout, so gui.err can be empty
+              # while the reason sits in gui.out. Print both, labelled.
+              echo "--- gui.out ---" >&2
+              cat "$smoke/gui.out" >&2 || true
+              echo "--- gui.err ---" >&2
               cat "$smoke/gui.err" >&2 || true
               exit 1
             fi
@@ -280,6 +294,9 @@ jobs:
           done
           if ! grep -qs 'Loading daemon state' "$gui_log"; then
             echo "::error::the GUI never reached the first daemon state"
+            echo "--- gui.out ---" >&2
+            cat "$smoke/gui.out" >&2 || true
+            echo "--- gui.err ---" >&2
             cat "$smoke/gui.err" >&2 || true
             exit 1
           fi
@@ -309,6 +326,9 @@ jobs:
               --object-path /dev/keepinfov/oxidom/Daemon \
               --method dev.keepinfov.oxidom1.RuntimeInfo); then
             echo "::error::the daemon did not answer RuntimeInfo"
+            echo "--- gui.out ---" >&2
+            cat "$smoke/gui.out" >&2 || true
+            echo "--- gui.err ---" >&2
             cat "$smoke/gui.err" >&2 || true
             exit 1
           fi
