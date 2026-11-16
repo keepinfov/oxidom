@@ -1173,6 +1173,18 @@ mod tests {
                 draft.password = Some("invented".to_string());
                 draft
             },
+            {
+                let mut draft = base(Protocol::Socks);
+                draft.username = Some("alice".to_string());
+                draft.password = Some("invented".to_string());
+                draft
+            },
+            {
+                let mut draft = base(Protocol::Http);
+                draft.username = Some("bob".to_string());
+                draft.password = Some("invented".to_string());
+                draft
+            },
             ServerDraft {
                 auth: Some("invented-auth".to_string()),
                 hysteria2: Some(Hysteria2Settings {

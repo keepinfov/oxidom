@@ -15,6 +15,7 @@ surface, packaging, or the CLI belongs here.
 ## [Unreleased]
 
 ### Fixed
+- **A SOCKS or HTTP proxy can be created and edited in the server dialog.** The protocol list omitted both, so an imported `socks://` or `http://` server opened as VLESS and editing it would have changed its protocol; the dialog now offers all seven protocols and round-trips the proxy's username and password.
 - **Enabling multiplexing no longer breaks XTLS Vision servers.** A Vision server treats a `v1.mux.cool` request as the vision stream's own destination and closes the connection on the first request, so a machine-wide `[core.mux] enabled = true` made every XTLS Vision connection die on its first request, which the latency check reported as “the check ran out of time”. Mux is now withheld from Vision outbounds; other outbounds still receive it. Hysteria2 outbounds were already exempt.
 - **A gRPC service name reaches Xray exactly as the link spells it.** The generator removed a leading slash, so a provider whose server registers `/api/v1/stream` answered `unknown service api/v1/stream` and the tunnel died on the first request. The link's spelling is now preserved, and a node that previously failed its latency check with a timeout connects.
 
