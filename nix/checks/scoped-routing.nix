@@ -252,5 +252,10 @@ in
           };
         };
       };
-      testScript = builtins.readFile ../../scripts/scoped-routing-vm.py;
+      testScript =
+        builtins.readFile ../../scripts/scoped-routing-vm.py
+        + "\n"
+        + builtins.readFile ../../scripts/scoped-routing-recovery.py
+        + "\n"
+        + builtins.readFile ../../scripts/scoped-routing-teardown.py;
     }

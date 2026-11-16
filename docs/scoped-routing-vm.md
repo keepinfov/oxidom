@@ -68,16 +68,24 @@ cgroup. The observer independently reads that cgroup and its filesystem inode.
 The durable record must identify the exact escaped profile slice at level 4.
 The PID, cgroup and slice inode remain the same through core loss, Down and Up.
 
-The saved owned envelope is explicitly disabled after each confirmed Up. That
-retains its installed routing while giving core-death assertions a stable hold
-checkpoint; neither an alternate attempt nor legacy reconnect may race that
-observation. Only a later explicit enable followed by Up starts a new
-activation.
+The saved owned envelope is disabled after each confirmed Up in the core-loss
+and explicit-Down windows. That retains its installed routing while giving
+those assertions a stable hold checkpoint; neither an alternate attempt nor
+legacy reconnect may race the observation. Only a later explicit enable
+followed by Up starts a new activation.
 
-Recovery in this check deliberately uses Down followed by Up, which creates a
-new interface while the application scope remains alive. It does not establish
-mark restoration during automatic A-to-B recovery on a retained interface;
-that bound-scope transition needs its own P15 evidence.
+Recovery is observed in two ways while the application scope remains alive.
+Explicit Down followed by Up creates a new interface. Automatic A-to-B recovery
+instead enables the saved failover envelope and starts one live bounded request
+window before it kills core A. Once candidate B reports connected and armed, the
+same device and mark must remain, and the profile chain must be reinstalled with
+its four cgroup rules, one connection rule and one restore rule. The actor window
+records at least one failed request during the observed transition; after B
+confirms, a fresh request crosses B's real SOCKS stream inside one finite capture
+pair that also requires no direct TCP to either candidate's HTTP port on the data
+NIC and exact zero kernel drops on every capture unit. The restored mark chain is
+sampled after B confirms. The check does not claim an uninterrupted transition or
+atomicity across that recovery.
 
 ## Packet and nftables evidence
 

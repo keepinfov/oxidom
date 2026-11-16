@@ -272,9 +272,9 @@ def session():
     return next(item for item in json.loads(cli("list", "sessions", "--json")) if item["profile"] == PROFILE)
 
 
-def wait_session(predicate):
+def wait_session(predicate, timeout=30):
     source = "import json,sys; s=next(s for s in json.load(sys.stdin) if s['profile']==" + repr(PROFILE) + "); assert " + predicate
-    client.wait_until_succeeds(user_command("oxidom list sessions --json") + " | python3 -c " + quote(source), timeout=30)
+    client.wait_until_succeeds(user_command("oxidom list sessions --json") + " | python3 -c " + quote(source), timeout=timeout)
     return session()
 
 
@@ -421,8 +421,11 @@ def start_capture(label):
     for suffix, device in [("nic", "eth1"), ("all", "any")]:
         unit = "p15-scoped-cap-" + label + "-" + suffix
         path = "/var/tmp/" + unit + ".pcap"
+        # TPACKET ring frames are MAXIMUM_SNAPLEN-sized, so 16 MiB is only 64
+        # frames. The blocked-traffic windows dropped packets in that ring on a
+        # loaded builder; the exact zero-drop check needs the larger ring.
         command = [
-            "tcpdump", "--immediate-mode", "-i", device, "-B", "16384",
+            "tcpdump", "--immediate-mode", "-i", device, "-B", "65536",
             "-s", "0", "-U", "-w", path, "tcp",
         ]
         definition = "\n".join([
@@ -496,7 +499,7 @@ def finish_capture(captures, controls, candidate_markers=()):
             port = 1080 if address in CANDIDATES else 18080
             assert marker in capture_read(path, "dst host " + address + " and dst port " + str(port), ascii_payload=True)
     nic = captures["nic"][1]
-    for address in [SINK4, SINK6, CANDIDATES[0]]:
+    for address in [SINK4, SINK6, *CANDIDATES]:
         expression = "dst host " + address + " and dst port 18080"
         escaped = capture_read(nic, expression).strip()
         print("Scoped data-NIC check " + address + ": " + repr(escaped))
@@ -722,25 +725,3 @@ with subtest("explicit Down blocks a live scope before releasing its IPv4 routin
     same_actor()
     nft_snapshot()
     scoped_success(SINK4, "/p15-down-explicit-up-same-scope")
-
-with subtest("the next teardown prunes a scope that has actually ended"):
-    assert actor("quit") == {"quitting": True}
-    client.wait_until_fails("test -e /proc/" + str(pinned_actor["pid"]), timeout=15)
-    user_systemctl_stop_if_loaded("p15-scoped-launcher.service")
-    user_systemctl_stop_if_loaded("oxidom\\x2dscoped.slice")
-    client.wait_until_succeeds(
-        user_command(shlex.join([
-            "systemctl", "--user", "show", "-p", "LoadState", "--value",
-            "p15-scoped-launcher.service",
-        ])) + " | grep -qx not-found",
-        timeout=15,
-    )
-    client.wait_until_fails("test -d " + quote("/sys/fs/cgroup/" + pinned_record["path"]), timeout=15)
-    cli("down", PROFILE)
-    assert not any(item["profile"] == PROFILE for item in saved_state().get("run_cgroups", []))
-    table = kernel_json("nft -j list table inet oxidom")["nftables"]
-    assert not [item for item in table if "chain" in item and item["chain"]["name"] in {"profile_scoped", "restore_scoped"}]
-    assert not [item for item in table if "rule" in item and item["rule"]["chain"] in {"profile_scoped", "restore_scoped"}]
-    client.fail("ip link show dev oxi-scoped")
-
-print("Scoped routing VM passed: real user scope, mark/restore, scoped IPv6 refusal, core/Down request windows, same-scope Up, and pruning")
