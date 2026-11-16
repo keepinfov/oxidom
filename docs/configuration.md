@@ -162,7 +162,7 @@ cooldown and revocation rules. Enabled interfaces require the restricted
 [owned-TUN envelope](routing.md#owned-tun-failover): effective hold, supported literal IPv4
 candidates, no custom profile routing and exclusive TUN admission. The
 [acceptance record](testing.md#accepted-evidence-and-remaining-acceptance) describes the accepted
-finite routing/fault observations and remaining P15 validation.
+finite routing/fault observations and their boundaries.
 
 ### Where the geo data comes from
 

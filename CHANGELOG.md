@@ -12,7 +12,7 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
-## [Unreleased]
+## [0.6.1] - 2026-11-16
 
 ### Fixed
 - **Per-install hardware identifiers come from the system CSPRNG instead of a timestamp-and-PID hash.** `state::hwid` previously hashed the wall-clock nanosecond timestamp and the daemon's process ID with `DefaultHasher` and appended the process ID in plain hex, making a newly minted `x-hwid` reproducible from the panel's request timestamp and disclosing the daemon PID. New identifiers are now 128 bits from `ring::rand::SystemRandom`; existing `hwid` files are preserved unchanged so opted-in subscriptions keep their device slot.

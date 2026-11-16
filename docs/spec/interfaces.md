@@ -134,8 +134,7 @@ process observation nor HTTP through SOCKS continuously proves TUN forwarding. P
 the configured IPv4 route/cgroup scope, not all device traffic or DNS/IPv6 containment.
 
 The [acceptance record](../testing.md#accepted-evidence-and-remaining-acceptance) identifies accepted
-isolated VM observations for list/default routing, real HTTP, explicit cleanup and endpoint
-failover/hold states. This contract text does not establish uninterrupted transition or daemon
-crash/replacement hold. Scoped cgroup marking and IPv6 refusal are accepted for their recorded
-HTTP/TCP windows; automatic A-to-B mark restoration on a retained interface and final P15
-acceptance remain separate.
+isolated VM observations for list/default routing, real HTTP, explicit cleanup, endpoint
+failover/hold states, scoped cgroup marking and IPv6 refusal, and automatic A-to-B mark restoration
+on a retained interface. This contract text does not establish uninterrupted transition or daemon
+crash/replacement hold; those remain outside the recorded finite windows.

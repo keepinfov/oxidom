@@ -217,13 +217,31 @@ code actually exercised; later source additions do not inherit their evidence.
   stable observation; the next public teardown pruned the departed scope's
   record and chains. Closed captures required positive IPv4/IPv6 controls,
   zero kernel drops and no direct TCP to the scoped HTTP endpoints during the
-  recorded windows. The check did not validate packaged geo data, multicast or
-  neighbour discovery, ambient-capability removal from helper children, or mark
-  restoration during automatic A-to-B recovery on a retained interface. Its
-  reverse-path and TUN readings are not strict-filtering claims.
+  recorded windows. The check did not validate packaged geo data, multicast,
+  neighbour discovery or ambient-capability removal from helper children;
+  automatic A-to-B recovery on a retained interface is covered by the separate
+  scenario below. Its reverse-path and TUN readings are not strict-filtering
+  claims.
+- [Automatic scoped recovery #280](https://github.com/keepinfov/oxidom/pull/280),
+  merged as `4490d64`, exercised head `65f53fb` passed
+  [scoped-routing build 43866895962](https://github.com/keepinfov/oxidom/actions/runs/43866895962).
+  The [scoped routing check](scoped-routing-vm.md) now also observes automatic
+  A-to-B recovery on the retained owned interface while a live `oxidom run`
+  scope keeps marking traffic: the same device, mark, ownership cookie and
+  device index; the same actor PID, cgroup and level-4 slice inode; the profile
+  chain restored with its four cgroup rules, one connection rule and one
+  restore rule; a fresh request through candidate B's real SOCKS stream; and
+  one finite capture pair with no direct TCP to either candidate's HTTP port
+  and exact zero kernel drops. The intermediate block chain is sampled by the
+  existing core-loss window rather than resampled here; daemon SIGKILL or
+  restart hold, atomicity, UDP and scoped IPv6 traffic remain outside this
+  observation.
 
-Final P15 acceptance remains outstanding; the complete P15 stage is not
-established by the merged slices above.
+P15 acceptance is complete: every mandatory case in the plan now has an
+accepted CI result, including automatic A-to-B mark restoration on a retained
+interface. The remaining statements above are limits of the recorded
+observations, not unrun mandatory cases. The 0.6.1 release validation supplies
+the final compatibility, specification, manual, changelog and packaging review.
 
 No accepted result here establishes universal no-leak behavior, atomic route
 transitions, packet-loss bounds, UDP containment, resolver containment or

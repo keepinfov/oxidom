@@ -97,8 +97,8 @@ replacement PID persistence is required. Repeated helper failure disarms while
 retaining the held device/routes. The full envelope, effective hold and current candidate set
 must remain valid at admission. Neither helper process survival nor HTTP through SOCKS proves
 continuous TUN forwarding, DNS containment or whole-device protection. The
-[acceptance record](../testing.md#accepted-evidence-and-remaining-acceptance) separates accepted
-VM routing/endpoint observations from helper restoration and remaining P15 evidence.
+[acceptance record](../testing.md#accepted-evidence-and-remaining-acceptance) records accepted
+VM routing/endpoint observations, including helper restoration, and their finite boundaries.
 
 Direct probes, latency ranking and diagnostic events grant no application authorization.
 Confirmation remains generation/core-attributed and traffic-based. Successful recovery resets

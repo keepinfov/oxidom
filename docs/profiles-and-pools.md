@@ -230,8 +230,8 @@ any cleanup error before restarting; never erase its recovery records or downgra
 
 Accepted isolated VM runs observe list/default routing with real HTTP, explicit cleanup and
 endpoint failover/held states; [the evidence record](testing.md#accepted-evidence-and-remaining-acceptance)
-adds scoped cgroup marking and IPv6 refusal and distinguishes those finite checks from the
-remaining P15 acceptance. Neither this mode nor status bookkeeping promises full-device
+adds scoped cgroup marking, IPv6 refusal and automatic A-to-B recovery, and records those
+finite checks and their boundaries. Neither this mode nor status bookkeeping promises full-device
 protection, resolver containment or uninterrupted connections.
 See the binding [failover specification](spec/failover.md) and
 [failure diagnosis](troubleshooting.md#failover-does-not-try-another-server).
