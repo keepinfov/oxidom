@@ -181,6 +181,14 @@ if command -v xvfb-run >/dev/null && command -v dbus-daemon >/dev/null && comman
         kill "$gui_pid" "$bus_pid" 2>/dev/null || true
         rm -rf "$work" "$smoke"
     }
+    # The client may write the reason to stdout while gui.err stays empty, so
+    # both are printed.
+    dump_gui() {
+        echo "--- gui.out ---" >&2
+        cat "$smoke/gui.out" >&2 || true
+        echo "--- gui.err ---" >&2
+        cat "$smoke/gui.err" >&2 || true
+    }
     trap cleanup_smoke EXIT
 
     mkdir -p "$smoke/home" "$smoke/run"
@@ -232,6 +240,7 @@ SH
     GSETTINGS_BACKEND=memory \
     GDK_BACKEND=x11 \
     GSK_RENDERER=cairo \
+    LANG=C.UTF-8 \
     GTK_A11Y=none \
     NO_AT_BRIDGE=1 \
     OXIDOM_SMOKE_PIDFILE="$smoke/gui.pid" \
@@ -242,7 +251,7 @@ SH
         sleep 0.1
         i=$((i + 1))
     done
-    [ -s "$smoke/gui.pid" ] || { echo "error: the GUI did not start under Xvfb" >&2; exit 1; }
+    [ -s "$smoke/gui.pid" ] || { echo "error: the GUI did not start under Xvfb" >&2; dump_gui; exit 1; }
     gui_pid=$(cat "$smoke/gui.pid")
 
     gui_log="$smoke/home/.local/share/oxidom/oxidom-gui.log"
@@ -250,7 +259,7 @@ SH
     while [ "$i" -lt 200 ] && ! grep -qs 'Loading daemon state' "$gui_log"; do
         if ! kill -0 "$gui_pid" 2>/dev/null; then
             echo "error: the GUI exited before loading daemon state" >&2
-            cat "$smoke/gui.err" >&2 || true
+            dump_gui
             exit 1
         fi
         sleep 0.1
@@ -258,7 +267,7 @@ SH
     done
     if ! grep -qs 'Loading daemon state' "$gui_log"; then
         echo "error: the GUI never reached the first daemon state" >&2
-        cat "$smoke/gui.err" >&2 || true
+        dump_gui
         exit 1
     fi
 
@@ -278,7 +287,7 @@ SH
         sleep 0.1
         i=$((i + 1))
     done
-    [ -n "$owned" ] || { echo "error: no daemon answered on the private session bus" >&2; exit 1; }
+    [ -n "$owned" ] || { echo "error: no daemon answered on the private session bus" >&2; dump_gui; exit 1; }
 
     # RuntimeInfo runs the core against the bundled lists before it answers, so
     # this single call is the wait for that probe as well.
@@ -287,7 +296,7 @@ SH
             --object-path /dev/keepinfov/oxidom/Daemon \
             --method dev.keepinfov.oxidom1.RuntimeInfo); then
         echo "error: the daemon did not answer RuntimeInfo" >&2
-        cat "$smoke/gui.err" >&2 || true
+        dump_gui
         exit 1
     fi
     echo "$info"
