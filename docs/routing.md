@@ -76,10 +76,11 @@ This is the **only** privileged part of oxidom, and it is available only from th
 system daemon holding `CAP_NET_ADMIN`. oxidom will not escalate on its own:
 
 ```
-profile 'work' asks for a network interface, but this daemon has no
-CAP_NET_ADMIN. Interfaces are only available from the system daemon: enable
-services.oxidom.enable together with services.oxidom.tun.enable. oxidom will
-not escalate privileges on its own.
+profile `work` asks for a network interface, but this daemon has no
+CAP_NET_ADMIN. Interfaces are only available from the system daemon
+(`oxidom.service` with `AmbientCapabilities=CAP_NET_ADMIN`, or
+`services.oxidom.tun.enable = true` on NixOS). oxidom will not escalate
+privileges on its own.
 ```
 
 Enable it per profile:
@@ -90,7 +91,8 @@ enable = true
 routes = "manual"
 ```
 
-and on the host — NixOS:
+and on the host the daemon unit must hold the capability, for example with
+`AmbientCapabilities=CAP_NET_ADMIN`. On NixOS the module grants it for you:
 
 ```nix
 services.oxidom.enable = true;

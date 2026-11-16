@@ -4,7 +4,8 @@ The privileged TUN path: what it takes, what names and addresses it claims, and 
 brought up and torn down in.
 
 `[interface] enable = false` is exactly the unprivileged proxy-only behavior. When enabled, the
-system daemon (and only it) requires `CAP_NET_ADMIN`; the NixOS module grants it only with
+system daemon (and only it) requires `CAP_NET_ADMIN`, granted to `oxidom.service` through
+`AmbientCapabilities=CAP_NET_ADMIN`; the NixOS module adds that grant only with
 `services.oxidom.tun.enable = true` and keeps `oxi-*` unmanaged by NetworkManager.
 
 The daemon unit sets `KillMode=process` because the Xray cores, not the daemon, carry the
