@@ -696,21 +696,18 @@ pub fn hwid() -> Result<String> {
             return Ok(trimmed.to_string());
         }
     }
-    let id = generate_hwid();
+    let id = generate_hwid()?;
     fsutil::write_private_atomic(&path, id.as_bytes()).context("writing hwid")?;
     Ok(id)
 }
 
-fn generate_hwid() -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        .hash(&mut h);
-    std::process::id().hash(&mut h);
-    format!("{:016x}{:016x}", h.finish(), std::process::id() as u64)
+fn generate_hwid() -> Result<String> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0_u8; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("generating hwid"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[cfg(test)]
@@ -1059,6 +1056,45 @@ priority = 12000
         assert_eq!(routes[0].prefix, 0);
         assert_eq!(routes[0].table, 28449);
         assert_eq!(routes[1].table, 254);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_hwid_is_random_hex_and_never_embeds_the_process_id() -> Result<()> {
+        let first = generate_hwid()?;
+        let second = generate_hwid()?;
+        for id in [&first, &second] {
+            assert_eq!(id.len(), 32);
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            );
+        }
+        assert_ne!(first, second);
+        let pid = format!("{:016x}", std::process::id());
+        assert!(!first.contains(&pid), "{first} embeds the process id");
+        assert!(!second.contains(&pid), "{second} embeds the process id");
+        Ok(())
+    }
+
+    #[test]
+    fn hwid_persists_once_and_reuses_the_existing_file() -> Result<()> {
+        let _guard = crate::sync::lock(&crate::paths::TEST_ROOT_LOCK);
+        let _root = TestRoot::install("hwid-persistence");
+
+        let first = hwid()?;
+        let second = hwid()?;
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        let path = crate::paths::hwid_file()?;
+        let mode = std::fs::metadata(&path)?.mode() & 0o777;
+        assert_eq!(mode, 0o600, "hwid file must be private");
+
+        crate::fsutil::write_private_atomic(&path, b"pinned-installation-id")?;
+        assert_eq!(hwid()?, "pinned-installation-id");
+        assert_eq!(hwid()?, "pinned-installation-id");
         Ok(())
     }
 }
