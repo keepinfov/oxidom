@@ -43,6 +43,25 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.6.1" date="2026-11-16">
+      <description>
+        <p>
+          Per-install hardware identifiers now come from the system random
+          source instead of a timestamp and the daemon's process identifier,
+          and existing identifiers are kept so opted-in subscriptions keep
+          their device slot. A machine-wide multiplexing setting no longer
+          closes XTLS Vision tunnels on their first request. A gRPC service
+          name reaches the core exactly as the link spells it.
+        </p>
+        <p>
+          The server dialog can create and edit SOCKS and HTTP proxies with
+          their credentials again, latency readings stay steady through
+          background checks, profile membership hints no longer log a markup
+          warning, and an interface refusal now names the system service that
+          grants CAP_NET_ADMIN alongside the NixOS option.
+        </p>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-11-15">
       <description>
         <p>
