@@ -45,10 +45,10 @@ const ROUTING_HINT: &str =
 
 const LIST_MEMBERSHIP_HINT: &str = "A fixed list; new servers do not join automatically. This profile \
     stores an independent copy, separate from Servers-page groups. Edit membership with \
-    `oxidom profile edit <name>` using this profile's name.";
+    `oxidom profile edit &lt;name&gt;` using this profile's name.";
 const RULE_MEMBERSHIP_HINT: &str = "A rule; matching servers added by refresh can join on the next connection. \
     This profile stores an independent copy, separate from Servers-page groups. Edit the rule with \
-    `oxidom profile edit <name>` using this profile's name.";
+    `oxidom profile edit &lt;name&gt;` using this profile's name.";
 
 /// One server the profile's picker can point at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1354,7 +1354,8 @@ mod tests {
     fn membership_guidance_names_the_independent_profile_and_supported_editor() {
         for hint in [LIST_MEMBERSHIP_HINT, RULE_MEMBERSHIP_HINT] {
             assert!(hint.contains("independent copy"));
-            assert!(hint.contains("oxidom profile edit <name>"));
+            assert!(hint.contains("oxidom profile edit &lt;name&gt;"));
+            assert!(!hint.contains("<name>"));
             assert!(!hint.contains("from the group chips"));
         }
     }
