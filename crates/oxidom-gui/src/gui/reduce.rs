@@ -152,6 +152,10 @@ pub(super) struct SnapshotState {
     /// a generation there is nothing to tell a snapshot from before the user's
     /// click apart from one taken after it.
     pub state_epoch: u64,
+    /// Ids whose superseded reading should be re-checked once no connect is in
+    /// flight. Asking while one is would measure a route that is about to be
+    /// replaced again, so the request is held until the session settles.
+    deferred_reprobes: HashSet<String>,
 }
 
 /// Where a check the daemon holds actually is.
@@ -196,6 +200,13 @@ pub(super) struct ProbeWait {
     ///
     /// [`ProbePhase::Unknown`] until a snapshot mentions the id.
     pub phase: ProbePhase,
+    /// Whether a poll round has been folded since this wait went up.
+    ///
+    /// False for the round that may already have been in flight when the user
+    /// pressed: the daemon read that round before the request reached it, and
+    /// a slow answer landing past [`PROBE_ACK_GRACE`] would otherwise retire a
+    /// spinner the next round puts straight back.
+    pub seen_snapshot: bool,
 }
 
 impl ProbeWait {
@@ -205,6 +216,7 @@ impl ProbeWait {
             acked: false,
             given_up: false,
             phase: ProbePhase::Unknown,
+            seen_snapshot: false,
         }
     }
 
@@ -249,6 +261,7 @@ impl SnapshotState {
             notified_error: None,
             notified_outdated: false,
             state_epoch: 0,
+            deferred_reprobes: HashSet::new(),
         }
     }
 
@@ -458,6 +471,21 @@ impl SnapshotState {
         self.running_wait(id).is_some()
     }
 
+    /// Whether a connect attempt is still settling anywhere.
+    ///
+    /// A superseded reading was taken over a route a connect is about to
+    /// replace, so asking for a fresh one now measures a context that is
+    /// already gone. The request waits until the session reaches `Connected`,
+    /// `Error` or `Disconnected`.
+    fn any_session_connecting(&self) -> bool {
+        matches!(self.current_status(), Status::Connecting)
+            || matches!(self.daemon_status, Status::Connecting)
+            || self
+                .sessions
+                .iter()
+                .any(|session| session.state == "connecting")
+    }
+
     /// The live wait for this id, if the card is drawing a check in progress.
     /// Carries the phase, which is what decides whether a stop is offered.
     pub(super) fn running_wait(&self, id: &str) -> Option<ProbeWait> {
@@ -657,7 +685,7 @@ pub(super) fn reduce(
             if !held.contains(id) && !state.checking.contains_key(id) {
                 let shown = state.card_state(id, now_unix_ms);
                 if shown == LatencyState::Superseded {
-                    effects.push(Effect::Reprobe(id.clone()));
+                    request_reprobe(&mut effects, state, id);
                 }
                 effects.push(Effect::Latency(id.clone(), shown));
             }
@@ -751,6 +779,15 @@ pub(super) fn reduce(
                 }
             }
             None => {
+                // A check the daemon runs on its own — the active session's
+                // thirty-second re-probe — must not blank a number the card is
+                // already showing. The fresh reading replaces it when it lands;
+                // only a card with no current reading, a user's own request or
+                // a server whose connect has not settled has nothing better to
+                // display in the meantime.
+                if !draws_background_checking(state, id.as_str(), now_unix_ms) {
+                    continue;
+                }
                 state.checking.insert(
                     (*id).clone(),
                     ProbeWait {
@@ -758,6 +795,7 @@ pub(super) fn reduce(
                         acked: true,
                         given_up: false,
                         phase,
+                        seen_snapshot: true,
                     },
                 );
                 effects.push(Effect::Latency(
@@ -787,7 +825,7 @@ pub(super) fn reduce(
             }
             continue;
         }
-        if wait.acked || now.duration_since(wait.since) > PROBE_ACK_GRACE {
+        if wait.acked || (wait.seen_snapshot && now.duration_since(wait.since) > PROBE_ACK_GRACE) {
             finished.push(id.clone());
         }
     }
@@ -798,16 +836,43 @@ pub(super) fn reduce(
         push_card(&mut effects, state, &id, now_unix_ms);
     }
     for id in finished {
-        state.checking.remove(&id);
+        if let Some(wait) = state.checking.remove(&id)
+            && !wait.acked
+        {
+            state.notify_probe.remove(&id);
+            state.notify_local.remove(&id);
+        }
         // A reading that never arrived leaves the card unmeasured rather than
         // unreachable: nothing was measured, so nothing may be claimed.
         push_card(&mut effects, state, &id, now_unix_ms);
+    }
+    // Every wait that survived this round has now been folded into a snapshot.
+    // A round that was already in flight when the user pressed may have been
+    // read before the request reached the daemon, so only a later round may
+    // judge the request lost — otherwise a slow answer past the grace retires
+    // a spinner the next poll raises again.
+    for wait in state.checking.values_mut() {
+        wait.seen_snapshot = true;
     }
     // Cards whose reading did not change but whose *meaning* did, because the
     // tunnel moved out from under it.
     for id in rerouted {
         if !state.is_checking(&id) {
             push_card(&mut effects, state, &id, now_unix_ms);
+        }
+    }
+    // A superseded reading held back by a connect is asked for once the
+    // session settles, and only while the reading is still superseded: a
+    // connect that restored the same route leaves nothing to re-measure.
+    if !state.any_session_connecting() && !state.deferred_reprobes.is_empty() {
+        let mut deferred: Vec<String> = state.deferred_reprobes.drain().collect();
+        deferred.sort();
+        for id in deferred {
+            if state.card_state(&id, now_unix_ms) == LatencyState::Superseded
+                && !state.is_checking(&id)
+            {
+                effects.push(Effect::Reprobe(id));
+            }
         }
     }
 
@@ -922,7 +987,7 @@ pub(super) fn reduce(
 /// Queue the card's current appearance, unless this snapshot already decided
 /// it, and ask for a fresh measurement when the reading on record was taken
 /// over a route that no longer applies.
-fn push_card(effects: &mut Vec<Effect>, state: &SnapshotState, id: &str, now_unix_ms: u64) {
+fn push_card(effects: &mut Vec<Effect>, state: &mut SnapshotState, id: &str, now_unix_ms: u64) {
     if effects
         .iter()
         .any(|effect| matches!(effect, Effect::Latency(updated, _) if updated == id))
@@ -931,9 +996,40 @@ fn push_card(effects: &mut Vec<Effect>, state: &SnapshotState, id: &str, now_uni
     }
     let shown = state.card_state(id, now_unix_ms);
     if shown == LatencyState::Superseded {
-        effects.push(Effect::Reprobe(id.to_string()));
+        request_reprobe(effects, state, id);
     }
     effects.push(Effect::Latency(id.to_string(), shown));
+}
+
+/// Ask for a fresh measurement, or hold the request while a connect settles.
+fn request_reprobe(effects: &mut Vec<Effect>, state: &mut SnapshotState, id: &str) {
+    if state.any_session_connecting() {
+        state.deferred_reprobes.insert(id.to_string());
+    } else {
+        effects.push(Effect::Reprobe(id.to_string()));
+    }
+}
+
+/// Whether a check the daemon holds on its own should draw a spinner.
+///
+/// A background probe — the active session's thirty-second re-probe — must not
+/// blank a number a card is already showing; the fresh reading replaces it
+/// when it lands. A spinner is still right for a request the user made, a
+/// server whose connect has not settled, or a card with no current reading.
+fn draws_background_checking(state: &SnapshotState, id: &str, now_unix_ms: u64) -> bool {
+    let requested = state.notify_probe.contains(id) || state.notify_local.contains(id);
+    let connecting = (matches!(state.current_status(), Status::Connecting)
+        && state.connected_id.as_deref() == Some(id))
+        || state
+            .sessions
+            .iter()
+            .any(|session| session.state == "connecting" && session_carries_server(session, id));
+    requested
+        || connecting
+        || matches!(
+            state.card_state(id, now_unix_ms),
+            LatencyState::Unmeasured | LatencyState::Superseded
+        )
 }
 
 /// The server the daemon would measure *through the tunnel*, which is exactly
@@ -7304,6 +7400,9 @@ mod tests {
         let now = Instant::now();
         let mut waiting = probe(&[], &[("a", Some(41))]);
         waiting.queued = vec!["a".to_string()];
+        // The user asked for this check; the daemon reports it queued behind
+        // the concurrency cap.
+        state.checking.insert("a".to_string(), ProbeWait::new(now));
 
         let effects = fold(
             &mut state,
@@ -8726,6 +8825,10 @@ mod tests {
             true,
         );
         assert!(state.card_failure("a", NOW_MS).is_some());
+        // The user's own check, in flight.
+        state
+            .checking
+            .insert("a".to_string(), ProbeWait::new(Instant::now()));
         fold(
             &mut state,
             &snapshot(StatusInfo::default(), probe(&["a"], &[("a", None)])),
@@ -9480,6 +9583,191 @@ mod tests {
         assert_eq!(
             connections_stopping_sentence(&["default".to_string(), "pool-work".to_string()]),
             "\n\nThis will also stop the connections in “default”, “pool-work”."
+        );
+    }
+
+    use super::super::server_card::latency_spins;
+
+    #[test]
+    fn a_background_probe_with_an_existing_reading_does_not_blank_the_number() {
+        let now = Instant::now();
+        let mut direct = state();
+        fold(
+            &mut direct,
+            &snapshot(StatusInfo::default(), probe(&[], &[("a", Some(41))])),
+            now,
+            true,
+        );
+
+        let effects = fold(
+            &mut direct,
+            &snapshot(StatusInfo::default(), probe(&["a"], &[("a", Some(41))])),
+            now,
+            true,
+        );
+        assert_eq!(
+            latency(&effects, "a"),
+            None,
+            "the daemon running its own check must not blank a number the card shows"
+        );
+        assert!(!direct.checking.contains_key("a"));
+        assert_eq!(direct.card_state("a", NOW_MS), fresh(41));
+
+        let mut queued = probe(&[], &[("a", Some(41))]);
+        queued.queued = vec!["a".to_string()];
+        let effects = fold(
+            &mut direct,
+            &snapshot(StatusInfo::default(), queued),
+            now,
+            true,
+        );
+        assert_eq!(
+            latency(&effects, "a"),
+            None,
+            "a queued background check is the same"
+        );
+
+        let effects = fold(
+            &mut direct,
+            &snapshot(StatusInfo::default(), probe(&[], &[("a", Some(55))])),
+            now,
+            true,
+        );
+        assert_eq!(
+            latency(&effects, "a"),
+            Some(fresh(55)),
+            "the fresh reading replaces the number on its own"
+        );
+
+        // The same holds for the connection's own reading, which the active
+        // session's periodic re-probe keeps refreshing.
+        let mut connected = state();
+        fold(
+            &mut connected,
+            &snapshot(connected_to("a"), tunnel_probe("a", 41)),
+            now,
+            true,
+        );
+        let mut recheck = tunnel_probe("a", 41);
+        recheck.running = vec!["a".to_string()];
+        let effects = fold(
+            &mut connected,
+            &snapshot(connected_to("a"), recheck),
+            now,
+            true,
+        );
+        assert_eq!(latency(&effects, "a"), None);
+        assert!(!connected.checking.contains_key("a"));
+    }
+
+    #[test]
+    fn a_queued_to_running_transition_keeps_the_spinner_active() {
+        let mut state = state();
+        let now = Instant::now();
+        let mut waiting = probe(&[], &[]);
+        waiting.queued = vec!["a".to_string()];
+
+        let queued = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), waiting),
+            now,
+            true,
+        );
+        let queued_state = latency(&queued, "a").expect("the card is checking");
+        assert_eq!(queued_state, LatencyState::Checking { stoppable: true });
+        assert!(latency_spins(queued_state));
+        assert!(state.is_checking("a"));
+
+        let running = fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), probe(&["a"], &[])),
+            now,
+            true,
+        );
+        let running_state = latency(&running, "a").expect("the card is still checking");
+        assert_eq!(
+            running_state,
+            LatencyState::Checking { stoppable: false },
+            "a running check keeps its spinner and loses its stop"
+        );
+        assert!(
+            latency_spins(running_state),
+            "the badge must not stop and restart its animation for a phase change"
+        );
+        assert!(state.is_checking("a"));
+    }
+
+    #[test]
+    fn an_unacknowledged_probe_survives_past_the_grace_until_a_snapshot_has_been_seen() {
+        let mut state = state();
+        let now = Instant::now();
+        state.checking.insert("a".to_string(), ProbeWait::new(now));
+        state.notify_probe.insert("a".to_string());
+        state.notify_local.insert("a".to_string());
+        let late = now + PROBE_ACK_GRACE + std::time::Duration::from_secs(1);
+
+        // The poll already in flight when the button was pressed can land this
+        // late, with an answer read before the request existed. One round
+        // proves nothing about the request.
+        fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), idle()),
+            late,
+            true,
+        );
+        assert!(
+            state.checking.contains_key("a"),
+            "the first round after the press may still predate it"
+        );
+
+        // A round folded after that one can see the request; with the grace
+        // past, it is assumed lost rather than left spinning.
+        fold(
+            &mut state,
+            &snapshot(StatusInfo::default(), idle()),
+            late + std::time::Duration::from_millis(500),
+            true,
+        );
+        assert!(!state.checking.contains_key("a"));
+        assert!(!state.notify_probe.contains("a"));
+        assert!(!state.notify_local.contains("a"));
+    }
+
+    #[test]
+    fn connecting_does_not_reprobe_a_superseded_reading_until_the_session_settles() {
+        let mut state = state();
+        let now = Instant::now();
+        fold(
+            &mut state,
+            &snapshot(connected_to("a"), tunnel_probe("a", 41)),
+            now,
+            true,
+        );
+
+        let mut connecting = StatusInfo::from_status(&Status::Connecting, Some("b".into()));
+        connecting.sessions = vec![session("default", "connecting", "b")];
+        let mut probes = tunnel_probe("a", 41);
+        probes.readings = state.readings.clone();
+        let effects = fold(&mut state, &snapshot(connecting, probes), now, true);
+        assert_eq!(latency(&effects, "a"), Some(LatencyState::Superseded));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Reprobe(_))),
+            "the route the reading belongs to is still being replaced"
+        );
+        assert!(state.deferred_reprobes.contains("a"));
+
+        let mut connected = StatusInfo::from_status(&Status::Connected, Some("b".into()));
+        connected.sessions = vec![session("default", "connected", "b")];
+        let mut probes = tunnel_probe("a", 41);
+        probes.readings = state.readings.clone();
+        let effects = fold(&mut state, &snapshot(connected, probes), now, true);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Reprobe(id) if id == "a")),
+            "once the session settles the held request is asked for"
         );
     }
 }

@@ -176,6 +176,9 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   therefore shows the same label. Stopping is not a failure and raises no error. Neither
   control offers a stop unless the read-only handshake advertises probe cancellation: a button that
   says it will stop something and then cannot is worse than the second press being ignored.
+  A check the daemon runs on its own updates a card's number when the reading lands, without
+  covering a number already shown with a spinner, and a superseded reading waits for a
+  connecting session to settle before it is re-checked.
  - **Server card** (custom widget): country **flag**, server **name**, protocol **subtitle**
    (`transport_label`, e.g. "vless + xhttp + reality"), **status badge** (`Connected`, `In use`,
    `Connecting`, `Error`) and optional **latency badge** (accent-coloured so green remains reserved
@@ -342,9 +345,9 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   wrong. Whether any of it may ever be *applied*, and whether a provider may choose where
   rule or geo data is fetched from, is a separate question and not answered here.
   - **A server can be typed in (binding).** *Create server* offers the fields per protocol —
-    vless, vmess, trojan, shadowsocks, hysteria2 — plus transport and TLS/Reality, and a raw
-    JSON field merged into the generated outbound, so a core option the form does not model is
-    still reachable. Row titles are the draft's JSON keys, deliberately: the dialog, the CLI
+    vless, vmess, trojan, shadowsocks, socks, http, hysteria2 — plus transport and TLS/Reality,
+    and a raw JSON field merged into the generated outbound, so a core option the form does not
+    model is still reachable. Row titles are the draft's JSON keys, deliberately: the dialog, the CLI
     template and the stored server must read as one thing, and a prettier label would be a
     third name for the same field. Passwords, UUIDs and pre-shared keys are masked with a
     reveal. Validation is `oxidom_core::draft::resolve` — the same validator the daemon runs —
