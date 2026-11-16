@@ -400,8 +400,9 @@ Locally pasted share links live in a built-in subscription called **My servers**
 
 *Create server*, next to *Import server*, is for a server whose parameters did
 not arrive as a link — a screenshot, a panel, a configuration fragment. The
-dialog offers the fields per protocol plus transport and TLS/Reality; every row
-is titled with the JSON key it fills (the reference is
+dialog offers the fields per protocol, including SOCKS and HTTP proxies, plus
+transport and TLS/Reality; every row is titled with the JSON key it fills (the
+reference is
 [spec/data-model.md](spec/data-model.md)), secrets are masked with a reveal,
 and an `outbound_patch` field takes raw JSON merged into the generated outbound
 for anything the form does not model. The same thing exists on the command line
