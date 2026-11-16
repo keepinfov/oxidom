@@ -1144,10 +1144,8 @@ impl SettingsView {
             &widgets.nft_binary,
         ] {
             row.set_sensitive(!info.binary_paths_locked);
+            row.set_tooltip_text(info.binary_paths_locked.then_some(PATH_LOCKED));
         }
-        widgets
-            .xray_binary
-            .set_tooltip_text(info.binary_paths_locked.then_some(PATH_LOCKED));
 
         if info.socks_port_locked || info.http_port_locked {
             let mut model = self.model.borrow_mut();
