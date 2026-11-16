@@ -39,6 +39,8 @@ jobs:
         run: |
           set -eux
           apt-get update
+          # A bare container ships no font package, and the smoke below should
+          # start from a desktop-like font environment.
           apt-get install -y --no-install-recommends \
             build-essential pkg-config curl ca-certificates git unzip \
             libgtk-4-dev libadwaita-1-dev \
@@ -46,7 +48,8 @@ jobs:
             dbus-daemon xvfb xauth \
             file binutils findutils \
             locales \
-            adwaita-icon-theme hicolor-icon-theme desktop-file-utils
+            adwaita-icon-theme hicolor-icon-theme desktop-file-utils \
+            fonts-dejavu-core
 
       - uses: actions/checkout@v4
 
@@ -182,7 +185,7 @@ jobs:
           set -eu
           apt-get update
           apt-get install -y --no-install-recommends \
-            patchelf dbus-daemon xvfb xauth libglib2.0-bin
+            patchelf dbus-daemon xvfb xauth libglib2.0-bin fonts-dejavu-core
           for t in dbus-daemon xvfb-run gdbus; do
             command -v "$t" > /dev/null || {
               echo "::error::$t is missing from ${{ matrix.image }}"
@@ -202,6 +205,14 @@ jobs:
           cleanup_smoke() {
             kill "$gui_pid" "$bus_pid" 2> /dev/null || true
             rm -rf "$smoke"
+          }
+          # The client may write the reason to stdout while gui.err stays
+          # empty, so both are printed.
+          dump_gui() {
+            echo "--- gui.out ---" >&2
+            cat "$smoke/gui.out" >&2 || true
+            echo "--- gui.err ---" >&2
+            cat "$smoke/gui.err" >&2 || true
           }
           trap cleanup_smoke EXIT
 
@@ -254,6 +265,7 @@ jobs:
           GSETTINGS_BACKEND=memory \
           GDK_BACKEND=x11 \
           GSK_RENDERER=cairo \
+          LANG=C.UTF-8 \
           GTK_A11Y=none \
           NO_AT_BRIDGE=1 \
           OXIDOM_SMOKE_PIDFILE="$smoke/gui.pid" \
@@ -264,7 +276,7 @@ jobs:
             sleep 0.1
             i=$((i + 1))
           done
-          [ -s "$smoke/gui.pid" ] || { echo "::error::the GUI did not start under Xvfb"; exit 1; }
+          [ -s "$smoke/gui.pid" ] || { echo "::error::the GUI did not start under Xvfb"; dump_gui; exit 1; }
           gui_pid=$(cat "$smoke/gui.pid")
 
           gui_log="$smoke/home/.local/share/oxidom/oxidom-gui.log"
@@ -272,7 +284,7 @@ jobs:
           while [ "$i" -lt 200 ] && ! grep -qs 'Loading daemon state' "$gui_log"; do
             if ! kill -0 "$gui_pid" 2> /dev/null; then
               echo "::error::the GUI exited before loading daemon state"
-              cat "$smoke/gui.err" >&2 || true
+              dump_gui
               exit 1
             fi
             sleep 0.1
@@ -280,7 +292,7 @@ jobs:
           done
           if ! grep -qs 'Loading daemon state' "$gui_log"; then
             echo "::error::the GUI never reached the first daemon state"
-            cat "$smoke/gui.err" >&2 || true
+            dump_gui
             exit 1
           fi
 
@@ -300,7 +312,7 @@ jobs:
             sleep 0.1
             i=$((i + 1))
           done
-          [ -n "$owned" ] || { echo "::error::no daemon answered on the private session bus"; exit 1; }
+          [ -n "$owned" ] || { echo "::error::no daemon answered on the private session bus"; dump_gui; exit 1; }
 
           # RuntimeInfo runs the core against the bundled lists before it
           # answers, so this single call is the wait for that probe as well.
@@ -309,7 +321,7 @@ jobs:
               --object-path /dev/keepinfov/oxidom/Daemon \
               --method dev.keepinfov.oxidom1.RuntimeInfo); then
             echo "::error::the daemon did not answer RuntimeInfo"
-            cat "$smoke/gui.err" >&2 || true
+            dump_gui
             exit 1
           fi
           echo "$info"
