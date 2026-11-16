@@ -22,9 +22,9 @@ pub fn has_net_admin() -> bool {
 pub fn missing_capability_error(profile: &str) -> String {
     format!(
         "profile `{profile}` asks for a network interface, but this daemon has no CAP_NET_ADMIN. \
-         Interfaces are only available from the system daemon: enable `services.oxidom.enable` \
-         together with `services.oxidom.tun.enable`. oxidom will not escalate privileges on its \
-         own."
+         Interfaces are only available from the system daemon (`oxidom.service` with \
+         `AmbientCapabilities=CAP_NET_ADMIN`, or `services.oxidom.tun.enable = true` on NixOS). \
+         oxidom will not escalate privileges on its own."
     )
 }
 
@@ -44,5 +44,15 @@ mod tests {
     fn missing_or_malformed_cap_eff_is_unknown() {
         assert_eq!(super::parse_cap_eff("Name:\toxidom\n"), None);
         assert_eq!(super::parse_cap_eff("CapEff:\tnot-hex\n"), None);
+    }
+
+    #[test]
+    fn missing_capability_refusal_names_the_system_service_as_well_as_nixos() {
+        let text = super::missing_capability_error("work");
+        assert!(text.contains("CAP_NET_ADMIN"), "{text}");
+        assert!(text.contains("oxidom.service"), "{text}");
+        assert!(text.contains("AmbientCapabilities=CAP_NET_ADMIN"), "{text}");
+        assert!(text.contains("services.oxidom.tun.enable"), "{text}");
+        assert!(text.contains("will not escalate privileges"), "{text}");
     }
 }

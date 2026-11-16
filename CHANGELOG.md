@@ -17,6 +17,7 @@ surface, packaging, or the CLI belongs here.
 ### Fixed
 - **Enabling multiplexing no longer breaks XTLS Vision servers.** A Vision server treats a `v1.mux.cool` request as the vision stream's own destination and closes the connection on the first request, so a machine-wide `[core.mux] enabled = true` made every XTLS Vision connection die on its first request, which the latency check reported as “the check ran out of time”. Mux is now withheld from Vision outbounds; other outbounds still receive it. Hysteria2 outbounds were already exempt.
 - **A gRPC service name reaches Xray exactly as the link spells it.** The generator removed a leading slash, so a provider whose server registers `/api/v1/stream` answered `unknown service api/v1/stream` and the tunnel died on the first request. The link's spelling is now preserved, and a node that previously failed its latency check with a timeout connects.
+- **The interface refusal names the system service, not only the NixOS module.** A daemon without `CAP_NET_ADMIN` refused an `[interface]` profile by pointing at `services.oxidom.enable` and `services.oxidom.tun.enable`, options that exist only on NixOS, so the message led `.deb`, `.rpm`, AUR and AppImage users to configuration their system does not have. It now names `oxidom.service` with `AmbientCapabilities=CAP_NET_ADMIN` alongside the NixOS option, and the `tun2socks` and `nft` path rows in Settings carry the same system-service lock explanation as the Xray binary row instead of being greyed out silently.
 
 ## [0.6.0] - 2026-11-15
 
