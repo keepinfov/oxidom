@@ -344,6 +344,15 @@ pub enum LatencyState {
     NotRun(Option<ProbeDetail>),
 }
 
+/// Whether this state is drawn as a spinner.
+///
+/// The card keeps one animation across a `Checking` → `Checking` transition:
+/// the change is the wait moving from the queue into a slot, not a new check,
+/// and restarting it makes the badge stutter.
+pub(super) fn latency_spins(state: LatencyState) -> bool {
+    matches!(state, LatencyState::Checking { .. })
+}
+
 /// How a reading was taken, for the badge's tooltip.
 ///
 /// Named after what actually happened on the wire rather than after the
@@ -1230,7 +1239,13 @@ impl ServerCard {
     }
 
     fn apply_latency(&self, state: LatencyState) {
-        self.latency_spinner.set_spinning(false);
+        // A `Checking` that follows another is the same wait moving from the
+        // queue into a slot. Stopping the animation here would restart it and
+        // the badge would visibly stutter for a phase change; only leaving the
+        // check takes the spinner down.
+        if !latency_spins(state) {
+            self.latency_spinner.set_spinning(false);
+        }
         for class in [
             "latency-reachable",
             "latency-tunnel",
@@ -1266,7 +1281,9 @@ impl ServerCard {
             }
             LatencyState::Checking { .. } => {
                 self.latency_display.set_visible_child_name("spinner");
-                self.latency_spinner.set_spinning(true);
+                if !self.latency_spinner.is_spinning() {
+                    self.latency_spinner.set_spinning(true);
+                }
                 self.latency_spinner_pill
                     .set_tooltip_text(Some("Checking latency"));
             }

@@ -176,6 +176,9 @@ Layout (from the mockups + Nautilus feel; dark, rounded, generous spacing):
   therefore shows the same label. Stopping is not a failure and raises no error. Neither
   control offers a stop unless the read-only handshake advertises probe cancellation: a button that
   says it will stop something and then cannot is worse than the second press being ignored.
+  A check the daemon runs on its own updates a card's number when the reading lands, without
+  covering a number already shown with a spinner, and a superseded reading waits for a
+  connecting session to settle before it is re-checked.
  - **Server card** (custom widget): country **flag**, server **name**, protocol **subtitle**
    (`transport_label`, e.g. "vless + xhttp + reality"), **status badge** (`Connected`, `In use`,
    `Connecting`, `Error`) and optional **latency badge** (accent-coloured so green remains reserved

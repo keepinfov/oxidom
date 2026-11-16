@@ -179,6 +179,11 @@ and older or newer peers interoperate without schema drift.
   silent early return, by any route, leaves a card checking forever.
 - **`queued ≠ finished`.** `ProbeState` reports `running` and `queued` separately; a card waiting
   for a slot still carries its *previous* number and must not present it as this measurement's.
+- **A daemon's own re-check is not the card's check.** The active session's periodic probe
+  updates the number when the reading lands; a card that already has a current reading keeps it
+  instead of being covered by a spinner. A superseded reading is not re-checked while its
+  session is still connecting — the route it would measure is about to change — so the request
+  waits for `Connected`, `Error` or `Disconnected`.
 - **`ProbeState.version`** is bumped for incompatible semantic changes. The additive,
   serde-defaulted `proxied` map does not bump it. A GUI seeing a lower required version reports
   everything as unmeasured and says why, rather than guessing.
