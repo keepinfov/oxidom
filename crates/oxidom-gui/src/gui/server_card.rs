@@ -43,6 +43,14 @@ mod card_frame {
     pub struct CardFrame {
         pub child: RefCell<Option<gtk::Widget>>,
         pub height: Cell<i32>,
+        /// The card's context menu, shared with the card that owns it.
+        ///
+        /// A popover attached with `set_parent` is a child of the header, not
+        /// of this frame, and GTK does not unparent it when the frame goes —
+        /// so a card that outlived a refresh would leave its menu behind. The
+        /// frame is the thing `rebuild()` actually drops, so it is the thing
+        /// that has to let the menu go.
+        pub context_menu: RefCell<Option<Rc<RefCell<Option<gtk::Popover>>>>>,
     }
 
     #[glib::object_subclass]
@@ -54,6 +62,19 @@ mod card_frame {
 
     impl ObjectImpl for CardFrame {
         fn dispose(&self) {
+            // Before the header, which is the popover's parent: this is the
+            // only owner of a menu the card opened and never replaced. The
+            // borrow is released before the popover is touched, so a signal it
+            // emits cannot find the slot still borrowed.
+            let popover = self
+                .context_menu
+                .borrow_mut()
+                .take()
+                .and_then(|slot| slot.borrow_mut().take());
+            if let Some(popover) = popover {
+                popover.popdown();
+                popover.unparent();
+            }
             if let Some(child) = self.child.borrow_mut().take() {
                 child.unparent();
             }
@@ -219,11 +240,12 @@ glib::wrapper! {
 }
 
 impl CardFrame {
-    fn new(child: &impl IsA<gtk::Widget>) -> Self {
+    fn new(child: &impl IsA<gtk::Widget>, context_menu: Rc<RefCell<Option<gtk::Popover>>>) -> Self {
         let frame: Self = glib::Object::new();
         let child = child.clone().upcast::<gtk::Widget>();
         child.set_parent(&frame);
         frame.imp().child.replace(Some(child));
+        frame.imp().context_menu.replace(Some(context_menu));
         frame.set_animated_height(COMPACT_CARD_HEIGHT);
         frame
     }
@@ -1001,16 +1023,43 @@ impl ServerCard {
         let open_context_menu: Rc<dyn Fn(i32, i32)> = {
             let context_menu = context_menu.clone();
             let primary_revision = primary_revision.clone();
-            let shell = shell.clone();
-            let connect_button = connect_button.clone();
-            let favourite_button = favourite_button.clone();
-            let details_button = details_button.clone();
-            let edit_button = edit_button.clone();
-            let edit_alias = edit_alias.clone();
-            let copy_button = copy_button.clone();
-            let ping_button = ping_button.clone();
-            let trust_button = trust_button.clone();
+            // All weak: this closure is owned by controllers on `shell`, and a
+            // strong handle to `shell` or to any of its buttons would be a
+            // cycle the card never gets out of when a refresh drops it.
+            let shell = shell.downgrade();
+            let connect_button = connect_button.downgrade();
+            let favourite_button = favourite_button.downgrade();
+            let details_button = details_button.downgrade();
+            let edit_button = edit_button.downgrade();
+            let edit_alias = edit_alias.downgrade();
+            let copy_button = copy_button.downgrade();
+            let ping_button = ping_button.downgrade();
+            let trust_button = trust_button.downgrade();
             Rc::new(move |x, y| {
+                let (
+                    Some(shell),
+                    Some(connect_button),
+                    Some(favourite_button),
+                    Some(details_button),
+                    Some(edit_button),
+                    Some(edit_alias),
+                    Some(copy_button),
+                    Some(ping_button),
+                    Some(trust_button),
+                ) = (
+                    shell.upgrade(),
+                    connect_button.upgrade(),
+                    favourite_button.upgrade(),
+                    details_button.upgrade(),
+                    edit_button.upgrade(),
+                    edit_alias.upgrade(),
+                    copy_button.upgrade(),
+                    ping_button.upgrade(),
+                    trust_button.upgrade(),
+                )
+                else {
+                    return;
+                };
                 let buttons = ContextButtons {
                     connect: &connect_button,
                     favourite: favourite_button.upcast_ref(),
@@ -1049,10 +1098,15 @@ impl ServerCard {
 
         let menu_key = gtk::EventControllerKey::new();
         menu_key.connect_key_pressed({
-            let header = header.clone();
+            // The controller belongs to `shell`, of which `header` is a child:
+            // a strong clone here would keep the whole card alive.
+            let header = header.downgrade();
             let open_context_menu = open_context_menu.clone();
             move |_, key, _, state| {
                 if is_context_menu_key(key, state) {
+                    let Some(header) = header.upgrade() else {
+                        return glib::Propagation::Proceed;
+                    };
                     let x = (header.width() / 2).max(1);
                     let y = COMPACT_CARD_HEIGHT / 2;
                     open_context_menu(x, y);
@@ -1064,7 +1118,7 @@ impl ServerCard {
         });
         shell.add_controller(menu_key);
 
-        let root = CardFrame::new(&shell);
+        let root = CardFrame::new(&shell, context_menu.clone());
         root.set_hexpand(true);
         root.set_valign(gtk::Align::Start);
         root.set_overflow(gtk::Overflow::Hidden);
@@ -1762,11 +1816,19 @@ fn show_alias_dialog(
     window.set_content(Some(&page));
     window.set_default_widget(Some(&save));
 
+    // Weak, because the entry owns this closure: a strong `entry` here would be
+    // an `entry -> changed -> update_validation -> entry` cycle that no close
+    // undoes. The window's widget tree keeps all three alive while it is open.
     let update_validation: Rc<dyn Fn()> = Rc::new({
-        let entry = entry.clone();
-        let save = save.clone();
-        let validation = validation.clone();
+        let entry = entry.downgrade();
+        let save = save.downgrade();
+        let validation = validation.downgrade();
         move || {
+            let (Some(entry), Some(save), Some(validation)) =
+                (entry.upgrade(), save.upgrade(), validation.upgrade())
+            else {
+                return;
+            };
             let issue = alias_validation(entry.text().as_str());
             save.set_sensitive(issue.is_none());
             set_validation(&validation, issue);
@@ -1778,16 +1840,25 @@ fn show_alias_dialog(
     });
     update_validation();
 
-    let window_for_cancel = window.clone();
-    cancel.connect_clicked(move |_| window_for_cancel.close());
-    let window_for_save = window.clone();
+    let window_for_cancel = window.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(window) = window_for_cancel.upgrade() {
+            window.close();
+        }
+    });
+    let window_for_save = window.downgrade();
+    let entry_for_save = entry.downgrade();
     save.connect_clicked(move |button| {
+        let (Some(window), Some(entry)) = (window_for_save.upgrade(), entry_for_save.upgrade())
+        else {
+            return;
+        };
         let alias = entry.text().to_string();
         if !button.is_sensitive() || alias_validation(&alias).is_some() {
             return;
         }
         on_save(alias);
-        window_for_save.close();
+        window.close();
     });
     window.present();
 }
@@ -1976,16 +2047,20 @@ fn show_server_details_dialog(
             );
             take_back.set_valign(gtk::Align::Center);
             let on_drop_override = on_drop_override.clone();
-            let window_for_drop = window.clone();
+            let window_for_drop = window.downgrade();
             take_back.connect_clicked(move |_| {
                 on_drop_override(field.clone());
-                window_for_drop.close();
+                if let Some(window) = window_for_drop.upgrade() {
+                    window.close();
+                }
             });
             row.add_suffix(&take_back);
         }
         if parameter.secret {
             let secret = parameter.value.clone();
-            let row_for_reveal = row.clone();
+            // `reveal` is a suffix child of `row`, so a strong clone of the row
+            // would be a cycle through the widget tree that survives the dialog.
+            let row_for_reveal = row.downgrade();
             let reveal = gtk::ToggleButton::builder()
                 .icon_name("view-reveal-symbolic")
                 .tooltip_text("Reveal")
@@ -1994,6 +2069,9 @@ fn show_server_details_dialog(
                 .build();
             reveal.update_property(&[gtk::accessible::Property::Label("Reveal")]);
             reveal.connect_toggled(move |button| {
+                let Some(row_for_reveal) = row_for_reveal.upgrade() else {
+                    return;
+                };
                 if button.is_active() {
                     row_for_reveal.set_subtitle(&glib::markup_escape_text(&secret));
                     button.set_tooltip_text(Some("Hide"));
@@ -2024,8 +2102,12 @@ fn show_server_details_dialog(
     page.append(&scroller);
     window.set_content(Some(&page));
 
-    let window_for_close = window.clone();
-    close.connect_clicked(move |_| window_for_close.close());
+    let window_for_close = window.downgrade();
+    close.connect_clicked(move |_| {
+        if let Some(window) = window_for_close.upgrade() {
+            window.close();
+        }
+    });
     window.present();
 }
 
@@ -2071,7 +2153,7 @@ fn context_popover(sources: &[ContextItem<'_>], primary_revision: &Rc<Cell<u64>>
             .child(&gtk::Label::builder().xalign(0.0).build())
             .build();
         item.connect_clicked({
-            let source = (*source).clone();
+            let source = (*source).downgrade();
             let dynamic = fixed.is_none();
             let primary_revision = primary_revision.clone();
             let revision = primary_revision.get();
@@ -2080,6 +2162,17 @@ fn context_popover(sources: &[ContextItem<'_>], primary_revision: &Rc<Cell<u64>>
                     .child()
                     .and_downcast::<gtk::Label>()
                     .map(|label| label.text());
+                if let Some(popover) = item
+                    .ancestor(gtk::Popover::static_type())
+                    .and_downcast::<gtk::Popover>()
+                {
+                    popover.popdown();
+                }
+                // Weak, because `item` is a child of the popover this menu item
+                // was built for: a strong source would outlive the card.
+                let Some(source) = source.upgrade() else {
+                    return;
+                };
                 let current = source
                     .label()
                     .filter(|label| !label.is_empty())
@@ -2087,12 +2180,6 @@ fn context_popover(sources: &[ContextItem<'_>], primary_revision: &Rc<Cell<u64>>
                 // Identical labels can refer to different profile targets.
                 let stale = (index == 0 && primary_revision.get() != revision)
                     || (dynamic && shown != current);
-                if let Some(popover) = item
-                    .ancestor(gtk::Popover::static_type())
-                    .and_downcast::<gtk::Popover>()
-                {
-                    popover.popdown();
-                }
                 if !stale && source.is_sensitive() {
                     source.emit_clicked();
                 }

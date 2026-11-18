@@ -279,6 +279,13 @@ enum SelectionIntent {
     Edit(Box<ServerGroup>),
 }
 
+/// The two closures that rebuild the selection picker.
+///
+/// Held only while its dialog is open, in a slot the close and unrealize
+/// handlers empty, so that closing the window releases the closures and every
+/// widget they captured instead of leaving the whole dialog alive.
+type HeldPicker = Rc<RefCell<Option<(Rc<dyn Fn()>, Rc<dyn Fn()>)>>>;
+
 #[derive(Clone)]
 pub struct ServersView {
     binding_revision: Rc<Cell<u64>>,
@@ -383,6 +390,10 @@ pub struct ServersView {
     /// them buys no extra spread while costing an observatory ping apiece.
     connect_rotation_value: Rc<Cell<usize>>,
     connect_rotation: gtk::MenuButton,
+    /// The rotation widths the menu was last built for. `sync_connect_bar` runs
+    /// on every poll tick, and rebuilding the menu each time replaced the
+    /// popover under the pointer and leaked one per second.
+    rotation_options_shown: Rc<RefCell<Vec<usize>>>,
     /// First thing in the chip row rather than an icon in the header. The
     /// header had six widgets packed before it and this one was the sixth, so
     /// nobody found it; the row of chips is where a scope is chosen, and the
@@ -573,6 +584,7 @@ impl ServersView {
             connect_strategy: Rc::new(Cell::new(0)),
             connect_rotation_value: Rc::new(Cell::new(oxidom_core::pool::DEFAULT_POOL_ROTATION)),
             connect_rotation,
+            rotation_options_shown: Rc::new(RefCell::new(Vec::new())),
             filter_button,
             filter_label,
             scope_members: Rc::new(RefCell::new(Vec::new())),
@@ -940,12 +952,23 @@ impl ServersView {
             // never disagree about whether the block is folded.
             let toggle: Rc<dyn Fn()> = {
                 let collapsed = collapsed.clone();
-                let columns_box = columns_box.clone();
-                let collapse_toggle = collapse_toggle.clone();
-                let title_toggle = title_toggle.clone();
+                // Weak, because both toggles own this closure: a strong handle
+                // to either would make `title_toggle -> toggle -> title_toggle`
+                // a cycle, and with `columns_box` inside it, hold every card of
+                // the block alive across each rebuild.
+                let columns_box = columns_box.downgrade();
+                let collapse_toggle = collapse_toggle.downgrade();
+                let title_toggle = title_toggle.downgrade();
                 let prefs = self.prefs.clone();
                 let subscription_id = subscription.id.clone();
                 Rc::new(move || {
+                    let (Some(columns_box), Some(collapse_toggle), Some(title_toggle)) = (
+                        columns_box.upgrade(),
+                        collapse_toggle.upgrade(),
+                        title_toggle.upgrade(),
+                    ) else {
+                        return;
+                    };
                     let now_collapsed = !collapsed.get();
                     collapsed.set(now_collapsed);
                     columns_box.set_visible(!now_collapsed);
@@ -1301,9 +1324,18 @@ impl ServersView {
         let position = active
             .as_deref()
             .and_then(|id| next_groups.iter().position(|group| group.id == id));
-        self.scope_menu_button.set_popover(Some(&self.scope_menu(
-            position.map(|index| (next_groups[index].clone(), index, next_groups.len())),
-        )));
+        // Replacing the popover while it is open would dismiss the menu under
+        // the pointer; the chip row is rebuilt for reasons that rarely change
+        // what this menu would say.
+        if !self
+            .scope_menu_button
+            .popover()
+            .is_some_and(|popover| popover.is_visible())
+        {
+            self.scope_menu_button.set_popover(Some(&self.scope_menu(
+                position.map(|index| (next_groups[index].clone(), index, next_groups.len())),
+            )));
+        }
         self.sync_chip_modified();
         // Until the first group exists, the row is two chips whose purpose is
         // not obvious from their labels alone. One line says what the row is
@@ -1356,9 +1388,11 @@ impl ServersView {
         );
         create_pool.connect_clicked({
             let view = self.clone();
-            let popover = popover.clone();
+            let popover = popover.downgrade();
             move |_| {
-                popover.popdown();
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
                 let Some(query) =
                     profile_selection(&view.current_filter.borrow(), view.scope_kind.get())
                 else {
@@ -1372,8 +1406,11 @@ impl ServersView {
         });
         popover.connect_show({
             let view = self.clone();
-            let create_pool = create_pool.clone();
+            let create_pool = create_pool.downgrade();
             move |_| {
+                let Some(create_pool) = create_pool.upgrade() else {
+                    return;
+                };
                 create_pool.set_sensitive(
                     profile_selection(&view.current_filter.borrow(), view.scope_kind.get())
                         .is_some(),
@@ -1396,9 +1433,11 @@ impl ServersView {
         edit.connect_clicked({
             let view = self.clone();
             let group = group.clone();
-            let popover = popover.clone();
+            let popover = popover.downgrade();
             move |_| {
-                popover.popdown();
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
                 view.present_selection_dialog(SelectionIntent::Edit(Box::new(group.clone())));
             }
         });
@@ -1415,9 +1454,11 @@ impl ServersView {
         update.connect_clicked({
             let view = self.clone();
             let group = group.clone();
-            let popover = popover.clone();
+            let popover = popover.downgrade();
             move |_| {
-                popover.popdown();
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
                 // A list takes the servers on screen; a rule takes the filters
                 // that put them there, because a rule that froze them would stop
                 // being a rule.
@@ -1446,8 +1487,13 @@ impl ServersView {
         popover.connect_show({
             let view = self.clone();
             let group = group.clone();
-            let update = update.clone();
-            move |_| update.set_sensitive(view.group_is_modified(&group))
+            let update = update.downgrade();
+            move |_| {
+                let Some(update) = update.upgrade() else {
+                    return;
+                };
+                update.set_sensitive(view.group_is_modified(&group))
+            }
         });
         list.append(&update);
 
@@ -1471,9 +1517,11 @@ impl ServersView {
             move_item.connect_clicked({
                 let view = self.clone();
                 let id = group.id.clone();
-                let popover = popover.clone();
+                let popover = popover.downgrade();
                 move |_| {
-                    popover.popdown();
+                    if let Some(popover) = popover.upgrade() {
+                        popover.popdown();
+                    }
                     view.move_chip(&id, delta);
                 }
             });
@@ -1497,9 +1545,11 @@ impl ServersView {
         delete.connect_clicked({
             let view = self.clone();
             let group = group.clone();
-            let popover = popover.clone();
+            let popover = popover.downgrade();
             move |_| {
-                popover.popdown();
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
                 view.delete_group_dialog(group.clone());
             }
         });
@@ -1566,9 +1616,11 @@ impl ServersView {
                 .build();
             button.connect_clicked({
                 let view = self.clone();
-                let popover = popover.clone();
+                let popover = popover.downgrade();
                 move |_| {
-                    popover.popdown();
+                    if let Some(popover) = popover.upgrade() {
+                        popover.popdown();
+                    }
                     view.connect_strategy.set(index);
                     view.sync_connect_bar();
                 }
@@ -1583,13 +1635,9 @@ impl ServersView {
     ///
     /// Built once, like the strategy menu: the bar outlives every rebuild, and
     /// hooking it up per rebuild is how the Nth click came to fire N times.
+    /// `sync_connect_bar` runs on every poll tick, so this also declines to
+    /// replace a menu whose widths have not changed, or one that is open.
     fn build_rotation_menu(&self) {
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        list.set_margin_top(6);
-        list.set_margin_bottom(6);
-        list.set_margin_start(6);
-        list.set_margin_end(6);
-        let popover = gtk::Popover::builder().child(&list).build();
         let available = selection_ids(
             &self.current_filter.borrow(),
             self.scope_kind.get(),
@@ -1597,7 +1645,25 @@ impl ServersView {
             &self.direct_latencies.borrow(),
         )
         .len();
-        for value in rotation_options(available) {
+        let options = rotation_options(available);
+        if !Self::should_rebuild_rotation_menu(
+            &self.rotation_options_shown.borrow(),
+            &options,
+            self.connect_rotation.popover().is_some(),
+            self.connect_rotation
+                .popover()
+                .is_some_and(|popover| popover.is_visible()),
+        ) {
+            return;
+        }
+        *self.rotation_options_shown.borrow_mut() = options.clone();
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        list.set_margin_top(6);
+        list.set_margin_bottom(6);
+        list.set_margin_start(6);
+        list.set_margin_end(6);
+        let popover = gtk::Popover::builder().child(&list).build();
+        for value in options {
             let button = gtk::Button::builder()
                 .label(rotation_label(value))
                 .css_classes(["flat"])
@@ -1605,9 +1671,11 @@ impl ServersView {
             button.set_tooltip_text(Some(&rotation_detail(value)));
             button.connect_clicked({
                 let view = self.clone();
-                let popover = popover.clone();
+                let popover = popover.downgrade();
                 move |_| {
-                    popover.popdown();
+                    if let Some(popover) = popover.upgrade() {
+                        popover.popdown();
+                    }
                     view.connect_rotation_value.set(value);
                     view.sync_connect_bar();
                 }
@@ -1615,6 +1683,20 @@ impl ServersView {
             list.append(&button);
         }
         self.connect_rotation.set_popover(Some(&popover));
+    }
+
+    /// Whether the rotation menu has to be rebuilt for `next`.
+    ///
+    /// Pure so the tick-time decision is testable without a display: an open
+    /// menu must never be replaced under the pointer, and a closed one only
+    /// when the widths on offer would differ from the ones already on it.
+    fn should_rebuild_rotation_menu(
+        shown: &[usize],
+        next: &[usize],
+        has_popover: bool,
+        popover_visible: bool,
+    ) -> bool {
+        !popover_visible && (!has_popover || shown != next)
     }
 
     // Hand the visible selection to the window as a pool.
@@ -1982,10 +2064,13 @@ impl ServersView {
                 .css_classes(["flat", "circular"])
                 .build();
             button.connect_clicked({
-                let icon_row = icon_row.clone();
+                let icon_row = icon_row.downgrade();
                 // Pressing the one already chosen clears it, so a group can get
                 // back to having no icon without selecting the text by hand.
                 move |_| {
+                    let Some(icon_row) = icon_row.upgrade() else {
+                        return;
+                    };
                     let next = if icon_row.text() == preset {
                         ""
                     } else {
@@ -2781,14 +2866,23 @@ impl ServersView {
         (*refresh)();
         measure_preview(&preview_list, &preview_scroll);
         *self.picker_refresh.borrow_mut() = Some(Rc::downgrade(&refresh));
+        // The two closures hold the whole dialog's widgets, and the dialog holds
+        // the handlers that would otherwise hold them: kept here only for as
+        // long as the window is open, and dropped the moment it closes.
+        let held: HeldPicker = Rc::new(RefCell::new(Some((refresh, read_back))));
         dialog.connect_close_request({
             let picker_refresh = self.picker_refresh.clone();
-            let refresh = refresh.clone();
-            let read_back = read_back.clone();
+            let held = held.clone();
             move |_| {
-                let _keep_alive = (&refresh, &read_back);
+                held.borrow_mut().take();
                 picker_refresh.borrow_mut().take();
                 glib::Propagation::Proceed
+            }
+        });
+        dialog.connect_unrealize({
+            let held = held.clone();
+            move |_| {
+                held.borrow_mut().take();
             }
         });
         dialog.present();
@@ -3888,9 +3982,11 @@ impl ServersView {
             button.connect_clicked({
                 let view = self.clone();
                 let subscription_id = subscription.id.clone();
-                let popover = popover.clone();
+                let popover = popover.downgrade();
                 move |_| {
-                    popover.popdown();
+                    if let Some(popover) = popover.upgrade() {
+                        popover.popdown();
+                    }
                     view.move_subscription(&subscription_id, delta);
                 }
             });
@@ -3904,9 +4000,11 @@ impl ServersView {
         details.connect_clicked({
             let cb = callbacks.subscription_details.clone();
             let subscription_id = subscription.id.clone();
-            let popover = popover.clone();
+            let popover = popover.downgrade();
             move |_| {
-                popover.popdown();
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
                 cb(subscription_id.clone());
             }
         });
@@ -3916,9 +4014,11 @@ impl ServersView {
             copy_url.connect_clicked({
                 let cb = callbacks.copy_subscription_url.clone();
                 let url = subscription.url.clone();
-                let popover = popover.clone();
+                let popover = popover.downgrade();
                 move |_| {
-                    popover.popdown();
+                    if let Some(popover) = popover.upgrade() {
+                        popover.popdown();
+                    }
                     cb(url.clone());
                 }
             });
@@ -3929,9 +4029,11 @@ impl ServersView {
             remove.connect_clicked({
                 let cb = callbacks.remove_subscription.clone();
                 let subscription_id = subscription.id.clone();
-                let popover = popover.clone();
+                let popover = popover.downgrade();
                 move |_| {
-                    popover.popdown();
+                    if let Some(popover) = popover.upgrade() {
+                        popover.popdown();
+                    }
                     cb(subscription_id.clone());
                 }
             });
@@ -5016,6 +5118,45 @@ mod tests {
                 ("Create server…", false),
             ]
         );
+    }
+
+    #[test]
+    fn the_rotation_menu_is_rebuilt_only_when_its_widths_change_or_nothing_is_open() {
+        // Nothing built yet: the first call has to produce a menu.
+        assert!(super::ServersView::should_rebuild_rotation_menu(
+            &[],
+            &[8, 4],
+            false,
+            false
+        ));
+        // Built, closed and unchanged: the poll tick must leave it alone.
+        assert!(!super::ServersView::should_rebuild_rotation_menu(
+            &[8, 4],
+            &[8, 4],
+            true,
+            false
+        ));
+        // Built, closed, different widths: rebuild so the count can be chosen.
+        assert!(super::ServersView::should_rebuild_rotation_menu(
+            &[8, 4],
+            &[8, 2],
+            true,
+            false
+        ));
+        // Open: never replace it, however the widths moved — doing so closes
+        // the menu under the pointer, which is what the tick used to do.
+        assert!(!super::ServersView::should_rebuild_rotation_menu(
+            &[8, 4],
+            &[8, 2],
+            true,
+            true
+        ));
+        assert!(!super::ServersView::should_rebuild_rotation_menu(
+            &[],
+            &[8, 2],
+            false,
+            true
+        ));
     }
 
     #[test]

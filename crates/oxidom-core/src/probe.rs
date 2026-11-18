@@ -240,8 +240,29 @@ fn refused(server: &Server, complaint: &str) -> ProbeOutcome {
 /// either behind.
 struct ProbeCore {
     child: Child,
+    /// Both pipes are read from the moment the core starts, on threads of their
+    /// own: a core that says more than the 64 KiB the kernel buffers would
+    /// otherwise block on a write and never reach the point of being killed.
+    stdout: Option<std::thread::JoinHandle<String>>,
+    stderr: Option<std::thread::JoinHandle<String>>,
     config_path: PathBuf,
     socks_port: u16,
+}
+
+/// Read at most `limit` bytes, keep them, and discard the rest so the writer
+/// never blocks.
+fn spawn_bounded_reader(
+    mut stream: impl io::Read + Send + 'static,
+    limit: usize,
+) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = (&mut stream).take(limit as u64).read_to_end(&mut buffer);
+        // Whatever the core goes on to say is of no interest, but it still has
+        // to be taken off the pipe or the core stalls mid-sentence.
+        let _ = io::copy(&mut stream, &mut io::sink());
+        String::from_utf8_lossy(&buffer).into_owned()
+    })
 }
 
 impl ProbeCore {
@@ -303,7 +324,7 @@ impl ProbeCore {
             // and `1>/dev/null` prints nothing — while other builds and the
             // runtime itself may still use stderr. Discarding these is how "the
             // certificate was rejected" reaches a user as "server is
-            // unreachable". The core is killed before either is read, so a full
+            // unreachable". Both are drained while the core runs, so a full
             // pipe cannot wedge it.
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -311,11 +332,25 @@ impl ProbeCore {
         // must not fail for want of data the connection would have found.
         crate::xray::assets::point_at_our_assets(&mut command);
         match command.spawn() {
-            Ok(child) => Ok(ProbeCore {
-                child,
-                config_path,
-                socks_port,
-            }),
+            Ok(mut child) => {
+                // A core that fails says so in a line or two; a core that is
+                // merely chatty must not be read forever.
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|pipe| spawn_bounded_reader(pipe, 8192));
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|pipe| spawn_bounded_reader(pipe, 4096));
+                Ok(ProbeCore {
+                    child,
+                    stdout,
+                    stderr,
+                    config_path,
+                    socks_port,
+                })
+            }
             Err(error) => {
                 log::warn!(
                     "could not start a probe core ({}): {error}",
@@ -342,22 +377,9 @@ impl ProbeCore {
         std::thread::sleep(Duration::from_millis(200));
         let _ = self.child.kill();
         let _ = self.child.wait();
-        use std::io::Read as _;
-        let mut text = String::new();
-        // stdout first: that is where Xray's log goes. stderr is read too,
-        // because nothing guarantees the next core keeps that habit.
-        if let Some(stdout) = self.child.stdout.take() {
-            let mut buffer = Vec::new();
-            // A core that fails says so in a line or two; a core that is merely
-            // chatty must not be read forever.
-            let _ = stdout.take(8192).read_to_end(&mut buffer);
-            text.push_str(&String::from_utf8_lossy(&buffer));
-        }
-        if let Some(stderr) = self.child.stderr.take() {
-            let mut buffer = Vec::new();
-            let _ = stderr.take(4096).read_to_end(&mut buffer);
-            text.push_str(&String::from_utf8_lossy(&buffer));
-        }
+        // Joining finishes the readers, which have been draining both pipes all
+        // along; whatever they captured is already in memory.
+        let text = self.collected();
         // The line that explains something, if there is one — a refusal is not
         // reliably the last thing a core says, and taking the last line reports
         // startup chatter as the reason. Falling back to the last line keeps
@@ -369,6 +391,24 @@ impl ProbeCore {
             .or_else(|| text.lines().map(str::trim).rev().find(|l| !l.is_empty()))?
             .to_string();
         (!line.is_empty()).then_some(line)
+    }
+
+    /// Whatever the two readers captured, stdout first: that is where Xray's
+    /// log goes, while stderr is read too because nothing guarantees the next
+    /// core keeps that habit.
+    fn collected(&mut self) -> String {
+        let mut text = String::new();
+        if let Some(stdout) = self.stdout.take()
+            && let Ok(part) = stdout.join()
+        {
+            text.push_str(&part);
+        }
+        if let Some(stderr) = self.stderr.take()
+            && let Ok(part) = stderr.join()
+        {
+            text.push_str(&part);
+        }
+        text
     }
 }
 
@@ -412,6 +452,10 @@ impl Drop for ProbeCore {
         // be paid on every server in the list.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // The readers end at end of file; joining them here keeps a probe that
+        // bailed out without asking for a complaint from leaving two threads
+        // holding the pipes.
+        let _ = self.collected();
         remove_quietly(&self.config_path);
     }
 }
@@ -887,6 +931,27 @@ fn has_default_route(proc_net_route: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chatty_core_is_drained_without_wedging_the_writer_and_captured_up_to_the_limit() {
+        use std::io::Write as _;
+        let (pipe, mut writer) = io::pipe().expect("a pipe");
+        let reader = spawn_bounded_reader(pipe, 64);
+        let writing = std::thread::spawn(move || {
+            // Four times what the kernel buffers, so a reader that stopped at
+            // the limit would leave the writer blocked forever.
+            let block = vec![b'x'; 32 * 1024];
+            for _ in 0..8 {
+                writer.write_all(&block).expect("the pipe is drained");
+            }
+        });
+        writing
+            .join()
+            .expect("the writer never blocked on a full pipe");
+        let text = reader.join().expect("the reader returns");
+        assert_eq!(text.len(), 64);
+        assert!(text.bytes().all(|byte| byte == b'x'));
+    }
 
     #[test]
     fn a_probe_rejected_after_resolution_creates_no_config_or_core() -> anyhow::Result<()> {

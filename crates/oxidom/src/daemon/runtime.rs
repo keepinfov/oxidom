@@ -27,6 +27,12 @@ impl RuntimeFacts {
         self.retry.clear();
     }
 
+    /// Forget everything held for profiles the caller no longer keeps.
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.health.retain(|profile, _| keep(profile));
+        self.retry.retain(|profile, _| keep(profile));
+    }
+
     pub(super) fn clear_health(&mut self, profile: &str) {
         self.health.remove(profile);
     }
@@ -316,6 +322,27 @@ mod tests {
         assert_eq!(facts.retry("work", Some(2), now).state, "idle");
         assert_eq!(remaining_ms(now, now + Duration::from_secs(1)), 0);
         assert_eq!(remaining_ms(now + Duration::from_nanos(1), now), 1);
+    }
+
+    #[test]
+    fn retiring_a_profile_forgets_its_health_and_its_retry_episode() {
+        let mut facts = RuntimeFacts::default();
+        let now = Instant::now();
+        for profile in ["work", "home"] {
+            facts.observe(
+                profile,
+                subject(1, 1),
+                &probe::ProbeOutcome::Timeout,
+                "active",
+                "2026-10-28T00:00:00Z".into(),
+            );
+            facts.backoff(profile, 1, 0, now);
+        }
+        facts.retain(|profile| profile == "home");
+        assert!(facts.health("work", Some(subject(1, 1))).is_none());
+        assert!(!facts.has_retry("work", 1));
+        assert!(facts.health("home", Some(subject(1, 1))).is_some());
+        assert!(facts.has_retry("home", 1));
     }
 
     #[test]
