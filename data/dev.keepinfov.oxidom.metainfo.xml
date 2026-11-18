@@ -43,6 +43,22 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.6.2" date="2026-11-18">
+      <description>
+        <p>
+          Refreshing subscriptions, filtering by group or search, and closing
+          server or subscription dialogs no longer keep replaced server cards,
+          subscription blocks, popovers, or dialog widgets in memory while the
+          window stays open. Latency probe cores also drain their output pipes
+          while running so verbose core output cannot stall a check.
+        </p>
+        <p>
+          Hysteria2 servers configured with Salamander obfuscation now place
+          their mask inside streamSettings.finalmask.udp so Xray obfuscates the
+          UDP stream instead of ignoring top-level mask fields.
+        </p>
+      </description>
+    </release>
     <release version="0.6.1" date="2026-11-16">
       <description>
         <p>
