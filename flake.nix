@@ -154,6 +154,13 @@
         packages.oxidom-cli = oxidom-cli;
         packages.oxidom-gui = oxidom-gui;
         packages.oxidom = oxidom;
+        # The dependency build on its own, so CI can hold a garbage-collection
+        # root on it. `nix flake check` takes it as an input and leaves no link
+        # behind, and the store cache in CI collects garbage before it writes
+        # its one snapshot per key: an unrooted input is deleted seconds before
+        # that snapshot is taken, so the snapshot never carries it and every
+        # later run recompiles it. A root is what makes the collector keep it.
+        packages.oxidom-deps = workspaceDeps;
         packages.default = oxidom;
         apps.default = {
           type = "app";

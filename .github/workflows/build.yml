@@ -81,16 +81,20 @@ jobs:
             extra-system-features = kvm
             keep-env-derivations = true
             keep-outputs = true
-      # The dependency graph has its own derivation whose inputs are the cargo
-      # manifests and the lock file, so its store path is stable across most
-      # commits — the precondition a cache needed, per the issue that asked for
-      # one. GitHub's Actions cache backs this, so there is no secret involved
-      # and a fork's pull request restores the same entries; a run that cannot
-      # reach the cache builds from scratch, slower but not broken.
+      # The store cache writes one snapshot per key and never rewrites it: once
+      # the key exists the action reports a hit and saves nothing, so whatever
+      # the snapshot is missing stays missing for that key's whole life. The key
+      # therefore has to name everything that decides what must be in the
+      # snapshot — the flake inputs, every cargo manifest (the dependency build
+      # hashes them), and this file, whose steps decide what gets built at all —
+      # and a change to any of them starts a new key with a fresh snapshot.
+      # GitHub's Actions cache backs this, so there is no secret involved and a
+      # fork's pull request restores the same entries; a run that cannot reach
+      # the cache builds from scratch, slower but not broken.
       - name: Restore and save Nix store
         uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'Cargo.lock', '**/Cargo.toml', '.github/workflows/build.yml') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 6G
       # Not `nix build` as well: `checks.{cli,gui}` are the very derivations
@@ -99,3 +103,12 @@ jobs:
       # without starting another package build or a second copy of the VM test.
       - name: nix flake check
         run: nix flake check --print-build-logs
+      # `nix flake check` leaves no root behind, and the store cache collects
+      # garbage before writing its single snapshot per key. Without a root the
+      # dependency build is garbage by then: the collector deletes it seconds
+      # before the snapshot is taken, the snapshot goes without it, and every
+      # later run on that key compiles the dependency graph again and throws
+      # the result away. A link to it is an ordinary garbage-collection root,
+      # which the collector must keep.
+      - name: Root the dependency build so the store cache keeps it
+        run: nix build .#oxidom-deps --out-link "$RUNNER_TEMP/oxidom-deps"
