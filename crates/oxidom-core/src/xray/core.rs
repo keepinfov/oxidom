@@ -243,20 +243,14 @@ impl XrayCore {
         let (insecure, pinned) = match &server.spec {
             OutboundSpec::Hysteria2 { settings, .. } => {
                 self.note(HYSTERIA2_CORE_HINT);
-                if let Some(obfs) = &settings.obfs {
-                    if obfs.kind.eq_ignore_ascii_case("salamander") {
-                        self.note(
-                            "this server uses salamander obfuscation; Xray's implementation is \
-                             not known to interoperate with every hysteria2 server, so if the \
-                             handshake times out ask the provider for a plain endpoint",
-                        );
-                    } else {
-                        self.note(&format!(
-                            "ignoring unknown \"{}\" obfuscation — Xray only implements \
-                             salamander, and an unknown type stops the core from starting",
-                            obfs.kind
-                        ));
-                    }
+                if let Some(obfs) = &settings.obfs
+                    && !obfs.kind.eq_ignore_ascii_case("salamander")
+                {
+                    self.note(&format!(
+                        "ignoring unknown \"{}\" obfuscation — Xray only implements \
+                         salamander, and an unknown type stops the core from starting",
+                        obfs.kind
+                    ));
                 }
                 (settings.allow_insecure, settings.pin_sha256.is_some())
             }

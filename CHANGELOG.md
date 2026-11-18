@@ -16,6 +16,7 @@ surface, packaging, or the CLI belongs here.
 
 ### Fixed
 - **Refreshes and dialogs no longer leave the pages holding the widgets they replaced.** Refreshing subscriptions, polling with a group or filter active, and closing a server or subscription dialog each kept what they had replaced — server cards, subscription blocks and their fold toggles, the context, group and rotation popovers, the alias, details and selection widgets — alive for as long as the window was open; on a page rebuilt on every poll tick, a leak that grew with every tick. They now let go when the page does, and the rotation menu is not rebuilt while its widths are unchanged or it is open. A latency probe core also drains its output pipes while it runs, so a core that says more than the pipe buffer holds cannot stall a check.
+- **Hysteria2 servers with Salamander obfuscation now send an obfuscated UDP stream.** The generated `streamSettings.finalmask` placed `type` and `settings` at the top level, which Xray 26.x does not read, so the mask was silently dropped and packets left unobfuscated against a server that expects them masked. The mask is now a one-element `finalmask.udp` array, and Xray JSON imports accept both that shape and the flat object older releases wrote.
 
 ## [0.6.1] - 2026-11-16
 
