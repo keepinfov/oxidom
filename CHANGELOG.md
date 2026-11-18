@@ -12,6 +12,11 @@ Each entry says what changed for someone using oxidom, not which function was
 edited. Anything that changes behaviour, configuration, on-disk files, the D-Bus
 surface, packaging, or the CLI belongs here.
 
+## [Unreleased]
+
+### Fixed
+- **Hysteria2 servers with Salamander obfuscation now send an obfuscated UDP stream.** The generated `streamSettings.finalmask` placed `type` and `settings` at the top level, which Xray 26.x does not read, so the mask was silently dropped and packets left unobfuscated against a server that expects them masked. The mask is now a one-element `finalmask.udp` array, and Xray JSON imports accept both that shape and the flat object older releases wrote.
+
 ## [0.6.1] - 2026-11-16
 
 ### Fixed

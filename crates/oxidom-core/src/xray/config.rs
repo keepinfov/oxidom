@@ -629,8 +629,12 @@ fn hysteria2_stream(auth: &str, s: &Hysteria2Settings, port: u16) -> Value {
         && obfs.kind.eq_ignore_ascii_case("salamander")
     {
         v["finalmask"] = json!({
-            "type": "salamander",
-            "settings": { "password": obfs.password }
+            "udp": [
+                {
+                    "type": "salamander",
+                    "settings": { "password": obfs.password }
+                }
+            ]
         });
     }
     v
@@ -1743,8 +1747,9 @@ mod tests {
     }
 
     /// The obfuscator is a sibling of `hysteriaSettings`, not a field inside
-    /// it, and the key is `finalmask` — `udpmasks` is only Xray's internal
-    /// protobuf name and is silently ignored when used in JSON.
+    /// it, and `finalmask` carries it under `udp` — a top-level `type` and
+    /// `settings` are silently dropped by the core, leaving the stream
+    /// unobfuscated. `udpmasks` is only Xray's internal protobuf name.
     #[test]
     fn salamander_is_a_stream_level_finalmask() {
         let config = generate(
@@ -1761,8 +1766,17 @@ mod tests {
             &ResolvedCore::default(),
         );
         let stream = &config["outbounds"][0]["streamSettings"];
-        assert_eq!(stream["finalmask"]["type"], "salamander");
-        assert_eq!(stream["finalmask"]["settings"]["password"], "obfspw");
+        assert_eq!(
+            stream["finalmask"],
+            json!({
+                "udp": [
+                    {
+                        "type": "salamander",
+                        "settings": { "password": "obfspw" }
+                    }
+                ]
+            })
+        );
         assert!(stream["hysteriaSettings"].get("finalmask").is_none());
         assert!(stream.get("udpmasks").is_none());
     }

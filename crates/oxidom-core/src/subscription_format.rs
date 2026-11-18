@@ -1142,8 +1142,11 @@ fn hysteria2_from_xray(name: &str, outbound: &Value) -> Option<Server> {
     let tls = outbound
         .pointer("/streamSettings/tlsSettings")
         .unwrap_or(&Value::Null);
+    // Xray keeps masks in `finalmask.udp`, an array. The flat object is the
+    // shape older oxidom releases emitted, so it is still accepted on import.
     let mask = outbound
-        .pointer("/streamSettings/finalmask")
+        .pointer("/streamSettings/finalmask/udp/0")
+        .or_else(|| outbound.pointer("/streamSettings/finalmask"))
         .unwrap_or(&Value::Null);
 
     let mut port_hop = port_ranges(hy.pointer("/udpHop/ports"));
@@ -1777,15 +1780,30 @@ proxies:
             "tlsSettings":{"serverName":"real.example"},
             "hysteriaSettings":{"version":2,"auth":"secret","up":"100 mbps",
                                 "udpHop":{"ports":["443","5000-6000"],"interval":30}},
-            "finalmask":{"type":"salamander","settings":{"password":"obfspw"}}}
+            "finalmask":{"udp":[{"type":"salamander","settings":{"password":"obfspw"}}]}}
         }]}"#;
         let (servers, _skipped) = parse(json).unwrap();
         assert_eq!(servers.len(), 1);
         let (auth, s) = hy2(&servers[0]);
         assert_eq!(auth, "secret");
         assert_eq!(s.up_mbps, Some(100));
+        assert_eq!(s.obfs.as_ref().unwrap().kind, "salamander");
         assert_eq!(s.obfs.as_ref().unwrap().password, "obfspw");
         assert_eq!(s.sni.as_deref(), Some("real.example"));
+
+        // Older oxidom releases wrote the mask as a flat object on
+        // `finalmask`. Those configs must still import.
+        let legacy = r#"{"outbounds":[{
+          "tag":"hy2","protocol":"hysteria",
+          "settings":{"version":2,"address":"h.example","port":443},
+          "streamSettings":{"hysteriaSettings":{"auth":"secret"},
+            "finalmask":{"type":"salamander","settings":{"password":"obfspw"}}}
+        }]}"#;
+        let (servers, _skipped) = parse(legacy).unwrap();
+        assert_eq!(servers.len(), 1);
+        let (_, s) = hy2(&servers[0]);
+        assert_eq!(s.obfs.as_ref().unwrap().kind, "salamander");
+        assert_eq!(s.obfs.as_ref().unwrap().password, "obfspw");
 
         // Version 1 is a different wire protocol and must not be imported.
         let v1 = r#"{"outbounds":[{"tag":"hy1","protocol":"hysteria",
