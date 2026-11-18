@@ -452,9 +452,12 @@ fn make_header_controls(
 
     let root_weak = root.downgrade();
     let callbacks_for_add = callbacks.clone();
-    let popover_for_add = popover.clone();
+    let popover_for_add = popover.downgrade();
     add_subscription.connect_clicked(move |_| {
-        popover_for_add.popdown();
+        let Some(popover) = popover_for_add.upgrade() else {
+            return;
+        };
+        popover.popdown();
         let Some(root) = root_weak.upgrade() else {
             return;
         };
@@ -466,9 +469,12 @@ fn make_header_controls(
 
     let root_weak = root.downgrade();
     let callbacks_for_import = callbacks.clone();
-    let popover_for_import = popover.clone();
+    let popover_for_import = popover.downgrade();
     import_server.connect_clicked(move |_| {
-        popover_for_import.popdown();
+        let Some(popover) = popover_for_import.upgrade() else {
+            return;
+        };
+        popover.popdown();
         let Some(root) = root_weak.upgrade() else {
             return;
         };
@@ -480,9 +486,12 @@ fn make_header_controls(
 
     let root_weak = root.downgrade();
     let callbacks_for_create = callbacks.clone();
-    let popover_for_create = popover.clone();
+    let popover_for_create = popover.downgrade();
     create_server.connect_clicked(move |_| {
-        popover_for_create.popdown();
+        let Some(popover) = popover_for_create.upgrade() else {
+            return;
+        };
+        popover.popdown();
         let Some(root) = root_weak.upgrade() else {
             return;
         };
@@ -580,11 +589,18 @@ fn show_add_subscription(
         }
     });
 
-    let window_for_cancel = window.clone();
-    cancel.connect_clicked(move |_| window_for_cancel.close());
-    let window_for_add = window.clone();
+    let window_for_cancel = window.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(window) = window_for_cancel.upgrade() {
+            window.close();
+        }
+    });
+    let window_for_add = window.downgrade();
     let url_entry_for_add = url_entry.clone();
     add.connect_clicked(move |_| {
+        let Some(window) = window_for_add.upgrade() else {
+            return;
+        };
         let url = url_entry_for_add.text().trim().to_string();
         if !is_valid_subscription_url(&url) {
             return;
@@ -595,7 +611,7 @@ fn show_add_subscription(
             (!name.is_empty()).then_some(name),
             send_hwid.is_active(),
         );
-        window_for_add.close();
+        window.close();
     });
     // A link already on the clipboard is almost always the reason this dialog
     // is open. Filling it in is not a guess about intent — the field is empty
@@ -687,8 +703,12 @@ fn show_import_servers(
         set_validation(&validation_for_change, issue);
     });
 
-    let window_for_cancel = window.clone();
-    cancel.connect_clicked(move |_| window_for_cancel.close());
+    let window_for_cancel = window.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(window) = window_for_cancel.upgrade() {
+            window.close();
+        }
+    });
     // Same reasoning as the subscription field: links on the clipboard are why
     // this is open. Writing them in also runs the validator, so the Import
     // button is live without a second paste.
@@ -705,15 +725,18 @@ fn show_import_servers(
             });
         }
     }
-    let window_for_import = window.clone();
+    let window_for_import = window.downgrade();
     import.connect_clicked(move |_| {
+        let Some(window) = window_for_import.upgrade() else {
+            return;
+        };
         let (start, end) = buffer.bounds();
         let text = buffer.text(&start, &end, false).to_string();
         if text.trim().is_empty() || validate_share_links(&text).is_some() {
             return;
         }
         (callbacks.import)(text);
-        window_for_import.close();
+        window.close();
     });
     window.present();
 }
@@ -753,8 +776,13 @@ fn show_subscription_details(
         .build();
     reveal.update_property(&[gtk::accessible::Property::Label("Reveal")]);
     let url_for_reveal = subscription.url.clone();
-    let row_for_reveal = url_row.clone();
+    // `reveal` is a suffix child of `url_row`; a strong clone of the row here
+    // would keep the dialog's widget tree alive through its own reveal button.
+    let row_for_reveal = url_row.downgrade();
     reveal.connect_toggled(move |button| {
+        let Some(row_for_reveal) = row_for_reveal.upgrade() else {
+            return;
+        };
         let active = button.is_active();
         row_for_reveal.set_subtitle(&subscription_url_subtitle(&url_for_reveal, active));
         let label = if active { "Hide" } else { "Reveal" };
@@ -903,11 +931,16 @@ fn show_subscription_details(
 
     let initial_ua = subscription.user_agent.clone().unwrap_or_default();
     let flush_ua = {
-        let user_agent = user_agent.clone();
+        // Weak: the handler outlives the dialog, and the row must not be kept
+        // alive by the closure that reads it.
+        let user_agent = user_agent.downgrade();
         let ua_id = ua_id.clone();
         let ua_callback = ua_callback.clone();
         let last_saved = Rc::new(RefCell::new(initial_ua));
         move || {
+            let Some(user_agent) = user_agent.upgrade() else {
+                return;
+            };
             let current = user_agent.text().to_string();
             if *last_saved.borrow() != current {
                 *last_saved.borrow_mut() = current.clone();
@@ -915,20 +948,24 @@ fn show_subscription_details(
             }
         }
     };
-    let window_for_close = window.clone();
+    let window_for_close = window.downgrade();
     let flush_for_close = flush_ua.clone();
     close.connect_clicked(move |_| {
         flush_for_close();
-        window_for_close.close();
+        if let Some(window) = window_for_close.upgrade() {
+            window.close();
+        }
     });
     let refresh_id = subscription.id.clone();
     let refresh = callbacks.refresh.clone();
-    let window_for_update = window.clone();
+    let window_for_update = window.downgrade();
     let flush_for_update = flush_ua;
     update.connect_clicked(move |_| {
         flush_for_update();
         refresh(refresh_id.clone());
-        window_for_update.close();
+        if let Some(window) = window_for_update.upgrade() {
+            window.close();
+        }
     });
 
     let remove_id = subscription.id.clone();
@@ -936,8 +973,11 @@ fn show_subscription_details(
     let remove = callbacks.remove.clone();
     let holding_any = callbacks.groups_holding_any.clone();
     let sessions_any = callbacks.sessions_holding_any.clone();
-    let details_window = window.clone();
+    let details_window = window.downgrade();
     delete.connect_clicked(move |_| {
+        let Some(details_window) = details_window.upgrade() else {
+            return;
+        };
         confirm_remove_subscription(
             &details_window,
             remove_id.clone(),
@@ -1045,8 +1085,11 @@ fn show_local_servers(
         let callback = callbacks.remove_server.clone();
         let holding = callbacks.groups_holding.clone();
         let sessions_holding = callbacks.sessions_holding.clone();
-        let window_for_remove = window.clone();
+        let window_for_remove = window.downgrade();
         remove.connect_clicked(move |_| {
+            let Some(window_for_remove) = window_for_remove.upgrade() else {
+                return;
+            };
             // Deleting is irreversible (there is no undo), so mirror the
             // subscription-delete confirmation.
             let dialog = adw::AlertDialog::new(
@@ -1084,8 +1127,12 @@ fn show_local_servers(
     page.append(&header);
     page.append(&content);
     window.set_content(Some(&page));
-    let window_for_close = window.clone();
-    close.connect_clicked(move |_| window_for_close.close());
+    let window_for_close = window.downgrade();
+    close.connect_clicked(move |_| {
+        if let Some(window) = window_for_close.upgrade() {
+            window.close();
+        }
+    });
     window.present();
 }
 
@@ -1230,11 +1277,14 @@ fn preset_menu(
             .css_classes(["flat"])
             .build();
         button.connect_clicked({
-            let row = row.clone();
-            let popover = popover.clone();
+            let row = row.downgrade();
+            let popover = popover.downgrade();
             let subscription_id = subscription_id.to_string();
             let on_apply = on_apply.clone();
             move |_| {
+                let (Some(row), Some(popover)) = (row.upgrade(), popover.upgrade()) else {
+                    return;
+                };
                 popover.popdown();
                 row.set_text(value);
                 on_apply(subscription_id.clone(), value.to_string());

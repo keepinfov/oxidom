@@ -2693,6 +2693,19 @@ impl Shared {
         {
             let engine = oxidom_core::sync::lock(&self.engine);
             oxidom_core::sync::lock(&self.identities).prune(&engine, &mut facts);
+            // A profile with no session and no failure standing over it can
+            // never be asked about again, so the bookkeeping that outlived it
+            // goes too. The locks are taken in the order every other path uses
+            // — diagnostic_order, engine, override_status, current_generations,
+            // runtime_facts — and pruning under the engine lock held by
+            // `claim_generation`'s callers is what keeps a concurrent claim
+            // from inserting an entry only for this pass to drop it.
+            let overrides = oxidom_core::sync::lock(&self.override_status);
+            let keep = |profile: &str| {
+                engine.sessions.get(profile).is_some() || overrides.contains_key(profile)
+            };
+            oxidom_core::sync::lock(&self.current_generations).retain(|profile, _| keep(profile));
+            oxidom_core::sync::lock(&self.runtime_facts).retain(keep);
         }
         drop(order);
         facts.emit(&self.recorder);
@@ -5452,6 +5465,66 @@ fn core_rejected_the_protocol(logs: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile that is no longer a session and has no failure standing over
+    /// it will never be asked about again, so the generation and retry state
+    /// held for it must go with it. A live session and a standing override
+    /// each keep theirs.
+    #[test]
+    fn retiring_a_stopped_context_forgets_only_profiles_nothing_still_owns() {
+        let _guard = oxidom_core::sync::lock(&oxidom_core::paths::TEST_ROOT_LOCK);
+        let root = TestRoot::install("retired-contexts");
+        let shared = Shared::new(Engine::load(), false, false, false);
+        {
+            let mut engine = oxidom_core::sync::lock(&shared.engine);
+            let socks = engine.registry.config.socks_port;
+            let http = engine.registry.config.http_port;
+            engine
+                .prepare_session("live", Ipv4Addr::LOCALHOST, socks, http)
+                .expect("a session with no interface to prepare");
+        }
+        let mut claimed = HashMap::new();
+        for profile in ["live", "failed", "gone"] {
+            let generation = shared.next_connect_generation(profile);
+            oxidom_core::sync::lock(&shared.runtime_facts).backoff(
+                profile,
+                generation,
+                0,
+                Instant::now(),
+            );
+            claimed.insert(profile, generation);
+        }
+        oxidom_core::sync::lock(&shared.override_status).insert(
+            "failed".to_string(),
+            ErrorOverride {
+                status: Status::Error(RECONNECTING_MESSAGE.to_string()),
+                selection: SessionSelection::Server("synthetic".to_string()),
+            },
+        );
+
+        shared.retire_stopped_contexts();
+
+        let generations = oxidom_core::sync::lock(&shared.current_generations);
+        assert!(
+            generations.contains_key("live"),
+            "a live session keeps its generation"
+        );
+        assert!(
+            generations.contains_key("failed"),
+            "an override keeps its generation"
+        );
+        assert!(
+            !generations.contains_key("gone"),
+            "a retired profile keeps nothing"
+        );
+        drop(generations);
+        let facts = oxidom_core::sync::lock(&shared.runtime_facts);
+        assert!(facts.has_retry("live", claimed["live"]));
+        assert!(facts.has_retry("failed", claimed["failed"]));
+        assert!(!facts.has_retry("gone", claimed["gone"]));
+        drop(facts);
+        drop(root);
+    }
 
     #[test]
     fn identity_handshake_does_not_touch_engine_or_cancel_downloads() {
