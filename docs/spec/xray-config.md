@@ -162,9 +162,11 @@ against a real core with `xray run -test -c <file>` rather than against document
   the replacement is `tlsSettings.pinnedPeerCertSha256`, a bare **hex** string (not an array,
   not base64).
 - hysteria2 is `protocol: "hysteria"` with `settings.version == 2`; the credential goes in
-  `streamSettings.hysteriaSettings.auth`, and salamander obfuscation is
-  `streamSettings.finalmask` — a single object beside `hysteriaSettings`, *not* the `udpmasks`
-  array that appears in Xray's protobuf.
+  `streamSettings.hysteriaSettings.auth`, and salamander obfuscation is a one-element array in
+  `streamSettings.finalmask.udp`:
+  `[{ "type": "salamander", "settings": { "password": … } }]`. The mask must be inside `udp`;
+  a flat `type`/`settings` object on `finalmask` is silently ignored and the stream goes out
+  unobfuscated. `udpmasks` is only Xray's internal protobuf name, not a JSON key.
 
 ### Advanced core settings (binding)
 
